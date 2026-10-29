@@ -134,8 +134,7 @@ const principals = output("principals");
 const sync = [
   "DELETE FROM principals;",
   ...principals.map(
-    (p) =>
-      `INSERT INTO principals (client_id, user_id, host) VALUES (${quote(p.client_id)}, ${quote(p.user_id)}, ${quote(p.host)});`,
+    (p) => `INSERT INTO principals (client_id, user_id) VALUES (${quote(p.client_id)}, ${quote(p.user_id)});`,
   ),
 ].join("\n");
 mkdirSync(WORK, { recursive: true });

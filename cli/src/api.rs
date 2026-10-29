@@ -66,6 +66,7 @@ struct Hits {
 struct SearchBody<'a> {
     query: &'a str,
     tags: &'a [String],
+    any: bool,
     limit: u32,
     min_score: f64,
 }
@@ -93,6 +94,12 @@ fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq
         return Ok(response);
     }
     let text = response.body_mut().read_to_string().unwrap_or_default();
+    if status.is_server_error() {
+        bail!(
+            "{what} failed: the recall service had an error ({status}): {}",
+            text.trim()
+        );
+    }
     let hint = match status.as_u16() {
         300..=399 => {
             "; Cloudflare Access refused the service token, check RECALL_CLIENT_ID and RECALL_CLIENT_SECRET in the recall env file"
@@ -186,6 +193,7 @@ impl Client {
         &self,
         query: &str,
         tags: &[String],
+        any: bool,
         limit: u32,
         min_score: f64,
     ) -> Result<Vec<Hit>> {
@@ -197,6 +205,7 @@ impl Client {
             .send_json(SearchBody {
                 query,
                 tags,
+                any,
                 limit,
                 min_score,
             })?;

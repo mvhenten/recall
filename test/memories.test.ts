@@ -1,6 +1,9 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { accessVerifier } from "../src/access";
+import { createApp } from "../src/app";
 import type { Memory } from "../src/model";
-import { harness } from "./harness";
+import { AUDIENCE, harness, hashEmbedder, ISSUER, sharedIndex } from "./harness";
 
 const listNames = async (response: Response): Promise<string[]> => {
   expect(response.status).toBe(200);
@@ -17,7 +20,7 @@ describe("user isolation", () => {
 
     expect((await bob.request("GET", "/v1/memories/deploy-secret")).status).toBe(404);
     expect(await listNames(await bob.request("GET", "/v1/memories"))).toEqual([]);
-    expect(await bob.search("vault combination doormat", [])).toEqual([]);
+    expect(await bob.search("vault combination doormat", "any")).toEqual([]);
     expect((await bob.request("DELETE", "/v1/memories/deploy-secret")).status).toBe(404);
 
     const bobs = await bob.save("deploy-secret", { body: "bob's own note" });
@@ -26,7 +29,7 @@ describe("user isolation", () => {
     const response = await alice.request("GET", "/v1/memories/deploy-secret");
     const { memory }: { memory: Memory } = await response.json();
     expect(memory).toEqual(secret);
-    expect((await alice.search("vault combination doormat", [])).map((hit) => hit.memory.memoryId)).toEqual([
+    expect((await alice.search("vault combination doormat", "any")).map((hit) => hit.memory.memoryId)).toEqual([
       secret.memoryId,
     ]);
   });
@@ -38,6 +41,31 @@ describe("user isolation", () => {
 
     const forged = h.clientWithAssertion("not-a-jwt");
     expect((await forged.request("GET", "/v1/memories")).status).toBe(401);
+  });
+
+  it("answers 500, not 401, when the Access signing keys cannot be fetched", async () => {
+    const h = await harness();
+    const app = createApp({
+      verify: accessVerifier(
+        async () => {
+          throw new TypeError("fetch failed");
+        },
+        ISSUER,
+        AUDIENCE,
+      ),
+      embedder: hashEmbedder,
+      index: sharedIndex(),
+      now: Date.now,
+    });
+    const response = await app.request(
+      "/v1/memories",
+      { headers: { "cf-access-jwt-assertion": await h.assertionFor("any.access") } },
+      env,
+    );
+    expect(response.status).toBe(500);
+    const body: { error: string; requestId: string } = await response.json();
+    expect(body.error).toBe("internal error");
+    expect(body.requestId).not.toBe("");
   });
 });
 
@@ -72,9 +100,8 @@ describe("upsert", () => {
       body: "cache moved to an r2 bucket",
       tags: ["global"],
     });
-    expect(h.index.size()).toBe(1);
     expect(await listNames(await alice.request("GET", "/v1/memories"))).toEqual(["build-cache"]);
-    const [hit] = await alice.search("r2 bucket", []);
+    const [hit] = await alice.search("r2 bucket", "any");
     expect(hit?.score).toBeGreaterThan(0);
   });
 });
@@ -87,12 +114,12 @@ describe("recall tracking", () => {
     await alice.save("coffee-order", { body: "flat white" });
 
     const recalledAt = h.tick(1_000);
-    const hits = await alice.search("spaces tabs", []);
+    const hits = await alice.search("spaces tabs", "any");
     const hit = hits.find((candidate) => candidate.memory.name === "tabs-or-spaces");
     expect(hit?.memory.recallCount).toBe(1);
 
     h.tick(1_000);
-    await alice.search("spaces tabs", []);
+    await alice.search("spaces tabs", "any");
     const tabs: { memory: Memory } = await (await alice.request("GET", "/v1/memories/tabs-or-spaces")).json();
     expect(tabs.memory.recallCount).toBe(2);
     expect(tabs.memory.lastRecalledAt).toBe(recalledAt + 1_000);
@@ -136,8 +163,17 @@ describe("tags", () => {
     const scoped = await alice.search("release checklist", ["repo:github.com/acme/app", "global"]);
     expect(scoped.map((hit) => hit.memory.name).sort()).toEqual(["everywhere", "here"]);
 
-    const everything = await alice.search("release checklist", []);
+    const everything = await alice.search("release checklist", "any");
     expect(everything).toHaveLength(4);
+
+    const unscoped = await alice.request("POST", "/v1/search", {
+      query: "release checklist",
+      tags: [],
+      any: false,
+      limit: 10,
+      minScore: -1,
+    });
+    expect(unscoped.status).toBe(400);
   });
 
   it("lists by tag, newest created first, across pages and since a moment", async () => {

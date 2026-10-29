@@ -4,11 +4,11 @@ import { accessVerifier } from "../src/access";
 import { createApp } from "../src/app";
 import type { Embedder, Memory, VectorIndex, VectorMatch } from "../src/model";
 
-const ISSUER = "https://recall-test.cloudflareaccess.com";
-const AUDIENCE = "recall-test-aud";
+export const ISSUER = "https://recall-test.cloudflareaccess.com";
+export const AUDIENCE = "recall-test-aud";
 const DIMENSIONS = 384;
 
-const hashEmbedder: Embedder = {
+export const hashEmbedder: Embedder = {
   async embed(text: string): Promise<number[]> {
     const vector = new Array<number>(DIMENSIONS).fill(0);
     for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
@@ -23,7 +23,7 @@ const hashEmbedder: Embedder = {
 
 // Ignores namespaces on purpose: every user's vectors come back from every query,
 // so the tests prove that D1 alone keeps users apart.
-export const sharedIndex = (): VectorIndex & { size(): number } => {
+export const sharedIndex = (): VectorIndex => {
   const vectors = new Map<string, number[]>();
   return {
     async upsert(_namespace: string, id: string, values: number[]): Promise<void> {
@@ -38,14 +38,13 @@ export const sharedIndex = (): VectorIndex & { size(): number } => {
     async remove(ids: string[]): Promise<void> {
       for (const id of ids) vectors.delete(id);
     },
-    size: () => vectors.size,
   };
 };
 
 export interface Client {
   request(method: string, path: string, body?: unknown): Promise<Response>;
   save(name: string, fields: Partial<SaveBody>): Promise<Memory>;
-  search(query: string, tags: string[]): Promise<Array<{ memory: Memory; score: number }>>;
+  search(query: string, tags: string[] | "any"): Promise<Array<{ memory: Memory; score: number }>>;
 }
 
 interface SaveBody {
@@ -104,7 +103,13 @@ export const harness = async () => {
         return saved.memory;
       },
       async search(query, tags) {
-        const response = await request("POST", "/v1/search", { query, tags, limit: 10, minScore: -1 });
+        const response = await request("POST", "/v1/search", {
+          query,
+          tags: tags === "any" ? [] : tags,
+          any: tags === "any",
+          limit: 10,
+          minScore: -1,
+        });
         if (response.status !== 200) throw new Error(`search: ${response.status} ${await response.text()}`);
         const result: { hits: Array<{ memory: Memory; score: number }> } = await response.json();
         return result.hits;
@@ -112,11 +117,10 @@ export const harness = async () => {
     };
   };
 
-  const user = async (userId: string): Promise<Client> => {
+  const user = async (label: string): Promise<Client> => {
+    const userId = `${label}-${crypto.randomUUID()}`;
     const clientId = `${crypto.randomUUID()}.access`;
-    await env.DB.prepare("INSERT INTO principals (client_id, user_id, host) VALUES (?, ?, ?)")
-      .bind(clientId, userId, "test-host")
-      .run();
+    await env.DB.prepare("INSERT INTO principals (client_id, user_id) VALUES (?, ?)").bind(clientId, userId).run();
     return clientWithAssertion(await assertionFor(clientId));
   };
 

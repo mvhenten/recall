@@ -46,7 +46,11 @@ const embeddingText = (name: string, description: string, body: string): string 
 export const createApp = (deps: Deps): Hono<AppEnv> => {
   const app = new Hono<AppEnv>();
 
-  app.onError((error, c) => c.json({ error: error.message }, 500));
+  app.onError((error, c) => {
+    const requestId = crypto.randomUUID();
+    console.error(JSON.stringify({ requestId, error: error.message, stack: error.stack }));
+    return c.json({ error: "internal error", requestId }, 500);
+  });
 
   app.use("/v1/*", async (c, next) => {
     const assertion = c.req.header("cf-access-jwt-assertion");

@@ -27,12 +27,18 @@ export const saveSchema = z.object({
   tags: tagsSchema,
 });
 
-export const searchSchema = z.object({
-  query: z.string().min(1).max(2_000),
-  tags: tagsSchema,
-  limit: z.number().int().min(1).max(50),
-  minScore: z.number().min(-1).max(1),
-});
+export const searchSchema = z
+  .object({
+    query: z.string().min(1).max(2_000),
+    tags: tagsSchema,
+    any: z.boolean(),
+    limit: z.number().int().min(1).max(50),
+    minScore: z.number().min(-1).max(1),
+  })
+  .refine((input) => input.any !== input.tags.length > 0, {
+    message: "pass at least one tag, or any: true with no tags to match every memory",
+    path: ["tags"],
+  });
 
 export const listSchema = z.object({
   tag: z.array(tagSchema),

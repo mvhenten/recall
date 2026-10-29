@@ -1,7 +1,6 @@
 CREATE TABLE principals (
   client_id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  host TEXT NOT NULL
+  user_id TEXT NOT NULL
 );
 
 CREATE TABLE memories (
@@ -22,9 +21,6 @@ CREATE INDEX memories_by_user_created ON memories (user_id, created_at DESC, mem
 
 CREATE TABLE memory_tags (
   memory_id TEXT NOT NULL REFERENCES memories (memory_id) ON DELETE CASCADE,
-  user_id TEXT NOT NULL,
   tag TEXT NOT NULL,
   PRIMARY KEY (memory_id, tag)
 );
-
-CREATE INDEX memory_tags_by_user_tag ON memory_tags (user_id, tag, memory_id);

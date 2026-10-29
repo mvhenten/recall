@@ -124,7 +124,9 @@ fn default_tags() -> Vec<String> {
     match current_repo_tag() {
         Some(tag) => vec![tag, repo::GLOBAL_TAG.to_string()],
         None => {
-            eprintln!("recall: no git remote here; using the global tag only");
+            eprintln!(
+                "recall: no git repository with a remote here; searching only memories tagged global"
+            );
             vec![repo::GLOBAL_TAG.to_string()]
         }
     }
@@ -240,10 +242,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             match (global, current_repo_tag()) {
                 (true, _) => all_tags.push(repo::GLOBAL_TAG.to_string()),
                 (false, Some(tag)) => all_tags.push(tag),
-                (false, None) => {
-                    eprintln!("recall: no git remote here; tagging the memory global");
-                    all_tags.push(repo::GLOBAL_TAG.to_string());
-                }
+                (false, None) => bail!(
+                    "no git repository with a remote here, so there is no repo tag; pass --global to save it as a global memory"
+                ),
             }
             let saved = client()?.save(
                 &name,
@@ -294,8 +295,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             limit,
             min_score,
         } => {
-            let hits =
-                client()?.search(&query.join(" "), &filter_tags(&filter), limit, min_score)?;
+            let hits = client()?.search(
+                &query.join(" "),
+                &filter_tags(&filter),
+                filter.any,
+                limit,
+                min_score,
+            )?;
             if cli.json {
                 print_json(&hits)?;
             } else if hits.is_empty() {

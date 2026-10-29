@@ -1,4 +1,7 @@
 use crate::api::{Hit, Memory};
+use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Document {
@@ -82,76 +85,30 @@ pub fn parse(text: &str) -> Document {
     document
 }
 
-const DAYS_PER_ERA: i64 = 146_097;
-
 pub fn iso(ms: i64) -> String {
     if ms == 0 {
         return "never".to_string();
     }
-    let seconds = ms.div_euclid(1000);
-    let days = seconds.div_euclid(86_400);
-    let time = seconds.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(DAYS_PER_ERA);
-    let doe = z - era * DAYS_PER_ERA;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        time / 3600,
-        time % 3600 / 60,
-        time % 60
-    )
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let yoe = year - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * DAYS_PER_ERA + doe - 719_468
+    match Timestamp::from_millisecond(ms) {
+        Ok(timestamp) => timestamp.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        Err(_) => format!("{ms} ms"),
+    }
 }
 
 pub fn parse_since(value: &str) -> Option<i64> {
     if let Ok(ms) = value.parse::<i64>() {
         return Some(ms);
     }
-    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    if value.get(4..5)? != "-" || value.get(7..8)? != "-" {
-        return None;
+    if let Ok(timestamp) = value.parse::<Timestamp>() {
+        return Some(timestamp.as_millisecond());
     }
-    let mut seconds = days_from_civil(year, month, day) * 86_400;
-    if value.len() == 10 {
-        return Some(seconds * 1000);
-    }
-    let rest = value
-        .get(10..)?
-        .strip_prefix('T')
-        .or_else(|| value.get(10..)?.strip_prefix(' '))?;
-    let (clock, offset) = rest.split_at(rest.find(['Z', 'z', '+', '-'])?);
-    let mut parts = clock.split(':');
-    let hours: i64 = parts.next()?.parse().ok()?;
-    let minutes: i64 = parts.next()?.parse().ok()?;
-    let secs: f64 = parts.next().unwrap_or("0").parse().ok()?;
-    seconds += hours * 3600 + minutes * 60 + secs.trunc() as i64;
-    let offset_seconds = match offset {
-        "Z" | "z" => 0,
-        _ => {
-            let sign = if offset.starts_with('-') { -1 } else { 1 };
-            let (oh, om) = offset[1..]
-                .split_once(':')
-                .unwrap_or((offset.get(1..3)?, offset.get(3..5).unwrap_or("0")));
-            sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60)
-        }
-    };
-    Some((seconds - offset_seconds) * 1000)
+    let date = value.parse::<Date>().ok()?;
+    Some(
+        date.to_zoned(TimeZone::UTC)
+            .ok()?
+            .timestamp()
+            .as_millisecond(),
+    )
 }
 
 pub fn render(memory: &Memory) -> String {

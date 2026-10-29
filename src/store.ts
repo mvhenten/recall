@@ -20,7 +20,7 @@ const MEMORY_COLUMNS = `m.memory_id, m.user_id, m.name, m.description, m.type, m
 
 const TAG_FILTER = `(json_array_length(?2) = 0 OR EXISTS (
   SELECT 1 FROM memory_tags t
-  WHERE t.memory_id = m.memory_id AND t.user_id = ?1 AND t.tag IN (SELECT value FROM json_each(?2))))`;
+  WHERE t.memory_id = m.memory_id AND t.tag IN (SELECT value FROM json_each(?2))))`;
 
 const toMemory = (row: MemoryRow): Memory => ({
   memoryId: row.memory_id,
@@ -74,10 +74,10 @@ export const saveMemory = async (
     db.prepare(`DELETE FROM memory_tags WHERE memory_id = ${ownedId}`).bind(userId, name),
     db
       .prepare(
-        `INSERT INTO memory_tags (memory_id, user_id, tag)
-         SELECT ${ownedId}, ?, value FROM json_each(?)`,
+        `INSERT INTO memory_tags (memory_id, tag)
+         SELECT ${ownedId}, value FROM json_each(?)`,
       )
-      .bind(userId, name, userId, JSON.stringify(input.tags)),
+      .bind(userId, name, JSON.stringify(input.tags)),
   ]);
   const memory = await getMemory(db, userId, name);
   if (!memory) throw new Error(`memory ${name} vanished right after it was saved`);
@@ -85,10 +85,7 @@ export const saveMemory = async (
 };
 
 export const deleteMemory = async (db: D1Database, userId: string, memoryId: string): Promise<void> => {
-  await db.batch([
-    db.prepare("DELETE FROM memory_tags WHERE user_id = ? AND memory_id = ?").bind(userId, memoryId),
-    db.prepare("DELETE FROM memories WHERE user_id = ? AND memory_id = ?").bind(userId, memoryId),
-  ]);
+  await db.prepare("DELETE FROM memories WHERE user_id = ? AND memory_id = ?").bind(userId, memoryId).run();
 };
 
 const encodeCursor = (memory: Memory): string => btoa(JSON.stringify([memory.createdAt, memory.memoryId]));
