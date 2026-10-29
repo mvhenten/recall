@@ -148,9 +148,7 @@ const tofuEnv = {
   TF_VAR_account_id: accountId,
   TF_VAR_hostname: hostname,
   TF_VAR_otp_idp_id: otpIdpId,
-  TF_VAR_users: JSON.stringify(
-    Object.fromEntries(Object.entries(users).map(([id, user]) => [id, { emails: user.emails }])),
-  ),
+  TF_VAR_users: JSON.stringify(users),
 };
 
 run(tofu, ["init", "-input=false", `-backend-config=endpoints={s3="https://${accountId}.r2.cloudflarestorage.com"}`], {
@@ -163,7 +161,7 @@ const plan = JSON.parse(run(tofu, ["show", "-json", planPath], { cwd: infra, env
 const retiredServiceTokens = (change) =>
   change.change.actions.length === 1 &&
   change.change.actions[0] === "delete" &&
-  ((change.mode === "managed" && change.type === "cloudflare_zero_trust_access_service_token") ||
+  (change.address.startsWith("cloudflare_zero_trust_access_service_token.principal[") ||
     change.address === "cloudflare_zero_trust_access_policy.service_tokens");
 const changes = plan.resource_changes ?? [];
 const retired = changes.filter(retiredServiceTokens);
