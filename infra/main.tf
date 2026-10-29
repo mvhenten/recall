@@ -16,25 +16,6 @@ resource "cloudflare_d1_database" "recall" {
   }
 }
 
-resource "cloudflare_zero_trust_access_service_token" "principal" {
-  for_each = toset(["mvhenten/control"])
-
-  account_id = var.account_id
-  name       = "recall-${replace(each.key, "/", "-")}"
-  duration   = "forever"
-}
-
-resource "cloudflare_zero_trust_access_policy" "service_tokens" {
-  account_id = var.account_id
-  name       = "recall service tokens"
-  decision   = "non_identity"
-  include = [
-    for token in cloudflare_zero_trust_access_service_token.principal : {
-      service_token = { token_id = token.id }
-    }
-  ]
-}
-
 resource "cloudflare_zero_trust_access_policy" "bypass" {
   account_id = var.account_id
   name       = "recall api"
