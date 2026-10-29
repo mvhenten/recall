@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "recall": {
+      "command": "sh",
+      "args": ["-c", "exec \"$(command -v recall || printf '%s' \"$HOME/.cargo/bin/recall\")\" mcp"]
+    }
+  }
+}

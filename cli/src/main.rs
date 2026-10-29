@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod markdown;
+mod mcp;
 mod repo;
 
 use anyhow::{Context, Result, bail};
@@ -118,6 +119,28 @@ enum Command {
     },
     #[command(about = "Update recall to the latest release")]
     Update,
+    #[command(about = "Show the settings, or get or set one")]
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+    #[command(about = "Serve the recall tools over MCP on stdio")]
+    Mcp,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    #[command(about = "Print one setting")]
+    Get {
+        #[arg(value_parser = ["mode"])]
+        key: String,
+    },
+    #[command(about = "Change a setting: recall config set mode hook|tools")]
+    Set {
+        #[arg(value_parser = ["mode"])]
+        key: String,
+        value: String,
+    },
 }
 
 fn host_name() -> String {
@@ -207,6 +230,35 @@ fn update() -> Result<ExitCode> {
     } else {
         ExitCode::from(1)
     })
+}
+
+fn print_mode_hint(mode: config::Mode) {
+    if mode == config::Mode::Tools {
+        eprintln!("recall: {}", config::AUTO_MEMORY_OFF);
+    }
+}
+
+fn run_config(json: bool, action: Option<ConfigAction>) -> Result<()> {
+    match action {
+        None | Some(ConfigAction::Get { .. }) => {
+            let mode = config::mode()?;
+            if json {
+                print_json(&serde_json::json!({ "mode": mode.as_str() }))?;
+            } else if action.is_some() {
+                println!("{}", mode.as_str());
+            } else {
+                println!("mode={}", mode.as_str());
+            }
+            print_mode_hint(mode);
+        }
+        Some(ConfigAction::Set { value, .. }) => {
+            let mode = config::Mode::parse(&value)?;
+            let path = config::set_mode(mode)?;
+            println!("mode set to {} in {}", mode.as_str(), path.display());
+            print_mode_hint(mode);
+        }
+    }
+    Ok(())
 }
 
 fn current_repo_tag() -> Option<String> {
@@ -311,6 +363,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Login { endpoint, name } => login(endpoint, name)?,
         Command::Update => return update(),
+        Command::Config { action } => run_config(cli.json, action)?,
+        Command::Mcp => mcp::serve()?,
         Command::Logout => {
             match client()?.revoke_device("current") {
                 Ok(true) => {}
