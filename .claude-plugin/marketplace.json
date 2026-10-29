@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "recall",
+  "description": "Claude Code plugin for the recall memory service",
+  "owner": {
+    "name": "Matthijs van Henten"
+  },
+  "plugins": [
+    {
+      "name": "recall",
+      "description": "Sync Claude auto-memory to the recall service and recall matching memories on every prompt",
+      "source": "./"
+    }
+  ]
+}

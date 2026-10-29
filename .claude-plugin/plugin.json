@@ -1,0 +1,10 @@
+{
+  "name": "recall",
+  "version": "0.1.0",
+  "description": "Sync Claude auto-memory to the recall service and recall matching memories on every prompt",
+  "author": {
+    "name": "Matthijs van Henten"
+  },
+  "repository": "https://github.com/mvhenten/recall",
+  "license": "MIT"
+}

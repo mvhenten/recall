@@ -1,0 +1,28 @@
+{
+  "description": "Sync Claude auto-memory files to recall and inject matching memories into each prompt",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/save-memory.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/recall-memories.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

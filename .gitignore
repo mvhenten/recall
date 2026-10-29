@@ -1,0 +1,10 @@
+*.tfstate*
+.dev.vars
+.env
+.terraform/
+.tmp/
+.wrangler/
+dist/
+node_modules/
+target/
+wrangler.deploy.json
