@@ -37,7 +37,7 @@ export function logRun(sessionId, outcome, started) {
   }
 }
 
-export function recall(args, { cwd, timeout }) {
+export function recall(args, { cwd, timeout, input }) {
   const binary = recallBinary();
   if (!binary) {
     return Promise.resolve({
@@ -47,10 +47,14 @@ export function recall(args, { cwd, timeout }) {
   }
   const dir = cwd && existsSync(cwd) ? cwd : homedir();
   return new Promise((resolve) => {
-    execFile(binary, args, { cwd: dir, timeout, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(binary, args, { cwd: dir, timeout, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (!error) return resolve({ ok: true, stdout });
       if (error.killed) return resolve({ ok: false, timedOut: true, error: `timed out after ${timeout} ms` });
       resolve({ ok: false, error: firstLine(stderr) || error.message });
     });
+    if (input === undefined) return;
+    // recall may exit before reading stdin; the exit callback above reports that failure.
+    child.stdin.on("error", () => {});
+    child.stdin.end(input);
   });
 }
