@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -21,8 +21,20 @@ function recallBinary() {
   return existsSync(cargo) ? cargo : undefined;
 }
 
-function firstLine(text) {
-  return text.trim().split("\n").find(Boolean) ?? "";
+export function firstLine(text) {
+  return String(text).trim().split("\n").find(Boolean) ?? "";
+}
+
+export function logRun(sessionId, outcome, started) {
+  const stateHome = process.env.XDG_STATE_HOME || path.join(homedir(), ".local", "state");
+  const dir = path.join(stateHome, "recall");
+  const line = [new Date().toISOString(), sessionId ?? "-", outcome, `${Date.now() - started}ms`].join(" ");
+  try {
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(path.join(dir, "hooks.log"), `${line}\n`);
+  } catch {
+    // A failing log must never change how the hook behaves.
+  }
 }
 
 export function recall(args, { cwd, timeout }) {
@@ -37,7 +49,7 @@ export function recall(args, { cwd, timeout }) {
   return new Promise((resolve) => {
     execFile(binary, args, { cwd: dir, timeout, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (!error) return resolve({ ok: true, stdout });
-      if (error.killed) return resolve({ ok: false, error: `timed out after ${timeout} ms` });
+      if (error.killed) return resolve({ ok: false, timedOut: true, error: `timed out after ${timeout} ms` });
       resolve({ ok: false, error: firstLine(stderr) || error.message });
     });
   });
