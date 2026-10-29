@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
@@ -96,6 +97,90 @@ enum Command {
     Delete { name: String },
     #[command(about = "Print the repo tag of the current directory")]
     Repo,
+    #[command(about = "Sign this host in through the browser and store its device token")]
+    Login {
+        #[arg(long, help = "recall service URL; defaults to RECALL_ENDPOINT")]
+        endpoint: Option<String>,
+        #[arg(long, help = "Device name shown on the approval page; defaults to the host name")]
+        name: Option<String>,
+    },
+    #[command(about = "Revoke this host's device token and remove it from the env file")]
+    Logout,
+    #[command(about = "List the devices signed in as you")]
+    Devices {
+        #[arg(long, value_name = "ID", help = "Revoke the device with this id")]
+        revoke: Option<String>,
+    },
+}
+
+fn host_name() -> String {
+    let from_file = std::fs::read_to_string("/etc/hostname").ok();
+    let from_command = || {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+    };
+    from_file
+        .or_else(from_command)
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unnamed host".to_string())
+}
+
+fn open_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        "xdg-open"
+    } else {
+        return;
+    };
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new(opener)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+}
+
+fn login(endpoint: Option<String>, name: Option<String>) -> Result<()> {
+    let Some(endpoint) = endpoint
+        .map(|value| value.trim_end_matches('/').to_string())
+        .or(config::endpoint()?)
+    else {
+        bail!("pass --endpoint https://<your recall host>");
+    };
+    let device = api::DeviceLogin::new(&endpoint);
+    let started = device.start(&name.unwrap_or_else(host_name))?;
+    eprintln!(
+        "Open {} and enter the code {}
+(or open {})",
+        started.verification_uri, started.user_code, started.verification_uri_complete
+    );
+    open_browser(&started.verification_uri_complete);
+    let deadline = Instant::now() + Duration::from_secs(started.expires_in);
+    let mut interval = Duration::from_secs(started.interval.max(1));
+    loop {
+        std::thread::sleep(interval);
+        if Instant::now() >= deadline {
+            bail!("the code expired before it was approved; run recall login again");
+        }
+        match device.poll(&started.device_code)? {
+            api::Poll::Pending => {}
+            api::Poll::SlowDown => interval += Duration::from_secs(5),
+            api::Poll::Denied => bail!("the sign-in was denied in the browser"),
+            api::Poll::Expired => bail!("the code expired before it was approved; run recall login again"),
+            api::Poll::Granted(token) => {
+                let path = config::save_login(&endpoint, &token)?;
+                eprintln!("signed in; wrote {}", path.display());
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn current_repo_tag() -> Option<String> {
@@ -198,6 +283,44 @@ fn editor_round_trip(memory: &Memory) -> Result<markdown::Document> {
 fn run(cli: Cli) -> Result<ExitCode> {
     let client = || -> Result<Client> { Ok(Client::new(config::load()?)) };
     match cli.command {
+        Command::Login { endpoint, name } => login(endpoint, name)?,
+        Command::Logout => {
+            match client()?.revoke_device("current") {
+                Ok(true) => {}
+                Ok(false) => eprintln!("recall: this device was already revoked"),
+                Err(error) => eprintln!(
+                    "recall: the server did not revoke this device ({error:#}); revoke it from another host with recall devices --revoke"
+                ),
+            }
+            let path = config::remove_token()?;
+            eprintln!("signed out; removed the token from {}", path.display());
+        }
+        Command::Devices { revoke } => {
+            let client = client()?;
+            if let Some(device_id) = revoke {
+                if !client.revoke_device(&device_id)? {
+                    eprintln!("recall: no device {device_id}");
+                    return Ok(ExitCode::from(1));
+                }
+                println!("revoked {device_id}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let devices = client.devices()?;
+            if cli.json {
+                print_json(&devices)?;
+            } else {
+                for device in &devices {
+                    println!(
+                        "{}  {}  created {}  last used {}{}",
+                        device.device_id,
+                        device.name,
+                        markdown::iso(device.created_at),
+                        markdown::iso(device.last_used_at),
+                        if device.current { "  (this device)" } else { "" }
+                    );
+                }
+            }
+        }
         Command::Repo => match current_repo_tag() {
             Some(tag) => println!("{tag}"),
             None => bail!("no git remote here"),

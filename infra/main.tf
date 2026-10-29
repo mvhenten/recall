@@ -1,9 +1,5 @@
 locals {
-  principals = merge([
-    for user_id, user in var.users : {
-      for host in user.hosts : "${user_id}/${host}" => { user_id = user_id, host = host }
-    }
-  ]...)
+  emails = distinct(flatten([for user in var.users : [for email in user.emails : lower(email)]]))
 }
 
 data "cloudflare_zero_trust_organization" "this" {
@@ -20,23 +16,18 @@ resource "cloudflare_d1_database" "recall" {
   }
 }
 
-resource "cloudflare_zero_trust_access_service_token" "principal" {
-  for_each = local.principals
-
+resource "cloudflare_zero_trust_access_policy" "bypass" {
   account_id = var.account_id
-  name       = "recall-${each.value.user_id}-${each.value.host}"
-  duration   = "forever"
+  name       = "recall api"
+  decision   = "bypass"
+  include    = [{ everyone = {} }]
 }
 
-resource "cloudflare_zero_trust_access_policy" "service_tokens" {
+resource "cloudflare_zero_trust_access_policy" "approvers" {
   account_id = var.account_id
-  name       = "recall service tokens"
-  decision   = "non_identity"
-  include = [
-    for token in cloudflare_zero_trust_access_service_token.principal : {
-      service_token = { token_id = token.id }
-    }
-  ]
+  name       = "recall device approvers"
+  decision   = "allow"
+  include    = [for email in local.emails : { email = { email = email } }]
 }
 
 resource "cloudflare_zero_trust_access_application" "recall" {
@@ -49,7 +40,24 @@ resource "cloudflare_zero_trust_access_application" "recall" {
   service_auth_401_redirect = true
   policies = [
     {
-      id         = cloudflare_zero_trust_access_policy.service_tokens.id
+      id         = cloudflare_zero_trust_access_policy.bypass.id
+      precedence = 1
+    }
+  ]
+}
+
+resource "cloudflare_zero_trust_access_application" "device" {
+  account_id                = var.account_id
+  name                      = "recall device approval"
+  type                      = "self_hosted"
+  domain                    = "${var.hostname}/device"
+  session_duration          = "24h"
+  app_launcher_visible      = false
+  allowed_idps              = [var.otp_idp_id]
+  auto_redirect_to_identity = true
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.approvers.id
       precedence = 1
     }
   ]

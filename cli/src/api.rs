@@ -2,8 +2,8 @@ use crate::config::Config;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use ureq::Agent;
 use ureq::http::Response;
+use ureq::{Agent, RequestBuilder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,25 +100,139 @@ fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq
         );
     }
     let hint = match status.as_u16() {
-        300..=399 => {
-            "; Cloudflare Access refused the service token, check RECALL_CLIENT_ID and RECALL_CLIENT_SECRET in the recall env file"
-        }
-        401 | 403 => "; check RECALL_CLIENT_ID and RECALL_CLIENT_SECRET in the recall env file",
+        300..=399 => "; Cloudflare Access redirected the call, check RECALL_ENDPOINT",
+        401 | 403 => "; run recall login",
         _ => "",
     };
     bail!("{what} failed with {status}: {}{hint}", text.trim())
 }
 
+fn agent() -> Agent {
+    Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_global(Some(Duration::from_secs(20)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+#[derive(Deserialize)]
+struct GrantError {
+    error: String,
+    #[serde(default)]
+    error_description: String,
+}
+
+#[derive(Deserialize)]
+struct Granted {
+    access_token: String,
+}
+
+pub enum Poll {
+    Granted(String),
+    Pending,
+    SlowDown,
+    Denied,
+    Expired,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Device {
+    pub device_id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub current: bool,
+}
+
+#[derive(Deserialize)]
+struct Devices {
+    devices: Vec<Device>,
+}
+
+pub struct DeviceLogin {
+    agent: Agent,
+    endpoint: String,
+}
+
+impl DeviceLogin {
+    pub fn new(endpoint: &str) -> DeviceLogin {
+        DeviceLogin {
+            agent: agent(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub fn start(&self, device_name: &str) -> Result<DeviceStart> {
+        let response = self
+            .agent
+            .post(format!("{}/v1/device/code", self.endpoint))
+            .send_json(serde_json::json!({ "device_name": device_name }))?;
+        Ok(check(response, "starting the device login")?.body_mut().read_json()?)
+    }
+
+    pub fn poll(&self, device_code: &str) -> Result<Poll> {
+        let mut response = self
+            .agent
+            .post(format!("{}/v1/device/token", self.endpoint))
+            .send_json(serde_json::json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+            }))?;
+        if response.status().as_u16() == 400 {
+            let grant: GrantError = response.body_mut().read_json()?;
+            return match grant.error.as_str() {
+                "authorization_pending" => Ok(Poll::Pending),
+                "slow_down" => Ok(Poll::SlowDown),
+                "access_denied" => Ok(Poll::Denied),
+                "expired_token" => Ok(Poll::Expired),
+                _ => bail!("the device login failed: {} {}", grant.error, grant.error_description),
+            };
+        }
+        let granted: Granted = check(response, "finishing the device login")?.body_mut().read_json()?;
+        Ok(Poll::Granted(granted.access_token))
+    }
+}
+
 impl Client {
     pub fn new(config: Config) -> Client {
-        let agent: Agent = Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_global(Some(Duration::from_secs(20)))
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .build()
-            .into();
-        Client { agent, config }
+        Client { agent: agent(), config }
+    }
+
+    fn authed<B>(&self, request: RequestBuilder<B>) -> RequestBuilder<B> {
+        request.header("authorization", format!("Bearer {}", self.config.token))
+    }
+
+    pub fn devices(&self) -> Result<Vec<Device>> {
+        let response = self.authed(self.agent.get(self.url("/v1/devices"))).call()?;
+        let devices: Devices = check(response, "listing devices")?.body_mut().read_json()?;
+        Ok(devices.devices)
+    }
+
+    pub fn revoke_device(&self, device_id: &str) -> Result<bool> {
+        let response = self
+            .authed(
+                self.agent
+                    .delete(self.url(&format!("/v1/devices/{}", encode(device_id)))),
+            )
+            .call()?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        check(response, &format!("revoking device {device_id}"))?;
+        Ok(true)
     }
 
     fn url(&self, path: &str) -> String {
@@ -131,21 +245,13 @@ impl Client {
 
     pub fn save(&self, name: &str, body: &SaveBody) -> Result<Saved> {
         let response = self
-            .agent
-            .put(self.url(&Self::memory_path(name)))
-            .header("cf-access-client-id", &self.config.client_id)
-            .header("cf-access-client-secret", &self.config.client_secret)
+            .authed(self.agent.put(self.url(&Self::memory_path(name))))
             .send_json(body)?;
         Ok(check(response, &format!("saving {name}"))?.body_mut().read_json()?)
     }
 
     pub fn get(&self, name: &str) -> Result<Option<Memory>> {
-        let response = self
-            .agent
-            .get(self.url(&Self::memory_path(name)))
-            .header("cf-access-client-id", &self.config.client_id)
-            .header("cf-access-client-secret", &self.config.client_secret)
-            .call()?;
+        let response = self.authed(self.agent.get(self.url(&Self::memory_path(name)))).call()?;
         if response.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -155,10 +261,7 @@ impl Client {
 
     pub fn delete(&self, name: &str) -> Result<bool> {
         let response = self
-            .agent
-            .delete(self.url(&Self::memory_path(name)))
-            .header("cf-access-client-id", &self.config.client_id)
-            .header("cf-access-client-secret", &self.config.client_secret)
+            .authed(self.agent.delete(self.url(&Self::memory_path(name))))
             .call()?;
         if response.status().as_u16() == 404 {
             return Ok(false);
@@ -174,20 +277,14 @@ impl Client {
             query.push(format!("cursor={}", encode(cursor)));
         }
         let response = self
-            .agent
-            .get(self.url(&format!("/v1/memories?{}", query.join("&"))))
-            .header("cf-access-client-id", &self.config.client_id)
-            .header("cf-access-client-secret", &self.config.client_secret)
+            .authed(self.agent.get(self.url(&format!("/v1/memories?{}", query.join("&")))))
             .call()?;
         Ok(check(response, "listing memories")?.body_mut().read_json()?)
     }
 
     pub fn search(&self, request: &SearchRequest) -> Result<Vec<Hit>> {
         let response = self
-            .agent
-            .post(self.url("/v1/search"))
-            .header("cf-access-client-id", &self.config.client_id)
-            .header("cf-access-client-secret", &self.config.client_secret)
+            .authed(self.agent.post(self.url("/v1/search")))
             .send_json(request)?;
         let hits: Hits = check(response, "searching")?.body_mut().read_json()?;
         Ok(hits.hits)

@@ -3,7 +3,7 @@
 Per-user semantic memory for coding agents. recall keeps the notes an agent learns about you and your projects (your preferences, feedback you gave, how a repo works) in a small service you run on your own Cloudflare account, so they follow you across machines and harnesses.
 
 - A command-line client, `recall`, saves, lists, searches and edits memories from any shell or agent.
-- A Cloudflare Worker behind Cloudflare Access stores each user's memories in D1, with an embedding per memory and a full-text index, and answers searches with both.
+- A Cloudflare Worker stores each user's memories in D1, with an embedding per memory and a full-text index, and answers searches with both.
 - A Claude Code plugin saves Claude's auto-memory files to recall and adds matching memories to each prompt.
 
 ## Install
@@ -14,7 +14,21 @@ Per-user semantic memory for coding agents. recall keeps the notes an agent lear
 cargo install --git https://github.com/mvhenten/recall recall
 ```
 
-From a checkout, `cargo install --path cli` does the same. The CLI reads `RECALL_ENDPOINT`, `RECALL_CLIENT_ID` and `RECALL_CLIENT_SECRET` from the environment or from `~/.config/recall/env` (`RECALL_ENV_FILE` points elsewhere). The setup below writes that file.
+From a checkout, `cargo install --path cli` does the same. Sign each host in once:
+
+```bash
+recall login --endpoint https://recall.example.com
+```
+
+The CLI prints a URL and a code and opens a browser when it can. Open the URL, sign in with the one-time PIN Cloudflare Access mails you, check the code and approve. The CLI then writes `RECALL_ENDPOINT` and `RECALL_TOKEN` to `~/.config/recall/env` (mode 600; `RECALL_ENV_FILE` points elsewhere). Both can also come from the environment.
+
+```bash
+recall devices                  # every device signed in as you
+recall devices --revoke <id>    # sign another device out
+recall logout                   # revoke this device and remove its token
+```
+
+A revoked or unknown token gets a 401, and the CLI says to run `recall login`.
 
 ### Self-host the service
 
@@ -23,10 +37,11 @@ You need a Cloudflare account with a domain on it and Zero Trust switched on (th
 ```bash
 npm ci
 read -rs CLOUDFLARE_API_TOKEN && export CLOUDFLARE_API_TOKEN
-npm run setup -- --hostname recall.example.com --user alice --host laptop
+npm run setup -- --hostname recall.example.com --user alice --email alice@example.com
+recall login --endpoint https://recall.example.com
 ```
 
-The setup creates the D1 database, a Cloudflare Access application on the hostname, an Access service token for that user and host, and a policy that admits it. It then migrates the database, registers the token as the user, deploys the Worker to the hostname and writes `~/.config/recall/env` (mode 600). Run it again at any time: it finds what exists and creates the rest. Run it on each new machine with a new `--host`, or with a new `--user` for another person; their memories stay apart. `--dry-run` prints what it would do, `--account <id>` picks an account when the token sees several, and `--env-path <path>` writes the env file elsewhere.
+The setup creates the D1 database and two Cloudflare Access applications. One covers the hostname and lets every request through, since the Worker checks device tokens itself. The other covers only `/device`, the approval page: it admits the listed emails through the one-time PIN login method, which the setup switches on. The setup then migrates the database, maps the emails to the user id, deploys the Worker to the hostname and prints the `recall login` command. Run it again at any time: it finds what exists and creates the rest. Run it with a new `--user` and `--email` to add a person; their memories stay apart. `--email` repeats for more addresses, `--dry-run` prints what it would do and `--account <id>` picks an account when the token sees several.
 
 Create the API token under My Profile → API Tokens → Create Custom Token, with:
 
@@ -37,8 +52,7 @@ Create the API token under My Profile → API Tokens → Create Custom Token, wi
 | Account | Workers Scripts · Edit                                       |
 | Account | Workers AI · Read                                            |
 | Account | Access: Apps and Policies · Edit                             |
-| Account | Access: Service Tokens · Edit                                |
-| Account | Access: Organizations, Identity Providers, and Groups · Read |
+| Account | Access: Organizations, Identity Providers, and Groups · Edit |
 | Zone    | Zone · Read                                                  |
 | Zone    | DNS · Edit                                                   |
 | Zone    | Workers Routes · Edit                                        |
@@ -82,7 +96,7 @@ recall --json search cache          # machine output
 
 ## API
 
-All routes sit under `/v1` and need a Cloudflare Access service token. The Worker resolves the user from the token; a client never names a user.
+The routes under `/v1/memories`, `/v1/search` and `/v1/devices` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
 
 | Method   | Path                                      |                                                                   |
 | -------- | ----------------------------------------- | ----------------------------------------------------------------- |
@@ -91,21 +105,25 @@ All routes sit under `/v1` and need a Cloudflare Access service token. The Worke
 | `DELETE` | `/v1/memories/:name`                      | delete one                                                        |
 | `GET`    | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first                                              |
 | `POST`   | `/v1/search`                              | `{query, tags, any, limit, minScore, mode}`; each hit is a recall |
+| `GET`    | `/v1/devices`                             | the caller's devices                                              |
+| `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                 |
+
+The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` is the only path behind an Access login; its approve and deny form checks the Access JWT, the origin and a CSRF token.
 
 ## Deploying from CI
 
-As an alternative to `npm run setup`, Cloudflare Workers Builds can deploy the repo on every push with `npm run deploy` as the deploy command. It applies `infra/` with OpenTofu, migrates D1, syncs the users from `RECALL_USERS` and deploys the Worker. It refuses a plan that would destroy a resource. Use one path per deployment, not both.
+As an alternative to `npm run setup`, Cloudflare Workers Builds can deploy the repo on every push with `npm run deploy` as the deploy command. It applies `infra/` with OpenTofu, migrates D1, syncs the users from `RECALL_USERS` and deploys the Worker. The account needs the One-time PIN login method (Zero Trust, Settings, Authentication). It refuses a plan that would destroy a resource, except the retired Access service tokens and their policy. Use one path per deployment, not both.
 
 The build reads the instance from build variables and stops with a message naming any that is missing:
 
-| Variable            | Example                                  |
-| ------------------- | ---------------------------------------- |
-| `RECALL_ACCOUNT_ID` | `0123456789abcdef0123456789abcdef`       |
-| `RECALL_ZONE_ID`    | `fedcba9876543210fedcba9876543210`       |
-| `RECALL_HOSTNAME`   | `recall.example.com`                     |
-| `RECALL_USERS`      | `{"alice": {"hosts": ["laptop", "ci"]}}` |
+| Variable            | Example                                        |
+| ------------------- | ---------------------------------------------- |
+| `RECALL_ACCOUNT_ID` | `0123456789abcdef0123456789abcdef`             |
+| `RECALL_ZONE_ID`    | `fedcba9876543210fedcba9876543210`             |
+| `RECALL_HOSTNAME`   | `recall.example.com`                           |
+| `RECALL_USERS`      | `{"alice": {"emails": ["alice@example.com"]}}` |
 
-The account needs an R2 bucket `recall-tfstate` for the OpenTofu state, and a private R2 bucket `recall-builder-secrets` holding three objects: `CLOUDFLARE_TOFU_TOKEN` (an API token with the permissions above), and `TFSTATE_ACCESS_KEY_ID` and `TFSTATE_SECRET_ACCESS_KEY` (R2 S3 credentials for the state bucket). Each (user, host) pair in `RECALL_USERS` gets its own service token. Once a deploy is green, `npm run service-token -- <user> <host>` writes that host's env file from the state, with `RECALL_ACCOUNT_ID` and the two state keys in the environment.
+The account needs an R2 bucket `recall-tfstate` for the OpenTofu state, and a private R2 bucket `recall-builder-secrets` holding three objects: `CLOUDFLARE_TOFU_TOKEN` (an API token with the permissions above), and `TFSTATE_ACCESS_KEY_ID` and `TFSTATE_SECRET_ACCESS_KEY` (R2 S3 credentials for the state bucket). Each email in `RECALL_USERS` may approve devices and signs in as that user id; adding a person is one entry. Removing a user signs out all their devices.
 
 ## Develop
 

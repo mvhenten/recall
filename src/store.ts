@@ -36,14 +36,6 @@ const toMemory = (row: MemoryRow): Memory => ({
   lastRecalledAt: row.last_recalled_at,
 });
 
-export const resolvePrincipal = async (db: D1Database, clientId: string): Promise<string | null> => {
-  const row = await db
-    .prepare("SELECT user_id FROM principals WHERE client_id = ?")
-    .bind(clientId)
-    .first<{ user_id: string }>();
-  return row ? row.user_id : null;
-};
-
 export const getMemory = async (db: D1Database, userId: string, name: string): Promise<Memory | null> => {
   const row = await db
     .prepare(`SELECT ${MEMORY_COLUMNS} FROM memories m WHERE m.user_id = ? AND m.name = ?`)

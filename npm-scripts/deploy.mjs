@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Workers Builds deploy step: applies infra/ with OpenTofu, migrates D1, syncs
-// the principals table from tofu, and deploys the Worker. Every value that
+// users into D1, and deploys the Worker. Every value that
 // names this deployment comes from build variables (see README, Deploy), and a
 // plan that would destroy anything stops the deploy.
 // Reads the runner token and state keys from recall-builder-secrets with the
@@ -28,7 +28,7 @@ const BUILD_VARIABLES = {
   RECALL_ACCOUNT_ID: "the Cloudflare account id",
   RECALL_ZONE_ID: "the id of the zone that holds RECALL_HOSTNAME",
   RECALL_HOSTNAME: "the hostname the Worker serves, behind Access",
-  RECALL_USERS: 'users and their hosts as JSON, {"<user>": {"hosts": ["<host>"]}}',
+  RECALL_USERS: 'users and the emails that sign in as them, as JSON, {"<user>": {"emails": ["<email>"]}}',
 };
 const missing = Object.keys(BUILD_VARIABLES).filter((name) => !process.env[name]);
 if (missing.length > 0) {
@@ -41,12 +41,13 @@ const accountId = process.env.RECALL_ACCOUNT_ID;
 const zoneId = process.env.RECALL_ZONE_ID;
 const hostname = process.env.RECALL_HOSTNAME;
 
+const isStrings = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
 const isUsers = (value) =>
   typeof value === "object" &&
   value !== null &&
   !Array.isArray(value) &&
   Object.values(value).every(
-    (user) => Array.isArray(user?.hosts) && user.hosts.every((host) => typeof host === "string"),
+    (user) => isStrings(user?.emails) && user.emails.length > 0 && Object.keys(user).every((key) => key === "emails"),
   );
 const users = (() => {
   try {
@@ -56,6 +57,11 @@ const users = (() => {
   }
 })();
 if (!isUsers(users)) die(`RECALL_USERS must look like ${BUILD_VARIABLES.RECALL_USERS}`);
+const emailOwners = Object.entries(users).flatMap(([userId, user]) =>
+  user.emails.map((email) => [email.trim().toLowerCase(), userId]),
+);
+const duplicate = emailOwners.find(([email], index) => emailOwners.findIndex(([other]) => other === email) !== index);
+if (duplicate) die(`RECALL_USERS lists ${duplicate[0]} under more than one user`);
 
 const builderObject = async (key) => {
   const path = `/accounts/${accountId}/r2/buckets/${BUILDER_BUCKET}/objects/${encodeURIComponent(key)}`;
@@ -114,6 +120,23 @@ const installTofu = async () => {
   return binary;
 };
 
+const otpIdpId = await (async () => {
+  const path = `/accounts/${accountId}/access/identity_providers`;
+  const response = await fetch(`${API}${path}`, {
+    headers: { authorization: `Bearer ${tofuToken}` },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) die(`GET ${path} returned ${response.status}; the tofu token needs Access identity providers read`);
+  const { result } = await response.json();
+  const otp = (result ?? []).find((provider) => provider.type === "onetimepin");
+  return (
+    otp?.id ??
+    die(
+      "the account has no One-time PIN login method; add it under Zero Trust, Settings, Authentication, Login methods",
+    )
+  );
+})();
+
 const tofu = await installTofu();
 const infra = join(ROOT, "infra");
 const tofuEnv = {
@@ -124,6 +147,7 @@ const tofuEnv = {
   TF_IN_AUTOMATION: "1",
   TF_VAR_account_id: accountId,
   TF_VAR_hostname: hostname,
+  TF_VAR_otp_idp_id: otpIdpId,
   TF_VAR_users: JSON.stringify(users),
 };
 
@@ -134,11 +158,19 @@ run(tofu, ["init", "-input=false", `-backend-config=endpoints={s3="https://${acc
 const planPath = join(WORK, "recall.tfplan");
 run(tofu, ["plan", "-input=false", `-out=${planPath}`], { cwd: infra, env: tofuEnv });
 const plan = JSON.parse(run(tofu, ["show", "-json", planPath], { cwd: infra, env: tofuEnv, capture: true }).stdout);
-const destroyed = (plan.resource_changes ?? []).filter((change) => change.change.actions.includes("delete"));
+const retiredServiceTokens = (change) =>
+  change.change.actions.length === 1 &&
+  change.change.actions[0] === "delete" &&
+  (change.address.startsWith("cloudflare_zero_trust_access_service_token.principal[") ||
+    change.address === "cloudflare_zero_trust_access_policy.service_tokens");
+const changes = plan.resource_changes ?? [];
+const retired = changes.filter(retiredServiceTokens);
+const destroyed = changes.filter((change) => change.change.actions.includes("delete") && !retiredServiceTokens(change));
+if (retired.length > 0) console.log(`deploy: retiring ${retired.map((change) => change.address).join(", ")}`);
 if (destroyed.length > 0) {
   die(`the plan destroys ${destroyed.map((change) => change.address).join(", ")}; refusing to apply`);
 }
-console.log("deploy: the plan destroys nothing");
+console.log("deploy: the plan destroys nothing but retired service tokens");
 run(tofu, ["apply", "-input=false", planPath], { cwd: infra, env: tofuEnv });
 const outputs = JSON.parse(run(tofu, ["output", "-json"], { cwd: infra, env: tofuEnv, capture: true }).stdout);
 const output = (name) => outputs[name]?.value ?? die(`tofu output ${name} is missing`);
@@ -166,17 +198,18 @@ writeFileSync(deployConfigPath, `${JSON.stringify(deployConfig, null, 2)}\n`);
 wrangler(["d1", "migrations", "apply", "recall", "--remote", "-c", deployConfigPath]);
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
-const principals = output("principals");
 const sync = [
-  "DELETE FROM principals;",
-  ...principals.map(
-    (p) => `INSERT INTO principals (client_id, user_id) VALUES (${quote(p.client_id)}, ${quote(p.user_id)});`,
+  `DELETE FROM principals WHERE email NOT IN (${emailOwners.map(([email]) => quote(email)).join(", ")});`,
+  ...emailOwners.map(
+    ([email, userId]) =>
+      `INSERT INTO principals (email, user_id) VALUES (${quote(email)}, ${quote(userId)}) ON CONFLICT (email) DO UPDATE SET user_id = excluded.user_id;`,
   ),
+  "DELETE FROM devices WHERE user_id NOT IN (SELECT user_id FROM principals);",
 ].join("\n");
 mkdirSync(WORK, { recursive: true });
 const syncPath = join(WORK, "principals.sql");
 writeFileSync(syncPath, `${sync}\n`);
 wrangler(["d1", "execute", "recall", "--remote", "--yes", `--file=${syncPath}`, "-c", deployConfigPath]);
-console.log(`principals: ${principals.map((p) => `${p.user_id}/${p.host}`).join(", ")}`);
+console.log(`users: ${Object.keys(users).join(", ")}`);
 
 wrangler(["deploy", "-c", deployConfigPath]);
