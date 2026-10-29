@@ -44,7 +44,8 @@ async function run(input) {
     return result.timedOut ? "timeout" : `error:${firstLine(result.error)}`;
   }
 
-  const found = JSON.parse(result.stdout);
+  const parsed = JSON.parse(result.stdout);
+  const found = Array.isArray(parsed) ? { hits: parsed, elsewhere: [] } : parsed;
   if (found.hits.length === 0 && found.elsewhere.length === 0) return "no-hits";
   emit({
     hookSpecificOutput: {
