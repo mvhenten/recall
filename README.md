@@ -10,11 +10,19 @@ Per-user semantic memory for coding agents. recall keeps the notes an agent lear
 
 ### The CLI
 
+Install the latest release on Linux or macOS (x86_64 or arm64):
+
 ```bash
-cargo install --git https://github.com/mvhenten/recall recall
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mvhenten/recall/releases/latest/download/recall-installer.sh | sh
 ```
 
-From a checkout, `cargo install --path cli` does the same. Sign each host in once:
+The installer puts `recall` and `recall-update` in `~/.cargo/bin`. Update to the latest release with:
+
+```bash
+recall update
+```
+
+Without a release for your platform, build from source with `cargo install --git https://github.com/mvhenten/recall recall`, or `cargo install --path cli` from a checkout. Sign each host in once:
 
 ```bash
 recall login --endpoint https://recall.example.com

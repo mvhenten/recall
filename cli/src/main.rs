@@ -111,6 +111,8 @@ enum Command {
         #[arg(long, value_name = "ID", help = "Revoke the device with this id")]
         revoke: Option<String>,
     },
+    #[command(about = "Update recall to the latest release")]
+    Update,
 }
 
 fn host_name() -> String {
@@ -181,6 +183,25 @@ fn login(endpoint: Option<String>, name: Option<String>) -> Result<()> {
             }
         }
     }
+}
+
+fn update() -> Result<ExitCode> {
+    let updater = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("recall-update")))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("recall-update"));
+    let status = std::process::Command::new(&updater).status().with_context(|| {
+        format!(
+            "could not run {}; reinstall with the installer from https://github.com/mvhenten/recall#install",
+            updater.display()
+        )
+    })?;
+    Ok(if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 fn current_repo_tag() -> Option<String> {
@@ -284,6 +305,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let client = || -> Result<Client> { Ok(Client::new(config::load()?)) };
     match cli.command {
         Command::Login { endpoint, name } => login(endpoint, name)?,
+        Command::Update => return update(),
         Command::Logout => {
             match client()?.revoke_device("current") {
                 Ok(true) => {}
