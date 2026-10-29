@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!target", "!**/*.tfvars"]
+    "includes": ["**", "!target", "!**/*.tfvars", "!.github/workflows/release.yml"]
   },
   "formatter": {
     "enabled": true,
