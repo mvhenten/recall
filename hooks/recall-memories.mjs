@@ -6,8 +6,8 @@ const MAX_QUERY_CHARS = 2000;
 const MAX_BODY_CHARS = 1200;
 const MAX_CONTEXT_BYTES = 4096;
 
-function truncate(text, max) {
-  return text.length <= max ? text : `${text.slice(0, max).trimEnd()} …`;
+function truncate(text, max, suffix = " …") {
+  return text.length <= max ? text : `${text.slice(0, max - suffix.length).trimEnd()}${suffix}`;
 }
 
 function format(memory) {
@@ -29,7 +29,7 @@ const input = await readInput();
 const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
 if (prompt.startsWith("/") || prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) process.exit(0);
 
-const result = await recall(["search", "--json", "--limit", "5", "--", truncate(prompt, MAX_QUERY_CHARS)], {
+const result = await recall(["search", "--json", "--limit", "5", "--", truncate(prompt, MAX_QUERY_CHARS, "")], {
   cwd: input.cwd,
   timeout: TIMEOUT_MS,
 });
