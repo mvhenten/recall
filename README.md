@@ -25,13 +25,13 @@ The CLI reads `RECALL_ENDPOINT`, `RECALL_CLIENT_ID` and `RECALL_CLIENT_SECRET` f
 
 All routes sit under `/v1` and need a Cloudflare Access service token. The Worker resolves the user from the token; a client never names a user.
 
-| Method | Path | |
-| --- | --- | --- |
-| `PUT` | `/v1/memories/:name` | create or replace `{description, type, body, tags}` |
-| `GET` | `/v1/memories/:name` | read one |
-| `DELETE` | `/v1/memories/:name` | delete one |
-| `GET` | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first |
-| `POST` | `/v1/search` | `{query, tags, limit, minScore}`; each hit counts as a recall |
+| Method   | Path                                      |                                                               |
+| -------- | ----------------------------------------- | ------------------------------------------------------------- |
+| `PUT`    | `/v1/memories/:name`                      | create or replace `{description, type, body, tags}`           |
+| `GET`    | `/v1/memories/:name`                      | read one                                                      |
+| `DELETE` | `/v1/memories/:name`                      | delete one                                                    |
+| `GET`    | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first                                          |
+| `POST`   | `/v1/search`                              | `{query, tags, limit, minScore}`; each hit counts as a recall |
 
 ## Setup
 
