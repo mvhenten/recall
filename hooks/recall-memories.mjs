@@ -9,9 +9,9 @@ function truncate(text, max) {
   return text.length <= max ? text : `${text.slice(0, max).trimEnd()} …`;
 }
 
-function entry({ memory }) {
-  const tags = memory.tags.filter((tag) => !tag.startsWith("source:")).join(", ");
-  return `- ${memory.name} (${memory.type}; ${tags}): ${memory.description}`;
+function entry({ name, type, tags, description }) {
+  const shown = tags.filter((tag) => !tag.startsWith("source:")).join(", ");
+  return `- ${name} (${type}; ${shown}): ${description}`;
 }
 
 function header(repoTag) {
@@ -19,8 +19,10 @@ function header(repoTag) {
   return `Memories from recall that may be relevant to this prompt. Searched ${scope}. \`recall search --any "<query>"\` searches every memory; \`recall get <name>\` prints one in full. Read the full text of any that looks relevant before acting on it:`;
 }
 
-function contextBlock(hits, repoTag) {
-  return [header(repoTag), ...hits.map(entry)].join("\n");
+function contextBlock({ hits, elsewhere }, repoTag) {
+  const lines = [header(repoTag), ...hits.map(({ memory }) => entry(memory))];
+  if (elsewhere.length > 0) lines.push("In other scopes:", ...elsewhere.map(entry));
+  return lines.join("\n");
 }
 
 async function repoTagOf(cwd) {
@@ -42,15 +44,15 @@ async function run(input) {
     return result.timedOut ? "timeout" : `error:${firstLine(result.error)}`;
   }
 
-  const hits = JSON.parse(result.stdout);
-  if (hits.length === 0) return "no-hits";
+  const found = JSON.parse(result.stdout);
+  if (found.hits.length === 0 && found.elsewhere.length === 0) return "no-hits";
   emit({
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
-      additionalContext: contextBlock(hits, await repoTagOf(input.cwd)),
+      additionalContext: contextBlock(found, await repoTagOf(input.cwd)),
     },
   });
-  return `hits=${hits.length}`;
+  return `hits=${found.hits.length} elsewhere=${found.elsewhere.length}`;
 }
 
 const started = Date.now();

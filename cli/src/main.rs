@@ -407,7 +407,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 mode: &mode,
             })?;
             if cli.json {
-                print_json(&result.hits)?;
+                print_json(&result)?;
             } else {
                 if result.hits.is_empty() {
                     println!("no memories matched");

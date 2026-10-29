@@ -56,7 +56,7 @@ struct Single {
     memory: Memory,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
     #[serde(default)]
