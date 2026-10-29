@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { Memory } from "../src/model";
 import { dot, ftsQuery, normalize, quantize, reciprocalRankFusion } from "../src/rank";
-import { harness } from "./harness";
+import { type Client, harness } from "./harness";
 
 const listNames = async (response: Response): Promise<string[]> => {
   expect(response.status).toBe(200);
@@ -224,5 +224,85 @@ describe("tags", () => {
       "newest",
       "middle",
     ]);
+  });
+});
+
+interface Elsewhere {
+  name: string;
+  type: string;
+  tags: string[];
+  description: string;
+  score: number;
+}
+
+const scopedSearch = async (
+  client: Client,
+  query: string,
+  tags: string[],
+  mode: "hybrid" | "vector" | "text" = "hybrid",
+): Promise<{ hits: Array<{ memory: Memory }>; elsewhere: Elsewhere[] }> => {
+  const response = await client.request("POST", "/v1/search", {
+    query,
+    tags,
+    any: tags.length === 0,
+    limit: 10,
+    minScore: 0.1,
+    mode,
+  });
+  expect(response.status).toBe(200);
+  return response.json();
+};
+
+describe("elsewhere", () => {
+  it("lists a match from another scope apart from the hits, without recalling it", async () => {
+    const h = await harness();
+    const alice = await h.user("alice");
+    await alice.save("here-deploy", { body: "deploy pipeline uses blue green", tags: ["repo:github.com/acme/app"] });
+    await alice.save("other-deploy", {
+      description: "deploy notes for the other repo",
+      type: "reference",
+      body: "deploy pipeline uses canary releases",
+      tags: ["repo:github.com/acme/other"],
+    });
+
+    for (const mode of ["hybrid", "vector", "text"] as const) {
+      const result = await scopedSearch(alice, "deploy pipeline", ["repo:github.com/acme/app", "global"], mode);
+      expect(result.hits.map((hit) => hit.memory.name)).toEqual(["here-deploy"]);
+      expect(result.elsewhere).toHaveLength(1);
+      expect(result.elsewhere[0]).toMatchObject({
+        name: "other-deploy",
+        type: "reference",
+        tags: ["repo:github.com/acme/other"],
+        description: "deploy notes for the other repo",
+      });
+      expect(result.elsewhere[0]?.score).toBeGreaterThan(0);
+    }
+
+    const other = await alice.get("other-deploy");
+    expect(other.recallCount).toBe(0);
+    expect(other.lastRecalledAt).toBe(0);
+    expect((await alice.get("here-deploy")).recallCount).toBe(3);
+
+    const everywhere = await scopedSearch(alice, "deploy pipeline", []);
+    expect(everywhere.hits).toHaveLength(2);
+    expect(everywhere.elsewhere).toEqual([]);
+  });
+
+  it("caps elsewhere at three and keeps it inside the user", async () => {
+    const h = await harness();
+    const alice = await h.user("alice");
+    const bob = await h.user("bob");
+    for (const repo of ["one", "two", "three", "four"]) {
+      await alice.save(`cache-${repo}`, { body: "build cache warming steps", tags: [`repo:github.com/acme/${repo}`] });
+    }
+    await bob.save("bob-cache", { body: "build cache warming steps", tags: ["repo:github.com/bob/tool"] });
+
+    const alices = await scopedSearch(alice, "build cache warming", ["global"]);
+    expect(alices.hits).toEqual([]);
+    expect(alices.elsewhere).toHaveLength(3);
+    expect(alices.elsewhere.map((entry) => entry.name)).not.toContain("bob-cache");
+
+    const bobs = await scopedSearch(bob, "build cache warming", ["global"]);
+    expect(bobs.elsewhere.map((entry) => entry.name)).toEqual(["bob-cache"]);
   });
 });

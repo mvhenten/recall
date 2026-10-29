@@ -71,7 +71,7 @@ In Claude Code:
 The plugin adds two hooks. Both need `node` 22 or later and find `recall` on `PATH` or in `~/.cargo/bin`.
 
 - After a `Write` or `Edit` to an auto-memory file (under `autoMemoryDirectory`, or `~/.claude/projects/*/memory/` when that is unset; `MEMORY.md` excluded), it runs `recall save`. `user` and `feedback` memories are saved as global; `project` and `reference` memories get the repo tag of the session's directory, or `global` outside a repo. When the save fails, a message says the memory was saved locally but not synced.
-- On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
+- On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. Up to three matches from other scopes follow under "In other scopes:", each with its tags. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
 - Every hook run appends one line to `${XDG_STATE_HOME:-~/.local/state}/recall/hooks.log`: time, session id, outcome (`hits=<n>`, `no-hits`, `skipped:<reason>`, `timeout`, `saved:<name>`, `error:<message>`) and duration. Prompts and memory bodies are never logged.
 
 ## Memories, tags and scope
@@ -80,7 +80,7 @@ A memory has a kebab-case `name` (unique per user), a `description`, a `type` (`
 
 Tags scope memories. `recall save` tags a memory with the current repo, `repo:<host>/<owner>/<repo>`, taken from the git remote: SSH and HTTPS remotes give the same tag, and a worktree gives its repo's tag. `--global` tags it `global` instead, and `--tag` adds free-form tags. Search and list match the current repo tag or `global` by default; `--tag` replaces that set, and `--any` matches every memory. Outside a repo, `save` needs `--global`, and search covers `global` only.
 
-Search is hybrid: it ranks by embedding similarity and by full-text match, then fuses the two rankings (reciprocal rank fusion, k = 60). `--mode vector` or `--mode text` uses one ranking. Every returned hit counts as a recall, so each memory carries a recall count and the time it was last recalled.
+Search is hybrid: it ranks by embedding similarity and by full-text match, then fuses the two rankings (reciprocal rank fusion, k = 60). `--mode vector` or `--mode text` uses one ranking. Every returned hit counts as a recall, so each memory carries a recall count and the time it was last recalled. A scoped search also answers `elsewhere`: the top three matches outside the requested tags, ranked the same way, with name, type, tags, description and score. These do not count as recalls, and `recall search` lists them under "Also in other scopes". `recall --json search` prints `{hits, elsewhere}`.
 
 ```bash
 recall save note.md                 # frontmatter: name, description, type, tags

@@ -398,7 +398,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             let query = query.join(" ");
             let tags = filter_tags(&filter);
-            let hits = client()?.search(&api::SearchRequest {
+            let result = client()?.search(&api::SearchRequest {
                 query: &query,
                 tags: &tags,
                 any: filter.any,
@@ -407,11 +407,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 mode: &mode,
             })?;
             if cli.json {
-                print_json(&hits)?;
-            } else if hits.is_empty() {
-                println!("no memories matched");
+                print_json(&result)?;
             } else {
-                print!("{}", markdown::render_hits(&hits));
+                if result.hits.is_empty() {
+                    println!("no memories matched");
+                }
+                print!("{}", markdown::render_hits(&result.hits));
+                print!("{}", markdown::render_elsewhere(&result.elsewhere));
             }
         }
         Command::Edit {

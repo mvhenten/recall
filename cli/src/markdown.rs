@@ -1,4 +1,4 @@
-use crate::api::{Hit, Memory};
+use crate::api::{Elsewhere, Hit, Memory};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -149,9 +149,45 @@ pub fn render_hits(hits: &[Hit]) -> String {
         .collect()
 }
 
+pub fn render_elsewhere(entries: &[Elsewhere]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let lines: String = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "- **{}** ({}, score {:.3}) {} `[{}]`\n",
+                entry.name,
+                entry.kind,
+                entry.score,
+                entry.description,
+                entry.tags.join(", ")
+            )
+        })
+        .collect();
+    format!("Also in other scopes:\n\n{lines}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_other_scopes_after_the_hits() {
+        let entries = [Elsewhere {
+            score: 0.5,
+            name: "other-deploy".into(),
+            kind: "reference".into(),
+            tags: vec!["repo:github.com/acme/other".into()],
+            description: "deploy notes".into(),
+        }];
+        assert_eq!(
+            render_elsewhere(&entries),
+            "Also in other scopes:\n\n- **other-deploy** (reference, score 0.500) deploy notes `[repo:github.com/acme/other]`\n"
+        );
+        assert_eq!(render_elsewhere(&[]), "");
+    }
 
     #[test]
     fn reads_frontmatter_and_body() {

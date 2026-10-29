@@ -32,6 +32,7 @@ import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
 import {
   decodeCursor,
   deleteMemory,
+  describeMemories,
   getMemory,
   listMemories,
   recall,
@@ -71,6 +72,15 @@ const GRANT_ERRORS = {
   authorization_pending: "waiting for approval in the browser",
   access_denied: "the sign-in was denied in the browser",
 } as const;
+
+const ELSEWHERE_LIMIT = 3;
+
+type Ranking = Array<[string, number]>;
+
+interface Rankings {
+  inScope: Ranking;
+  elsewhere: Ranking;
+}
 
 const decodeSegment = (segment: string): string | null => {
   try {
@@ -220,48 +230,84 @@ export const createApp = (deps: Deps): App => {
     return json(await listMemories(db, userId, input.value, cursor));
   };
 
-  const vectorRanking = async (
+  const vectorRankings = async (db: D1Database, userId: string, input: SearchInput): Promise<Rankings> => {
+    const vector = await deps.embedder.embed(input.query);
+    const inScope: Ranking = [];
+    const elsewhere: Ranking = [];
+    for (const candidate of await vectorCandidates(db, userId, input.tags)) {
+      const score = dot(vector, candidate.embedding);
+      if (score >= input.minScore) (candidate.inScope ? inScope : elsewhere).push([candidate.memoryId, score]);
+    }
+    const byScore = (a: [string, number], b: [string, number]): number => b[1] - a[1];
+    return { inScope: inScope.sort(byScore), elsewhere: elsewhere.sort(byScore) };
+  };
+
+  const textRankings = async (
     db: D1Database,
     userId: string,
     input: SearchInput,
-  ): Promise<Array<[string, number]>> => {
-    const vector = await deps.embedder.embed(input.query);
-    const scored: Array<[string, number]> = [];
-    for (const [memoryId, stored] of await vectorCandidates(db, userId, input.tags)) {
-      const score = dot(vector, stored);
-      if (score >= input.minScore) scored.push([memoryId, score]);
-    }
-    return scored.sort((a, b) => b[1] - a[1]);
+  ): Promise<{ inScope: string[]; elsewhere: string[] }> => {
+    const match = ftsQuery(input.query);
+    const candidates = match ? await textCandidates(db, userId, input.tags, match) : [];
+    return {
+      inScope: candidates.filter((candidate) => candidate.inScope).map((candidate) => candidate.memoryId),
+      elsewhere: candidates.filter((candidate) => !candidate.inScope).map((candidate) => candidate.memoryId),
+    };
   };
 
-  const textRanking = async (db: D1Database, userId: string, input: SearchInput): Promise<string[]> => {
-    const match = ftsQuery(input.query);
-    return match ? textCandidates(db, userId, input.tags, match) : [];
+  const rank = async (db: D1Database, userId: string, input: SearchInput): Promise<Rankings> => {
+    if (input.mode === "vector") return vectorRankings(db, userId, input);
+    if (input.mode === "text") {
+      const text = await textRankings(db, userId, input);
+      return { inScope: reciprocalRankFusion([text.inScope]), elsewhere: reciprocalRankFusion([text.elsewhere]) };
+    }
+    const [vector, text] = await Promise.all([vectorRankings(db, userId, input), textRankings(db, userId, input)]);
+    const ids = (ranking: Ranking): string[] => ranking.map(([id]) => id);
+    return {
+      inScope: reciprocalRankFusion([ids(vector.inScope), text.inScope]),
+      elsewhere: reciprocalRankFusion([ids(vector.elsewhere), text.elsewhere]),
+    };
   };
 
   const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
     const parsed = parseSearch(await readJson(request));
     if (!parsed.ok) return error(400, parsed.error);
     const input = parsed.value;
-    const ranked: Array<[string, number]> =
-      input.mode === "vector"
-        ? await vectorRanking(db, userId, input)
-        : input.mode === "text"
-          ? reciprocalRankFusion([await textRanking(db, userId, input)])
-          : await Promise.all([vectorRanking(db, userId, input), textRanking(db, userId, input)]).then(
-              ([vector, text]) => reciprocalRankFusion([vector.map(([id]) => id), text]),
-            );
-    const top = ranked.slice(0, input.limit);
-    if (top.length === 0) return json({ hits: [] });
-    const ids = top.map(([id]) => id);
-    const recalled = new Map<string, Memory>(
-      (await recall(db, userId, ids, deps.now())).map((memory) => [memory.memoryId, memory]),
-    );
+    const rankings = await rank(db, userId, input);
+    const top = rankings.inScope.slice(0, input.limit);
+    const nearby = rankings.elsewhere.slice(0, ELSEWHERE_LIMIT);
+    const [recalled, described] = await Promise.all([
+      top.length > 0
+        ? recall(
+            db,
+            userId,
+            top.map(([id]) => id),
+            deps.now(),
+          )
+        : [],
+      nearby.length > 0
+        ? describeMemories(
+            db,
+            userId,
+            nearby.map(([id]) => id),
+          )
+        : [],
+    ]);
+    const byId = (memories: Memory[]): Map<string, Memory> =>
+      new Map(memories.map((memory) => [memory.memoryId, memory]));
+    const recalledById = byId(recalled);
+    const describedById = byId(described);
     const hits = top.flatMap(([id, score]) => {
-      const memory = recalled.get(id);
+      const memory = recalledById.get(id);
       return memory ? [{ score, memory }] : [];
     });
-    return json({ hits });
+    const elsewhere = nearby.flatMap(([id, score]) => {
+      const memory = describedById.get(id);
+      return memory
+        ? [{ score, name: memory.name, type: memory.type, tags: memory.tags, description: memory.description }]
+        : [];
+    });
+    return json({ hits, elsewhere });
   };
 
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
