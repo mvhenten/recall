@@ -1,0 +1,9 @@
+node_modules/
+target/
+.tmp/
+.wrangler/
+.terraform/
+*.tfstate*
+.env
+.dev.vars
+dist/
