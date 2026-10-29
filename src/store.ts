@@ -128,16 +128,27 @@ const toBytes = (value: unknown): Uint8Array => {
   throw new Error("embedding column is not a blob");
 };
 
-export const vectorCandidates = async (
-  db: D1Database,
-  userId: string,
-  tags: string[],
-): Promise<Array<[string, Uint8Array]>> => {
+export interface VectorCandidate {
+  memoryId: string;
+  embedding: Uint8Array;
+  inScope: boolean;
+}
+
+export interface TextCandidate {
+  memoryId: string;
+  inScope: boolean;
+}
+
+export const vectorCandidates = async (db: D1Database, userId: string, tags: string[]): Promise<VectorCandidate[]> => {
   const rows = await db
-    .prepare(`SELECT m.memory_id, m.embedding FROM memories m WHERE m.user_id = ?1 AND ${TAG_FILTER}`)
+    .prepare(`SELECT m.memory_id, m.embedding, ${TAG_FILTER} AS in_scope FROM memories m WHERE m.user_id = ?1`)
     .bind(userId, JSON.stringify(tags))
-    .raw<[string, unknown]>();
-  return rows.map(([memoryId, embedding]) => [memoryId, toBytes(embedding)]);
+    .raw<[string, unknown, number]>();
+  return rows.map(([memoryId, embedding, inScope]) => ({
+    memoryId,
+    embedding: toBytes(embedding),
+    inScope: inScope === 1,
+  }));
 };
 
 export const textCandidates = async (
@@ -145,16 +156,26 @@ export const textCandidates = async (
   userId: string,
   tags: string[],
   query: string,
-): Promise<string[]> => {
+): Promise<TextCandidate[]> => {
   const { results } = await db
     .prepare(
-      `SELECT m.memory_id FROM memories_fts f JOIN memories m ON m.memory_seq = f.rowid
-       WHERE memories_fts MATCH ?3 AND m.user_id = ?1 AND ${TAG_FILTER}
-       ORDER BY bm25(memories_fts, 5.0, 2.0, 1.0) LIMIT 50`,
+      `SELECT m.memory_id, ${TAG_FILTER} AS in_scope FROM memories_fts f JOIN memories m ON m.memory_seq = f.rowid
+       WHERE memories_fts MATCH ?3 AND m.user_id = ?1
+       ORDER BY in_scope DESC, bm25(memories_fts, 5.0, 2.0, 1.0) LIMIT 50`,
     )
     .bind(userId, JSON.stringify(tags), query)
-    .all<{ memory_id: string }>();
-  return results.map((row) => row.memory_id);
+    .all<{ memory_id: string; in_scope: number }>();
+  return results.map((row) => ({ memoryId: row.memory_id, inScope: row.in_scope === 1 }));
+};
+
+export const describeMemories = async (db: D1Database, userId: string, memoryIds: string[]): Promise<Memory[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT ${MEMORY_COLUMNS} FROM memories m WHERE m.user_id = ? AND m.memory_id IN (SELECT value FROM json_each(?))`,
+    )
+    .bind(userId, JSON.stringify(memoryIds))
+    .all<MemoryRow>();
+  return results.map(toMemory);
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {

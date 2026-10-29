@@ -57,8 +57,20 @@ struct Single {
 }
 
 #[derive(Deserialize)]
-struct Hits {
-    hits: Vec<Hit>,
+pub struct SearchResult {
+    pub hits: Vec<Hit>,
+    #[serde(default)]
+    pub elsewhere: Vec<Elsewhere>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Elsewhere {
+    pub score: f64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub tags: Vec<String>,
+    pub description: String,
 }
 
 #[derive(Serialize)]
@@ -282,11 +294,10 @@ impl Client {
         Ok(check(response, "listing memories")?.body_mut().read_json()?)
     }
 
-    pub fn search(&self, request: &SearchRequest) -> Result<Vec<Hit>> {
+    pub fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
         let response = self
             .authed(self.agent.post(self.url("/v1/search")))
             .send_json(request)?;
-        let hits: Hits = check(response, "searching")?.body_mut().read_json()?;
-        Ok(hits.hits)
+        Ok(check(response, "searching")?.body_mut().read_json()?)
     }
 }
