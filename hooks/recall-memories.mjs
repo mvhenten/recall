@@ -1,13 +1,8 @@
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
+import { MIN_SCORE, searchQuery } from "./query.mjs";
 
 const TIMEOUT_MS = 4000;
 const MIN_WORDS = 3;
-// bge-small-en-v1.5 accepts 512 tokens; 2000 chars is about that
-const MAX_QUERY_CHARS = 2000;
-
-function truncate(text, max) {
-  return text.length <= max ? text : `${text.slice(0, max).trimEnd()} …`;
-}
 
 function entry({ name, type, tags, description }) {
   const shown = tags.filter((tag) => !tag.startsWith("source:")).join(", ");
@@ -35,10 +30,13 @@ async function run(input) {
   if (prompt.startsWith("/")) return "skipped:slash-command";
   if (prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) return "skipped:short-prompt";
 
-  const result = await recall(["search", "--json", "--limit", "5", "--", truncate(prompt, MAX_QUERY_CHARS)], {
-    cwd: input.cwd,
-    timeout: TIMEOUT_MS,
-  });
+  const result = await recall(
+    ["search", "--json", "--limit", "5", `--min-score=${MIN_SCORE}`, "--", searchQuery(prompt)],
+    {
+      cwd: input.cwd,
+      timeout: TIMEOUT_MS,
+    },
+  );
   if (!result.ok) {
     emit({ systemMessage: `recall unavailable: ${result.error}` });
     return result.timedOut ? "timeout" : `error:${firstLine(result.error)}`;

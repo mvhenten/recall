@@ -130,6 +130,27 @@ describe("hybrid search", () => {
     expect(top?.memory.name).toBe("cold-cache");
   });
 
+  it("keeps a memory that shares only a stopword out of text and hybrid results", async () => {
+    const h = await harness();
+    const alice = await h.user("alice");
+    await alice.save("cache-warming", { body: "cache warming steps" });
+    await alice.save("weather", { body: "the weather is nice" });
+    const search = (mode: "hybrid" | "text") =>
+      alice.request("POST", "/v1/search", {
+        query: "warming the cache",
+        tags: [],
+        any: true,
+        limit: 10,
+        minScore: 0.5,
+        mode,
+      });
+
+    const text: { hits: Array<{ memory: Memory }> } = await (await search("text")).json();
+    expect(text.hits.map((hit) => hit.memory.name)).toEqual(["cache-warming"]);
+    const hybrid: { hits: Array<{ memory: Memory }> } = await (await search("hybrid")).json();
+    expect(hybrid.hits.map((hit) => hit.memory.name)).toEqual(["cache-warming"]);
+  });
+
   it("removes a deleted memory from the full-text index", async () => {
     const h = await harness();
     const alice = await h.user("alice");
@@ -153,8 +174,9 @@ describe("hybrid search", () => {
   });
 
   it("quotes every full-text term and fuses rankings by reciprocal rank", () => {
-    expect(ftsQuery('ERR-4521 "cache" OR')).toBe('"4521" OR "cache" OR "err" OR "or"');
+    expect(ftsQuery('ERR-4521 "cache" OR')).toBe('"4521" OR "cache" OR "err"');
     expect(ftsQuery("--")).toBeNull();
+    expect(ftsQuery("the and of")).toBeNull();
     expect(
       reciprocalRankFusion([
         ["a", "b", "c"],
