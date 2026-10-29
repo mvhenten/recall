@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Workers Builds deploy step: applies infra/ with OpenTofu, migrates D1, syncs
-// users and legacy service tokens into D1, and deploys the Worker. Every value that
+// users into D1, and deploys the Worker. Every value that
 // names this deployment comes from build variables (see README, Deploy), and a
 // plan that would destroy anything stops the deploy.
 // Reads the runner token and state keys from recall-builder-secrets with the
@@ -47,7 +47,7 @@ const isUsers = (value) =>
   value !== null &&
   !Array.isArray(value) &&
   Object.values(value).every(
-    (user) => isStrings(user?.emails) && user.emails.length > 0 && (user.hosts === undefined || isStrings(user.hosts)),
+    (user) => isStrings(user?.emails) && user.emails.length > 0 && Object.keys(user).every((key) => key === "emails"),
   );
 const users = (() => {
   try {
@@ -148,7 +148,9 @@ const tofuEnv = {
   TF_VAR_account_id: accountId,
   TF_VAR_hostname: hostname,
   TF_VAR_otp_idp_id: otpIdpId,
-  TF_VAR_users: JSON.stringify(users),
+  TF_VAR_users: JSON.stringify(
+    Object.fromEntries(Object.entries(users).map(([id, user]) => [id, { emails: user.emails }])),
+  ),
 };
 
 run(tofu, ["init", "-input=false", `-backend-config=endpoints={s3="https://${accountId}.r2.cloudflarestorage.com"}`], {
@@ -158,11 +160,19 @@ run(tofu, ["init", "-input=false", `-backend-config=endpoints={s3="https://${acc
 const planPath = join(WORK, "recall.tfplan");
 run(tofu, ["plan", "-input=false", `-out=${planPath}`], { cwd: infra, env: tofuEnv });
 const plan = JSON.parse(run(tofu, ["show", "-json", planPath], { cwd: infra, env: tofuEnv, capture: true }).stdout);
-const destroyed = (plan.resource_changes ?? []).filter((change) => change.change.actions.includes("delete"));
+const retiredServiceTokens = (change) =>
+  change.change.actions.length === 1 &&
+  change.change.actions[0] === "delete" &&
+  ((change.mode === "managed" && change.type === "cloudflare_zero_trust_access_service_token") ||
+    change.address === "cloudflare_zero_trust_access_policy.service_tokens");
+const changes = plan.resource_changes ?? [];
+const retired = changes.filter(retiredServiceTokens);
+const destroyed = changes.filter((change) => change.change.actions.includes("delete") && !retiredServiceTokens(change));
+if (retired.length > 0) console.log(`deploy: retiring ${retired.map((change) => change.address).join(", ")}`);
 if (destroyed.length > 0) {
   die(`the plan destroys ${destroyed.map((change) => change.address).join(", ")}; refusing to apply`);
 }
-console.log("deploy: the plan destroys nothing");
+console.log("deploy: the plan destroys nothing but retired service tokens");
 run(tofu, ["apply", "-input=false", planPath], { cwd: infra, env: tofuEnv });
 const outputs = JSON.parse(run(tofu, ["output", "-json"], { cwd: infra, env: tofuEnv, capture: true }).stdout);
 const output = (name) => outputs[name]?.value ?? die(`tofu output ${name} is missing`);
@@ -190,13 +200,7 @@ writeFileSync(deployConfigPath, `${JSON.stringify(deployConfig, null, 2)}\n`);
 wrangler(["d1", "migrations", "apply", "recall", "--remote", "-c", deployConfigPath]);
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
-const principals = output("principals");
 const sync = [
-  "DELETE FROM service_tokens;",
-  ...principals.map(
-    (p) =>
-      `INSERT INTO service_tokens (client_id, user_id, secret_sha256) VALUES (${quote(p.client_id)}, ${quote(p.user_id)}, ${quote(p.secret_sha256)});`,
-  ),
   `DELETE FROM principals WHERE email NOT IN (${emailOwners.map(([email]) => quote(email)).join(", ")});`,
   ...emailOwners.map(
     ([email, userId]) =>
@@ -208,6 +212,6 @@ mkdirSync(WORK, { recursive: true });
 const syncPath = join(WORK, "principals.sql");
 writeFileSync(syncPath, `${sync}\n`);
 wrangler(["d1", "execute", "recall", "--remote", "--yes", `--file=${syncPath}`, "-c", deployConfigPath]);
-console.log(`users: ${Object.keys(users).join(", ")}; legacy service tokens: ${principals.length}`);
+console.log(`users: ${Object.keys(users).join(", ")}`);
 
 wrangler(["deploy", "-c", deployConfigPath]);

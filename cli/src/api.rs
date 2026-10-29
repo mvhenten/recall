@@ -1,4 +1,4 @@
-use crate::config::{Auth, Config};
+use crate::config::Config;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -212,19 +212,7 @@ impl Client {
     }
 
     fn authed<B>(&self, request: RequestBuilder<B>) -> RequestBuilder<B> {
-        match &self.config.auth {
-            Auth::Device(token) => request.header("authorization", format!("Bearer {token}")),
-            Auth::ServiceToken {
-                client_id,
-                client_secret,
-            } => request
-                .header("cf-access-client-id", client_id)
-                .header("cf-access-client-secret", client_secret),
-        }
-    }
-
-    pub fn uses_device_token(&self) -> bool {
-        matches!(self.config.auth, Auth::Device(_))
+        request.header("authorization", format!("Bearer {}", self.config.token))
     }
 
     pub fn devices(&self) -> Result<Vec<Device>> {

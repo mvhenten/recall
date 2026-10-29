@@ -1,6 +1,7 @@
 import {
   type Caller,
   DEVICE_CODE_TTL_MS,
+  type DeviceCodeLimits,
   decideDeviceCode,
   deviceForToken,
   formatUserCode,
@@ -15,7 +16,6 @@ import {
   startDeviceCode,
   TOKEN_PATTERN,
   userForEmail,
-  userForServiceToken,
 } from "./device";
 import {
   type Embedder,
@@ -42,6 +42,7 @@ import {
 
 export interface Deps {
   verify: Verify;
+  deviceCodeLimits: DeviceCodeLimits;
   embedder: Embedder;
   now: () => number;
 }
@@ -81,23 +82,13 @@ const decodeSegment = (segment: string): string | null => {
 
 export const createApp = (deps: Deps): App => {
   const authenticate = async (request: Request, db: D1Database): Promise<Caller | Response> => {
-    const authorization = request.headers.get("authorization");
-    if (authorization !== null) {
-      const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-      if (!TOKEN_PATTERN.test(token))
-        return error(401, "Authorization must be Bearer <device token>; run recall login");
-      const caller = await deviceForToken(db, token, deps.now());
-      return caller ?? error(401, "this device token is unknown or revoked; run recall login");
+    const authorization = request.headers.get("authorization") ?? "";
+    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+    if (!TOKEN_PATTERN.test(token)) {
+      return error(401, "missing or malformed Authorization: Bearer <device token>; run recall login");
     }
-    const clientId = request.headers.get("cf-access-client-id");
-    const clientSecret = request.headers.get("cf-access-client-secret");
-    if (clientId && clientSecret) {
-      const userId = await userForServiceToken(db, clientId, clientSecret);
-      return userId === null
-        ? error(401, "this service token is unknown; run recall login")
-        : { userId, deviceId: null };
-    }
-    return error(401, "missing Authorization: Bearer <device token>; run recall login");
+    const caller = await deviceForToken(db, token, deps.now());
+    return caller ?? error(401, "this device token is unknown or revoked; run recall login");
   };
 
   const grantError = (code: string, description: string): Response =>
@@ -116,7 +107,17 @@ export const createApp = (deps: Deps): App => {
     if (typeof deviceName !== "string" || !/^[\p{L}\p{N} ._'()-]{1,100}$/u.test(deviceName)) {
       return grantError("invalid_request", "device_name must hold 1 to 100 letters, digits, spaces or . _ ' ( ) -");
     }
-    const started = await startDeviceCode(db, deviceName, deps.now());
+    const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown";
+    const started = await startDeviceCode(db, deviceName, clientIp, deps.deviceCodeLimits, deps.now());
+    if (!started) {
+      return json(
+        {
+          error: "slow_down",
+          error_description: "too many sign-ins are waiting for approval; try again in ten minutes",
+        },
+        429,
+      );
+    }
     const userCode = formatUserCode(started.userCode);
     return json({
       device_code: started.deviceCode,
@@ -152,7 +153,6 @@ export const createApp = (deps: Deps): App => {
     }
     if (request.method !== "DELETE") return error(405, "method not allowed");
     const target = deviceId === "current" ? caller.deviceId : deviceId;
-    if (target === null) return error(400, "this caller uses a service token, not a device token");
     if (!(await revokeDevice(db, caller.userId, target))) return error(404, `no device ${target}`);
     return new Response(null, { status: 204 });
   };
@@ -170,6 +170,10 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "GET" && request.method !== "POST") return error(405, "method not allowed");
     const email = await approver(request);
     if (email instanceof Response) return email;
+    const userId = await userForEmail(db, email);
+    if (userId === null) {
+      return messagePage(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
+    }
     if (request.method === "GET") {
       const raw = url.searchParams.get("code");
       if (raw === null || raw === "") return enterCodePage(email);
@@ -189,8 +193,10 @@ export const createApp = (deps: Deps): App => {
     if (action !== "approve" && action !== "deny") return messagePage(400, "Bad request", "Choose approve or deny.");
     const userCode = parseUserCode(form.get("user_code") ?? "");
     const decision = action === "approve" ? "approved" : "denied";
-    const userId = decision === "approved" ? await userForEmail(db, email) : "";
-    if (!userCode || !(await decideDeviceCode(db, userCode, decision, userId, deps.now()))) {
+    if (
+      !userCode ||
+      !(await decideDeviceCode(db, userCode, decision, decision === "approved" ? userId : "", deps.now()))
+    ) {
       return messagePage(404, "Code not found", "The code is wrong, expired or used. Run recall login again.");
     }
     return decision === "approved"

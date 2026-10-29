@@ -1,9 +1,4 @@
 locals {
-  principals = merge([
-    for user_id, user in var.users : {
-      for host in user.hosts : "${user_id}/${host}" => { user_id = user_id, host = host }
-    }
-  ]...)
   emails = distinct(flatten([for user in var.users : [for email in user.emails : lower(email)]]))
 }
 
@@ -19,25 +14,6 @@ resource "cloudflare_d1_database" "recall" {
   lifecycle {
     prevent_destroy = true
   }
-}
-
-resource "cloudflare_zero_trust_access_service_token" "principal" {
-  for_each = local.principals
-
-  account_id = var.account_id
-  name       = "recall-${each.value.user_id}-${each.value.host}"
-  duration   = "forever"
-}
-
-resource "cloudflare_zero_trust_access_policy" "service_tokens" {
-  account_id = var.account_id
-  name       = "recall service tokens"
-  decision   = "non_identity"
-  include = [
-    for token in cloudflare_zero_trust_access_service_token.principal : {
-      service_token = { token_id = token.id }
-    }
-  ]
 }
 
 resource "cloudflare_zero_trust_access_policy" "bypass" {

@@ -52,7 +52,6 @@ Create the API token under My Profile → API Tokens → Create Custom Token, wi
 | Account | Workers Scripts · Edit                                       |
 | Account | Workers AI · Read                                            |
 | Account | Access: Apps and Policies · Edit                             |
-| Account | Access: Service Tokens · Edit                                |
 | Account | Access: Organizations, Identity Providers, and Groups · Edit |
 | Zone    | Zone · Read                                                  |
 | Zone    | DNS · Edit                                                   |
@@ -108,13 +107,11 @@ The routes under `/v1/memories`, `/v1/search` and `/v1/devices` need `Authorizat
 | `GET`    | `/v1/devices`                             | the caller's devices                                              |
 | `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                 |
 
-The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. The approval page at `/device` is the only path behind an Access login; its approve and deny form checks the Access JWT, the origin and a CSRF token.
-
-Access service tokens registered through `RECALL_USERS` hosts still work as `cf-access-client-id` and `cf-access-client-secret` headers while hosts move to `recall login`.
+The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` is the only path behind an Access login; its approve and deny form checks the Access JWT, the origin and a CSRF token.
 
 ## Deploying from CI
 
-As an alternative to `npm run setup`, Cloudflare Workers Builds can deploy the repo on every push with `npm run deploy` as the deploy command. It applies `infra/` with OpenTofu, migrates D1, syncs the users from `RECALL_USERS` and deploys the Worker. The account needs the One-time PIN login method (Zero Trust, Settings, Authentication). It refuses a plan that would destroy a resource. Use one path per deployment, not both.
+As an alternative to `npm run setup`, Cloudflare Workers Builds can deploy the repo on every push with `npm run deploy` as the deploy command. It applies `infra/` with OpenTofu, migrates D1, syncs the users from `RECALL_USERS` and deploys the Worker. The account needs the One-time PIN login method (Zero Trust, Settings, Authentication). It refuses a plan that would destroy a resource, except the retired Access service tokens and their policy. Use one path per deployment, not both.
 
 The build reads the instance from build variables and stops with a message naming any that is missing:
 
@@ -125,7 +122,7 @@ The build reads the instance from build variables and stops with a message namin
 | `RECALL_HOSTNAME`   | `recall.example.com`                           |
 | `RECALL_USERS`      | `{"alice": {"emails": ["alice@example.com"]}}` |
 
-The account needs an R2 bucket `recall-tfstate` for the OpenTofu state, and a private R2 bucket `recall-builder-secrets` holding three objects: `CLOUDFLARE_TOFU_TOKEN` (an API token with the permissions above), and `TFSTATE_ACCESS_KEY_ID` and `TFSTATE_SECRET_ACCESS_KEY` (R2 S3 credentials for the state bucket). Each email in `RECALL_USERS` may approve devices and signs in as that user id; adding a person is one entry. Removing a user signs out all their devices. An optional `hosts` list per user keeps a legacy Access service token per host while hosts move to `recall login`; `npm run service-token -- <user> <host>` writes such a host's env file from the state, with `RECALL_ACCOUNT_ID` and the two state keys in the environment.
+The account needs an R2 bucket `recall-tfstate` for the OpenTofu state, and a private R2 bucket `recall-builder-secrets` holding three objects: `CLOUDFLARE_TOFU_TOKEN` (an API token with the permissions above), and `TFSTATE_ACCESS_KEY_ID` and `TFSTATE_SECRET_ACCESS_KEY` (R2 S3 credentials for the state bucket). Each email in `RECALL_USERS` may approve devices and signs in as that user id; adding a person is one entry. Removing a user signs out all their devices.
 
 ## Develop
 

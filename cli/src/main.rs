@@ -285,11 +285,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Login { endpoint, name } => login(endpoint, name)?,
         Command::Logout => {
-            let client = client()?;
-            if !client.uses_device_token() {
-                bail!("this host signs in with a service token, not a device token; run recall login to switch");
-            }
-            match client.revoke_device("current") {
+            match client()?.revoke_device("current") {
                 Ok(true) => {}
                 Ok(false) => eprintln!("recall: this device was already revoked"),
                 Err(error) => eprintln!(

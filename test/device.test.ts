@@ -38,7 +38,7 @@ describe("device login", () => {
       interval: 5,
     });
 
-    const approver = await h.assertionFor(email("alice"));
+    const approver = await h.assertionFor(await h.invite(email("alice")));
     const page = await h.openApproval(started.user_code.toLowerCase().replace("-", ""), approver);
     expect(page.status).toBe(200);
     expect(page.headers.get("x-frame-options")).toBe("DENY");
@@ -73,7 +73,7 @@ describe("device login", () => {
     const h = await harness();
     const configured = email("owner");
     const userId = `owner-${crypto.randomUUID()}`;
-    await env.DB.prepare("INSERT INTO principals (email, user_id) VALUES (?, ?)").bind(configured, userId).run();
+    await h.invite(configured, userId);
 
     const first = h.clientWithToken(await h.login(configured.toUpperCase(), "desktop"));
     const second = h.clientWithToken(await h.login(configured, "laptop"));
@@ -88,7 +88,7 @@ describe("device login", () => {
   it("answers access_denied after a deny and never issues a token", async () => {
     const h = await harness();
     const started = await h.startDevice();
-    const denied = await h.decide(started.user_code, "deny", await h.assertionFor(email("alice")));
+    const denied = await h.decide(started.user_code, "deny", await h.assertionFor(await h.invite(email("alice"))));
     expect(denied.status).toBe(200);
     h.tick(5_000);
     expect(await grantError(await h.poll(started.device_code))).toBe("access_denied");
@@ -99,7 +99,7 @@ describe("device login", () => {
   it("expires an unapproved code after ten minutes", async () => {
     const h = await harness();
     const started = await h.startDevice();
-    const approver = await h.assertionFor(email("alice"));
+    const approver = await h.assertionFor(await h.invite(email("alice")));
     h.tick(600_000);
     expect(await grantError(await h.poll(started.device_code))).toBe("expired_token");
     expect((await h.openApproval(started.user_code, approver)).status).toBe(404);
@@ -134,7 +134,7 @@ describe("approval page", () => {
   it("refuses to approve without a valid Access JWT", async () => {
     const h = await harness();
     const started = await h.startDevice();
-    const valid = await h.assertionFor(email("alice"));
+    const valid = await h.assertionFor(await h.invite(email("alice")));
     const csrf = await h.csrfOf(await h.openApproval(started.user_code, valid));
     const [header, payload] = valid.split(".");
     for (const assertion of [
@@ -154,7 +154,7 @@ describe("approval page", () => {
   it("refuses a post whose CSRF token or origin does not match", async () => {
     const h = await harness();
     const started = await h.startDevice();
-    const assertion = await h.assertionFor(email("alice"));
+    const assertion = await h.assertionFor(await h.invite(email("alice")));
     const csrf = await h.csrfOf(await h.openApproval(started.user_code, assertion));
     const send = (origin: string, cookie: string, formCsrf: string): Promise<Response> =>
       h.send("/device", {
@@ -168,6 +168,7 @@ describe("approval page", () => {
         body: new URLSearchParams({ user_code: started.user_code, action: "approve", csrf: formCsrf }),
       });
     expect((await send("https://evil.example", csrf, csrf)).status).toBe(403);
+    expect((await send("null", csrf, csrf)).status).toBe(403);
     expect((await send("https://recall.test", csrf, "forged")).status).toBe(403);
     expect((await send("https://recall.test", "forged", "forged-too")).status).toBe(403);
     h.tick(5_000);
@@ -189,8 +190,8 @@ describe("approval page", () => {
 describe("device tokens", () => {
   it("cannot reach another user's memories or devices", async () => {
     const h = await harness();
-    const alice = h.clientWithToken(await h.login(email("alice"), "alice-laptop"));
-    const bob = h.clientWithToken(await h.login(email("bob"), "bob-laptop"));
+    const alice = h.clientWithToken(await h.login(await h.invite(email("alice")), "alice-laptop"));
+    const bob = h.clientWithToken(await h.login(await h.invite(email("bob")), "bob-laptop"));
     await alice.save("private-plan", { body: "alice only" });
 
     expect((await bob.request("GET", "/v1/memories/private-plan")).status).toBe(404);
@@ -205,7 +206,7 @@ describe("device tokens", () => {
 
   it("answers 401 to a revoked, unknown or malformed token", async () => {
     const h = await harness();
-    const owner = email("alice");
+    const owner = await h.invite(email("alice"));
     const laptop = h.clientWithToken(await h.login(owner, "laptop"));
     const desktop = h.clientWithToken(await h.login(owner, "desktop"));
     const listed = await devicesOf(await desktop.request("GET", "/v1/devices"));
@@ -231,7 +232,7 @@ describe("device tokens", () => {
 
   it("stores only the SHA-256 hash of a device token", async () => {
     const h = await harness();
-    const token = await h.login(email("alice"), "hash-check");
+    const token = await h.login(await h.invite(email("alice")), "hash-check");
     const rows = await env.DB.prepare("SELECT * FROM devices WHERE name = 'hash-check'").all<Record<string, unknown>>();
     expect(rows.results).toHaveLength(1);
     const [row] = rows.results;
@@ -240,18 +241,77 @@ describe("device tokens", () => {
   });
 });
 
-describe("service token fallback", () => {
-  it("admits a registered service token by its hashed secret", async () => {
+describe("invitations", () => {
+  it("refuses an Access sign-in whose email is not invited", async () => {
     const h = await harness();
-    const clientId = `${crypto.randomUUID()}.access`;
-    const secret = crypto.randomUUID();
-    await env.DB.prepare("INSERT INTO service_tokens (client_id, user_id, secret_sha256) VALUES (?, ?, ?)")
-      .bind(clientId, `legacy-${crypto.randomUUID()}`, await sha256Hex(secret))
-      .run();
+    const started = await h.startDevice();
+    const stranger = await h.assertionFor(email("stranger"));
+    const page = await h.openApproval(started.user_code, stranger);
+    expect(page.status).toBe(403);
+    expect(await page.text()).toContain("not invited");
+    expect((await h.decide(started.user_code, "approve", stranger, "any-csrf")).status).toBe(403);
+    h.tick(5_000);
+    expect(await grantError(await h.poll(started.device_code))).toBe("authorization_pending");
+    const rows = await env.DB.prepare("SELECT count(*) AS n FROM principals WHERE email LIKE 'stranger-%'").first<{
+      n: number;
+    }>();
+    expect(rows?.n).toBe(0);
+  });
+});
 
-    const legacy = h.clientWithHeaders({ "cf-access-client-id": clientId, "cf-access-client-secret": secret });
-    expect((await legacy.save("legacy-note", {})).name).toBe("legacy-note");
-    const wrong = h.clientWithHeaders({ "cf-access-client-id": clientId, "cf-access-client-secret": "wrong" });
-    expect((await wrong.request("GET", "/v1/memories")).status).toBe(401);
+describe("approval page origin", () => {
+  it("approves a post from the page's own origin", async () => {
+    const h = await harness();
+    const started = await h.startDevice();
+    const response = await h.decide(started.user_code, "approve", await h.assertionFor(await h.invite(email("alice"))));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("referrer-policy")).toBe("same-origin");
+    expect(await response.text()).toContain("Device approved");
+  });
+});
+
+describe("device code limits", () => {
+  it("caps unexpired codes per client address", async () => {
+    const h = await harness();
+    const clientIp = crypto.randomUUID();
+    for (let i = 0; i < 5; i++) expect((await h.requestDevice("laptop", clientIp)).status).toBe(200);
+    const refused = await h.requestDevice("laptop", clientIp);
+    expect(refused.status).toBe(429);
+    expect((await h.requestDevice("laptop", crypto.randomUUID())).status).toBe(200);
+  });
+
+  it("caps unexpired codes overall, whatever the client address", async () => {
+    const h = await harness("up", { perClient: 5, total: 3 });
+    const statuses: number[] = [];
+    for (let i = 0; i < 4; i++) statuses.push((await h.requestDevice("laptop", crypto.randomUUID())).status);
+    expect(statuses.filter((status) => status === 200).length).toBeLessThanOrEqual(3);
+    expect(statuses.at(-1)).toBe(429);
+  });
+
+  it("deletes a code as soon as a poll finds it expired", async () => {
+    const h = await harness();
+    const started = await h.startDevice();
+    h.tick(600_000);
+    expect(await grantError(await h.poll(started.device_code))).toBe("expired_token");
+    const row = await env.DB.prepare("SELECT count(*) AS n FROM device_codes WHERE user_code = ?")
+      .bind(started.user_code.replace("-", ""))
+      .first<{ n: number }>();
+    expect(row?.n).toBe(0);
+  });
+});
+
+describe("last used", () => {
+  it("records use at most once an hour", async () => {
+    const h = await harness();
+    const client = h.clientWithToken(await h.login(await h.invite(email("alice"))));
+    const issuedAt = h.now();
+    const lastUsed = async (): Promise<number> => {
+      const [device] = await devicesOf(await client.request("GET", "/v1/devices"));
+      return device?.lastUsedAt ?? 0;
+    };
+    h.tick(3_599_000);
+    expect(await lastUsed()).toBe(issuedAt);
+    h.tick(1_000);
+    expect(await lastUsed()).toBe(h.now());
   });
 });

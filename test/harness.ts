@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { accessVerifier, type KeySource, localKeys } from "../src/access";
 import { createApp } from "../src/app";
+import { DEVICE_CODE_LIMITS, type DeviceCodeLimits } from "../src/device";
 import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
 
@@ -47,7 +48,7 @@ export interface Client {
   search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
 }
 
-export const harness = async (keys: "up" | "down" = "up") => {
+export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
   const { n, e } = await exportJWK(publicKey);
   if (!n || !e) throw new Error("the generated key has no RSA modulus");
@@ -63,6 +64,7 @@ export const harness = async (keys: "up" | "down" = "up") => {
       AUDIENCE,
     ),
     embedder: wordEmbedder,
+    deviceCodeLimits,
     now: () => clock,
   });
 
@@ -78,12 +80,20 @@ export const harness = async (keys: "up" | "down" = "up") => {
   const send = (path: string, init: RequestInit = {}): Promise<Response> =>
     app.fetch(new Request(`${ORIGIN}${path}`, init), env);
 
-  const startDevice = async (deviceName = "laptop"): Promise<DeviceStart> => {
-    const response = await send("/v1/device/code", {
+  const requestDevice = (deviceName: string, clientIp: string): Promise<Response> =>
+    send("/v1/device/code", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "cf-connecting-ip": clientIp },
       body: JSON.stringify({ device_name: deviceName }),
     });
+
+  const invite = async (email: string, userId = `user-${crypto.randomUUID()}`): Promise<string> => {
+    await env.DB.prepare("INSERT INTO principals (email, user_id) VALUES (?, ?)").bind(email, userId).run();
+    return email;
+  };
+
+  const startDevice = async (deviceName = "laptop", clientIp = crypto.randomUUID()): Promise<DeviceStart> => {
+    const response = await requestDevice(deviceName, clientIp);
     if (response.status !== 200) throw new Error(`device code: ${response.status} ${await response.text()}`);
     return response.json();
   };
@@ -185,10 +195,12 @@ export const harness = async (keys: "up" | "down" = "up") => {
   const clientWithToken = (token: string): Client => clientWithHeaders({ authorization: `Bearer ${token}` });
 
   const user = async (label: string): Promise<Client> =>
-    clientWithToken(await login(`${label}-${crypto.randomUUID()}@example.com`));
+    clientWithToken(await login(await invite(`${label}-${crypto.randomUUID()}@example.com`)));
 
   return {
     user,
+    invite,
+    requestDevice,
     send,
     login,
     startDevice,

@@ -3,7 +3,14 @@ export const POLL_INTERVAL_S = 5;
 const SLOW_DOWN_STEP_S = 5;
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ";
 const USER_CODE_LENGTH = 8;
-const PRUNE_AFTER_MS = 3_600_000;
+const LAST_USED_RESOLUTION_MS = 3_600_000;
+
+export interface DeviceCodeLimits {
+  perClient: number;
+  total: number;
+}
+
+export const DEVICE_CODE_LIMITS: DeviceCodeLimits = { perClient: 5, total: 200 };
 
 export type DeviceCodeStatus = "pending" | "approved" | "denied";
 
@@ -25,7 +32,7 @@ export interface Device {
 
 export interface Caller {
   userId: string;
-  deviceId: string | null;
+  deviceId: string;
 }
 
 export type PollOutcome =
@@ -80,21 +87,35 @@ export const sameSecret = (a: string, b: string): boolean => {
 export const startDeviceCode = async (
   db: D1Database,
   deviceName: string,
+  clientIp: string,
+  limits: DeviceCodeLimits,
   now: number,
-): Promise<{ deviceCode: string; userCode: string; expiresAt: number }> => {
+): Promise<{ deviceCode: string; userCode: string; expiresAt: number } | null> => {
   const deviceCode = randomToken();
   const userCode = newUserCode();
   const expiresAt = now + DEVICE_CODE_TTL_MS;
-  await db.batch([
-    db.prepare("DELETE FROM device_codes WHERE expires_at < ?").bind(now - PRUNE_AFTER_MS),
+  const [, inserted] = await db.batch([
+    db.prepare("DELETE FROM device_codes WHERE expires_at <= ?").bind(now),
     db
       .prepare(
-        `INSERT INTO device_codes (device_code_sha256, user_code, device_name, status, user_id, created_at, expires_at, interval_s, last_polled_at)
-         VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?)`,
+        `INSERT INTO device_codes (device_code_sha256, user_code, device_name, client_ip, status, user_id, created_at, expires_at, interval_s, last_polled_at)
+         SELECT ?1, ?2, ?3, ?4, 'pending', '', ?5, ?6, ?7, ?5
+         WHERE (SELECT count(*) FROM device_codes WHERE expires_at > ?5) < ?8
+           AND (SELECT count(*) FROM device_codes WHERE client_ip = ?4 AND expires_at > ?5) < ?9`,
       )
-      .bind(await sha256Hex(deviceCode), userCode, deviceName, now, expiresAt, POLL_INTERVAL_S, now),
+      .bind(
+        await sha256Hex(deviceCode),
+        userCode,
+        deviceName,
+        clientIp,
+        now,
+        expiresAt,
+        POLL_INTERVAL_S,
+        limits.total,
+        limits.perClient,
+      ),
   ]);
-  return { deviceCode, userCode, expiresAt };
+  return inserted?.meta.changes === 1 ? { deviceCode, userCode, expiresAt } : null;
 };
 
 interface DeviceCodeRow {
@@ -154,7 +175,10 @@ export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: nu
     .first<DeviceCodeRow>();
   if (!row) return { ok: false, error: "invalid_grant" };
   const code = toDeviceCode(row);
-  if (now >= code.expiresAt) return { ok: false, error: "expired_token" };
+  if (now >= code.expiresAt) {
+    await db.prepare("DELETE FROM device_codes WHERE device_code_sha256 = ?").bind(codeHash).run();
+    return { ok: false, error: "expired_token" };
+  }
   if (now - code.lastPolledAt < code.intervalS * 1000) {
     await db
       .prepare("UPDATE device_codes SET interval_s = ?, last_polled_at = ? WHERE device_code_sha256 = ?")
@@ -188,37 +212,24 @@ export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: nu
   return { ok: true, accessToken };
 };
 
-export const userForEmail = async (db: D1Database, email: string): Promise<string> => {
+export const userForEmail = async (db: D1Database, email: string): Promise<string | null> => {
   const row = await db
-    .prepare(
-      `INSERT INTO principals (email, user_id) VALUES (?, ?)
-       ON CONFLICT (email) DO UPDATE SET email = excluded.email
-       RETURNING user_id`,
-    )
-    .bind(email, crypto.randomUUID())
+    .prepare("SELECT user_id FROM principals WHERE email = ?")
+    .bind(email)
     .first<{ user_id: string }>();
-  if (!row) throw new Error(`no principal row for ${email} after the upsert`);
-  return row.user_id;
+  return row ? row.user_id : null;
 };
 
 export const deviceForToken = async (db: D1Database, token: string, now: number): Promise<Caller | null> => {
   const row = await db
-    .prepare("UPDATE devices SET last_used_at = ? WHERE token_sha256 = ? RETURNING device_id, user_id")
-    .bind(now, await sha256Hex(token))
-    .first<{ device_id: string; user_id: string }>();
-  return row ? { userId: row.user_id, deviceId: row.device_id } : null;
-};
-
-export const userForServiceToken = async (
-  db: D1Database,
-  clientId: string,
-  clientSecret: string,
-): Promise<string | null> => {
-  const row = await db
-    .prepare("SELECT user_id FROM service_tokens WHERE client_id = ? AND secret_sha256 = ? AND secret_sha256 != ''")
-    .bind(clientId, await sha256Hex(clientSecret))
-    .first<{ user_id: string }>();
-  return row ? row.user_id : null;
+    .prepare("SELECT device_id, user_id, last_used_at FROM devices WHERE token_sha256 = ?")
+    .bind(await sha256Hex(token))
+    .first<{ device_id: string; user_id: string; last_used_at: number }>();
+  if (!row) return null;
+  if (now - row.last_used_at >= LAST_USED_RESOLUTION_MS) {
+    await db.prepare("UPDATE devices SET last_used_at = ? WHERE device_id = ?").bind(now, row.device_id).run();
+  }
+  return { userId: row.user_id, deviceId: row.device_id };
 };
 
 export const listDevices = async (db: D1Database, userId: string): Promise<Device[]> => {

@@ -1,5 +1,6 @@
 import { accessVerifier, cachedAccessKeys } from "./access";
 import { createApp } from "./app";
+import { DEVICE_CODE_LIMITS } from "./device";
 import type { Embedder } from "./model";
 import { DIMENSIONS, normalize } from "./rank";
 
@@ -29,6 +30,7 @@ const appFor = (env: Env): ReturnType<typeof createApp> => {
   const issuer = `https://${env.ACCESS_TEAM_DOMAIN}`;
   app = createApp({
     verify: accessVerifier(cachedAccessKeys(`${issuer}/cdn-cgi/access/certs`), issuer, env.ACCESS_AUD),
+    deviceCodeLimits: DEVICE_CODE_LIMITS,
     embedder: workersAiEmbedder(env.AI),
     now: Date.now,
   });

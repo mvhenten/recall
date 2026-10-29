@@ -4,14 +4,9 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub enum Auth {
-    Device(String),
-    ServiceToken { client_id: String, client_secret: String },
-}
-
 pub struct Config {
     pub endpoint: String,
-    pub auth: Auth,
+    pub token: String,
 }
 
 const AUTH_KEYS: [&str; 4] = [
@@ -87,21 +82,12 @@ pub fn load() -> Result<Config> {
             path.display()
         );
     };
-    let auth = match (
-        lookup(&file, "RECALL_TOKEN"),
-        lookup(&file, "RECALL_CLIENT_ID"),
-        lookup(&file, "RECALL_CLIENT_SECRET"),
-    ) {
-        (Some(token), _, _) => Auth::Device(token),
-        (None, Some(client_id), Some(client_secret)) => Auth::ServiceToken {
-            client_id,
-            client_secret,
-        },
-        _ => bail!("this host is not signed in to recall; run recall login"),
+    let Some(token) = lookup(&file, "RECALL_TOKEN") else {
+        bail!("this host is not signed in to recall; run recall login");
     };
     Ok(Config {
         endpoint: endpoint.trim_end_matches('/').to_string(),
-        auth,
+        token,
     })
 }
 

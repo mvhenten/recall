@@ -21,7 +21,7 @@ const page = (status: number, title: string, body: string, headers: Record<strin
         "content-security-policy":
           "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         "x-frame-options": "DENY",
-        "referrer-policy": "no-referrer",
+        "referrer-policy": "same-origin",
         ...headers,
       },
     },
