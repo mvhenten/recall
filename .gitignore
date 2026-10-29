@@ -7,3 +7,4 @@ target/
 .env
 .dev.vars
 dist/
+wrangler.deploy.json

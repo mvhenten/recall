@@ -1,0 +1,17 @@
+{
+  "account": [
+    "Account Settings Read",
+    "Workers Scripts Write",
+    "Workers Tail Read",
+    "Workers Observability Write",
+    "Workers CI Read",
+    "Workers CI Write",
+    "D1 Write",
+    "Vectorize Write",
+    "Workers R2 Storage Write",
+    "Access: Apps and Policies Write",
+    "Access: Service Tokens Write",
+    "Access: Organizations, Identity Providers, and Groups Read"
+  ],
+  "zone": ["Zone Read", "DNS Write", "Workers Routes Write"]
+}
