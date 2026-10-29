@@ -74,7 +74,12 @@ enum Command {
         filter: TagFilter,
         #[arg(long, default_value_t = 5)]
         limit: u32,
-        #[arg(long, default_value_t = 0.5, help = "Cosine cutoff for vector matches")]
+        #[arg(
+            long,
+            default_value_t = 0.55,
+            allow_negative_numbers = true,
+            help = "Cosine similarity every hybrid or vector match must reach; text mode ignores it"
+        )]
         min_score: f64,
         #[arg(long, default_value = "hybrid", value_parser = ["hybrid", "vector", "text"])]
         mode: String,

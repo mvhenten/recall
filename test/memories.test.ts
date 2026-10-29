@@ -115,7 +115,7 @@ describe("recall tracking", () => {
 });
 
 describe("hybrid search", () => {
-  it("finds an exact identifier through text search that vector search misses", async () => {
+  it("finds an exact identifier through text search, and hybrid keeps it out below the cosine cutoff", async () => {
     const h = await harness();
     const alice = await h.user("alice");
     await alice.save("cold-cache", { body: "error qx4521 means the cache is cold, warm it first" });
@@ -126,8 +126,28 @@ describe("hybrid search", () => {
     const vector = await alice.search("qx4521", "any", "vector");
     expect(vector.map((hit) => hit.memory.name)).not.toContain("cold-cache");
     expect((await alice.search("qx4521", "any", "text")).map((hit) => hit.memory.name)).toEqual(["cold-cache"]);
-    const [top] = await alice.search("qx4521", "any");
-    expect(top?.memory.name).toBe("cold-cache");
+    expect(await alice.search("qx4521", "any")).toEqual([]);
+  });
+
+  it("keeps a memory that shares only a common word out of hybrid results", async () => {
+    const h = await harness();
+    const alice = await h.user("alice");
+    await alice.save("cache-warming", { body: "cache warming steps" });
+    await alice.save("weather", { body: "the weather is nice" });
+    const search = (mode: "hybrid" | "text") =>
+      alice.request("POST", "/v1/search", {
+        query: "warming the cache",
+        tags: [],
+        any: true,
+        limit: 10,
+        minScore: 0.5,
+        mode,
+      });
+
+    const text: { hits: Array<{ memory: Memory }> } = await (await search("text")).json();
+    expect(text.hits.map((hit) => hit.memory.name).sort()).toEqual(["cache-warming", "weather"]);
+    const hybrid: { hits: Array<{ memory: Memory }> } = await (await search("hybrid")).json();
+    expect(hybrid.hits.map((hit) => hit.memory.name)).toEqual(["cache-warming"]);
   });
 
   it("removes a deleted memory from the full-text index", async () => {
