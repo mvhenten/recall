@@ -1,6 +1,18 @@
 {
-  "description": "Sync Claude auto-memory files to recall, inject matching memories into each prompt and the recall command surface into each session",
+  "description": "Redirect Claude auto-memory writes into recall, sync memory files written locally, inject matching memories into each prompt and the recall command surface into each session",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/redirect-memory.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Write|Edit",
