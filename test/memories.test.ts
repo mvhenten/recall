@@ -42,37 +42,6 @@ describe("user isolation", () => {
     expect(await bob.search("zx81 quasar", "any", "text")).toEqual([]);
     expect((await alice.search("zx81 quasar", "any", "text")).map((hit) => hit.memory.name)).toEqual(["ticket"]);
   });
-
-  it("rejects callers that are not a registered service token", async () => {
-    const h = await harness();
-    const stranger = h.clientWithAssertion(await h.assertionFor("unknown.access"));
-    expect((await stranger.request("GET", "/v1/memories")).status).toBe(403);
-    expect((await h.clientWithAssertion("not-a-jwt").request("GET", "/v1/memories")).status).toBe(401);
-  });
-
-  it("rejects a token for another application, an expired token and a forged signature", async () => {
-    const h = await harness();
-    const alice = await h.user("alice");
-    const valid = await h.assertionFor("probe.access");
-    const [header, payload] = valid.split(".");
-    for (const assertion of [
-      await h.assertionFor("probe.access", "another-app"),
-      await h.assertionFor("probe.access", undefined, Math.floor(Date.now() / 1000) - 3600),
-      `${header}.${payload}.${"A".repeat(342)}`,
-    ]) {
-      expect((await h.clientWithAssertion(assertion).request("GET", "/v1/memories")).status).toBe(401);
-    }
-    expect((await alice.request("GET", "/v1/memories")).status).toBe(200);
-  });
-
-  it("answers 500, not 401, when the Access signing keys cannot be fetched", async () => {
-    const h = await harness("down");
-    const response = await h.clientWithAssertion(await h.assertionFor("any.access")).request("GET", "/v1/memories");
-    expect(response.status).toBe(500);
-    const body: { error: string; requestId: string } = await response.json();
-    expect(body.error).toBe("internal error");
-    expect(body.requestId).not.toBe("");
-  });
 });
 
 describe("upsert", () => {

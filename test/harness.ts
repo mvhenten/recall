@@ -7,6 +7,16 @@ import { DIMENSIONS, normalize } from "../src/rank";
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const AUDIENCE = "recall-test-aud";
+const ORIGIN = "https://recall.test";
+
+export interface DeviceStart {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete: string;
+  expires_in: number;
+  interval: number;
+}
 
 // Embeds plain words only: tokens holding a digit are invisible to it, the way
 // rare identifiers barely register with a real embedding model.
@@ -56,8 +66,8 @@ export const harness = async (keys: "up" | "down" = "up") => {
     now: () => clock,
   });
 
-  const assertionFor = (clientId: string, audience = AUDIENCE, expiresAt: string | number = "5m"): Promise<string> =>
-    new SignJWT({ common_name: clientId, type: "app" })
+  const assertionFor = (email: string, audience = AUDIENCE, expiresAt: string | number = "5m"): Promise<string> =>
+    new SignJWT({ email, type: "app" })
       .setProtectedHeader({ alg: "RS256", kid: "test" })
       .setIssuer(ISSUER)
       .setAudience([audience])
@@ -65,16 +75,77 @@ export const harness = async (keys: "up" | "down" = "up") => {
       .setExpirationTime(expiresAt)
       .sign(privateKey);
 
-  const clientWithAssertion = (assertion: string): Client => {
+  const send = (path: string, init: RequestInit = {}): Promise<Response> =>
+    app.fetch(new Request(`${ORIGIN}${path}`, init), env);
+
+  const startDevice = async (deviceName = "laptop"): Promise<DeviceStart> => {
+    const response = await send("/v1/device/code", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ device_name: deviceName }),
+    });
+    if (response.status !== 200) throw new Error(`device code: ${response.status} ${await response.text()}`);
+    return response.json();
+  };
+
+  const poll = (deviceCode: string): Promise<Response> =>
+    send("/v1/device/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+        device_code: deviceCode,
+      }),
+    });
+
+  const openApproval = (userCode: string, assertion: string | null): Promise<Response> =>
+    send(`/device?code=${encodeURIComponent(userCode)}`, {
+      headers: assertion === null ? {} : { "cf-access-jwt-assertion": assertion },
+    });
+
+  const csrfOf = async (response: Response): Promise<string> => {
+    const match = /name="csrf" value="([^"]+)"/.exec(await response.text());
+    if (!match?.[1]) throw new Error(`the approval page shows no form: ${response.status}`);
+    return match[1];
+  };
+
+  const decide = async (
+    userCode: string,
+    action: "approve" | "deny",
+    assertion: string | null,
+    csrf?: string,
+  ): Promise<Response> => {
+    const token = csrf ?? (await csrfOf(await openApproval(userCode, assertion)));
+    return send("/device", {
+      method: "POST",
+      headers: {
+        ...(assertion === null ? {} : { "cf-access-jwt-assertion": assertion }),
+        origin: ORIGIN,
+        cookie: `__Host-recall_csrf=${token}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ user_code: userCode, action, csrf: token }),
+    });
+  };
+
+  const login = async (email: string, deviceName = "laptop"): Promise<string> => {
+    const started = await startDevice(deviceName);
+    const approved = await decide(started.user_code, "approve", await assertionFor(email));
+    if (approved.status !== 200) throw new Error(`approve: ${approved.status} ${await approved.text()}`);
+    clock += started.interval * 1000;
+    const response = await poll(started.device_code);
+    if (response.status !== 200) throw new Error(`token: ${response.status} ${await response.text()}`);
+    const granted: { access_token: string } = await response.json();
+    return granted.access_token;
+  };
+
+  const clientWithHeaders = (headers: Record<string, string>): Client => {
     const request = async (method: string, path: string, body?: unknown): Promise<Response> =>
-      app.fetch(
-        new Request(`https://recall.test${path}`, {
-          method,
-          headers: { "cf-access-jwt-assertion": assertion, "content-type": "application/json" },
-          body: body === undefined ? undefined : JSON.stringify(body),
-        }),
-        env,
-      );
+      send(path, {
+        method,
+        headers: { ...headers, "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
     return {
       request,
       async save(name, fields) {
@@ -111,17 +182,22 @@ export const harness = async (keys: "up" | "down" = "up") => {
     };
   };
 
-  const user = async (label: string): Promise<Client> => {
-    const clientId = `${crypto.randomUUID()}.access`;
-    await env.DB.prepare("INSERT INTO principals (client_id, user_id) VALUES (?, ?)")
-      .bind(clientId, `${label}-${crypto.randomUUID()}`)
-      .run();
-    return clientWithAssertion(await assertionFor(clientId));
-  };
+  const clientWithToken = (token: string): Client => clientWithHeaders({ authorization: `Bearer ${token}` });
+
+  const user = async (label: string): Promise<Client> =>
+    clientWithToken(await login(`${label}-${crypto.randomUUID()}@example.com`));
 
   return {
     user,
-    clientWithAssertion,
+    send,
+    login,
+    startDevice,
+    poll,
+    openApproval,
+    csrfOf,
+    decide,
+    clientWithToken,
+    clientWithHeaders,
     assertionFor,
     tick: (ms: number) => {
       clock += ms;

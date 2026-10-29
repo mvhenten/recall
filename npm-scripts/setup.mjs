@@ -1,16 +1,15 @@
 #!/usr/bin/env node
-// Self-hosts recall in your own Cloudflare account and writes this host's
-// recall env file. Safe to run again: it finds what exists and creates the rest.
+// Self-hosts recall in your own Cloudflare account. Safe to run again: it finds
+// what exists and creates the rest. Each host then signs in with recall login.
 //
-//   CLOUDFLARE_API_TOKEN=... npm run setup -- --hostname recall.example.com --user alice --host laptop
+//   CLOUDFLARE_API_TOKEN=... npm run setup -- --hostname recall.example.com --user alice --email alice@example.com
 //
-// Options: --account <id> (when the token sees several), --name <worker> (default
-// recall), --env-path <path> (default ~/.config/recall/env), --dry-run.
+// Options: --email again for more addresses, --account <id> (when the token sees
+// several), --name <worker> (default recall), --dry-run.
 // The token is read from the environment only and never printed.
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -30,27 +29,26 @@ const { values: options } = parseArgs({
   options: {
     hostname: { type: "string" },
     user: { type: "string" },
-    host: { type: "string" },
+    email: { type: "string", multiple: true, default: [] },
     account: { type: "string" },
     name: { type: "string", default: "recall" },
-    "env-path": { type: "string", default: join(homedir(), ".config", "recall", "env") },
     "dry-run": { type: "boolean", default: false },
   },
 });
 const usage =
-  "usage: CLOUDFLARE_API_TOKEN=... npm run setup -- --hostname <host.example.com> --user <user> --host <host>";
+  "usage: CLOUDFLARE_API_TOKEN=... npm run setup -- --hostname <host.example.com> --user <user> --email <email>";
 const token = process.env.CLOUDFLARE_API_TOKEN || die(`CLOUDFLARE_API_TOKEN is not set\n${usage}`);
-const { hostname, user, host, name } = options;
-if (!hostname || !user || !host) die(usage);
+const { hostname, user, name } = options;
+const emails = options.email.map((email) => email.trim().toLowerCase());
+if (!hostname || !user || emails.length === 0) die(usage);
+for (const email of emails) if (!/^[^@\s]+@[^@\s]+$/.test(email)) die(`--email ${email} is not an email address`);
 for (const [label, value] of [
   ["--user", user],
-  ["--host", host],
   ["--name", name],
 ]) {
   if (!SLUG.test(value)) die(`${label} must be lower-case letters, digits and dashes`);
 }
 const dryRun = options["dry-run"];
-const envFile = options["env-path"];
 
 const cf = async (method, path, body, { optional = false } = {}) => {
   const response = await fetch(`${API}${path}`, {
@@ -119,84 +117,81 @@ const database =
   (await create(`D1 database ${name}`, () => cf("POST", `${account}/d1/database`, { name })));
 const databaseId = database?.uuid ?? database?.id ?? "00000000-0000-0000-0000-000000000000";
 
-const readEnvFile = () =>
-  existsSync(envFile)
-    ? Object.fromEntries(
-        readFileSync(envFile, "utf8")
-          .split("\n")
-          .filter((line) => line.includes("="))
-          .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1).trim()]),
-      )
-    : {};
+const otp =
+  (await list(`${account}/access/identity_providers`)).find((idp) => idp.type === "onetimepin") ??
+  (await create("the One-time PIN login method", () =>
+    cf("POST", `${account}/access/identity_providers`, { name: "One-time PIN", type: "onetimepin", config: {} }),
+  ));
 
-const tokenName = `${name}-${user}-${host}`;
-const credentials = await (async () => {
-  const existing = (await list(`${account}/access/service_tokens`)).find((t) => t.name === tokenName);
-  const local = readEnvFile();
-  if (existing && local.RECALL_CLIENT_ID === existing.client_id && local.RECALL_CLIENT_SECRET) {
-    say(`reusing service token ${tokenName} from ${envFile}`);
-    return { id: existing.id, clientId: existing.client_id, clientSecret: local.RECALL_CLIENT_SECRET };
-  }
-  if (existing) {
-    if (dryRun) {
-      say(`would rotate the secret of service token ${tokenName}, since ${envFile} does not hold it`);
-      return { id: existing.id, clientId: existing.client_id, clientSecret: "" };
-    }
-    const rotated = await cf("POST", `${account}/access/service_tokens/${existing.id}/rotate`);
-    say(`rotated the secret of service token ${tokenName}; other copies of the old secret stop working`);
-    return { id: existing.id, clientId: existing.client_id, clientSecret: rotated.client_secret };
-  }
-  const created = await create(`service token ${tokenName}`, () =>
-    cf("POST", `${account}/access/service_tokens`, { name: tokenName, duration: "forever" }),
-  );
-  return { id: created?.id ?? "", clientId: created?.client_id ?? "", clientSecret: created?.client_secret ?? "" };
-})();
-
-const policyName = `${name} service tokens`;
-const policy = await (async () => {
-  const existing = (await list(`${account}/access/policies`)).find((p) => p.name === policyName);
-  const tokenIds = new Set(
-    (existing?.include ?? []).map((rule) => rule.service_token?.token_id).filter((id) => typeof id === "string"),
-  );
-  if (credentials.id) tokenIds.add(credentials.id);
-  const body = {
-    name: policyName,
-    decision: "non_identity",
-    include: [...tokenIds].map((id) => ({ service_token: { token_id: id } })),
-  };
+const policies = await list(`${account}/access/policies`);
+const upsertPolicy = async (policyName, body, sameAs) => {
+  const existing = policies.find((p) => p.name === policyName);
   if (!existing) return create(`Access policy ${policyName}`, () => cf("POST", `${account}/access/policies`, body));
-  if (existing.include?.length === body.include.length) return existing;
+  if (sameAs(existing)) return existing;
   if (dryRun) {
-    say(`would add ${tokenName} to Access policy ${policyName}`);
+    say(`would update Access policy ${policyName}`);
     return existing;
   }
-  say(`added ${tokenName} to Access policy ${policyName}`);
+  say(`updated Access policy ${policyName}`);
   return cf("PUT", `${account}/access/policies/${existing.id}`, body);
-})();
+};
 
-const application = await (async () => {
-  const existing = (await list(`${account}/access/apps`)).find((app) => app.domain === hostname);
-  const body = {
-    name,
-    domain: hostname,
-    type: "self_hosted",
-    session_duration: "24h",
-    app_launcher_visible: false,
-    service_auth_401_redirect: true,
-    policies: policy ? [{ id: policy.id, precedence: 1 }] : [],
-  };
-  if (!existing) return create(`Access application for ${hostname}`, () => cf("POST", `${account}/access/apps`, body));
-  if (existing.policies?.some((p) => p.id === policy?.id)) return existing;
+const bypassName = `${name} api`;
+const bypass = await upsertPolicy(
+  bypassName,
+  { name: bypassName, decision: "bypass", include: [{ everyone: {} }] },
+  (existing) => existing.decision === "bypass",
+);
+
+const approversName = `${name} device approvers`;
+const approverEmails = await (async () => {
+  const existing = policies.find((p) => p.name === approversName);
+  const known = (existing?.include ?? []).map((rule) => rule.email?.email).filter((email) => typeof email === "string");
+  return [...new Set([...known, ...emails])].sort();
+})();
+const approvers = await upsertPolicy(
+  approversName,
+  { name: approversName, decision: "allow", include: approverEmails.map((email) => ({ email: { email } })) },
+  (existing) => (existing.include ?? []).length === approverEmails.length,
+);
+
+const apps = await list(`${account}/access/apps`);
+const upsertApp = async (domain, body) => {
+  const existing = apps.find((app) => app.domain === domain);
+  if (!existing) return create(`Access application for ${domain}`, () => cf("POST", `${account}/access/apps`, body));
+  const policyIds = (existing.policies ?? []).map((p) => p.id);
+  const wanted = body.policies.map((p) => p.id);
+  if (policyIds.length === wanted.length && wanted.every((id) => policyIds.includes(id))) return existing;
   if (dryRun) {
-    say(`would attach ${policyName} to the Access application for ${hostname}`);
+    say(`would update the Access application for ${domain}`);
     return existing;
   }
-  say(`attached ${policyName} to the Access application for ${hostname}`);
+  say(`updated the Access application for ${domain}`);
   return cf("PUT", `${account}/access/apps/${existing.id}`, body);
-})();
+};
+
+await upsertApp(hostname, {
+  name,
+  domain: hostname,
+  type: "self_hosted",
+  session_duration: "24h",
+  app_launcher_visible: false,
+  policies: bypass ? [{ id: bypass.id, precedence: 1 }] : [],
+});
+const deviceDomain = `${hostname}/device`;
+const deviceApp = await upsertApp(deviceDomain, {
+  name: `${name} device approval`,
+  domain: deviceDomain,
+  type: "self_hosted",
+  session_duration: "24h",
+  app_launcher_visible: false,
+  allowed_idps: otp ? [otp.id] : [],
+  auto_redirect_to_identity: true,
+  policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
+});
 
 if (dryRun) {
-  say(`would deploy the Worker ${name} to ${hostname} and write ${envFile}`);
+  say(`would deploy the Worker ${name} to ${hostname}`);
   process.exit(0);
 }
 
@@ -224,44 +219,39 @@ const config = {
     migrations_dir: join(ROOT, db.migrations_dir),
   })),
   routes: [{ pattern: hostname, custom_domain: true, zone_id: zone.id }],
-  vars: { ACCESS_TEAM_DOMAIN: teamDomain, ACCESS_AUD: application.aud },
+  vars: { ACCESS_TEAM_DOMAIN: teamDomain, ACCESS_AUD: deviceApp.aud },
 };
 mkdirSync(WORK, { recursive: true });
 const configPath = join(WORK, "wrangler.json");
 writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
-const principalPath = join(WORK, "principal.sql");
+const principalPath = join(WORK, "principals.sql");
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
 writeFileSync(
   principalPath,
-  `INSERT INTO principals (client_id, user_id) VALUES (${quote(credentials.clientId)}, ${quote(user)})
-  ON CONFLICT (client_id) DO UPDATE SET user_id = excluded.user_id;\n`,
+  emails
+    .map(
+      (email) =>
+        `INSERT INTO principals (email, user_id) VALUES (${quote(email)}, ${quote(user)}) ON CONFLICT (email) DO UPDATE SET user_id = excluded.user_id;\n`,
+    )
+    .join(""),
 );
 
 run(["d1", "migrations", "apply", name, "--remote", "-c", configPath]);
 run(["d1", "execute", name, "--remote", "--yes", `--file=${principalPath}`, "-c", configPath]);
 run(["deploy", "-c", configPath]);
 
-mkdirSync(dirname(envFile), { recursive: true });
-writeFileSync(
-  envFile,
-  `RECALL_ENDPOINT=https://${hostname}\nRECALL_CLIENT_ID=${credentials.clientId}\nRECALL_CLIENT_SECRET=${credentials.clientSecret}\n`,
-  { mode: 0o600 },
-);
-chmodSync(envFile, 0o600);
-say(`wrote ${envFile}`);
-
 const probe = async () => {
   const deadline = Date.now() + 120_000;
   for (let delay = 5_000; ; delay = Math.min(delay * 2, 20_000)) {
     const response = await fetch(`https://${hostname}/v1/memories?limit=1`, {
-      headers: { "cf-access-client-id": credentials.clientId, "cf-access-client-secret": credentials.clientSecret },
       redirect: "manual",
       signal: AbortSignal.timeout(15_000),
     }).catch((error) => ({ status: 0, statusText: error.message }));
-    if (response.status === 200) return say(`https://${hostname} answers; try: recall list --any`);
+    if (response.status === 401)
+      return say(`https://${hostname} answers; on each host run: recall login --endpoint https://${hostname}`);
     if (Date.now() + delay > deadline) {
       return say(
-        `https://${hostname} still answers ${response.status}; Access and the certificate can take a few minutes`,
+        `https://${hostname} still answers ${response.status}; Access and the certificate can take a few minutes, then run: recall login --endpoint https://${hostname}`,
       );
     }
     await new Promise((resolve) => setTimeout(resolve, delay));

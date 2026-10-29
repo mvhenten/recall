@@ -148,9 +148,9 @@ export const accessVerifier =
     if (typeof payload.exp !== "number" || payload.exp + CLOCK_LEEWAY_S <= nowS) return reject("the JWT has expired");
     if (typeof payload.nbf === "number" && payload.nbf - CLOCK_LEEWAY_S > nowS)
       return reject("the JWT is not valid yet");
-    const clientId = payload.common_name;
-    if (typeof clientId !== "string" || clientId === "") {
-      return reject("the token carries no service token common_name; only service tokens may call recall");
+    const email = payload.email;
+    if (typeof email !== "string" || !email.includes("@")) {
+      return reject("the JWT carries no email; sign in to Access with a one-time PIN");
     }
-    return { ok: true, clientId };
+    return { ok: true, email: email.toLowerCase() };
   };

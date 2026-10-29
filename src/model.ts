@@ -44,7 +44,7 @@ export interface Embedder {
   embed(text: string): Promise<Float32Array>;
 }
 
-export type Verification = { ok: true; clientId: string } | { ok: false; reason: string };
+export type Verification = { ok: true; email: string } | { ok: false; reason: string };
 
 export type Verify = (assertion: string) => Promise<Verification>;
 
