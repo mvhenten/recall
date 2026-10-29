@@ -73,6 +73,54 @@ pub fn endpoint() -> Result<Option<String>> {
     Ok(lookup(&file, "RECALL_ENDPOINT").map(|value| value.trim_end_matches('/').to_string()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Hook,
+    Tools,
+}
+
+pub const MODE_KEY: &str = "RECALL_MODE";
+
+pub const AUTO_MEMORY_OFF: &str = "Turn off Claude Code's built-in auto-memory: add \"autoMemoryEnabled\": false to ~/.claude/settings.json, or set CLAUDE_CODE_DISABLE_AUTO_MEMORY=1";
+
+impl Mode {
+    pub fn parse(value: &str) -> Result<Mode> {
+        match value.trim() {
+            "hook" => Ok(Mode::Hook),
+            "tools" => Ok(Mode::Tools),
+            other => bail!("unknown mode {other:?}; use hook or tools"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Hook => "hook",
+            Mode::Tools => "tools",
+        }
+    }
+}
+
+pub fn mode() -> Result<Mode> {
+    let path = env_file();
+    let file = parse_env(&read_file(&path)?);
+    match lookup(&file, MODE_KEY) {
+        None => Ok(Mode::Hook),
+        Some(value) => Mode::parse(&value).with_context(|| {
+            format!(
+                "{MODE_KEY} in {} or the environment is invalid; run recall config set mode hook|tools",
+                path.display()
+            )
+        }),
+    }
+}
+
+pub fn set_mode(mode: Mode) -> Result<PathBuf> {
+    let path = env_file();
+    let kept = keep_lines(&read_file(&path)?, &[MODE_KEY]);
+    write_private(&path, &format!("{kept}{MODE_KEY}={}\n", mode.as_str()))?;
+    Ok(path)
+}
+
 pub fn load() -> Result<Config> {
     let path = env_file();
     let file = parse_env(&read_file(&path)?);
@@ -138,9 +186,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn modes_parse_and_unknown_values_fail() {
+        assert_eq!(Mode::parse("hook").unwrap(), Mode::Hook);
+        assert_eq!(Mode::parse(" tools\n").unwrap(), Mode::Tools);
+        assert!(Mode::parse("Tools").is_err());
+        assert!(Mode::parse("").is_err());
+    }
+
+    #[test]
     fn login_replaces_every_credential_and_keeps_other_lines() {
         let text = "# recall\nRECALL_ENDPOINT=https://old\nexport RECALL_CLIENT_ID=a\nRECALL_CLIENT_SECRET=b\nRECALL_TOKEN=c\nOTHER=1\n";
         assert_eq!(keep_lines(text, &AUTH_KEYS), "# recall\nOTHER=1\n");
+        assert_eq!(
+            keep_lines("RECALL_MODE=hook\nRECALL_TOKEN=c\n", &[MODE_KEY]),
+            "RECALL_TOKEN=c\n"
+        );
         assert_eq!(
             keep_lines(text, &["RECALL_TOKEN"]),
             "# recall\nRECALL_ENDPOINT=https://old\nexport RECALL_CLIENT_ID=a\nRECALL_CLIENT_SECRET=b\nOTHER=1\n"
