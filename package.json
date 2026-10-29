@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "deploy": "node npm-scripts/deploy.mjs",
-    "setup": "node npm-scripts/setup.mjs"
+    "setup": "node npm-scripts/setup.mjs",
+    "release": "node npm-scripts/release.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.0",
