@@ -1,5 +1,5 @@
 {
-  "description": "Sync Claude auto-memory files to recall and inject matching memories into each prompt",
+  "description": "Sync Claude auto-memory files to recall, inject matching memories into each prompt and the recall command surface into each session",
   "hooks": {
     "PostToolUse": [
       {
@@ -19,6 +19,17 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/recall-memories.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs\"",
             "timeout": 5
           }
         ]
