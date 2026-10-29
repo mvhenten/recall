@@ -78,7 +78,7 @@ enum Command {
             long,
             default_value_t = 0.55,
             allow_negative_numbers = true,
-            help = "Cosine similarity every hybrid or vector match must reach; text mode ignores it"
+            help = "Cosine similarity a vector match must reach; full-text matches do not use it"
         )]
         min_score: f64,
         #[arg(long, default_value = "hybrid", value_parser = ["hybrid", "vector", "text"])]

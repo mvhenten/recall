@@ -263,11 +263,9 @@ export const createApp = (deps: Deps): App => {
     }
     const [vector, text] = await Promise.all([vectorRankings(db, userId, input), textRankings(db, userId, input)]);
     const ids = (ranking: Ranking): string[] => ranking.map(([id]) => id);
-    const similar = new Set([...ids(vector.inScope), ...ids(vector.elsewhere)]);
-    const clearsCutoff = (id: string): boolean => similar.has(id);
     return {
-      inScope: reciprocalRankFusion([ids(vector.inScope), text.inScope.filter(clearsCutoff)]),
-      elsewhere: reciprocalRankFusion([ids(vector.elsewhere), text.elsewhere.filter(clearsCutoff)]),
+      inScope: reciprocalRankFusion([ids(vector.inScope), text.inScope]),
+      elsewhere: reciprocalRankFusion([ids(vector.elsewhere), text.elsewhere]),
     };
   };
 

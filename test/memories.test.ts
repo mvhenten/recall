@@ -115,7 +115,7 @@ describe("recall tracking", () => {
 });
 
 describe("hybrid search", () => {
-  it("finds an exact identifier through text search, and hybrid keeps it out below the cosine cutoff", async () => {
+  it("finds an exact identifier through text search that vector search misses", async () => {
     const h = await harness();
     const alice = await h.user("alice");
     await alice.save("cold-cache", { body: "error qx4521 means the cache is cold, warm it first" });
@@ -126,10 +126,11 @@ describe("hybrid search", () => {
     const vector = await alice.search("qx4521", "any", "vector");
     expect(vector.map((hit) => hit.memory.name)).not.toContain("cold-cache");
     expect((await alice.search("qx4521", "any", "text")).map((hit) => hit.memory.name)).toEqual(["cold-cache"]);
-    expect(await alice.search("qx4521", "any")).toEqual([]);
+    const [top] = await alice.search("qx4521", "any");
+    expect(top?.memory.name).toBe("cold-cache");
   });
 
-  it("keeps a memory that shares only a common word out of hybrid results", async () => {
+  it("keeps a memory that shares only a stopword out of text and hybrid results", async () => {
     const h = await harness();
     const alice = await h.user("alice");
     await alice.save("cache-warming", { body: "cache warming steps" });
@@ -145,7 +146,7 @@ describe("hybrid search", () => {
       });
 
     const text: { hits: Array<{ memory: Memory }> } = await (await search("text")).json();
-    expect(text.hits.map((hit) => hit.memory.name).sort()).toEqual(["cache-warming", "weather"]);
+    expect(text.hits.map((hit) => hit.memory.name)).toEqual(["cache-warming"]);
     const hybrid: { hits: Array<{ memory: Memory }> } = await (await search("hybrid")).json();
     expect(hybrid.hits.map((hit) => hit.memory.name)).toEqual(["cache-warming"]);
   });
@@ -173,8 +174,9 @@ describe("hybrid search", () => {
   });
 
   it("quotes every full-text term and fuses rankings by reciprocal rank", () => {
-    expect(ftsQuery('ERR-4521 "cache" OR')).toBe('"4521" OR "cache" OR "err" OR "or"');
+    expect(ftsQuery('ERR-4521 "cache" OR')).toBe('"4521" OR "cache" OR "err"');
     expect(ftsQuery("--")).toBeNull();
+    expect(ftsQuery("the and of")).toBeNull();
     expect(
       reciprocalRankFusion([
         ["a", "b", "c"],

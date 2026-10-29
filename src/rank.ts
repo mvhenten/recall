@@ -33,8 +33,18 @@ export const dot = (query: Float32Array, stored: Uint8Array): number => {
   return sum * scale;
 };
 
+const STOPWORDS = new Set(
+  `a about after again all also am an and any are as at be been before being but by can could did do does doing
+  for from had has have having he her here hers him his how i if in into is it its just me more most my no nor not
+  now of off on once only or other our ours out over own same she should so some such than that the their theirs
+  them then there these they this those through to too under until up us very was we were what when where which
+  while who whom why will with would you your yours`.split(/\s+/),
+);
+
 export const ftsQuery = (query: string): string | null => {
-  const terms = [...new Set(query.toLowerCase().split(/[^\p{L}\p{N}]+/u))].filter((term) => term !== "").sort();
+  const terms = [...new Set(query.toLowerCase().split(/[^\p{L}\p{N}]+/u))]
+    .filter((term) => term !== "" && !STOPWORDS.has(term))
+    .sort();
   if (terms.length === 0) return null;
   return terms.map((term) => `"${term}"`).join(" OR ");
 };
