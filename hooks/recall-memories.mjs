@@ -1,6 +1,6 @@
-import { emit, readInput, recall } from "./lib.mjs";
+import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
 
-const TIMEOUT_MS = 2000;
+const TIMEOUT_MS = 4000;
 const MIN_WORDS = 3;
 const MAX_QUERY_CHARS = 2000;
 const MAX_BODY_CHARS = 1200;
@@ -25,19 +25,31 @@ function contextBlock(hits) {
   return block;
 }
 
-const input = await readInput();
-const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
-if (prompt.startsWith("/") || prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) process.exit(0);
+async function run(input) {
+  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+  if (prompt.startsWith("/")) return "skipped:slash-command";
+  if (prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) return "skipped:short-prompt";
 
-const result = await recall(["search", "--json", "--limit", "5", "--", truncate(prompt, MAX_QUERY_CHARS)], {
-  cwd: input.cwd,
-  timeout: TIMEOUT_MS,
-});
-if (!result.ok) {
-  emit({ systemMessage: `recall unavailable: ${result.error}` });
-  process.exit(0);
+  const result = await recall(["search", "--json", "--limit", "5", "--", truncate(prompt, MAX_QUERY_CHARS)], {
+    cwd: input.cwd,
+    timeout: TIMEOUT_MS,
+  });
+  if (!result.ok) {
+    emit({ systemMessage: `recall unavailable: ${result.error}` });
+    return result.timedOut ? "timeout" : `error:${firstLine(result.error)}`;
+  }
+
+  const hits = JSON.parse(result.stdout);
+  if (hits.length === 0) return "no-hits";
+  emit({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: contextBlock(hits) } });
+  return `hits=${hits.length}`;
 }
 
-const hits = JSON.parse(result.stdout);
-if (hits.length === 0) process.exit(0);
-emit({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: contextBlock(hits) } });
+const started = Date.now();
+const input = await readInput();
+try {
+  logRun(input.session_id, await run(input), started);
+} catch (error) {
+  logRun(input.session_id, `error:${firstLine(error.message)}`, started);
+  throw error;
+}

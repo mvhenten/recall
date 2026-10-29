@@ -58,6 +58,7 @@ The plugin adds two hooks. Both need `node` 22 or later and find `recall` on `PA
 
 - After a `Write` or `Edit` to an auto-memory file (under `autoMemoryDirectory`, or `~/.claude/projects/*/memory/` when that is unset; `MEMORY.md` excluded), it runs `recall save`. `user` and `feedback` memories are saved as global; `project` and `reference` memories get the repo tag of the session's directory, or `global` outside a repo. When the save fails, a message says the memory was saved locally but not synced.
 - On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
+- Every hook run appends one line to `${XDG_STATE_HOME:-~/.local/state}/recall/hooks.log`: time, session id, outcome (`hits=<n>`, `no-hits`, `skipped:<reason>`, `timeout`, `saved:<name>`, `error:<message>`) and duration. Prompts and memory bodies are never logged.
 
 ## Memories, tags and scope
 
