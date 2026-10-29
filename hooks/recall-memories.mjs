@@ -4,44 +4,19 @@ const TIMEOUT_MS = 4000;
 const MIN_WORDS = 3;
 // bge-small-en-v1.5 accepts 512 tokens; 2000 chars is about that
 const MAX_QUERY_CHARS = 2000;
-const MAX_BODY_CHARS = 1200;
-const MAX_CONTEXT_BYTES = 4096;
-const HEADER = "Memories from recall that may be relevant to this prompt:";
-const GET_HINT = "Run `recall get <name>` to read the full text of any memory below.";
+const HEADER =
+  "Memories from recall that may be relevant to this prompt. For the full text of any that looks relevant, run `recall get <name>` before acting on it:";
 
 function truncate(text, max) {
   return text.length <= max ? text : `${text.slice(0, max).trimEnd()} …`;
 }
 
-function heading(memory) {
-  return `### ${memory.name} (${memory.type}; ${memory.tags.join(", ")})\n${memory.description}`;
-}
-
-function fullEntry(memory) {
-  const body = memory.body.trim();
-  if (body.length <= MAX_BODY_CHARS) return `${heading(memory)}\n\n${body}`;
-  return `${heading(memory)}\n\n${body.slice(0, MAX_BODY_CHARS).trimEnd()} …\n[truncated, full text: recall get ${memory.name}]`;
-}
-
-function stubEntry(memory) {
-  return `${heading(memory)}\n[not shown, full text: recall get ${memory.name}]`;
-}
-
-function byteLength(text) {
-  return Buffer.byteLength(text);
+function entry({ memory }) {
+  return `- ${memory.name} (${memory.type}; ${memory.tags.join(", ")}): ${memory.description}`;
 }
 
 function contextBlock(hits) {
-  const memories = hits.map(({ memory }) => memory);
-  const stubs = memories.map((memory) => `\n\n${stubEntry(memory)}`);
-  let block = `${HEADER}\n\n${GET_HINT}`;
-  memories.forEach((memory, index) => {
-    const full = `\n\n${fullEntry(memory)}`;
-    const reservedForRest = stubs.slice(index + 1).reduce((total, stub) => total + byteLength(stub), 0);
-    const fits = byteLength(block + full) + reservedForRest <= MAX_CONTEXT_BYTES;
-    block += fits ? full : stubs[index];
-  });
-  return block;
+  return [HEADER, ...hits.map(entry)].join("\n");
 }
 
 async function run(input) {
