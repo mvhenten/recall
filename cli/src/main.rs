@@ -233,7 +233,10 @@ fn update() -> Result<ExitCode> {
 }
 
 fn print_mode_hint(mode: config::Mode) {
-    if mode == config::Mode::Tools {
+    let disable_env = std::env::var("CLAUDE_CODE_DISABLE_AUTO_MEMORY").ok();
+    if mode == config::Mode::Tools
+        && config::auto_memory_enabled(&config::claude_settings_file(), disable_env.as_deref())
+    {
         eprintln!("recall: {}", config::AUTO_MEMORY_OFF);
     }
 }
