@@ -83,6 +83,27 @@ pub const MODE_KEY: &str = "RECALL_MODE";
 
 pub const AUTO_MEMORY_OFF: &str = "Turn off Claude Code's built-in auto-memory: add \"autoMemoryEnabled\": false to ~/.claude/settings.json, or set CLAUDE_CODE_DISABLE_AUTO_MEMORY=1";
 
+pub fn claude_settings_file() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .unwrap_or_default()
+        .join("settings.json")
+}
+
+pub fn auto_memory_enabled(settings_file: &Path, disable_env: Option<&str>) -> bool {
+    if disable_env.is_some_and(|value| matches!(value.trim(), "1" | "true")) {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(settings_file) else {
+        return true;
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return true;
+    };
+    settings.get("autoMemoryEnabled") != Some(&serde_json::Value::Bool(false))
+}
+
 impl Mode {
     pub fn parse(value: &str) -> Result<Mode> {
         match value.trim() {
@@ -205,5 +226,27 @@ mod tests {
             keep_lines(text, &["RECALL_TOKEN"]),
             "# recall\nRECALL_ENDPOINT=https://old\nexport RECALL_CLIENT_ID=a\nRECALL_CLIENT_SECRET=b\nOTHER=1\n"
         );
+    }
+
+    #[test]
+    fn auto_memory_reads_the_settings_file_through_a_symlink_and_the_env() {
+        let dir = std::env::temp_dir().join(format!("recall-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("dotfiles-settings.json");
+        let link = dir.join("settings.json");
+        std::fs::write(
+            &target,
+            "{\n  \"model\": \"opus\",\n  \"autoMemoryEnabled\": false\n}\n",
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!auto_memory_enabled(&link, None));
+
+        std::fs::write(&target, "{\"autoMemoryEnabled\": true}").unwrap();
+        assert!(auto_memory_enabled(&link, None));
+        assert!(!auto_memory_enabled(&link, Some("1")));
+        assert!(auto_memory_enabled(&dir.join("missing.json"), Some("0")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Cuts a CLI release: sets the version in cli/Cargo.toml, commits, tags vX.Y.Z
+// Cuts a release: sets the version in cli/Cargo.toml and the plugin manifest, commits, tags vX.Y.Z
 // and pushes both. The tag push starts the cargo-dist release workflow.
 
 import { spawnSync } from "node:child_process";
@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const MANIFEST = join(ROOT, "cli", "Cargo.toml");
+const PLUGIN = join(ROOT, ".claude-plugin", "plugin.json");
+const MARKETPLACE = join(ROOT, ".claude-plugin", "marketplace.json");
 
 function fail(message) {
   console.error(`release: ${message}`);
@@ -39,8 +41,18 @@ const versionLine = /^version = "[^"]*"$/m;
 if (!versionLine.test(manifest)) fail("no version line in cli/Cargo.toml");
 writeFileSync(MANIFEST, manifest.replace(versionLine, `version = "${version}"`));
 
+const plugin = JSON.parse(readFileSync(PLUGIN, "utf8"));
+plugin.version = version;
+writeFileSync(PLUGIN, `${JSON.stringify(plugin, null, 2)}\n`);
+
+const marketplace = JSON.parse(readFileSync(MARKETPLACE, "utf8"));
+for (const entry of marketplace.plugins) {
+  if (entry.name === plugin.name && "version" in entry) entry.version = version;
+}
+writeFileSync(MARKETPLACE, `${JSON.stringify(marketplace, null, 2)}\n`);
+
 run("cargo", ["update", "--workspace"]);
-run("git", ["add", "cli/Cargo.toml", "Cargo.lock"]);
+run("git", ["add", "cli/Cargo.toml", "Cargo.lock", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json"]);
 run("git", ["commit", "-m", `chore(release): ${tag}`]);
 run("git", ["tag", "-a", tag, "-m", tag]);
 run("git", ["push", "--atomic", "origin", "main", tag]);
