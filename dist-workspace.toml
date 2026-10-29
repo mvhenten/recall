@@ -9,5 +9,3 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-d
 install-path = "CARGO_HOME"
 hosting = "github"
 install-updater = true
-dispatch-releases = true
-create-release = false

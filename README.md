@@ -38,6 +38,8 @@ recall logout                   # revoke this device and remove its token
 
 A revoked or unknown token gets a 401, and the CLI says to run `recall login`.
 
+To release, run `npm run release -- X.Y.Z` on a clean, up-to-date main: it sets the version, commits, tags `vX.Y.Z` and pushes, and the tag builds and publishes the binaries.
+
 ### Self-host the service
 
 You need a Cloudflare account with a domain on it and Zero Trust switched on (the free plan is enough: open Zero Trust in the dashboard once and pick a team name). From a checkout, with Node 22 or later:
