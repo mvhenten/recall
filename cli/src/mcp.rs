@@ -256,7 +256,7 @@ impl Recall {
     #[tool(name = "recall_get", description = "Read one memory in full by its name.")]
     async fn get(&self, Parameters(params): Parameters<NameParams>) -> Result<String, String> {
         blocking(move || {
-            let memory = client()?.get(&params.name)?.ok_or_else(|| not_found(&params.name))?;
+            let memory = client()?.recall(&params.name)?.ok_or_else(|| not_found(&params.name))?;
             Ok(markdown::render(&memory))
         })
         .await

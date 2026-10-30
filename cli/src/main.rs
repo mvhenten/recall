@@ -442,7 +442,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print_saved(cli.json, &saved)?;
         }
         Command::Get { name } => {
-            let Some(memory) = client()?.get(&name)? else {
+            let Some(memory) = client()?.recall(&name)? else {
                 eprintln!("recall: no memory named {name}");
                 return Ok(ExitCode::from(1));
             };

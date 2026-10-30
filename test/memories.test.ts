@@ -84,23 +84,23 @@ describe("upsert", () => {
 });
 
 describe("recall tracking", () => {
-  it("counts every search hit and stamps when it was last recalled", async () => {
+  it("counts a deliberate read, not a search hit, and stamps when it was last recalled", async () => {
     const h = await harness();
     const alice = await h.user("alice");
     await alice.save("tabs-or-spaces", { body: "two spaces, never tabs" });
-    await alice.save("coffee-order", { body: "flat white" });
-
-    const recalledAt = h.tick(1_000);
-    const [hit] = await alice.search("spaces tabs", "any");
-    expect(hit?.memory.name).toBe("tabs-or-spaces");
-    expect(hit?.memory.recallCount).toBe(1);
 
     h.tick(1_000);
-    await alice.search("spaces tabs", "any");
-    const tabs = await alice.get("tabs-or-spaces");
-    expect(tabs.recallCount).toBe(2);
-    expect(tabs.lastRecalledAt).toBe(recalledAt + 1_000);
-    expect((await alice.get("coffee-order")).recallCount).toBe(0);
+    const [hit] = await alice.search("spaces tabs", "any");
+    expect(hit?.memory.name).toBe("tabs-or-spaces");
+    expect(hit?.memory.recallCount).toBe(0);
+    expect(hit?.memory.lastRecalledAt).toBe(0);
+
+    const readAt = h.tick(1_000);
+    const response = await alice.request("GET", "/v1/memories/tabs-or-spaces?recall=true");
+    const read: { memory: Memory } = await response.json();
+    expect(read.memory.recallCount).toBe(1);
+    expect(read.memory.lastRecalledAt).toBe(readAt);
+    expect((await alice.get("tabs-or-spaces")).recallCount).toBe(1);
   });
 
   it("leaves memories outside the requested tags untouched", async () => {
@@ -303,7 +303,7 @@ describe("elsewhere", () => {
     const other = await alice.get("other-deploy");
     expect(other.recallCount).toBe(0);
     expect(other.lastRecalledAt).toBe(0);
-    expect((await alice.get("here-deploy")).recallCount).toBe(3);
+    expect((await alice.get("here-deploy")).recallCount).toBe(0);
 
     const everywhere = await scopedSearch(alice, "deploy pipeline", []);
     expect(everywhere.hits).toHaveLength(2);

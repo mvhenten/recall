@@ -263,7 +263,15 @@ impl Client {
     }
 
     pub fn get(&self, name: &str) -> Result<Option<Memory>> {
-        let response = self.authed(self.agent.get(self.url(&Self::memory_path(name)))).call()?;
+        self.read(name, &Self::memory_path(name))
+    }
+
+    pub fn recall(&self, name: &str) -> Result<Option<Memory>> {
+        self.read(name, &format!("{}?recall=true", Self::memory_path(name)))
+    }
+
+    fn read(&self, name: &str, path: &str) -> Result<Option<Memory>> {
+        let response = self.authed(self.agent.get(self.url(path))).call()?;
         if response.status().as_u16() == 404 {
             return Ok(None);
         }

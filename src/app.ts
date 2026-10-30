@@ -276,13 +276,12 @@ export const createApp = (deps: Deps): App => {
     const rankings = await rank(db, userId, input);
     const top = rankings.inScope.slice(0, input.limit);
     const nearby = rankings.elsewhere.slice(0, ELSEWHERE_LIMIT);
-    const [recalled, described] = await Promise.all([
+    const [shown, described] = await Promise.all([
       top.length > 0
-        ? recall(
+        ? describeMemories(
             db,
             userId,
             top.map(([id]) => id),
-            deps.now(),
           )
         : [],
       nearby.length > 0
@@ -295,10 +294,10 @@ export const createApp = (deps: Deps): App => {
     ]);
     const byId = (memories: Memory[]): Map<string, Memory> =>
       new Map(memories.map((memory) => [memory.memoryId, memory]));
-    const recalledById = byId(recalled);
+    const shownById = byId(shown);
     const describedById = byId(described);
     const hits = top.flatMap(([id, score]) => {
-      const memory = recalledById.get(id);
+      const memory = shownById.get(id);
       return memory ? [{ score, memory }] : [];
     });
     const elsewhere = nearby.flatMap(([id, score]) => {
@@ -338,7 +337,11 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
     const memory = await getMemory(env.DB, userId, name.value);
     if (!memory) return error(404, `no memory named ${name.value}`);
-    if (request.method === "GET") return json({ memory });
+    if (request.method === "GET" && url.searchParams.get("recall") !== "true") return json({ memory });
+    if (request.method === "GET") {
+      const [recalled] = await recall(env.DB, userId, [memory.memoryId], deps.now());
+      return recalled ? json({ memory: recalled }) : error(404, `no memory named ${name.value}`);
+    }
     await deleteMemory(env.DB, userId, memory.memoryId);
     return new Response(null, { status: 204 });
   };
