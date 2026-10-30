@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_QUERY_CHARS, searchQuery } from "../hooks/query.mjs";
+import { MAX_QUERY_CHARS, searchQuery, unseen } from "../hooks/query.mjs";
 import { harness } from "./harness";
 
 describe("hook search query", () => {
@@ -15,9 +15,20 @@ describe("hook search query", () => {
       tags: [],
       any: true,
       limit: 5,
-      minScore: 0.55,
-      mode: "hybrid",
+      minScore: 0.65,
+      mode: "vector",
     });
     expect(response.status).toBe(200);
+  });
+
+  it("drops memories the session was already shown, in scope and elsewhere", () => {
+    const found = {
+      hits: [{ memory: { name: "shown-hit" } }, { memory: { name: "new-hit" } }],
+      elsewhere: [{ name: "shown-elsewhere" }, { name: "new-elsewhere" }],
+    };
+    expect(unseen(found, new Set(["shown-hit", "shown-elsewhere"]))).toEqual({
+      hits: [{ memory: { name: "new-hit" } }],
+      elsewhere: [{ name: "new-elsewhere" }],
+    });
   });
 });

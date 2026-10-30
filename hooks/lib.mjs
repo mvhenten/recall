@@ -25,9 +25,13 @@ export function firstLine(text) {
   return String(text).trim().split("\n").find(Boolean) ?? "";
 }
 
-export function logRun(sessionId, outcome, started) {
+export function stateDir() {
   const stateHome = process.env.XDG_STATE_HOME || path.join(homedir(), ".local", "state");
-  const dir = path.join(stateHome, "recall");
+  return path.join(stateHome, "recall");
+}
+
+export function logRun(sessionId, outcome, started) {
+  const dir = stateDir();
   const line = [new Date().toISOString(), sessionId ?? "-", outcome, `${Date.now() - started}ms`].join(" ");
   try {
     mkdirSync(dir, { recursive: true });
