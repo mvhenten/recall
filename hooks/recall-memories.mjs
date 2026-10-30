@@ -1,5 +1,6 @@
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
-import { MIN_SCORE, searchQuery } from "./query.mjs";
+import { MIN_SCORE, searchQuery, unseen } from "./query.mjs";
+import { readShown, recordShown } from "./shown.mjs";
 
 const TIMEOUT_MS = 4000;
 const MIN_WORDS = 3;
@@ -31,7 +32,7 @@ async function run(input) {
   if (prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) return "skipped:short-prompt";
 
   const result = await recall(
-    ["search", "--json", "--limit", "5", `--min-score=${MIN_SCORE}`, "--", searchQuery(prompt)],
+    ["search", "--json", "--mode", "vector", "--limit", "5", `--min-score=${MIN_SCORE}`, "--", searchQuery(prompt)],
     {
       cwd: input.cwd,
       timeout: TIMEOUT_MS,
@@ -43,7 +44,8 @@ async function run(input) {
   }
 
   const parsed = JSON.parse(result.stdout);
-  const found = Array.isArray(parsed) ? { hits: parsed, elsewhere: [] } : parsed;
+  const shown = readShown(input.session_id);
+  const found = unseen(Array.isArray(parsed) ? { hits: parsed, elsewhere: [] } : parsed, shown);
   if (found.hits.length === 0 && found.elsewhere.length === 0) return "no-hits";
   emit({
     hookSpecificOutput: {
@@ -51,6 +53,11 @@ async function run(input) {
       additionalContext: contextBlock(found, await repoTagOf(input.cwd)),
     },
   });
+  recordShown(input.session_id, [
+    ...shown,
+    ...found.hits.map(({ memory }) => memory.name),
+    ...found.elsewhere.map(({ name }) => name),
+  ]);
   return `hits=${found.hits.length} elsewhere=${found.elsewhere.length}`;
 }
 
