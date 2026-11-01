@@ -1,4 +1,5 @@
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
+import { messagingEnabled, register } from "./messaging.mjs";
 
 const TIMEOUT_MS = 3000;
 const INSTALL_HINT = "recall CLI not found; install it from https://github.com/mvhenten/recall#install";
@@ -46,11 +47,26 @@ function modeOf(result) {
   return { error: result.error };
 }
 
+function registerSession(input) {
+  if (!messagingEnabled()) return "off";
+  if (!input.session_id) return "no-session";
+  try {
+    return register(input.session_id, input.cwd) ? "registered" : "no-inbox";
+  } catch (error) {
+    return `failed:${firstLine(error.message)}`;
+  }
+}
+
 async function run(input) {
-  const [repo, config] = await Promise.all([
+  const messaging = registerSession(input);
+  const work = [
     recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
     recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
-  ]);
+  ];
+  if (messaging === "registered") {
+    work.push(recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }));
+  }
+  const [repo, config] = await Promise.all(work);
   if (!config.ok && config.error.includes("recall CLI not found")) {
     sessionContext(INSTALL_HINT);
     return "not-installed";
@@ -62,7 +78,7 @@ async function run(input) {
   }
   const repoTag = repo.ok ? repo.stdout.trim() : "";
   sessionContext(context(mode, repoTag));
-  return `crib:${mode}:${repoTag ? "repo" : "global"}`;
+  return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${messaging}`;
 }
 
 const started = Date.now();
