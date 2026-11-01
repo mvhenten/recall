@@ -161,17 +161,17 @@ Durable Objects with SQLite storage run on the Workers Free plan, which allows 1
 
 The routes under `/v1/memories`, `/v1/search` and `/v1/devices` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
 
-| Method   | Path                                      |                                                                   |
-| -------- | ----------------------------------------- | ----------------------------------------------------------------- |
-| `PUT`    | `/v1/memories/:name`                      | create or replace `{description, type, body, tags}`               |
-| `GET`    | `/v1/memories/:name`                      | read one                                                          |
-| `DELETE` | `/v1/memories/:name`                      | delete one                                                        |
-| `GET`    | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first                                              |
-| `POST`   | `/v1/search`                              | `{query, tags, any, limit, minScore, mode}`; each hit is a recall |
-| `GET`    | `/v1/devices`                             | the caller's devices                                              |
-| `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                 |
+| Method   | Path                                      |                                                                    |
+| -------- | ----------------------------------------- | ------------------------------------------------------------------ |
+| `PUT`    | `/v1/memories/:name`                      | create or replace `{description, type, body, tags}`                |
+| `GET`    | `/v1/memories/:name`                      | read one                                                           |
+| `DELETE` | `/v1/memories/:name`                      | delete one                                                         |
+| `GET`    | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first                                               |
+| `POST`   | `/v1/search`                              | `{query, tags, any, limit, minScore, mode}`; each hit is a recall  |
+| `GET`    | `/v1/devices`                             | the caller's devices                                               |
+| `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                  |
 | `POST`   | `/v1/messages`                            | `{toDeviceId, body}`; queues a message for a device on the account |
-| `GET`    | `/v1/messages/listen`                     | WebSocket only; pushes the caller's queue and takes ack frames    |
+| `GET`    | `/v1/messages/listen`                     | WebSocket only; pushes the caller's queue and takes ack frames     |
 
 The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` is the only path behind an Access login; its approve and deny form checks the Access JWT, the origin and a CSRF token.
 
