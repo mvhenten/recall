@@ -121,6 +121,17 @@ enum Command {
         #[arg(long, value_name = "ID", help = "Revoke the device with this id")]
         revoke: Option<String>,
     },
+    #[command(about = "Send a message to the Claude Code sessions on another host signed in as you")]
+    Send {
+        #[arg(value_name = "HOST", help = "Device name from recall devices, or a device id")]
+        host: String,
+        #[arg(
+            value_name = "MESSAGE",
+            num_args = 1..,
+            help = "The message; stdin when omitted or -"
+        )]
+        message: Vec<String>,
+    },
     #[command(about = "Update recall to the latest release")]
     Update,
     #[command(about = "Show the settings, or get or set one")]
@@ -321,6 +332,32 @@ fn read_input(file: Option<&PathBuf>) -> Result<String> {
     }
 }
 
+fn message_body(words: &[String]) -> Result<String> {
+    let joined = words.join(" ");
+    let text = if joined.is_empty() || joined == "-" {
+        if std::io::stdin().is_terminal() {
+            bail!("pass a message, or pipe one into recall send");
+        }
+        let mut piped = String::new();
+        std::io::stdin().read_to_string(&mut piped)?;
+        piped
+    } else {
+        joined
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        bail!("the message is empty");
+    }
+    Ok(text)
+}
+
+fn require_messaging(settings: &Settings) -> Result<()> {
+    if settings.messaging_enabled() {
+        return Ok(());
+    }
+    bail!("messaging is disabled; run recall config set messaging.enabled true to turn it on")
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -383,7 +420,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Login { endpoint, name } => login(endpoint, name)?,
         Command::Update => return update(),
         Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
-        Command::Mcp => mcp::serve()?,
+        Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
+        Command::Send { host, message } => {
+            require_messaging(&settings::load(&cli.settings)?)?;
+            let body = message_body(&message)?;
+            let client = client()?;
+            let to_device_id = api::resolve_host(&client.devices()?, &host)?;
+            let sent = client.send(&to_device_id, &body)?;
+            if cli.json {
+                print_json(&sent)?;
+            } else {
+                println!("sent {} to {host}", sent.message_id);
+            }
+        }
         Command::Logout => {
             match client()?.revoke_device("current") {
                 Ok(true) => {}
