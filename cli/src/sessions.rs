@@ -24,12 +24,26 @@ use tokio::net::UnixStream;
 /// is the session id Claude reports on the hook's stdin. The file name is what a delivered frame
 /// carries as `session_id`, so a registration that outlived its session is dropped by Claude
 /// instead of landing in whatever session now owns the socket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub socket: PathBuf,
     pub token: String,
     pub pid: i32,
     pub cwd: PathBuf,
+}
+
+/// Holds the inbox token back, so no log line or error can carry the credential that writes into
+/// a session.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .field("pid", &self.pid)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +52,8 @@ pub struct Registered {
     pub path: PathBuf,
     pub session: Session,
 }
+
+pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Fanout {
@@ -108,7 +124,7 @@ fn frames(registered: &Registered, body: &str) -> String {
     format!("{auth}\n{user}\n")
 }
 
-async fn write_frames(registered: &Registered, body: &str) -> Result<()> {
+async fn send(registered: &Registered, body: &str) -> Result<()> {
     let socket = &registered.session.socket;
     let mut stream = UnixStream::connect(socket)
         .await
@@ -121,6 +137,21 @@ async fn write_frames(registered: &Registered, body: &str) -> Result<()> {
         .flush()
         .await
         .with_context(|| format!("flushing {}", socket.display()))
+}
+
+/// A session that has stopped reading its socket is treated as one that refused the message.
+/// The pump awaits delivery inside the same select! that drives its heartbeat, so a wedged
+/// Claude would otherwise take the whole host's mailbox connection down with it.
+async fn write_frames(registered: &Registered, body: &str) -> Result<()> {
+    tokio::time::timeout(DELIVER_TIMEOUT, send(registered, body))
+        .await
+        .with_context(|| {
+            format!(
+                "{} did not take the message within {} seconds",
+                registered.session.socket.display(),
+                DELIVER_TIMEOUT.as_secs()
+            )
+        })?
 }
 
 /// Delivers a message body to every live session, once per inbox socket: a child session shares

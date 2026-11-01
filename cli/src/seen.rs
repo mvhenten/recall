@@ -25,10 +25,17 @@ impl Seen {
         }
     }
 
-    /// Records a message id, answering whether this daemon or an earlier one already had it.
-    pub fn insert(&mut self, message_id: &str) -> bool {
+    /// Whether this daemon or an earlier one already handled the message.
+    pub fn contains(&self, message_id: &str) -> bool {
+        self.ids.contains(message_id)
+    }
+
+    /// Records a message id, which only happens once it has been delivered. Recording ahead of
+    /// delivery would turn an interrupted handover into a lost message: the id would survive the
+    /// restart, the redelivery would short-circuit, and the ack would drop the row unread.
+    pub fn record(&mut self, message_id: &str) {
         if !self.ids.insert(message_id.to_string()) {
-            return false;
+            return;
         }
         self.order.push_back(message_id.to_string());
         while self.order.len() > MAX_SEEN {
@@ -37,7 +44,6 @@ impl Seen {
             }
         }
         self.save();
-        true
     }
 
     fn save(&self) {
@@ -65,22 +71,23 @@ mod tests {
         let path = dir.join("seen.json");
 
         let mut seen = Seen::load(&path);
-        assert!(seen.insert("m-1"));
-        assert!(!seen.insert("m-1"));
-        assert!(seen.insert("m-2"));
+        assert!(!seen.contains("m-1"));
+        seen.record("m-1");
+        assert!(seen.contains("m-1"));
+        seen.record("m-2");
 
         let mut restarted = Seen::load(&path);
-        assert!(!restarted.insert("m-1"));
-        assert!(!restarted.insert("m-2"));
-        assert!(restarted.insert("m-3"));
+        assert!(restarted.contains("m-1"));
+        assert!(restarted.contains("m-2"));
+        assert!(!restarted.contains("m-3"));
 
         for index in 0..MAX_SEEN {
-            restarted.insert(&format!("m-fill-{index}"));
+            restarted.record(&format!("m-fill-{index}"));
         }
-        let mut wrapped = Seen::load(&path);
+        let wrapped = Seen::load(&path);
         assert_eq!(wrapped.order.len(), MAX_SEEN);
-        assert!(wrapped.insert("m-1"), "the oldest ids fall off once the set is full");
-        assert!(!wrapped.insert("m-fill-999"));
+        assert!(!wrapped.contains("m-1"), "the oldest ids fall off once the set is full");
+        assert!(wrapped.contains("m-fill-999"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -158,11 +158,12 @@ fn log(outcome: &str, took: Duration) {
 
 async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
     let started = Instant::now();
-    if !seen.insert(&message.message_id) {
+    if seen.contains(&message.message_id) {
         log(&format!("message:replayed:{}", message.message_id), started.elapsed());
         return;
     }
     let fanout = sessions::fanout(sessions_dir, &message.body).await;
+    seen.record(&message.message_id);
     log(
         &format!(
             "message:{}:{}:{}/{}",
