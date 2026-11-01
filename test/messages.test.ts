@@ -64,9 +64,13 @@ describe("messages", () => {
 
     expect((await send(laptop, desktopId, "x".repeat(MAX_BODY_BYTES + 1))).status).toBe(413);
 
-    await runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => {
+    await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
       for (let index = 0; index < MAX_QUEUED_MESSAGES; index += 1) {
-        mailbox.enqueue({ toDeviceId: desktopId, body: `queued ${index}` }, desktopId, h.now());
+        await mailbox.enqueue(
+          { toDeviceId: desktopId, body: `queued ${index}` },
+          { userId, deviceId: desktopId },
+          h.now(),
+        );
       }
     });
     expect((await send(laptop, desktopId, "one too many")).status).toBe(429);

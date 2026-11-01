@@ -18,7 +18,15 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
-import { MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, parseSend } from "./mailbox";
+import {
+  DEVICE_HEADER,
+  MAX_BODY_BYTES,
+  MAX_QUEUED_MESSAGES,
+  type Mailbox,
+  NOW_HEADER,
+  parseSend,
+  USER_HEADER,
+} from "./mailbox";
 import {
   type Embedder,
   type Memory,
@@ -182,9 +190,21 @@ export const createApp = (deps: Deps): App => {
     if (!(await hasDevice(env.DB, caller.userId, input.value.toDeviceId))) {
       return error(404, `no device ${input.value.toDeviceId}`);
     }
-    const message = await mailboxFor(env, caller.userId).enqueue(input.value, caller.deviceId, deps.now());
+    const message = await mailboxFor(env, caller.userId).enqueue(input.value, caller, deps.now());
     if (message === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
     return json({ message }, 201);
+  };
+
+  const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+    const upgrade = new Request(request.url, {
+      headers: {
+        upgrade: "websocket",
+        [DEVICE_HEADER]: caller.deviceId,
+        [USER_HEADER]: caller.userId,
+        [NOW_HEADER]: String(deps.now()),
+      },
+    });
+    return mailboxFor(env, caller.userId).fetch(upgrade);
   };
 
   const approver = async (request: Request): Promise<string | Response> => {
@@ -344,6 +364,13 @@ export const createApp = (deps: Deps): App => {
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
     if (collection === "messages") {
+      if (rawName === "listen") {
+        if (request.method !== "GET") return error(405, "method not allowed");
+        if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
+          return error(426, "/v1/messages/listen only answers a WebSocket upgrade; send Upgrade: websocket");
+        }
+        return listen(request, env, caller);
+      }
       if (rawName !== undefined) return error(404, "not found");
       return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
     }

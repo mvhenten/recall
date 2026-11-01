@@ -1,9 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
+import { type Caller, listDevices } from "./device";
 import type { Parsed } from "./model";
 
 export const MESSAGE_TTL_MS = 259_200_000;
 export const MAX_QUEUED_MESSAGES = 1_000;
 export const MAX_BODY_BYTES = 32_768;
+export const SWEEP_INTERVAL_MS = 900_000;
+
+export const DEVICE_HEADER = "x-recall-device-id";
+export const USER_HEADER = "x-recall-user-id";
+export const NOW_HEADER = "x-recall-now";
+
+export const CLOSE_BAD_FRAME = 4000;
+export const CLOSE_REVOKED = 4001;
 
 export interface Message {
   messageId: string;
@@ -19,6 +28,20 @@ export interface SendInput {
   body: string;
 }
 
+export interface MessageFrame {
+  type: "message";
+  message: Message;
+}
+
+export interface AckFrame {
+  type: "ack";
+  messageId: string;
+}
+
+export interface MailboxEnv {
+  DB: D1Database;
+}
+
 interface MessageRow extends Record<string, string | number> {
   message_id: string;
   to_device_id: string;
@@ -26,6 +49,10 @@ interface MessageRow extends Record<string, string | number> {
   body: string;
   created_at: number;
   expires_at: number;
+}
+
+interface Attachment {
+  deviceId: string;
 }
 
 const toMessage = (row: MessageRow): Message => ({
@@ -49,10 +76,35 @@ export const parseSend = (input: unknown): Parsed<SendInput> => {
   return { ok: true, value: { toDeviceId, body } };
 };
 
-export class Mailbox extends DurableObject {
+const readJson = (raw: string): unknown => {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+};
+
+const parseAck = (raw: string): string | null => {
+  const frame = readJson(raw);
+  if (typeof frame !== "object" || frame === null || Array.isArray(frame)) return null;
+  const { type, messageId } = frame as Record<string, unknown>;
+  if (type !== "ack" || typeof messageId !== "string" || messageId.length < 1) return null;
+  return messageId;
+};
+
+const deviceOf = (socket: WebSocket): string | null => {
+  const stored: unknown = socket.deserializeAttachment();
+  if (typeof stored !== "object" || stored === null) return null;
+  const { deviceId } = stored as Record<string, unknown>;
+  return typeof deviceId === "string" ? deviceId : null;
+};
+
+const messageFrame = (message: Message): string => JSON.stringify({ type: "message", message } satisfies MessageFrame);
+
+export class Mailbox extends DurableObject<MailboxEnv> {
   private readonly sql: SqlStorage;
 
-  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+  constructor(ctx: DurableObjectState, env: MailboxEnv) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(
@@ -66,16 +118,59 @@ export class Mailbox extends DurableObject {
        )`,
     );
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS account (user_id TEXT PRIMARY KEY)");
   }
 
-  enqueue(input: SendInput, fromDeviceId: string, now: number): Message | null {
+  async fetch(request: Request): Promise<Response> {
+    const deviceId = request.headers.get(DEVICE_HEADER) ?? "";
+    const userId = request.headers.get(USER_HEADER) ?? "";
+    const now = Number(request.headers.get(NOW_HEADER));
+    if (deviceId === "" || userId === "" || !Number.isFinite(now)) {
+      return new Response("the mailbox only answers the listen upgrade", { status: 400 });
+    }
+    this.remember(userId);
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1]);
+    pair[1].serializeAttachment({ deviceId } satisfies Attachment);
+    for (const message of this.list(deviceId, now)) pair[1].send(messageFrame(message));
+    await this.scheduleSweep();
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  webSocketMessage(socket: WebSocket, received: string | ArrayBuffer): void {
+    const deviceId = deviceOf(socket);
+    const messageId = typeof received === "string" ? parseAck(received) : null;
+    if (deviceId === null || messageId === null) {
+      socket.close(CLOSE_BAD_FRAME, 'every frame must be {"type":"ack","messageId":"<id>"}');
+      return;
+    }
+    this.remove(deviceId, messageId);
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
     this.expire(now);
-    const { queued } = this.sql.exec<{ queued: number }>("SELECT count(*) AS queued FROM messages").one();
-    if (queued >= MAX_QUEUED_MESSAGES) return null;
+    const live = await this.liveDevices();
+    if (live !== null) {
+      this.reap(live);
+      for (const socket of this.ctx.getWebSockets()) {
+        const deviceId = deviceOf(socket);
+        if (deviceId === null || !live.has(deviceId)) {
+          socket.close(CLOSE_REVOKED, "this device is no longer signed in; run recall login");
+        }
+      }
+    }
+    await this.scheduleSweep();
+  }
+
+  async enqueue(input: SendInput, from: Caller, now: number): Promise<Message | null> {
+    this.remember(from.userId);
+    this.expire(now);
+    if (this.queued() >= MAX_QUEUED_MESSAGES) return null;
     const message: Message = {
       messageId: crypto.randomUUID(),
       toDeviceId: input.toDeviceId,
-      fromDeviceId,
+      fromDeviceId: from.deviceId,
       body: input.body,
       createdAt: now,
       expiresAt: now + MESSAGE_TTL_MS,
@@ -90,6 +185,8 @@ export class Mailbox extends DurableObject {
       message.createdAt,
       message.expiresAt,
     );
+    this.push(message);
+    await this.scheduleSweep();
     return message;
   }
 
@@ -107,10 +204,51 @@ export class Mailbox extends DurableObject {
 
   ack(toDeviceId: string, messageId: string, now: number): boolean {
     this.expire(now);
+    return this.remove(toDeviceId, messageId);
+  }
+
+  private remove(toDeviceId: string, messageId: string): boolean {
     return (
       this.sql.exec("DELETE FROM messages WHERE to_device_id = ? AND message_id = ?", toDeviceId, messageId)
         .rowsWritten > 0
     );
+  }
+
+  private push(message: Message): void {
+    const frame = messageFrame(message);
+    for (const socket of this.ctx.getWebSockets()) {
+      if (deviceOf(socket) === message.toDeviceId) socket.send(frame);
+    }
+  }
+
+  private remember(userId: string): void {
+    this.sql.exec("INSERT OR IGNORE INTO account (user_id) VALUES (?)", userId);
+  }
+
+  private async liveDevices(): Promise<Set<string> | null> {
+    const [row] = this.sql.exec<{ user_id: string }>("SELECT user_id FROM account").toArray();
+    if (!row) return null;
+    const devices = await listDevices(this.env.DB, row.user_id);
+    return new Set(devices.map((device) => device.deviceId));
+  }
+
+  private reap(live: Set<string>): void {
+    const targets = this.sql.exec<{ to_device_id: string }>("SELECT DISTINCT to_device_id FROM messages").toArray();
+    for (const target of targets) {
+      if (!live.has(target.to_device_id)) {
+        this.sql.exec("DELETE FROM messages WHERE to_device_id = ?", target.to_device_id);
+      }
+    }
+  }
+
+  private queued(): number {
+    return this.sql.exec<{ queued: number }>("SELECT count(*) AS queued FROM messages").one().queued;
+  }
+
+  private async scheduleSweep(): Promise<void> {
+    if (this.queued() === 0 && this.ctx.getWebSockets().length === 0) return;
+    if ((await this.ctx.storage.getAlarm()) !== null) return;
+    await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
   }
 
   private expire(now: number): void {
