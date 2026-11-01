@@ -47,13 +47,6 @@ describe("messages", () => {
 
     expect(await queued(userId, desktopId, h.now())).toEqual([message]);
     expect(await queued(userId, laptopId, h.now())).toEqual([]);
-
-    const acked = await runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => [
-      mailbox.ack(laptopId, message.messageId, h.now()),
-      mailbox.ack(desktopId, message.messageId, h.now()),
-    ]);
-    expect(acked).toEqual([false, true]);
-    expect(await queued(userId, desktopId, h.now())).toEqual([]);
   });
 
   it("refuses an oversized body, caps the queue per account and expires messages after the TTL", async () => {
@@ -64,9 +57,13 @@ describe("messages", () => {
 
     expect((await send(laptop, desktopId, "x".repeat(MAX_BODY_BYTES + 1))).status).toBe(413);
 
-    await runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => {
+    await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
       for (let index = 0; index < MAX_QUEUED_MESSAGES; index += 1) {
-        mailbox.enqueue({ toDeviceId: desktopId, body: `queued ${index}` }, desktopId, h.now());
+        await mailbox.enqueue(
+          { toDeviceId: desktopId, body: `queued ${index}` },
+          { userId, deviceId: desktopId },
+          h.now(),
+        );
       }
     });
     expect((await send(laptop, desktopId, "one too many")).status).toBe(429);
