@@ -90,7 +90,7 @@ The plugin starts `recall mcp` as an MCP server and adds four hooks. The hooks n
 
 ### Modes
 
-The plugin works in one of two modes, set per host with `recall config set mode hook|tools` and stored as `RECALL_MODE` in `~/.config/recall/env`. `recall config` prints the current mode.
+The plugin works in one of two modes, set per host with `recall config set mode hook|tools` and stored in `~/.config/recall/config.json`. A `RECALL_MODE` left in `~/.config/recall/env` by an earlier release still applies until the mode is set again. `recall config` prints every setting, `recall config get <key>` one of them, and `recall config schema` the JSON Schema of the settings file.
 
 - `hook` (the default) leaves Claude Code's built-in auto-memory on. Claude saves memories its usual way and the plugin redirects each memory file write into recall.
 - `tools` replaces auto-memory with recall. Session start tells Claude what to remember and to use the `recall_*` tools. Turn auto-memory off yourself, since a plugin cannot change your settings: add `"autoMemoryEnabled": false` to `~/.claude/settings.json`, or set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
