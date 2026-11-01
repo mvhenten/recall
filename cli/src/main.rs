@@ -246,34 +246,38 @@ fn print_mode_hint(mode: Mode) {
 }
 
 fn run_config(cli_settings: &Settings, json: bool, action: Option<ConfigAction>) -> Result<()> {
-    if let Some(ConfigAction::Schema) = action {
-        return print_json(&settings::schema());
-    }
-    if let Some(ConfigAction::Set { key, value }) = action {
-        let (path, _) = settings::set(&key, &value)?;
-        println!("{key} set to {value} in {}", path.display());
-        print_mode_hint(settings::load(cli_settings)?.mode());
-        return Ok(());
-    }
-    let resolved = settings::resolved(cli_settings)?;
     match action {
+        Some(ConfigAction::Schema) => print_json(&settings::schema()),
+        Some(ConfigAction::Set { key, value }) => {
+            let (path, _) = settings::set(&key, &value)?;
+            println!("{} set to {value} in {}", settings::display(&key), path.display());
+            print_mode_hint(settings::load(cli_settings)?.mode());
+            Ok(())
+        }
         Some(ConfigAction::Get { key }) => {
+            let resolved = settings::resolved(cli_settings)?;
             let value = settings::get(&resolved, &key)?;
             if json {
                 print_json(value)?;
             } else {
                 println!("{}", settings::scalar(value));
             }
+            print_mode_hint(settings::from_value(&resolved)?.mode());
+            Ok(())
         }
-        _ if json => print_json(&resolved)?,
-        _ => {
-            for line in settings::lines(&resolved) {
-                println!("{line}");
+        None => {
+            let resolved = settings::resolved(cli_settings)?;
+            if json {
+                print_json(&resolved)?;
+            } else {
+                for line in settings::lines(&resolved) {
+                    println!("{line}");
+                }
             }
+            print_mode_hint(settings::from_value(&resolved)?.mode());
+            Ok(())
         }
     }
-    print_mode_hint(settings::from_value(&resolved)?.mode());
-    Ok(())
 }
 
 fn current_repo_tag() -> Option<String> {
@@ -578,6 +582,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
+    settings::drop_empty_env();
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(error) => {

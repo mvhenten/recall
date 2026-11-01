@@ -1,5 +1,5 @@
 use crate::config;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,12 +14,7 @@ pub enum Mode {
     Tools,
 }
 
-impl Mode {
-    pub fn parse(value: &str) -> Result<Mode> {
-        serde_json::from_value(Value::String(value.trim().to_string()))
-            .with_context(|| format!("unknown mode {value:?}; use hook or tools"))
-    }
-}
+pub const MESSAGING_ENABLED_KEY: &str = "RECALL_MESSAGING_ENABLED";
 
 /// Settings read from ~/.config/recall/config.json, overridden by the environment and these flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args, Serialize, Deserialize, JsonSchema)]
@@ -30,7 +25,7 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
     /// Opt in to messaging between Claude Code sessions on the hosts signed in as you.
-    #[arg(long, value_name = "BOOL", env = "RECALL_MESSAGING_ENABLED")]
+    #[arg(long, value_name = "BOOL", env = MESSAGING_ENABLED_KEY)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messaging_enabled: Option<bool>,
 }
@@ -49,6 +44,14 @@ impl Settings {
         Settings {
             mode: Some(empty.mode()),
             messaging_enabled: Some(empty.messaging_enabled()),
+        }
+    }
+}
+
+pub fn drop_empty_env() {
+    for name in [config::MODE_KEY, MESSAGING_ENABLED_KEY] {
+        if std::env::var_os(name).is_some_and(|value| value.is_empty()) {
+            unsafe { std::env::remove_var(name) };
         }
     }
 }
@@ -92,9 +95,9 @@ fn migrated_mode() -> Result<Map<String, Value>> {
     let Some(value) = config::env_file_mode()? else {
         return Ok(Map::new());
     };
-    let mode = Mode::parse(&value).with_context(|| {
+    let mode = serde_json::from_value(Value::String(value.trim().to_string())).with_context(|| {
         format!(
-            "{} in {} is invalid; run recall config set mode hook|tools",
+            "unknown mode {value:?} from {} in {}; run recall config set mode hook|tools",
             config::MODE_KEY,
             config::env_file().display()
         )
@@ -125,6 +128,10 @@ fn key(path: &str) -> String {
     path.replace('.', "_")
 }
 
+pub fn display(path: &str) -> String {
+    path.replace('_', ".")
+}
+
 pub fn get<'a>(resolved: &'a Value, path: &str) -> Result<&'a Value> {
     resolved
         .get(key(path))
@@ -135,9 +142,15 @@ pub fn set(path: &str, raw: &str) -> Result<(PathBuf, Settings)> {
     let file = config_file();
     let mut stored = read_file(&file)?;
     let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+    if value.is_null() {
+        bail!(
+            "{} cannot be set to {raw}; run recall config schema to see the values a setting takes",
+            display(path)
+        );
+    }
     stored.insert(key(path), value);
     let settings = parse(&serde_json::to_string(&Value::Object(stored))?)
-        .with_context(|| format!("{path} cannot be set to {raw}"))?;
+        .with_context(|| format!("{} cannot be set to {raw}", display(path)))?;
     write(&file, &settings)?;
     if settings.mode.is_some() {
         config::remove_env_file_mode()?;
@@ -165,7 +178,7 @@ pub fn lines(resolved: &Value) -> Vec<String> {
         return Vec::new();
     };
     map.iter()
-        .map(|(key, value)| format!("{key}={}", scalar(value)))
+        .map(|(key, value)| format!("{}={}", display(key), scalar(value)))
         .collect()
 }
 
@@ -262,6 +275,16 @@ mod tests {
     }
 
     #[test]
+    fn a_setting_cannot_be_cleared_back_to_null() {
+        let sandbox = Sandbox::new("null");
+        sandbox.write_env("RECALL_MODE=tools\n");
+        sandbox.write_config("{\"mode\": \"hook\"}");
+        let error = format!("{:#}", set("mode", "null").unwrap_err());
+        assert!(error.contains("mode cannot be set to null"), "{error}");
+        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Hook);
+    }
+
+    #[test]
     fn a_dotted_path_addresses_the_same_key_as_the_flag() {
         let sandbox = Sandbox::new("paths");
         sandbox.write_config("{\"mode\": \"tools\"}");
@@ -273,8 +296,7 @@ mod tests {
         let resolved = resolved(&Settings::default()).unwrap();
         assert_eq!(scalar(get(&resolved, "mode").unwrap()), "tools");
         assert_eq!(scalar(get(&resolved, "messaging.enabled").unwrap()), "true");
-        assert_eq!(scalar(get(&resolved, "messaging_enabled").unwrap()), "true");
-        assert_eq!(lines(&resolved), vec!["messaging_enabled=true", "mode=tools"]);
+        assert_eq!(lines(&resolved), vec!["messaging.enabled=true", "mode=tools"]);
         assert!(get(&resolved, "listening").is_err());
     }
 
