@@ -8,6 +8,8 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+const SEND_TOOL: &str = "recall_send";
+
 const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -113,6 +115,15 @@ pub struct EditParams {
     pub add_tags: Option<Vec<String>>,
     /// Tags to remove.
     pub remove_tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SendParams {
+    /// The host to reach, named as recall devices shows it, or a device id.
+    pub host: String,
+    /// The message to deliver to the Claude Code sessions on that host.
+    pub message: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -225,10 +236,12 @@ pub struct Recall {
 
 #[tool_router]
 impl Recall {
-    pub fn new() -> Recall {
-        Recall {
-            tool_router: Self::tool_router(),
+    pub fn new(messaging_enabled: bool) -> Recall {
+        let mut tool_router = Self::tool_router();
+        if !messaging_enabled {
+            tool_router.remove_route(SEND_TOOL);
         }
+        Recall { tool_router }
     }
 
     #[tool(
@@ -326,6 +339,20 @@ impl Recall {
     }
 
     #[tool(
+        name = "recall_send",
+        description = "Message the Claude Code sessions running on another host signed in as this user. Name the host as recall devices shows it; the message arrives as a user turn there."
+    )]
+    async fn send(&self, Parameters(params): Parameters<SendParams>) -> Result<String, String> {
+        blocking(move || {
+            let client = client()?;
+            let to_device_id = api::resolve_host(&client.devices()?, &params.host)?;
+            let sent = client.send(&to_device_id, &params.message)?;
+            to_json(&serde_json::json!({ "messageId": sent.message_id, "toDeviceId": sent.to_device_id }))
+        })
+        .await
+    }
+
+    #[tool(
         name = "recall_delete",
         description = "Delete a memory that turned out wrong or no longer holds."
     )]
@@ -349,10 +376,10 @@ impl ServerHandler for Recall {
     }
 }
 
-pub fn serve() -> Result<()> {
+pub fn serve(messaging_enabled: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
-        let service = Recall::new().serve(rmcp::transport::stdio()).await?;
+        let service = Recall::new(messaging_enabled).serve(rmcp::transport::stdio()).await?;
         service.waiting().await?;
         Ok(())
     })
@@ -363,8 +390,26 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    fn names(messaging_enabled: bool) -> Vec<String> {
+        let mut names: Vec<String> = Recall::new(messaging_enabled)
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                assert!(
+                    tool.description.as_deref().is_some_and(|d| !d.is_empty()),
+                    "{}",
+                    tool.name
+                );
+                tool.name.to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     fn tool(name: &str) -> rmcp::model::Tool {
-        Recall::new()
+        Recall::new(true)
             .tool_router
             .list_all()
             .into_iter()
@@ -402,23 +447,9 @@ mod tests {
     }
 
     #[test]
-    fn serves_the_six_tools_with_descriptions() {
-        let mut names: Vec<String> = Recall::new()
-            .tool_router
-            .list_all()
-            .into_iter()
-            .map(|tool| {
-                assert!(
-                    tool.description.as_deref().is_some_and(|d| !d.is_empty()),
-                    "{}",
-                    tool.name
-                );
-                tool.name.to_string()
-            })
-            .collect();
-        names.sort();
+    fn serves_the_six_memory_tools_with_descriptions() {
         assert_eq!(
-            names,
+            names(false),
             [
                 "recall_delete",
                 "recall_edit",
@@ -428,6 +459,12 @@ mod tests {
                 "recall_search"
             ]
         );
+    }
+
+    #[test]
+    fn serves_recall_send_only_when_messaging_is_enabled() {
+        assert!(names(true).contains(&SEND_TOOL.to_string()));
+        assert_eq!(required("recall_send"), ["host", "message"]);
     }
 
     #[test]

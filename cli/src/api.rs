@@ -174,6 +174,41 @@ struct Devices {
     devices: Vec<Device>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub message_id: String,
+    pub to_device_id: String,
+    pub from_device_id: String,
+    pub body: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Deserialize)]
+struct Sent {
+    message: Message,
+}
+
+pub fn resolve_host(devices: &[Device], host: &str) -> Result<String> {
+    if devices.iter().any(|device| device.device_id == host) {
+        return Ok(host.to_string());
+    }
+    let named: Vec<&Device> = devices.iter().filter(|device| device.name == host).collect();
+    match named.as_slice() {
+        [device] => Ok(device.device_id.clone()),
+        [] => bail!("no host named {host}; recall devices lists the hosts signed in as you"),
+        many => {
+            let ids: Vec<&str> = many.iter().map(|device| device.device_id.as_str()).collect();
+            bail!(
+                "{} hosts are named {host}; pass one of these ids instead: {}",
+                many.len(),
+                ids.join(", ")
+            )
+        }
+    }
+}
+
 pub struct DeviceLogin {
     agent: Agent,
     endpoint: String,
@@ -307,5 +342,52 @@ impl Client {
             .authed(self.agent.post(self.url("/v1/search")))
             .send_json(request)?;
         Ok(check(response, "searching")?.body_mut().read_json()?)
+    }
+
+    pub fn send(&self, to_device_id: &str, body: &str) -> Result<Message> {
+        let response = self
+            .authed(self.agent.post(self.url("/v1/messages")))
+            .send_json(serde_json::json!({ "toDeviceId": to_device_id, "body": body }))?;
+        let sent: Sent = check(response, &format!("sending to {to_device_id}"))?
+            .body_mut()
+            .read_json()?;
+        Ok(sent.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(device_id: &str, name: &str) -> Device {
+        Device {
+            device_id: device_id.to_string(),
+            name: name.to_string(),
+            created_at: 0,
+            last_used_at: 0,
+            current: false,
+        }
+    }
+
+    #[test]
+    fn a_host_resolves_by_device_name() {
+        let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
+        assert_eq!(resolve_host(&devices, "desktop").unwrap(), "d-2");
+        let error = resolve_host(&devices, "deskstop").unwrap_err().to_string();
+        assert!(error.contains("no host named deskstop"), "{error}");
+    }
+
+    #[test]
+    fn two_hosts_of_the_same_name_name_their_ids() {
+        let devices = [device("d-1", "ubuntu"), device("d-2", "ubuntu")];
+        let error = resolve_host(&devices, "ubuntu").unwrap_err().to_string();
+        assert!(error.contains("2 hosts are named ubuntu"), "{error}");
+        assert!(error.contains("d-1, d-2"), "{error}");
+    }
+
+    #[test]
+    fn a_device_id_passes_through_even_when_it_is_also_a_name() {
+        let devices = [device("d-1", "laptop"), device("d-2", "d-1")];
+        assert_eq!(resolve_host(&devices, "d-1").unwrap(), "d-1");
     }
 }
