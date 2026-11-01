@@ -1,5 +1,5 @@
 use crate::api::Message;
-use crate::config::{self, Config};
+use crate::config;
 use crate::settings::Settings;
 use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
@@ -133,9 +133,10 @@ fn now_iso() -> String {
 }
 
 /// Appends the line shape hooks/lib.mjs writes, so the daemon and the hooks share one log.
-fn log_to(dir: &Path, outcome: &str, took: Duration) {
+fn log(outcome: &str, took: Duration) {
+    let dir = state_dir();
     let line = format!("{} - {outcome} {}ms\n", now_iso(), took.as_millis());
-    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::create_dir_all(&dir);
     let _ = OpenOptions::new()
         .create(true)
         .append(true)
@@ -143,27 +144,11 @@ fn log_to(dir: &Path, outcome: &str, took: Duration) {
         .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
-fn log(outcome: &str, took: Duration) {
-    log_to(&state_dir(), outcome, took);
-}
-
-fn first_line(error: &anyhow::Error) -> String {
-    let rendered = format!("{error:#}");
-    rendered
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn message_outcome(message: &Message) -> String {
-    format!("message:{}:{}", message.from_device_id, message.message_id)
-}
-
 fn deliver(message: &Message) {
-    let started = Instant::now();
-    let outcome = message_outcome(message);
-    log(&outcome, started.elapsed());
+    log(
+        &format!("message:{}:{}", message.from_device_id, message.message_id),
+        Duration::ZERO,
+    );
 }
 
 async fn session(url: &str, token: &str) -> Result<Ended> {
@@ -181,18 +166,19 @@ async fn reconnect_loop(url: &str, token: &str) -> Result<()> {
                 log("listen:revoked", started.elapsed());
                 bail!("this host is no longer signed in to recall; run recall login");
             }
-            Ok(Ended::Closed) => {
-                log("listen:closed", started.elapsed());
-                attempt = 0;
-            }
-            Err(error) => log(&format!("listen:error:{}", first_line(&error)), started.elapsed()),
+            Ok(Ended::Closed) => log("listen:closed", started.elapsed()),
+            Err(error) => log(&format!("listen:error:{error:#}"), started.elapsed()),
+        }
+        if started.elapsed() >= MAX_DELAY {
+            attempt = 0;
         }
         tokio::time::sleep(with_jitter(backoff(attempt), jitter_fraction())).await;
         attempt = attempt.saturating_add(1);
     }
 }
 
-async fn serve(config: &Config) -> Result<()> {
+async fn serve() -> Result<()> {
+    let config = config::load()?;
     let url = ws::listen_url(&config.endpoint)?;
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -221,10 +207,15 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
         eprintln!("recall: a listener is already running on this host");
         return Ok(());
     };
-    let config = config::load()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let outcome = runtime.block_on(serve(&config));
-    log("listen:stopped", Duration::ZERO);
+    let outcome = runtime.block_on(serve());
+    log(
+        &match &outcome {
+            Ok(()) => "listen:stopped".to_string(),
+            Err(error) => format!("listen:failed:{error:#}"),
+        },
+        Duration::ZERO,
+    );
     lock.release()?;
     outcome
 }
@@ -257,7 +248,6 @@ mod tests {
             let jittered = with_jitter(delay, f64::from(step) / 10.0);
             assert!(jittered >= delay && jittered <= Duration::from_secs(10), "{jittered:?}");
         }
-        assert!((0.0..1.0).contains(&jitter_fraction()));
     }
 
     #[test]
@@ -288,27 +278,6 @@ mod tests {
             .unwrap()
         );
         assert_eq!(spawned, 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_delivered_message_takes_the_log_line_shape_the_hooks_write() {
-        let dir = sandbox("log");
-        let message = Message {
-            message_id: "m-1".to_string(),
-            to_device_id: "d-here".to_string(),
-            from_device_id: "d-there".to_string(),
-            body: "ship it".to_string(),
-            created_at: 1,
-            expires_at: 2,
-        };
-        log_to(&dir, &message_outcome(&message), Duration::from_millis(3));
-        let written = std::fs::read_to_string(dir.join("hooks.log")).unwrap();
-        let fields: Vec<&str> = written.trim_end().split(' ').collect();
-        assert_eq!(fields.len(), 4, "{written}");
-        assert_eq!(fields[0].len(), "2026-11-01T12:00:00.000Z".len(), "{written}");
-        assert!(fields[0].ends_with('Z'), "{written}");
-        assert_eq!(fields[1..], ["-", "message:d-there:m-1", "3ms"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

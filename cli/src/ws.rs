@@ -2,13 +2,12 @@ use crate::api::Message;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
-use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const CLOSE_REVOKED: u16 = 4001;
@@ -53,17 +52,6 @@ pub fn parse_frame(raw: &str) -> Result<Incoming> {
     Ok(Incoming::Message(Box::new(message)))
 }
 
-fn tls() -> Connector {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default TLS versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Connector::Rustls(Arc::new(config))
-}
-
 pub fn listen_request(url: &str, token: &str) -> Result<Request> {
     let mut request = url
         .into_client_request()
@@ -76,7 +64,7 @@ pub fn listen_request(url: &str, token: &str) -> Result<Request> {
 }
 
 pub async fn connect(url: &str, token: &str) -> Result<Socket> {
-    let (socket, _) = connect_async_tls_with_config(listen_request(url, token)?, None, false, Some(tls()))
+    let (socket, _) = connect_async_tls_with_config(listen_request(url, token)?, None, false, None)
         .await
         .with_context(|| format!("connecting to {url}"))?;
     Ok(socket)
@@ -85,15 +73,21 @@ pub async fn connect(url: &str, token: &str) -> Result<Socket> {
 pub async fn pump(socket: &mut Socket, mut on_message: impl FnMut(&Message)) -> Result<Ended> {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.tick().await;
+    let mut silent = false;
     loop {
         let frame = tokio::select! {
             _ = heartbeat.tick() => {
+                if silent {
+                    return Ok(Ended::Closed);
+                }
                 socket.send(Frame::Ping(Default::default())).await.context("sending a heartbeat")?;
+                silent = true;
                 continue;
             }
             frame = socket.next() => frame,
         };
         let Some(frame) = frame else { return Ok(Ended::Closed) };
+        silent = false;
         match frame.context("reading from the mailbox")? {
             Frame::Text(text) => {
                 let Incoming::Message(message) = parse_frame(&text)? else {
@@ -139,6 +133,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cannot read"), "{error}");
+    }
+
+    #[test]
+    fn the_tls_config_tokio_tungstenite_builds_finds_a_crypto_provider() {
+        rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
     #[test]
