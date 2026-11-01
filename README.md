@@ -6,6 +6,7 @@ Per-user semantic memory for coding agents. recall keeps the notes an agent lear
 - A Cloudflare Worker stores each user's memories in D1, with an embedding per memory and a full-text index, and answers searches with both.
 - `recall mcp` serves the same operations as MCP tools over stdio, for any harness that speaks MCP.
 - A Claude Code plugin gives Claude the recall tools, adds matching memories to each prompt, and either syncs Claude's auto-memory files to recall or replaces auto-memory outright.
+- An opt-in add-on carries messages between the Claude Code sessions on the hosts signed in as you.
 
 ## Install
 
@@ -86,16 +87,34 @@ The plugin starts `recall mcp` as an MCP server and adds four hooks. The hooks n
 - After a `Write` or `Edit` to an auto-memory file (under `autoMemoryDirectory`, or `~/.claude/projects/*/memory/` when that is unset; `MEMORY.md` excluded), it runs `recall save`. `user` and `feedback` memories are saved as global; `project` and `reference` memories get the repo tag of the session's directory, or `global` outside a repo. When the save fails, a message says the memory was saved locally but not synced.
 - On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. Up to three matches from other scopes follow under "In other scopes:", each with its tags. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
 - At session start, it adds a short block saying recall is the durable store, listing the CLI commands and the session directory's repo tag (or "global only"). In `tools` mode it first adds memory instructions: what to save, what not to, to update rather than duplicate, and to delete what turns out wrong. When `recall` is missing, it adds an install hint instead.
-- Every hook run appends one line to `${XDG_STATE_HOME:-~/.local/state}/recall/hooks.log`: time, session id, outcome (`hits=<n>`, `no-hits`, `skipped:<reason>`, `crib:<mode>:repo`, `crib:<mode>:global`, `not-installed`, `timeout`, `saved:<name>`, `redirect:saved:<name>`, `redirect:fallback:<error>`, `redirect:index`, `redirect:edit`, `error:<message>`) and duration. Prompts and memory bodies are never logged.
+- Every hook run appends one line to `${XDG_STATE_HOME:-~/.local/state}/recall/hooks.log`: time, session id, outcome (`hits=<n>`, `no-hits`, `skipped:<reason>`, `crib:<mode>:repo:messaging:<state>`, `crib:<mode>:global:messaging:<state>`, `messaging:<state>`, `not-installed`, `timeout`, `saved:<name>`, `redirect:saved:<name>`, `redirect:fallback:<error>`, `redirect:index`, `redirect:edit`, `error:<message>`) and duration. Prompts and memory bodies are never logged.
 
 ### Modes
 
-The plugin works in one of two modes, set per host with `recall config set mode hook|tools` and stored in `~/.config/recall/config.json`. A `RECALL_MODE` left in `~/.config/recall/env` by an earlier release still applies until the mode is set again. `recall config` prints every setting, `recall config get <key>` one of them, and `recall config schema` the JSON Schema of the settings file.
+The plugin works in one of two modes, set per host with `recall config set mode hook|tools` and stored in `~/.config/recall/config.json`.
 
 - `hook` (the default) leaves Claude Code's built-in auto-memory on. Claude saves memories its usual way and the plugin redirects each memory file write into recall.
 - `tools` replaces auto-memory with recall. Session start tells Claude what to remember and to use the `recall_*` tools. Turn auto-memory off yourself, since a plugin cannot change your settings: add `"autoMemoryEnabled": false` to `~/.claude/settings.json`, or set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
 
 Both modes serve the tools and add matching memories to each prompt.
+
+## Settings
+
+`~/.config/recall/config.json` holds the settings; `~/.config/recall/env` keeps the endpoint and the device token. A setting comes from the first place that names it: a command flag, then the environment, then the file, then the default. `XDG_CONFIG_HOME` moves the file and `RECALL_CONFIG_FILE` names it outright.
+
+```bash
+recall config                             # every setting, as key=value
+recall config get messaging.enabled       # one setting
+recall config set messaging.enabled true  # write it to the file
+recall config schema                      # the JSON Schema of the file
+```
+
+| Setting             | Default | Environment                | Flag                         |
+| ------------------- | ------- | -------------------------- | ---------------------------- |
+| `mode`              | `hook`  | `RECALL_MODE`              | `--mode hook\|tools`         |
+| `messaging.enabled` | `false` | `RECALL_MESSAGING_ENABLED` | `--messaging-enabled <BOOL>` |
+
+A flag goes before the subcommand: `recall --mode tools mcp`. The dotted name is the display name; `messaging.enabled` on the command line is `messaging_enabled` in the file. An unknown key or a value of the wrong type is rejected and the message names the key. A `RECALL_MODE` left in `~/.config/recall/env` still sets the mode until `recall config set mode` writes one, which also takes it out of the env file.
 
 ## Memories, tags and scope
 
@@ -117,6 +136,27 @@ recall delete indent
 recall --json search cache          # machine output
 ```
 
+## Messaging between hosts
+
+A Claude Code session on one host can message the sessions running on another host signed in as you. Messaging stays off until you turn it on, on each host that takes part.
+
+```bash
+recall config set messaging.enabled true
+recall devices                                        # the host names you can address
+recall send desktop "pull main and rerun the migration"
+echo "the build is green" | recall send desktop
+```
+
+`<host>` is a device name as `recall devices` prints it, or a device id; a name two devices share is an error. The message arrives in every live Claude Code session on that host as a user turn. Claude reaches the same hosts through the `recall_send` MCP tool, registered only while messaging is on.
+
+The plugin runs the listener. At session start the hook writes the session's inbox socket, token and pid to `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json`, then runs `recall listen --ensure`. That starts a background daemon unless one already holds an exclusive `flock` on `$XDG_RUNTIME_DIR/recall/listen.lock`. The daemon holds one WebSocket to the Worker, reconnects with a backoff that doubles from a second to a minute, and writes each message it receives into every registered socket. Session end removes the registry file, and the daemon exits once the registry has stood empty for five minutes; the next session start brings it back. It writes its own `listen:…` and `message:…` lines to the hooks log.
+
+Delivery rides on Claude Code's cross-session inbox, which sits behind the server-side gate `agents_cross_session_inbox`. With the gate off, Claude sets no `CLAUDE_CODE_MESSAGING_SOCKET` and the hooks log one line and stop. No command reports an error, and a message sent to such a host sits in the queue until it expires.
+
+The mailbox is a SQLite-backed Durable Object, one per account. A message carries at most 32 KiB, an account queues at most 1000 messages, and a message expires after 72 hours. A revoked device loses its socket and its queued messages.
+
+Durable Objects with SQLite storage run on the Workers Free plan, which allows 100,000 Durable Object requests and 100,000 SQLite rows written a day. Every send, push, ack and reconnect counts against both.
+
 ## API
 
 The routes under `/v1/memories`, `/v1/search` and `/v1/devices` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
@@ -130,6 +170,8 @@ The routes under `/v1/memories`, `/v1/search` and `/v1/devices` need `Authorizat
 | `POST`   | `/v1/search`                              | `{query, tags, any, limit, minScore, mode}`; each hit is a recall |
 | `GET`    | `/v1/devices`                             | the caller's devices                                              |
 | `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                 |
+| `POST`   | `/v1/messages`                            | `{toDeviceId, body}`; queues a message for a device on the account |
+| `GET`    | `/v1/messages/listen`                     | WebSocket only; pushes the caller's queue and takes ack frames    |
 
 The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` is the only path behind an Access login; its approve and deny form checks the Access JWT, the origin and a CSRF token.
 
