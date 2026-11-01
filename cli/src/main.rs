@@ -1,9 +1,11 @@
 mod api;
 mod config;
+mod listen;
 mod markdown;
 mod mcp;
 mod repo;
 mod settings;
+mod ws;
 
 use anyhow::{Context, Result, bail};
 use api::{Client, Memory, SaveBody};
@@ -131,6 +133,14 @@ enum Command {
             help = "The message; stdin when omitted or -"
         )]
         message: Vec<String>,
+    },
+    #[command(about = "Hold the connection that carries messages from your other hosts to this one")]
+    Listen {
+        #[arg(
+            long,
+            help = "Start the listener in the background unless one already holds the lock, then exit"
+        )]
+        ensure: bool,
     },
     #[command(about = "Update recall to the latest release")]
     Update,
@@ -421,6 +431,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Update => return update(),
         Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
         Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
+        Command::Listen { ensure } => listen::run(&settings::load(&cli.settings)?, ensure)?,
         Command::Send { host, message } => {
             require_messaging(&settings::load(&cli.settings)?)?;
             let body = message_body(&message)?;
