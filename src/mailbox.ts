@@ -3,7 +3,7 @@ import type { Parsed } from "./model";
 
 export const MESSAGE_TTL_MS = 259_200_000;
 export const MAX_QUEUED_MESSAGES = 1_000;
-export const MAX_BODY_BYTES = 262_144;
+export const MAX_BODY_BYTES = 32_768;
 
 export interface Message {
   messageId: string;

@@ -187,21 +187,10 @@ export const createApp = (deps: Deps): App => {
     return json({ message: enqueued.message }, 201);
   };
 
-  const messages = async (
-    request: Request,
-    env: AppEnv,
-    caller: Caller,
-    messageId: string | undefined,
-  ): Promise<Response> => {
-    const mailbox = mailboxFor(env, caller.userId);
-    if (messageId === undefined) {
-      if (request.method === "POST") return sendMessage(request, env, caller);
-      if (request.method !== "GET") return error(405, "method not allowed");
-      return json({ messages: await mailbox.list(caller.deviceId, deps.now()) });
-    }
-    if (request.method !== "DELETE") return error(405, "method not allowed");
-    if (!(await mailbox.ack(caller.deviceId, messageId, deps.now()))) return error(404, `no message ${messageId}`);
-    return new Response(null, { status: 204 });
+  const messages = (request: Request, env: AppEnv, caller: Caller, rest: string | undefined): Promise<Response> => {
+    if (rest !== undefined) return Promise.resolve(error(404, "not found"));
+    if (request.method !== "POST") return Promise.resolve(error(405, "method not allowed"));
+    return sendMessage(request, env, caller);
   };
 
   const approver = async (request: Request): Promise<string | Response> => {
