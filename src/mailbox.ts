@@ -19,8 +19,6 @@ export interface SendInput {
   body: string;
 }
 
-export type Enqueued = { ok: true; message: Message } | { ok: false; error: "full" };
-
 interface MessageRow extends Record<string, string | number> {
   message_id: string;
   to_device_id: string;
@@ -39,18 +37,12 @@ const toMessage = (row: MessageRow): Message => ({
   expiresAt: row.expires_at,
 });
 
-const DEVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-const encoder = new TextEncoder();
-
-export const bodyBytes = (body: string): number => encoder.encode(body).byteLength;
-
 export const parseSend = (input: unknown): Parsed<SendInput> => {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return { ok: false, error: "body must be a JSON object" };
   }
   const { toDeviceId, body } = input as Record<string, unknown>;
-  if (typeof toDeviceId !== "string" || !DEVICE_ID.test(toDeviceId)) {
+  if (typeof toDeviceId !== "string" || toDeviceId.length < 1) {
     return { ok: false, error: "toDeviceId must be the id of a device on this account; see GET /v1/devices" };
   }
   if (typeof body !== "string" || body.length < 1) return { ok: false, error: "body must hold at least one character" };
@@ -76,10 +68,10 @@ export class Mailbox extends DurableObject {
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
   }
 
-  enqueue(input: SendInput, fromDeviceId: string, now: number): Enqueued {
+  enqueue(input: SendInput, fromDeviceId: string, now: number): Message | null {
     this.expire(now);
     const { queued } = this.sql.exec<{ queued: number }>("SELECT count(*) AS queued FROM messages").one();
-    if (queued >= MAX_QUEUED_MESSAGES) return { ok: false, error: "full" };
+    if (queued >= MAX_QUEUED_MESSAGES) return null;
     const message: Message = {
       messageId: crypto.randomUUID(),
       toDeviceId: input.toDeviceId,
@@ -98,7 +90,7 @@ export class Mailbox extends DurableObject {
       message.createdAt,
       message.expiresAt,
     );
-    return { ok: true, message };
+    return message;
   }
 
   list(toDeviceId: string, now: number): Message[] {

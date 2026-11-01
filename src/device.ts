@@ -247,6 +247,14 @@ export const listDevices = async (db: D1Database, userId: string): Promise<Devic
   }));
 };
 
+export const hasDevice = async (db: D1Database, userId: string, deviceId: string): Promise<boolean> => {
+  const row = await db
+    .prepare("SELECT device_id FROM devices WHERE user_id = ? AND device_id = ?")
+    .bind(userId, deviceId)
+    .first<{ device_id: string }>();
+  return row !== null;
+};
+
 export const revokeDevice = async (db: D1Database, userId: string, deviceId: string): Promise<boolean> => {
   const result = await db
     .prepare("DELETE FROM devices WHERE user_id = ? AND device_id = ?")

@@ -5,6 +5,7 @@ import {
   decideDeviceCode,
   deviceForToken,
   formatUserCode,
+  hasDevice,
   listDevices,
   POLL_INTERVAL_S,
   parseUserCode,
@@ -17,7 +18,7 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
-import { bodyBytes, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, parseSend } from "./mailbox";
+import { MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, parseSend } from "./mailbox";
 import {
   type Embedder,
   type Memory,
@@ -175,22 +176,15 @@ export const createApp = (deps: Deps): App => {
   const sendMessage = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
     const input = parseSend(await readJson(request));
     if (!input.ok) return error(400, input.error);
-    if (bodyBytes(input.value.body) > MAX_BODY_BYTES) {
+    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
-    const devices = await listDevices(env.DB, caller.userId);
-    if (!devices.some((device) => device.deviceId === input.value.toDeviceId)) {
+    if (!(await hasDevice(env.DB, caller.userId, input.value.toDeviceId))) {
       return error(404, `no device ${input.value.toDeviceId}`);
     }
-    const enqueued = await mailboxFor(env, caller.userId).enqueue(input.value, caller.deviceId, deps.now());
-    if (!enqueued.ok) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
-    return json({ message: enqueued.message }, 201);
-  };
-
-  const messages = (request: Request, env: AppEnv, caller: Caller, rest: string | undefined): Promise<Response> => {
-    if (rest !== undefined) return Promise.resolve(error(404, "not found"));
-    if (request.method !== "POST") return Promise.resolve(error(405, "method not allowed"));
-    return sendMessage(request, env, caller);
+    const message = await mailboxFor(env, caller.userId).enqueue(input.value, caller.deviceId, deps.now());
+    if (message === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
+    return json({ message }, 201);
   };
 
   const approver = async (request: Request): Promise<string | Response> => {
@@ -349,7 +343,10 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
-    if (collection === "messages") return messages(request, env, caller, rawName);
+    if (collection === "messages") {
+      if (rawName !== undefined) return error(404, "not found");
+      return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
+    }
     const { userId } = caller;
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");
