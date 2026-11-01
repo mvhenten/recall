@@ -300,10 +300,7 @@ mod tests {
 
     #[test]
     fn the_schema_matches_the_published_snapshot() {
-        let expected = include_str!("../tests/settings.schema.json");
-        assert_eq!(
-            format!("{}\n", serde_json::to_string_pretty(&schema()).unwrap()),
-            expected
-        );
+        let expected: Value = serde_json::from_str(include_str!("../tests/settings.schema.json")).unwrap();
+        assert_eq!(schema(), expected);
     }
 }

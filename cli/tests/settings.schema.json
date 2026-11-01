@@ -1,10 +1,7 @@
 {
   "$defs": {
     "Mode": {
-      "enum": [
-        "hook",
-        "tools"
-      ],
+      "enum": ["hook", "tools"],
       "type": "string"
     }
   },
@@ -14,10 +11,7 @@
   "properties": {
     "messaging_enabled": {
       "description": "Opt in to messaging between Claude Code sessions on the hosts signed in as you.",
-      "type": [
-        "boolean",
-        "null"
-      ]
+      "type": ["boolean", "null"]
     },
     "mode": {
       "anyOf": [
