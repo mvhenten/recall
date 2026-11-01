@@ -70,7 +70,10 @@ pub async fn connect(url: &str, token: &str) -> Result<Socket> {
     Ok(socket)
 }
 
-pub async fn pump(socket: &mut Socket, mut on_message: impl FnMut(&Message)) -> Result<Ended> {
+/// Reads the mailbox until it closes, handing every message to `on_message` and acking it
+/// afterwards. A message that cannot be delivered is acked all the same: the mailbox has no
+/// other host to hand it to, so redelivery would only replay it into the same silence.
+pub async fn pump(socket: &mut Socket, mut on_message: impl AsyncFnMut(Message)) -> Result<Ended> {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.tick().await;
     let mut silent = false;
@@ -93,9 +96,10 @@ pub async fn pump(socket: &mut Socket, mut on_message: impl FnMut(&Message)) -> 
                 let Incoming::Message(message) = parse_frame(&text)? else {
                     continue;
                 };
-                on_message(&message);
+                let message_id = message.message_id.clone();
+                on_message(*message).await;
                 socket
-                    .send(Frame::text(ack(&message.message_id)))
+                    .send(Frame::text(ack(&message_id)))
                     .await
                     .context("acking a message")?;
             }
@@ -167,7 +171,7 @@ mod tests {
             .await
             .unwrap();
         let mut delivered = Vec::new();
-        let ended = pump(&mut socket, |message| delivered.push(message.body.clone()))
+        let ended = pump(&mut socket, async |message: Message| delivered.push(message.body))
             .await
             .unwrap();
 
@@ -198,7 +202,7 @@ mod tests {
         let mut socket = connect(&format!("ws://127.0.0.1:{port}/v1/messages/listen"), "t-token")
             .await
             .unwrap();
-        let ended = pump(&mut socket, |_| ()).await.unwrap();
+        let ended = pump(&mut socket, async |_: Message| ()).await.unwrap();
         assert!(matches!(ended, Ended::Revoked));
     }
 }

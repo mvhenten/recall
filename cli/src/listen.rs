@@ -1,5 +1,7 @@
 use crate::api::Message;
 use crate::config;
+use crate::seen::Seen;
+use crate::sessions;
 use crate::settings::Settings;
 use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
@@ -16,6 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const BASE_DELAY: Duration = Duration::from_secs(1);
 pub const MAX_DELAY: Duration = Duration::from_secs(60);
 pub const MAX_JITTER: f64 = 0.25;
+pub const IDLE_CHECK: Duration = Duration::from_secs(30);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn backoff(attempt: u32) -> Duration {
     BASE_DELAY
@@ -44,6 +48,14 @@ pub fn runtime_dir() -> PathBuf {
 
 pub fn lock_path() -> PathBuf {
     runtime_dir().join("listen.lock")
+}
+
+pub fn sessions_dir() -> PathBuf {
+    runtime_dir().join("sessions")
+}
+
+pub fn seen_path() -> PathBuf {
+    runtime_dir().join("seen.json")
 }
 
 /// An exclusive flock held for the daemon's lifetime. It is both the mutual exclusion and the
@@ -144,24 +156,36 @@ fn log(outcome: &str, took: Duration) {
         .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
-fn deliver(message: &Message) {
+async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
+    let started = Instant::now();
+    if !seen.insert(&message.message_id) {
+        log(&format!("message:replayed:{}", message.message_id), started.elapsed());
+        return;
+    }
+    let fanout = sessions::fanout(sessions_dir, &message.body).await;
     log(
-        &format!("message:{}:{}", message.from_device_id, message.message_id),
-        Duration::ZERO,
+        &format!(
+            "message:{}:{}:{}/{}",
+            message.from_device_id, message.message_id, fanout.delivered, fanout.pruned
+        ),
+        started.elapsed(),
     );
 }
 
-async fn session(url: &str, token: &str) -> Result<Ended> {
+async fn session(url: &str, token: &str, sessions_dir: &Path, seen: &mut Seen) -> Result<Ended> {
     let mut socket = ws::connect(url, token).await?;
     log("listen:connected", Duration::ZERO);
-    ws::pump(&mut socket, deliver).await
+    ws::pump(&mut socket, async |message: Message| {
+        deliver(&message, sessions_dir, seen).await;
+    })
+    .await
 }
 
-async fn reconnect_loop(url: &str, token: &str) -> Result<()> {
+async fn reconnect_loop(url: &str, token: &str, sessions_dir: &Path, seen: &mut Seen) -> Result<()> {
     let mut attempt = 0u32;
     loop {
         let started = Instant::now();
-        match session(url, token).await {
+        match session(url, token, sessions_dir, seen).await {
             Ok(Ended::Revoked) => {
                 log("listen:revoked", started.elapsed());
                 bail!("this host is no longer signed in to recall; run recall login");
@@ -180,13 +204,16 @@ async fn reconnect_loop(url: &str, token: &str) -> Result<()> {
 async fn serve() -> Result<()> {
     let config = config::load()?;
     let url = ws::listen_url(&config.endpoint)?;
+    let sessions_dir = sessions_dir();
+    let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
-    let work = reconnect_loop(&url, &config.token);
+    let work = reconnect_loop(&url, &config.token, &sessions_dir, &mut seen);
     tokio::pin!(work);
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
+        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT) => Ok(()),
         result = &mut work => result,
     }
 }
