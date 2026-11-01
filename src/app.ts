@@ -5,6 +5,7 @@ import {
   decideDeviceCode,
   deviceForToken,
   formatUserCode,
+  hasDevice,
   listDevices,
   POLL_INTERVAL_S,
   parseUserCode,
@@ -17,6 +18,7 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
+import { MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, parseSend } from "./mailbox";
 import {
   type Embedder,
   type Memory,
@@ -50,6 +52,7 @@ export interface Deps {
 
 export interface AppEnv {
   DB: D1Database;
+  MAILBOX: DurableObjectNamespace<Mailbox>;
 }
 
 export interface App {
@@ -165,6 +168,23 @@ export const createApp = (deps: Deps): App => {
     const target = deviceId === "current" ? caller.deviceId : deviceId;
     if (!(await revokeDevice(db, caller.userId, target))) return error(404, `no device ${target}`);
     return new Response(null, { status: 204 });
+  };
+
+  const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
+    env.MAILBOX.get(env.MAILBOX.idFromName(userId));
+
+  const sendMessage = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+    const input = parseSend(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
+      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
+    }
+    if (!(await hasDevice(env.DB, caller.userId, input.value.toDeviceId))) {
+      return error(404, `no device ${input.value.toDeviceId}`);
+    }
+    const message = await mailboxFor(env, caller.userId).enqueue(input.value, caller.deviceId, deps.now());
+    if (message === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
+    return json({ message }, 201);
   };
 
   const approver = async (request: Request): Promise<string | Response> => {
@@ -323,6 +343,10 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
+    if (collection === "messages") {
+      if (rawName !== undefined) return error(404, "not found");
+      return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
+    }
     const { userId } = caller;
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");

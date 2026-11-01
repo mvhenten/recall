@@ -1,12 +1,16 @@
 import { accessVerifier, cachedAccessKeys } from "./access";
 import { createApp } from "./app";
 import { DEVICE_CODE_LIMITS } from "./device";
+import type { Mailbox } from "./mailbox";
 import type { Embedder } from "./model";
 import { DIMENSIONS, normalize } from "./rank";
+
+export { Mailbox } from "./mailbox";
 
 export interface Env {
   DB: D1Database;
   AI: Ai;
+  MAILBOX: DurableObjectNamespace<Mailbox>;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
 }
