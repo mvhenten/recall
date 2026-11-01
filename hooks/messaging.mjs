@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -11,6 +11,7 @@ export function configFile(env = process.env) {
 // Read here rather than through `recall config get`: SessionStart has a five second budget and
 // already spawns the CLI twice.
 export function messagingEnabled(env = process.env) {
+  if (env.RECALL_MESSAGING_ENABLED) return env.RECALL_MESSAGING_ENABLED === "true";
   try {
     return JSON.parse(readFileSync(configFile(env), "utf8")).messaging_enabled === true;
   } catch {
@@ -32,29 +33,28 @@ export function registryPath(sessionId, env = process.env, uid = process.getuid(
 }
 
 // Absent means Claude's cross-session inbox is gated off for this account, which is a no-op and
-// never an error.
-export function inbox(env = process.env) {
+// never an error. The socket is named for the Claude process that owns it, and that pid is the
+// one the daemon checks for liveness; the hook's own parent is a shell that exits immediately.
+function inbox(env = process.env) {
   const socket = env.CLAUDE_CODE_MESSAGING_SOCKET;
   const token = env.CLAUDE_CODE_MESSAGING_TOKEN;
-  if (!socket || !token) return undefined;
-  return { socket, token, pid: Number(env.CLAUDE_PID) || process.ppid };
+  const pid = Number(path.basename(socket ?? "", ".sock"));
+  if (!socket || !token || !pid) return undefined;
+  return { socket, token, pid };
 }
 
 export function register(sessionId, cwd, env = process.env, uid = process.getuid()) {
   const session = inbox(env);
   if (!session) return false;
   const dir = sessionsDir(env, uid);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  mkdirSync(dir, { recursive: true });
   chmodSync(dir, 0o700);
   const file = registryPath(sessionId, env, uid);
-  writeFileSync(file, `${JSON.stringify({ ...session, cwd: cwd || process.cwd() })}\n`, { mode: 0o600 });
+  writeFileSync(file, `${JSON.stringify({ ...session, cwd })}\n`);
   chmodSync(file, 0o600);
   return true;
 }
 
 export function unregister(sessionId, env = process.env, uid = process.getuid()) {
-  const file = registryPath(sessionId, env, uid);
-  if (!existsSync(file)) return false;
-  rmSync(file, { force: true });
-  return true;
+  rmSync(registryPath(sessionId, env, uid), { force: true });
 }

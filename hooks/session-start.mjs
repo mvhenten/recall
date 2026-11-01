@@ -1,5 +1,5 @@
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
-import { inbox, messagingEnabled, register } from "./messaging.mjs";
+import { messagingEnabled, register } from "./messaging.mjs";
 
 const TIMEOUT_MS = 3000;
 const INSTALL_HINT = "recall CLI not found; install it from https://github.com/mvhenten/recall#install";
@@ -49,11 +49,9 @@ function modeOf(result) {
 
 function registerSession(input) {
   if (!messagingEnabled()) return "off";
-  if (!inbox()) return "no-inbox";
   if (!input.session_id) return "no-session";
   try {
-    register(input.session_id, input.cwd);
-    return "registered";
+    return register(input.session_id, input.cwd) ? "registered" : "no-inbox";
   } catch (error) {
     return `failed:${firstLine(error.message)}`;
   }

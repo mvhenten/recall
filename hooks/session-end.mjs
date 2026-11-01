@@ -4,7 +4,8 @@ import { messagingEnabled, unregister } from "./messaging.mjs";
 function run(input) {
   if (!messagingEnabled()) return "messaging:off";
   if (!input.session_id) return "messaging:no-session";
-  return unregister(input.session_id) ? "messaging:unregistered" : "messaging:absent";
+  unregister(input.session_id);
+  return "messaging:unregistered";
 }
 
 const started = Date.now();

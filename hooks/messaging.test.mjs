@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +8,6 @@ import { messagingEnabled, register, registryPath, runtimeDir, sessionsDir, unre
 const INBOX = {
   CLAUDE_CODE_MESSAGING_SOCKET: "/run/user/1000/cc-socks/42.sock",
   CLAUDE_CODE_MESSAGING_TOKEN: "t-inbox",
-  CLAUDE_PID: "42",
 };
 
 function sandbox() {
@@ -31,6 +30,10 @@ test("messaging stays off until the config file turns it on", () => {
   writeFileSync(path.join(configDir, "config.json"), "not json\n");
   assert.equal(messagingEnabled(env), false);
 
+  assert.equal(messagingEnabled({ ...env, RECALL_MESSAGING_ENABLED: "true" }), true);
+  writeFileSync(path.join(configDir, "config.json"), '{"messaging_enabled":true}\n');
+  assert.equal(messagingEnabled({ ...env, RECALL_MESSAGING_ENABLED: "false" }), false);
+
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -50,9 +53,11 @@ test("a session registers into the directory the daemon reads", () => {
   assert.equal(statSync(file).mode & 0o777, 0o600);
   assert.equal(statSync(sessionsDir(env)).mode & 0o777, 0o700);
 
-  assert.equal(unregister("s-1", env), true);
-  assert.equal(unregister("s-1", env), false);
+  unregister("s-1", env);
+  assert.equal(existsSync(file), false);
+  unregister("s-1", env);
   assert.equal(register("s-2", "/tmp", { XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }), false);
+  assert.equal(register("s-3", "/tmp", { ...env, CLAUDE_CODE_MESSAGING_SOCKET: "/run/cc-socks/parent.sock" }), false);
 
   rmSync(dir, { recursive: true, force: true });
 });
