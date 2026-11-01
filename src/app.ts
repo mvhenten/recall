@@ -17,6 +17,7 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
+import { bodyBytes, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, parseSend } from "./mailbox";
 import {
   type Embedder,
   type Memory,
@@ -50,6 +51,7 @@ export interface Deps {
 
 export interface AppEnv {
   DB: D1Database;
+  MAILBOX: DurableObjectNamespace<Mailbox>;
 }
 
 export interface App {
@@ -164,6 +166,41 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "DELETE") return error(405, "method not allowed");
     const target = deviceId === "current" ? caller.deviceId : deviceId;
     if (!(await revokeDevice(db, caller.userId, target))) return error(404, `no device ${target}`);
+    return new Response(null, { status: 204 });
+  };
+
+  const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
+    env.MAILBOX.get(env.MAILBOX.idFromName(userId));
+
+  const sendMessage = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+    const input = parseSend(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    if (bodyBytes(input.value.body) > MAX_BODY_BYTES) {
+      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
+    }
+    const devices = await listDevices(env.DB, caller.userId);
+    if (!devices.some((device) => device.deviceId === input.value.toDeviceId)) {
+      return error(404, `no device ${input.value.toDeviceId}`);
+    }
+    const enqueued = await mailboxFor(env, caller.userId).enqueue(input.value, caller.deviceId, deps.now());
+    if (!enqueued.ok) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
+    return json({ message: enqueued.message }, 201);
+  };
+
+  const messages = async (
+    request: Request,
+    env: AppEnv,
+    caller: Caller,
+    messageId: string | undefined,
+  ): Promise<Response> => {
+    const mailbox = mailboxFor(env, caller.userId);
+    if (messageId === undefined) {
+      if (request.method === "POST") return sendMessage(request, env, caller);
+      if (request.method !== "GET") return error(405, "method not allowed");
+      return json({ messages: await mailbox.list(caller.deviceId, deps.now()) });
+    }
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    if (!(await mailbox.ack(caller.deviceId, messageId, deps.now()))) return error(404, `no message ${messageId}`);
     return new Response(null, { status: 204 });
   };
 
@@ -323,6 +360,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
+    if (collection === "messages") return messages(request, env, caller, rawName);
     const { userId } = caller;
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");
