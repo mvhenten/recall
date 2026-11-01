@@ -85,6 +85,21 @@ describe("device login", () => {
     ]);
   });
 
+  it("suffixes a device name another device on the same account already holds", async () => {
+    const h = await harness();
+    const owner = await h.invite(email("alice"));
+    await h.login(owner, "ubuntu");
+    await h.login(owner, "ubuntu");
+    const third = h.clientWithToken(await h.login(owner, "ubuntu"));
+    const names = (await devicesOf(await third.request("GET", "/v1/devices"))).map((device) => device.name);
+    expect(names).toEqual(["ubuntu", "ubuntu-2", "ubuntu-3"]);
+
+    const stranger = h.clientWithToken(await h.login(await h.invite(email("bob")), "ubuntu"));
+    expect((await devicesOf(await stranger.request("GET", "/v1/devices"))).map((device) => device.name)).toEqual([
+      "ubuntu",
+    ]);
+  });
+
   it("answers access_denied after a deny and never issues a token", async () => {
     const h = await harness();
     const started = await h.startDevice();

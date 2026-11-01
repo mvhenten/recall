@@ -4,6 +4,7 @@ const SLOW_DOWN_STEP_S = 5;
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ";
 const USER_CODE_LENGTH = 8;
 const LAST_USED_RESOLUTION_MS = 3_600_000;
+const DEVICE_NAME_MAX = 100;
 
 export interface DeviceCodeLimits {
   perClient: number;
@@ -121,6 +122,7 @@ export const startDeviceCode = async (
 interface DeviceCodeRow {
   user_code: string;
   device_name: string;
+  user_id: string;
   status: DeviceCodeStatus;
   expires_at: number;
   interval_s: number;
@@ -139,7 +141,7 @@ const toDeviceCode = (row: DeviceCodeRow): DeviceCode => ({
 export const pendingDeviceCode = async (db: D1Database, userCode: string, now: number): Promise<DeviceCode | null> => {
   const row = await db
     .prepare(
-      `SELECT user_code, device_name, status, expires_at, interval_s, last_polled_at FROM device_codes
+      `SELECT user_code, device_name, user_id, status, expires_at, interval_s, last_polled_at FROM device_codes
        WHERE user_code = ? AND status = 'pending' AND expires_at > ?`,
     )
     .bind(userCode, now)
@@ -164,11 +166,30 @@ export const decideDeviceCode = async (
   return result.meta.changes === 1;
 };
 
+const suffixed = (name: string, suffix: number): string => {
+  const tail = `-${suffix}`;
+  return name.slice(0, DEVICE_NAME_MAX - tail.length) + tail;
+};
+
+// recall login defaults the name to the hostname and there is no rename, so two
+// identically named boxes would be indistinguishable in recall devices.
+const freeDeviceName = async (db: D1Database, userId: string, wanted: string): Promise<string> => {
+  const { results } = await db
+    .prepare("SELECT name FROM devices WHERE user_id = ?")
+    .bind(userId)
+    .all<{ name: string }>();
+  const taken = new Set(results.map((row) => row.name));
+  if (!taken.has(wanted)) return wanted;
+  let suffix = 2;
+  while (taken.has(suffixed(wanted, suffix))) suffix += 1;
+  return suffixed(wanted, suffix);
+};
+
 export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: number): Promise<PollOutcome> => {
   const codeHash = await sha256Hex(deviceCode);
   const row = await db
     .prepare(
-      `SELECT user_code, device_name, status, expires_at, interval_s, last_polled_at FROM device_codes
+      `SELECT user_code, device_name, user_id, status, expires_at, interval_s, last_polled_at FROM device_codes
        WHERE device_code_sha256 = ?`,
     )
     .bind(codeHash)
@@ -198,14 +219,18 @@ export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: nu
     return { ok: false, error: "access_denied" };
   }
   const accessToken = randomToken();
+  const name = await freeDeviceName(db, row.user_id, code.deviceName);
   const [issued] = await db.batch([
     db
       .prepare(
         `INSERT INTO devices (device_id, token_sha256, user_id, name, created_at, last_used_at)
-         SELECT ?, ?, user_id, device_name, ?, ? FROM device_codes
-         WHERE device_code_sha256 = ? AND status = 'approved'`,
+         SELECT ?1, ?2, user_id, ?3, ?4, ?4 FROM device_codes
+         WHERE device_code_sha256 = ?5 AND status = 'approved'
+           AND NOT EXISTS (
+             SELECT 1 FROM devices WHERE devices.user_id = device_codes.user_id AND devices.name = ?3
+           )`,
       )
-      .bind(crypto.randomUUID(), await sha256Hex(accessToken), now, now, codeHash),
+      .bind(crypto.randomUUID(), await sha256Hex(accessToken), name, now, codeHash),
     db.prepare("DELETE FROM device_codes WHERE device_code_sha256 = ?").bind(codeHash),
   ]);
   if (issued?.meta.changes !== 1) return { ok: false, error: "invalid_grant" };
