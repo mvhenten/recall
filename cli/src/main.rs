@@ -4,6 +4,8 @@ mod listen;
 mod markdown;
 mod mcp;
 mod repo;
+mod seen;
+mod sessions;
 mod settings;
 mod ws;
 
