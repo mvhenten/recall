@@ -3,10 +3,12 @@ mod config;
 mod markdown;
 mod mcp;
 mod repo;
+mod settings;
 
 use anyhow::{Context, Result, bail};
 use api::{Client, Memory, SaveBody};
 use clap::{Args, Parser, Subcommand};
+use settings::{Mode, Settings};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +23,8 @@ use std::time::{Duration, Instant};
 struct Cli {
     #[arg(long, global = true, help = "Print JSON instead of markdown")]
     json: bool,
+    #[command(flatten)]
+    settings: Settings,
     #[command(subcommand)]
     command: Command,
 }
@@ -130,17 +134,19 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    #[command(about = "Print one setting")]
+    #[command(about = "Print one setting by its dotted path: recall config get messaging.enabled")]
     Get {
-        #[arg(value_parser = ["mode"])]
+        #[arg(value_name = "KEY")]
         key: String,
     },
-    #[command(about = "Change a setting: recall config set mode hook|tools")]
+    #[command(about = "Change one setting: recall config set mode hook|tools")]
     Set {
-        #[arg(value_parser = ["mode"])]
+        #[arg(value_name = "KEY")]
         key: String,
         value: String,
     },
+    #[command(about = "Print the JSON Schema of ~/.config/recall/config.json")]
+    Schema,
 }
 
 fn host_name() -> String {
@@ -232,36 +238,46 @@ fn update() -> Result<ExitCode> {
     })
 }
 
-fn print_mode_hint(mode: config::Mode) {
+fn print_mode_hint(mode: Mode) {
     let disable_env = std::env::var("CLAUDE_CODE_DISABLE_AUTO_MEMORY").ok();
-    if mode == config::Mode::Tools
-        && config::auto_memory_enabled(&config::claude_settings_file(), disable_env.as_deref())
-    {
+    if mode == Mode::Tools && config::auto_memory_enabled(&config::claude_settings_file(), disable_env.as_deref()) {
         eprintln!("recall: {}", config::AUTO_MEMORY_OFF);
     }
 }
 
-fn run_config(json: bool, action: Option<ConfigAction>) -> Result<()> {
+fn run_config(cli_settings: &Settings, json: bool, action: Option<ConfigAction>) -> Result<()> {
     match action {
-        None | Some(ConfigAction::Get { .. }) => {
-            let mode = config::mode()?;
-            if json {
-                print_json(&serde_json::json!({ "mode": mode.as_str() }))?;
-            } else if action.is_some() {
-                println!("{}", mode.as_str());
-            } else {
-                println!("mode={}", mode.as_str());
-            }
-            print_mode_hint(mode);
+        Some(ConfigAction::Schema) => print_json(&settings::schema()),
+        Some(ConfigAction::Set { key, value }) => {
+            let (path, _) = settings::set(&key, &value)?;
+            println!("{} set to {value} in {}", settings::display(&key), path.display());
+            print_mode_hint(settings::load(cli_settings)?.mode());
+            Ok(())
         }
-        Some(ConfigAction::Set { value, .. }) => {
-            let mode = config::Mode::parse(&value)?;
-            let path = config::set_mode(mode)?;
-            println!("mode set to {} in {}", mode.as_str(), path.display());
-            print_mode_hint(mode);
+        Some(ConfigAction::Get { key }) => {
+            let resolved = settings::resolved(cli_settings)?;
+            let value = settings::get(&resolved, &key)?;
+            if json {
+                print_json(value)?;
+            } else {
+                println!("{}", settings::scalar(value));
+            }
+            print_mode_hint(settings::from_value(&resolved)?.mode());
+            Ok(())
+        }
+        None => {
+            let resolved = settings::resolved(cli_settings)?;
+            if json {
+                print_json(&resolved)?;
+            } else {
+                for line in settings::lines(&resolved) {
+                    println!("{line}");
+                }
+            }
+            print_mode_hint(settings::from_value(&resolved)?.mode());
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn current_repo_tag() -> Option<String> {
@@ -366,7 +382,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Login { endpoint, name } => login(endpoint, name)?,
         Command::Update => return update(),
-        Command::Config { action } => run_config(cli.json, action)?,
+        Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
         Command::Mcp => mcp::serve()?,
         Command::Logout => {
             match client()?.revoke_device("current") {
@@ -566,6 +582,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
+    settings::drop_empty_env();
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(error) => {

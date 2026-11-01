@@ -16,15 +16,18 @@ const AUTH_KEYS: [&str; 4] = [
     "RECALL_CLIENT_SECRET",
 ];
 
+pub fn config_home() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_default()
+}
+
 pub fn env_file() -> PathBuf {
     if let Some(path) = std::env::var_os("RECALL_ENV_FILE") {
         return PathBuf::from(path);
     }
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_default();
-    config_home.join("recall").join("env")
+    config_home().join("recall").join("env")
 }
 
 fn env_key(line: &str) -> Option<&str> {
@@ -73,12 +76,6 @@ pub fn endpoint() -> Result<Option<String>> {
     Ok(lookup(&file, "RECALL_ENDPOINT").map(|value| value.trim_end_matches('/').to_string()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Hook,
-    Tools,
-}
-
 pub const MODE_KEY: &str = "RECALL_MODE";
 
 pub const AUTO_MEMORY_OFF: &str = "Turn off Claude Code's built-in auto-memory: add \"autoMemoryEnabled\": false to ~/.claude/settings.json, or set CLAUDE_CODE_DISABLE_AUTO_MEMORY=1";
@@ -104,42 +101,19 @@ pub fn auto_memory_enabled(settings_file: &Path, disable_env: Option<&str>) -> b
     settings.get("autoMemoryEnabled") != Some(&serde_json::Value::Bool(false))
 }
 
-impl Mode {
-    pub fn parse(value: &str) -> Result<Mode> {
-        match value.trim() {
-            "hook" => Ok(Mode::Hook),
-            "tools" => Ok(Mode::Tools),
-            other => bail!("unknown mode {other:?}; use hook or tools"),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Hook => "hook",
-            Mode::Tools => "tools",
-        }
-    }
+pub fn env_file_mode() -> Result<Option<String>> {
+    let file = parse_env(&read_file(&env_file())?);
+    Ok(file.get(MODE_KEY).filter(|value| !value.is_empty()).cloned())
 }
 
-pub fn mode() -> Result<Mode> {
+pub fn remove_env_file_mode() -> Result<()> {
     let path = env_file();
-    let file = parse_env(&read_file(&path)?);
-    match lookup(&file, MODE_KEY) {
-        None => Ok(Mode::Hook),
-        Some(value) => Mode::parse(&value).with_context(|| {
-            format!(
-                "{MODE_KEY} in {} or the environment is invalid; run recall config set mode hook|tools",
-                path.display()
-            )
-        }),
+    let text = read_file(&path)?;
+    let kept = keep_lines(&text, &[MODE_KEY]);
+    if kept == text {
+        return Ok(());
     }
-}
-
-pub fn set_mode(mode: Mode) -> Result<PathBuf> {
-    let path = env_file();
-    let kept = keep_lines(&read_file(&path)?, &[MODE_KEY]);
-    write_private(&path, &format!("{kept}{MODE_KEY}={}\n", mode.as_str()))?;
-    Ok(path)
+    write_private(&path, &kept)
 }
 
 pub fn load() -> Result<Config> {
@@ -205,14 +179,6 @@ pub fn remove_token() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn modes_parse_and_unknown_values_fail() {
-        assert_eq!(Mode::parse("hook").unwrap(), Mode::Hook);
-        assert_eq!(Mode::parse(" tools\n").unwrap(), Mode::Tools);
-        assert!(Mode::parse("Tools").is_err());
-        assert!(Mode::parse("").is_err());
-    }
 
     #[test]
     fn login_replaces_every_credential_and_keeps_other_lines() {

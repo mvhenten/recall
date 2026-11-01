@@ -1,0 +1,30 @@
+{
+  "$defs": {
+    "Mode": {
+      "enum": ["hook", "tools"],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Settings read from ~/.config/recall/config.json, overridden by the environment and these flags.",
+  "properties": {
+    "messaging_enabled": {
+      "description": "Opt in to messaging between Claude Code sessions on the hosts signed in as you.",
+      "type": ["boolean", "null"]
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Mode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Whether the plugin teaches Claude through hook context or the recall_* MCP tools."
+    }
+  },
+  "title": "Settings",
+  "type": "object"
+}
