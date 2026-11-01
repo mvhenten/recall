@@ -18,15 +18,7 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
-import {
-  DEVICE_HEADER,
-  MAX_BODY_BYTES,
-  MAX_QUEUED_MESSAGES,
-  type Mailbox,
-  NOW_HEADER,
-  parseSend,
-  USER_HEADER,
-} from "./mailbox";
+import { DEVICE_HEADER, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, NOW_HEADER, parseSend } from "./mailbox";
 import {
   type Embedder,
   type Memory,
@@ -200,7 +192,6 @@ export const createApp = (deps: Deps): App => {
       headers: {
         upgrade: "websocket",
         [DEVICE_HEADER]: caller.deviceId,
-        [USER_HEADER]: caller.userId,
         [NOW_HEADER]: String(deps.now()),
       },
     });

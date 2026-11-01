@@ -8,7 +8,6 @@ export const MAX_BODY_BYTES = 32_768;
 export const SWEEP_INTERVAL_MS = 900_000;
 
 export const DEVICE_HEADER = "x-recall-device-id";
-export const USER_HEADER = "x-recall-user-id";
 export const NOW_HEADER = "x-recall-now";
 
 export const CLOSE_BAD_FRAME = 4000;
@@ -118,17 +117,14 @@ export class Mailbox extends DurableObject<MailboxEnv> {
        )`,
     );
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
-    this.sql.exec("CREATE TABLE IF NOT EXISTS account (user_id TEXT PRIMARY KEY)");
   }
 
   async fetch(request: Request): Promise<Response> {
     const deviceId = request.headers.get(DEVICE_HEADER) ?? "";
-    const userId = request.headers.get(USER_HEADER) ?? "";
     const now = Number(request.headers.get(NOW_HEADER));
-    if (deviceId === "" || userId === "" || !Number.isFinite(now)) {
+    if (deviceId === "" || !Number.isFinite(now)) {
       return new Response("the mailbox only answers the listen upgrade", { status: 400 });
     }
-    this.remember(userId);
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
     pair[1].serializeAttachment({ deviceId } satisfies Attachment);
@@ -151,20 +147,17 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     const now = Date.now();
     this.expire(now);
     const live = await this.liveDevices();
-    if (live !== null) {
-      this.reap(live);
-      for (const socket of this.ctx.getWebSockets()) {
-        const deviceId = deviceOf(socket);
-        if (deviceId === null || !live.has(deviceId)) {
-          socket.close(CLOSE_REVOKED, "this device is no longer signed in; run recall login");
-        }
+    this.reap(live);
+    for (const socket of this.ctx.getWebSockets()) {
+      const deviceId = deviceOf(socket);
+      if (deviceId === null || !live.has(deviceId)) {
+        socket.close(CLOSE_REVOKED, "this device is no longer signed in; run recall login");
       }
     }
     await this.scheduleSweep();
   }
 
   async enqueue(input: SendInput, from: Caller, now: number): Promise<Message | null> {
-    this.remember(from.userId);
     this.expire(now);
     if (this.queued() >= MAX_QUEUED_MESSAGES) return null;
     const message: Message = {
@@ -195,16 +188,11 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     return this.sql
       .exec<MessageRow>(
         `SELECT message_id, to_device_id, from_device_id, body, created_at, expires_at FROM messages
-         WHERE to_device_id = ? ORDER BY created_at, message_id`,
+         WHERE to_device_id = ? ORDER BY created_at, rowid`,
         toDeviceId,
       )
       .toArray()
       .map(toMessage);
-  }
-
-  ack(toDeviceId: string, messageId: string, now: number): boolean {
-    this.expire(now);
-    return this.remove(toDeviceId, messageId);
   }
 
   private remove(toDeviceId: string, messageId: string): boolean {
@@ -221,14 +209,10 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     }
   }
 
-  private remember(userId: string): void {
-    this.sql.exec("INSERT OR IGNORE INTO account (user_id) VALUES (?)", userId);
-  }
-
-  private async liveDevices(): Promise<Set<string> | null> {
-    const [row] = this.sql.exec<{ user_id: string }>("SELECT user_id FROM account").toArray();
-    if (!row) return null;
-    const devices = await listDevices(this.env.DB, row.user_id);
+  private async liveDevices(): Promise<Set<string>> {
+    const userId = this.ctx.id.name;
+    if (userId === undefined) throw new Error("a mailbox is only ever addressed as idFromName(userId)");
+    const devices = await listDevices(this.env.DB, userId);
     return new Set(devices.map((device) => device.deviceId));
   }
 

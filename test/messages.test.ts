@@ -47,13 +47,6 @@ describe("messages", () => {
 
     expect(await queued(userId, desktopId, h.now())).toEqual([message]);
     expect(await queued(userId, laptopId, h.now())).toEqual([]);
-
-    const acked = await runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => [
-      mailbox.ack(laptopId, message.messageId, h.now()),
-      mailbox.ack(desktopId, message.messageId, h.now()),
-    ]);
-    expect(acked).toEqual([false, true]);
-    expect(await queued(userId, desktopId, h.now())).toEqual([]);
   });
 
   it("refuses an oversized body, caps the queue per account and expires messages after the TTL", async () => {
