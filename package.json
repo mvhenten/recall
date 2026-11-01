@@ -9,7 +9,7 @@
     "lint": "biome check .",
     "fix": "biome check --write .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && node --test --test-timeout=10000 hooks/*.test.mjs",
     "deploy": "node npm-scripts/deploy.mjs",
     "setup": "node npm-scripts/setup.mjs",
     "release": "node npm-scripts/release.mjs"
