@@ -4,7 +4,6 @@ const SLOW_DOWN_STEP_S = 5;
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ";
 const USER_CODE_LENGTH = 8;
 const LAST_USED_RESOLUTION_MS = 3_600_000;
-const DEVICE_NAME_MAX = 100;
 
 export interface DeviceCodeLimits {
   perClient: number;
@@ -122,7 +121,6 @@ export const startDeviceCode = async (
 interface DeviceCodeRow {
   user_code: string;
   device_name: string;
-  user_id: string;
   status: DeviceCodeStatus;
   expires_at: number;
   interval_s: number;
@@ -141,7 +139,7 @@ const toDeviceCode = (row: DeviceCodeRow): DeviceCode => ({
 export const pendingDeviceCode = async (db: D1Database, userCode: string, now: number): Promise<DeviceCode | null> => {
   const row = await db
     .prepare(
-      `SELECT user_code, device_name, user_id, status, expires_at, interval_s, last_polled_at FROM device_codes
+      `SELECT user_code, device_name, status, expires_at, interval_s, last_polled_at FROM device_codes
        WHERE user_code = ? AND status = 'pending' AND expires_at > ?`,
     )
     .bind(userCode, now)
@@ -166,13 +164,8 @@ export const decideDeviceCode = async (
   return result.meta.changes === 1;
 };
 
-const suffixed = (name: string, suffix: number): string => {
-  const tail = `-${suffix}`;
-  return name.slice(0, DEVICE_NAME_MAX - tail.length) + tail;
-};
+const suffixed = (name: string, suffix: number): string => `${name}-${suffix}`;
 
-// recall login defaults the name to the hostname and there is no rename, so two
-// identically named boxes would be indistinguishable in recall devices.
 const freeDeviceName = async (db: D1Database, userId: string, wanted: string): Promise<string> => {
   const { results } = await db
     .prepare("SELECT name FROM devices WHERE user_id = ?")
@@ -193,7 +186,7 @@ export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: nu
        WHERE device_code_sha256 = ?`,
     )
     .bind(codeHash)
-    .first<DeviceCodeRow>();
+    .first<DeviceCodeRow & { user_id: string }>();
   if (!row) return { ok: false, error: "invalid_grant" };
   const code = toDeviceCode(row);
   if (now >= code.expiresAt) {
