@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { messagingEnabled, record, register, registryPath, runtimeDir, sessionsDir, unregister } from "./messaging.mjs";
+import {
+  messagingEnabled,
+  record,
+  register,
+  registryPath,
+  runtimeDir,
+  sessionPid,
+  sessionsDir,
+  unregister,
+} from "./messaging.mjs";
 
 const INBOX = {
   CLAUDE_CODE_MESSAGING_SOCKET: "/run/user/1000/cc-socks/42.sock",
@@ -51,6 +61,7 @@ test("a session registers into the directory the daemon reads", () => {
     pid: 42,
     cwd: "/home/you/src/recall",
   });
+  assert.equal(sessionPid(env), 42, "a registered session takes its pid from the socket name");
   assert.equal(statSync(file).mode & 0o777, 0o600);
   assert.equal(statSync(sessionsDir(env)).mode & 0o777, 0o700);
 
@@ -61,28 +72,45 @@ test("a session registers into the directory the daemon reads", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a session the hook passed over is recorded with the reason and no inbox", () => {
+test("a session the hook passed over is recorded with the reason, a live pid and no inbox", () => {
   const { dir, env } = sandbox();
+  const noInbox = { XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR };
 
-  assert.equal(register("s-2", "/tmp", { XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }), "no-inbox");
-  assert.deepEqual(JSON.parse(readFileSync(registryPath("s-2", env), "utf8")), {
-    state: "no-inbox",
-    cwd: "/tmp",
-  });
+  assert.equal(register("s-2", "/tmp", noInbox), "no-inbox");
+  const skipped = JSON.parse(readFileSync(registryPath("s-2", env), "utf8"));
+  assert.deepEqual({ state: skipped.state, cwd: skipped.cwd }, { state: "no-inbox", cwd: "/tmp" });
+  assert.equal(existsSync(`/proc/${skipped.pid}`), true, "the recorded pid outlives the hook");
 
   const parentSocket = { ...env, CLAUDE_CODE_MESSAGING_SOCKET: "/run/cc-socks/parent.sock" };
   assert.equal(register("s-3", "/tmp", parentSocket), "no-inbox");
 
   record("s-4", { state: "off" }, "/tmp", env);
-  assert.deepEqual(JSON.parse(readFileSync(registryPath("s-4", env), "utf8")), { state: "off", cwd: "/tmp" });
+  assert.equal(JSON.parse(readFileSync(registryPath("s-4", env), "utf8")).state, "off");
 
   record("s-5", { state: "failed", error: "EACCES, permission denied" }, "/tmp", env);
-  assert.deepEqual(JSON.parse(readFileSync(registryPath("s-5", env), "utf8")), {
-    state: "failed",
-    error: "EACCES, permission denied",
-    cwd: "/tmp",
-  });
+  const failed = JSON.parse(readFileSync(registryPath("s-5", env), "utf8"));
+  assert.deepEqual(
+    { state: failed.state, error: failed.error, cwd: failed.cwd },
+    { state: "failed", error: "EACCES, permission denied", cwd: "/tmp" },
+  );
   assert.equal(statSync(registryPath("s-5", env)).mode & 0o777, 0o600);
 
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("the session pid skips the shell Claude runs the hook through", () => {
+  assert.equal(sessionPid(INBOX), 42, "an inbox socket names the session's process");
+  assert.equal(sessionPid({}), sessionPid({ CLAUDE_CODE_MESSAGING_SOCKET: "/run/cc-socks/nan.sock" }));
+
+  const module = JSON.stringify(path.join(import.meta.dirname, "messaging.mjs"));
+  const script = `import { sessionPid } from ${module}; console.log(sessionPid({}));`;
+  const through = execFileSync("sh", ["-c", `node --input-type=module -e ${JSON.stringify(script)}`], {
+    encoding: "utf8",
+  });
+
+  assert.equal(
+    Number(through.trim()),
+    process.pid,
+    "the walk passes the sh that exits with the hook and lands on this process",
+  );
 });

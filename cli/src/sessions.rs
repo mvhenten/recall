@@ -6,16 +6,6 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
-/// How `hooks/session-start.mjs` left one Claude Code session. It writes
-/// `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json` at mode 600 for every session, registered
-/// or not, and `hooks/session-end.mjs` removes it; the daemon only ever reads the directory.
-///
-/// ```json
-/// { "state": "registered", "socket": "/run/user/1000/cc-socks/4242.sock",
-///   "token": "<CLAUDE_CODE_MESSAGING_TOKEN>", "pid": 4242, "cwd": "/home/you/src/recall" }
-/// { "state": "no-inbox", "cwd": "/home/you/src/recall" }
-/// ```
-///
 /// A record carrying an inbox is one the daemon can deliver to; the rest say why it cannot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "kebab-case")]
@@ -27,13 +17,11 @@ pub enum State {
 }
 
 /// `socket` and `token` are `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN` as
-/// the hook inherited them, and `pid` is the Claude process the socket belongs to, which is the
-/// one the daemon checks for liveness.
+/// the hook inherited them.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Inbox {
     pub socket: PathBuf,
     pub token: String,
-    pub pid: i32,
 }
 
 /// Holds the inbox token back, so no log line or error can carry the credential that writes into
@@ -44,25 +32,33 @@ impl std::fmt::Debug for Inbox {
             .debug_struct("Inbox")
             .field("socket", &self.socket)
             .field("token", &"<redacted>")
-            .field("pid", &self.pid)
             .finish()
     }
 }
 
+/// How `hooks/session-start.mjs` left one Claude Code session. It writes
+/// `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json` at mode 600 for every session, registered
+/// or not, and `hooks/session-end.mjs` removes it; the daemon only ever reads the directory.
+///
+/// ```json
+/// { "state": "registered", "socket": "/run/user/1000/cc-socks/4242.sock",
+///   "token": "<CLAUDE_CODE_MESSAGING_TOKEN>", "pid": 4242, "cwd": "/home/you/src/recall" }
+/// { "state": "no-inbox", "pid": 4242, "cwd": "/home/you/src/recall" }
+/// ```
+///
+/// `pid` is the Claude process that owns the session, whatever the state, so a record outliving a
+/// session that never reached session end is removed on the next pass.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Record {
     pub cwd: PathBuf,
+    pub pid: i32,
     #[serde(flatten)]
     pub state: State,
 }
 
-/// One session as the registry holds it. The file name is the session id Claude reports on the
-/// hook's stdin, and a delivered frame carries it back, so a registration that outlived its
-/// session is dropped by Claude instead of landing in whatever session now owns the socket.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub session_id: String,
-    #[serde(flatten)]
     pub record: Record,
 }
 
@@ -95,10 +91,10 @@ fn read(path: &Path) -> Option<Status> {
     Some(Status { session_id, record })
 }
 
-/// Every session still running, newest first. A registered session whose process is gone or whose
-/// socket has been removed is unlinked on the way past; a record that cannot be parsed is left
-/// alone, because a half-written file becomes readable on the next pass. A session the hook passed
-/// over carries no pid to check, so it stays until session end removes it.
+/// Every session still running, newest first. A record whose Claude process is gone, or whose
+/// socket has been removed, is unlinked on the way past, so a session that never reached session
+/// end leaves nothing behind; a record that cannot be parsed is left alone, because a half-written
+/// file becomes readable on the next pass.
 pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -112,9 +108,11 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
         let Some(status) = read(&path) else {
             continue;
         };
-        if let State::Registered(inbox) = &status.record.state
-            && (!alive(inbox.pid) || !inbox.socket.exists())
-        {
+        let socketless = match &status.record.state {
+            State::Registered(inbox) => !inbox.socket.exists(),
+            _ => false,
+        };
+        if !alive(status.record.pid) || socketless {
             let _ = std::fs::remove_file(&path);
             continue;
         }
@@ -148,6 +146,9 @@ pub fn registered(dir: &Path) -> Vec<Registered> {
         .collect()
 }
 
+/// The registry file name is the session id Claude reports on the hook's stdin, and the delivered
+/// frame carries it back, so a registration that outlived its session is dropped by Claude instead
+/// of landing in whatever session now owns the socket.
 fn frames(registered: &Registered, body: &str) -> String {
     let auth = serde_json::json!({ "type": "auth", "token": registered.inbox.token });
     let user = serde_json::json!({
@@ -250,9 +251,10 @@ mod tests {
             self.dir.join("sessions")
         }
 
-        fn record(&self, session_id: &str, state: State) {
+        fn record(&self, session_id: &str, pid: i32, state: State) {
             let record = Record {
                 cwd: self.dir.clone(),
+                pid,
                 state,
             };
             std::fs::write(
@@ -265,10 +267,10 @@ mod tests {
         fn register(&self, session_id: &str, socket: &Path, pid: i32) {
             self.record(
                 session_id,
+                pid,
                 State::Registered(Inbox {
                     socket: socket.to_path_buf(),
                     token: "t-inbox".to_string(),
-                    pid,
                 }),
             );
         }
@@ -345,19 +347,21 @@ mod tests {
     }
 
     #[test]
-    fn a_session_the_hook_passed_over_stays_in_the_registry_with_its_reason() {
+    fn a_session_the_hook_passed_over_stays_until_its_process_is_gone() {
         let sandbox = Sandbox::new("status");
         let socket = sandbox.dir.join("inbox.sock");
         std::fs::write(&socket, "").unwrap();
         let mine = std::process::id() as i32;
-        sandbox.record("s-off", State::Off);
-        sandbox.record("s-no-inbox", State::NoInbox);
+        sandbox.record("s-off", mine, State::Off);
+        sandbox.record("s-no-inbox", mine, State::NoInbox);
         sandbox.record(
             "s-failed",
+            mine,
             State::Failed {
                 error: "EACCES, permission denied".to_string(),
             },
         );
+        sandbox.record("s-crashed", i32::MAX, State::Off);
         sandbox.register("s-live", &socket, mine);
         sandbox.register("s-pruned", &sandbox.dir.join("gone.sock"), mine);
 
@@ -382,12 +386,15 @@ mod tests {
                     &State::Registered(Inbox {
                         socket: socket.clone(),
                         token: "t-inbox".to_string(),
-                        pid: mine,
                     })
                 ),
                 ("s-no-inbox", &State::NoInbox),
                 ("s-off", &State::Off),
             ]
+        );
+        assert!(
+            !sandbox.sessions().join("s-crashed.json").exists(),
+            "a skipped session that never reached session end is pruned with its process"
         );
         assert!(!sandbox.sessions().join("s-pruned.json").exists());
         assert_eq!(statuses[0].1.record.cwd, sandbox.dir);
@@ -402,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_round_trips_the_json_the_hook_writes() {
+    fn the_registry_reads_back_the_json_the_hook_writes() {
         let registered: Record = serde_json::from_str(
             r#"{"state":"registered","socket":"/run/user/1000/cc-socks/4242.sock","token":"t","pid":4242,"cwd":"/src"}"#,
         )
@@ -412,18 +419,24 @@ mod tests {
             State::Registered(Inbox {
                 socket: PathBuf::from("/run/user/1000/cc-socks/4242.sock"),
                 token: "t".to_string(),
-                pid: 4242,
             })
         );
+        assert_eq!(registered.pid, 4242);
         assert_eq!(registered.cwd, PathBuf::from("/src"));
-
-        let skipped: Record = serde_json::from_str(r#"{"state":"no-inbox","cwd":"/src"}"#).unwrap();
-        assert_eq!(skipped.state, State::NoInbox);
-        assert_eq!(
-            serde_json::to_value(&skipped).unwrap(),
-            serde_json::json!({ "state": "no-inbox", "cwd": "/src" })
-        );
         assert!(format!("{registered:?}").contains("<redacted>"), "{registered:?}");
+
+        let skipped: Record = serde_json::from_str(r#"{"state":"no-inbox","pid":4242,"cwd":"/src"}"#).unwrap();
+        assert_eq!(skipped.state, State::NoInbox);
+        assert_eq!(skipped.pid, 4242);
+
+        let failed: Record =
+            serde_json::from_str(r#"{"state":"failed","error":"EACCES","pid":4242,"cwd":"/src"}"#).unwrap();
+        assert_eq!(
+            failed.state,
+            State::Failed {
+                error: "EACCES".to_string()
+            }
+        );
     }
 
     #[tokio::test]

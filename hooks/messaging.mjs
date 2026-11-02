@@ -33,14 +33,47 @@ export function registryPath(sessionId, env = process.env, uid = process.getuid(
 }
 
 // Absent means Claude's cross-session inbox is gated off for this account, which is a no-op and
-// never an error. The socket is named for the Claude process that owns it, and that pid is the
-// one the daemon checks for liveness; the hook's own parent is a shell that exits immediately.
+// never an error. The socket is named for the Claude process that owns it.
 function inbox(env = process.env) {
   const socket = env.CLAUDE_CODE_MESSAGING_SOCKET;
   const token = env.CLAUDE_CODE_MESSAGING_TOKEN;
   const pid = Number(path.basename(socket ?? "", ".sock"));
   if (!socket || !token || !pid) return undefined;
-  return { socket, token, pid };
+  return { pid, inbox: { socket, token } };
+}
+
+const SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh", "fish"]);
+
+function procStatus(pid) {
+  const status = readFileSync(`/proc/${pid}/status`, "utf8");
+  return {
+    comm: readFileSync(`/proc/${pid}/comm`, "utf8").trim(),
+    ppid: Number(status.match(/^PPid:\s+(\d+)$/m)[1]),
+  };
+}
+
+// Claude runs each hook through a shell that exits the moment the hook does, so the hook's own
+// parent is no liveness handle at all. The first ancestor that is not a shell is the Claude
+// process that owns the session, and it is the same pid the inbox socket is named for.
+function ancestorPid() {
+  let pid = process.ppid;
+  try {
+    for (let hop = 0; hop < 8 && pid > 1; hop += 1) {
+      const { comm, ppid } = procStatus(pid);
+      if (!SHELLS.has(comm)) return pid;
+      pid = ppid;
+    }
+  } catch {
+    // Without procfs there is no chain to walk, so the record keeps the pid reached so far. A pid
+    // that outlives the session only delays the record's removal; it never removes a live one.
+  }
+  return pid;
+}
+
+// The pid the daemon checks to decide a session is gone, for every state: a skipped session has no
+// socket to take it from, so its Claude process is found by walking up from the hook.
+export function sessionPid(env = process.env) {
+  return inbox(env)?.pid ?? ancestorPid();
 }
 
 // The registry is the one record of what became of a session, so a session the hook passed over
@@ -51,13 +84,13 @@ export function record(sessionId, state, cwd, env = process.env, uid = process.g
   mkdirSync(dir, { recursive: true });
   chmodSync(dir, 0o700);
   const file = registryPath(sessionId, env, uid);
-  writeFileSync(file, `${JSON.stringify({ ...state, cwd })}\n`);
+  writeFileSync(file, `${JSON.stringify({ ...state, pid: sessionPid(env), cwd })}\n`);
   chmodSync(file, 0o600);
 }
 
 export function register(sessionId, cwd, env = process.env, uid = process.getuid()) {
-  const session = inbox(env);
-  const state = session ? { state: "registered", ...session } : { state: "no-inbox" };
+  const found = inbox(env);
+  const state = found ? { state: "registered", ...found.inbox } : { state: "no-inbox" };
   record(sessionId, state, cwd, env, uid);
   return state.state;
 }
