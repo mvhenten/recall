@@ -98,6 +98,7 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     artifactHost: {
       hostname: ARTIFACT_HOSTNAME,
       verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
+      bucket: env.ARTIFACTS,
     },
     embedder: wordEmbedder,
     deviceCodeLimits,

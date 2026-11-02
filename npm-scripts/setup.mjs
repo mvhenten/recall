@@ -269,8 +269,7 @@ const config = {
   vars: {
     ACCESS_TEAM_DOMAIN: teamDomain,
     ACCESS_AUD: browserApp.aud,
-    ARTIFACT_HOSTNAME: artifactHostname,
-    ARTIFACT_ACCESS_AUD: artifactApp ? artifactApp.aud : "",
+    ...(artifactApp ? { ARTIFACT_HOSTNAME: artifactHostname, ARTIFACT_ACCESS_AUD: artifactApp.aud } : {}),
   },
 };
 mkdirSync(WORK, { recursive: true });

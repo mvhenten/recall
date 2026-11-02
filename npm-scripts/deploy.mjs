@@ -199,16 +199,15 @@ const deployConfig = {
     { pattern: hostname, custom_domain: true, zone_id: zoneId },
     ...(artifactHostname === "" ? [] : [{ pattern: artifactHostname, custom_domain: true, zone_id: zoneId }]),
   ],
-  // R2 is bound only where pages are published, so a deployment without an artifact hostname needs
-  // no R2 on its account.
   ...(artifactHostname === ""
     ? {}
     : { r2_buckets: [{ binding: "ARTIFACTS", bucket_name: output("artifact_bucket") }] }),
   vars: {
     ACCESS_TEAM_DOMAIN: output("access_team_domain"),
     ACCESS_AUD: output("access_aud"),
-    ARTIFACT_HOSTNAME: artifactHostname,
-    ARTIFACT_ACCESS_AUD: output("artifact_access_aud"),
+    ...(artifactHostname === ""
+      ? {}
+      : { ARTIFACT_HOSTNAME: artifactHostname, ARTIFACT_ACCESS_AUD: output("artifact_access_aud") }),
   },
 };
 const deployConfigPath = join(ROOT, "wrangler.deploy.json");

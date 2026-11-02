@@ -35,19 +35,18 @@ export const htmlPage = (
     },
   );
 
-// A published page carries everything it draws, so its own inline style, script and data: assets
-// run while nothing may reach another host. It answers on its own hostname alone, never on the one
-// that holds the dashboard and the API.
+// Every user's pages share this hostname, so each one loads into an opaque origin: inline style
+// and script run, and a page reaches neither another host nor the storage, cookies and pages of
+// whoever else publishes here.
 const ARTIFACT_CSP =
-  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; " +
-  "font-src data:; media-src data:; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
+  "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'unsafe-inline'; " +
+  "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data:; " +
+  "form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
 
-// Every read goes through the Worker and nothing caches at the edge, so a republished page is the
-// one the next reload draws.
-export const artifactPage = (body: ReadableStream, contentType = ARTIFACT_CONTENT_TYPE): Response =>
+export const artifactPage = (body: ReadableStream): Response =>
   new Response(body, {
     headers: {
-      "content-type": contentType,
+      "content-type": ARTIFACT_CONTENT_TYPE,
       "cache-control": "private, no-cache",
       "content-security-policy": ARTIFACT_CSP,
       "x-content-type-options": "nosniff",

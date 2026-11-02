@@ -99,26 +99,23 @@ import {
   writeLabels,
 } from "./store";
 
-// The hostname that serves published pages, and the Access application that guards it. An empty
-// hostname turns the feature off: the Worker then answers on the main hostname alone.
 export interface ArtifactHost {
   hostname: string;
   verify: Verify;
+  bucket: R2Bucket;
 }
 
 export interface Deps {
   verify: Verify;
-  artifactHost: ArtifactHost;
+  artifactHost: ArtifactHost | null;
   deviceCodeLimits: DeviceCodeLimits;
   embedder: Embedder;
   now: () => number;
 }
 
-// ARTIFACTS is bound only where the artifact hostname is set, and nothing reads it unless it is.
 export interface AppEnv {
   DB: D1Database;
   MAILBOX: DurableObjectNamespace<Mailbox>;
-  ARTIFACTS: R2Bucket;
 }
 
 export interface App {
@@ -332,19 +329,17 @@ export const createApp = (deps: Deps): App => {
     return userId ?? refuse(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
   };
 
-  // The artifact hostname serves published pages and nothing else: the dashboard, the device pages
-  // and the API live on the main hostname, where a published page can never run.
-  const artifactSite = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
+  const artifactSite = async (request: Request, url: URL, db: D1Database, host: ArtifactHost): Promise<Response> => {
     const lost = (): Response => messagePage(404, "No such page", "This recall publishes no page at this address.");
     if (request.method !== "GET") return messagePage(405, "Not allowed", "This host only answers a GET.");
-    const email = await approver(request, deps.artifactHost.verify);
+    const email = await approver(request, host.verify);
     if (email instanceof Response) return email;
-    const userId = await invited(env.DB, email, messagePage);
+    const userId = await invited(db, email, messagePage);
     if (userId instanceof Response) return userId;
     const name = parseName(decodeSegment(url.pathname.slice(1)) ?? "");
     if (!name.ok) return lost();
-    const object = await readArtifact(env.ARTIFACTS, userId, name.value);
-    return object === null ? lost() : artifactPage(object.body, object.httpMetadata?.contentType);
+    const object = await readArtifact(host.bucket, userId, name.value);
+    return object === null ? lost() : artifactPage(object.body);
   };
 
   const dashboard = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
@@ -539,16 +534,11 @@ export const createApp = (deps: Deps): App => {
     return json(saved, saved.created ? 201 : 200);
   };
 
-  const artifacts = async (
-    request: Request,
-    env: AppEnv,
-    userId: string,
-    rawName: string | undefined,
-  ): Promise<Response> => {
-    if (deps.artifactHost.hostname === "") {
-      return error(404, "this recall publishes no pages; its deployment sets no artifact hostname");
+  const artifacts = async (request: Request, userId: string, rawName: string | undefined): Promise<Response> => {
+    if (deps.artifactHost === null) {
+      return error(404, "this recall publishes no pages; its deployment names no artifact hostname");
     }
-    const bucket = env.ARTIFACTS;
+    const { bucket } = deps.artifactHost;
     if (rawName === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
       return json({ artifacts: await listArtifacts(bucket, userId) });
@@ -562,21 +552,18 @@ export const createApp = (deps: Deps): App => {
       const body = await request.arrayBuffer();
       if (body.byteLength === 0) return error(400, "the request body must hold the page's HTML");
       if (body.byteLength > MAX_ARTIFACT_BYTES) return tooLarge();
-      const saved = await putArtifact(bucket, userId, name.value, body, deps.now());
-      return json({ artifact: saved.artifact }, saved.created ? 201 : 200);
+      return json({ artifact: await putArtifact(bucket, userId, name.value, body) });
     }
     if (request.method === "DELETE") {
-      if (!(await deleteArtifact(bucket, userId, name.value))) return error(404, `no page named ${name.value}`);
+      await deleteArtifact(bucket, userId, name.value);
       return new Response(null, { status: 204 });
     }
     if (request.method !== "GET") return error(405, "method not allowed");
     const object = await readArtifact(bucket, userId, name.value);
     if (object === null) return error(404, `no page named ${name.value}`);
-    // The stored bytes, read back by a client holding a device token. Nothing in them may run on
-    // this hostname, which is why a browser reads a page from the artifact hostname instead.
     return new Response(object.body, {
       headers: {
-        "content-type": object.httpMetadata?.contentType ?? ARTIFACT_CONTENT_TYPE,
+        "content-type": ARTIFACT_CONTENT_TYPE,
         "cache-control": "no-store",
         "content-security-policy": "default-src 'none'; sandbox",
         "x-content-type-options": "nosniff",
@@ -676,8 +663,8 @@ export const createApp = (deps: Deps): App => {
 
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
     const url = new URL(request.url);
-    const { hostname } = deps.artifactHost;
-    if (hostname !== "" && url.hostname === hostname) return artifactSite(request, url, env);
+    const host = deps.artifactHost;
+    if (host !== null && url.hostname === host.hostname) return artifactSite(request, url, env.DB, host);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
       return dashboard(request, url, env.DB);
@@ -716,7 +703,7 @@ export const createApp = (deps: Deps): App => {
       return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
     }
     const { userId } = caller;
-    if (collection === "artifacts") return artifacts(request, env, userId, rawName);
+    if (collection === "artifacts") return artifacts(request, userId, rawName);
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");
     }
