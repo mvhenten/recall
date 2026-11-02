@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { dayWindow, USAGE_CHART_DAYS } from "../src/model";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -630,13 +631,15 @@ describe("the stats tab", () => {
       cacheReadTokens: 1_000_000,
     });
     await spend({ at: NOON, model: "mystery-1", inputTokens: 2_000_000 });
+    await spend({ at: NOON, model: "mystery-1", account: "lab", inputTokens: 1_000_000 });
 
     const html = await statsTab(h, owner);
     expect(html).toContain("Cost today $36.75");
-    expect(html).toContain("2.0M tokens carry no price.");
-    expect(html).toContain("mystery-1");
-    expect(html).toContain("unpriced");
+    expect(html).toContain("3.0M tokens carry no price.");
     expect(html).toContain("Opus 4.5 4.0M $37");
+    expect(html).toContain("mystery-1 3.0M unpriced");
+    expect(html).toContain("work 6.0M ≈ $36.75");
+    expect(html).toContain("lab 1.0M unpriced");
   });
 
   it("reads the cache hit and the output-to-input ratio out of the seeded counters", async () => {
@@ -773,40 +776,72 @@ describe("the insights tab", () => {
     expect(html).not.toContain("fresh-note");
   });
 
-  it("sums session time per repo and finds the busiest hour of the week", async () => {
+  it("clips session time to the window and counts it as session time", async () => {
     const h = await harness();
     const owner = await reporting(h);
     h.tick(NOON - h.now());
-    await owner.client.sync("hours001", {
+    const { since } = dayWindow(NOON, USAGE_CHART_DAYS);
+    await owner.client.sync("long0001", {
       repo: "repo:github.com/acme/app",
+      startedAt: since - DAY_MS,
+      lastActivityAt: since + 2 * 3_600_000,
+    });
+    await owner.client.sync("short001", {
+      repo: "repo:github.com/acme/infra",
       startedAt: NOON - 3 * 3_600_000,
       lastActivityAt: NOON,
     });
-    await owner.client.sync("hours002", {
-      repo: "repo:github.com/acme/app",
-      startedAt: NOON - 3 * 3_600_000 + 600_000,
-      lastActivityAt: NOON,
-    });
-    await owner.client.sync("hours003", { repo: "", startedAt: NOON - 3_600_000, lastActivityAt: NOON });
 
     const html = await insightsTab(h, owner);
-    expect(html).toContain("repo:github.com/acme/app 6h");
-    expect(html).toContain("global 1h");
-    expect(html).toContain("repo:github.com/acme/app took 6h of the fortnight's 7h");
-    expect(html).toContain("The busiest hour is 09:00 on Monday, with 2 sessions started.");
+    expect(html).toContain("acme/infra 3h");
+    expect(html).toContain("acme/app 2h");
+    expect(html).toContain("acme/infra took 3h of the fortnight's 5h of session time.");
+    expect(html).not.toContain("26h");
   });
 
-  it("reports what the cache saved over the fortnight", async () => {
+  it("finds the busiest hour of the week", async () => {
     const h = await harness();
     const owner = await reporting(h);
     h.tick(NOON - h.now());
-    await spender(owner)({ at: NOON, prompts: 1, inputTokens: 2_000_000, cacheReadTokens: 10_000_000 });
+    for (const [id, offset] of [
+      ["busy0001", 3 * 3_600_000],
+      ["busy0002", 3 * 3_600_000 - 600_000],
+      ["busy0003", 3_600_000],
+    ] as const) {
+      await owner.client.sync(id, { repo: "", startedAt: NOON - offset, lastActivityAt: NOON });
+    }
 
     const html = await insightsTab(h, owner);
-    expect(html).toContain("Cache reads 10M tokens");
-    expect(html).toContain("Saved vs fresh input ≈ $45.00");
-    expect(html).toContain("Worst day 2026-11-02 · 83.3%");
+    expect(html).toContain("The busiest hour is 09:00 on Monday, with 2 sessions started.");
+  });
+
+  it("reports what the cache saved, ranking a day that read nothing out of it", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    const spend = spender(owner);
+    await spend({ at: NOON, prompts: 1, inputTokens: 2_000_000, cacheReadTokens: 10_000_000 });
+    await spend({ at: NOON - DAY_MS, prompts: 1, inputTokens: 1_000_000, cacheReadTokens: 9_000_000 });
+    await spend({ at: NOON - 2 * DAY_MS, prompts: 1, inputTokens: 1_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("Cache reads 19M tokens");
+    expect(html).toContain("Saved vs fresh input ≈ $85.50");
+    expect(html).toContain("Best day 2026-11-01 · 90.0%");
+    expect(html).toContain("Worst day 2026-10-31 · 0.0%");
     expect(html).toContain("83% of the fortnight's input came back out of the cache");
+  });
+
+  it("names no best or worst day until there are two to tell apart", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await spender(owner)({ at: NOON, prompts: 1, inputTokens: 1_000_000, cacheReadTokens: 9_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("Cache reads 9.0M tokens");
+    expect(html).not.toContain("Best day");
+    expect(html).not.toContain("Worst day");
   });
 
   it("renders an empty state per module when there is nothing to say", async () => {
@@ -822,7 +857,7 @@ describe("the insights tab", () => {
     expect(html).toContain("Nothing is going stale.");
     expect(html).toContain("No cache read is recorded yet.");
     expect(html).toContain("No session has been recorded yet.");
-    expect(html).toContain("No session has ended in this window.");
+    expect(html).toContain("No session ran in this window.");
     expect(html).not.toContain("stranger-note");
   });
 

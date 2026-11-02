@@ -11,6 +11,7 @@ export interface Series {
 
 export interface Bar {
   label: string;
+  title: string;
   value: number;
   text: string;
 }
@@ -23,7 +24,7 @@ export interface HeatCell {
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-export const dayLabel = (day: string, withMonth: boolean): string => {
+const dayLabel = (day: string, withMonth: boolean): string => {
   const date = Number(day.slice(8, 10));
   const month = MONTHS[Number(day.slice(5, 7)) - 1] ?? "";
   return withMonth ? `${month} ${date}` : String(date);
@@ -61,8 +62,6 @@ const grid = (
 const axis = (left: number, right: number, y: number): string =>
   `<line x1="${left}" y1="${y}" x2="${right}" y2="${y}" style="stroke:var(--axis);stroke-width:1"/>`;
 
-// A bar whose top two corners are rounded, falling back to a plain rectangle when the bar is
-// shorter than the radius and the curve would swallow it.
 const capped = (x: number, width: number, top: number, bottom: number, radius: number, color: string): string => {
   if (bottom - top <= radius) {
     return `<rect x="${n(x)}" y="${n(top)}" width="${n(width)}" height="${n(Math.max(bottom - top, 0))}" style="fill:${color}"/>`;
@@ -200,9 +199,13 @@ export const miniBars = (days: string[], values: number[], label: string, last: 
   return svg("0 0 440 150", label, `${bars}${value}${axis(left, right, base)}${ticks}`);
 };
 
+// The label column is wide enough for a repo path at this type size, and a longer one is cut with
+// its full text left on the row's title so hovering still reads it.
+const LABEL_CHARS = 23;
+
 export const horizontalBars = (bars: Bar[], label: string): string => {
   const rowHeight = 30;
-  const trackLeft = 100;
+  const trackLeft = 160;
   const trackRight = 346;
   const high = Math.max(...bars.map((bar) => bar.value), 0);
   const rows = bars
@@ -214,7 +217,8 @@ export const horizontalBars = (bars: Bar[], label: string): string => {
         width <= 3
           ? `<rect x="${trackLeft}" y="${top}" width="${n(Math.max(width, 1))}" height="12" style="fill:var(--bar)"/>`
           : `<path d="M${trackLeft},${top} L${n(trackLeft + width - 3)},${top} Q${n(trackLeft + width)},${top} ${n(trackLeft + width)},${top + 3} L${n(trackLeft + width)},${top + 9} Q${n(trackLeft + width)},${top + 12} ${n(trackLeft + width - 3)},${top + 12} L${trackLeft},${top + 12} Z" style="fill:var(--bar)"/>`;
-      return `<text x="0" y="${baseline}" class="cl-bl">${escapeHtml(bar.label)}</text>${shape}<text x="400" y="${baseline}" text-anchor="end" class="cl-val">${escapeHtml(bar.text)}</text>`;
+      const shown = bar.label.length <= LABEL_CHARS ? bar.label : `${bar.label.slice(0, LABEL_CHARS - 1)}…`;
+      return `<g><title>${escapeHtml(`${bar.title} · ${bar.text}`)}</title><text x="0" y="${baseline}" class="cl-bl">${escapeHtml(shown)}</text>${shape}<text x="400" y="${baseline}" text-anchor="end" class="cl-val">${escapeHtml(bar.text)}</text></g>`;
     })
     .join("");
   return svg(`0 0 400 ${bars.length * rowHeight + 4}`, label, rows);

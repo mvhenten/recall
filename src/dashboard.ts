@@ -1,13 +1,14 @@
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
 import {
-  type DaySessions,
+  DAY_MS,
+  type DayWindow,
   type Focus,
   FRESH_WINDOW_DAYS,
-  type GoingStale,
   HISTORY_PARAMS,
   type HistoryFilters,
   type HistoryInput,
   IDLE_AFTER_MS,
+  type Insights,
   LIST_PARAMS,
   type ListInput,
   type Live,
@@ -18,11 +19,10 @@ import {
   type ModelTotals,
   memoryTypes,
   type PastSession,
-  type RepoHours,
-  type RhythmCell,
   SESSION_HISTORY_DAYS,
   type Session,
   STALE_AFTER_DAYS,
+  type Stats,
   type TokenCounts,
   USAGE_CHART_DAYS,
   USAGE_MONTH_DAYS,
@@ -30,7 +30,6 @@ import {
   type UsageSplit,
   type UsageSplitField,
   usageDay,
-  type WorkingSet,
 } from "./model";
 import { escapeHtml, htmlPage } from "./page";
 
@@ -339,7 +338,7 @@ const PROVIDERS = new Map<string, Array<[RegExp, Price]>>([
 
 const MILLION = 1_000_000;
 
-export const priceOf = (provider: string, model: string): Price | null => {
+const priceOf = (provider: string, model: string): Price | null => {
   const families = PROVIDERS.get(provider.toLowerCase());
   if (!families) return null;
   return families.find(([family]) => family.test(model.toLowerCase()))?.[1] ?? null;
@@ -673,11 +672,9 @@ export const memoryBodyPage = (email: string, live: Live, memory: Memory, now: n
   );
 };
 
-const DAY_MS = 86_400_000;
 const SERIES_COLORS = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)"];
-const OTHER = " other";
 
-const keyOf = (totals: ModelTotals): string => `${totals.provider} ${totals.model}`;
+const keyOf = (totals: ModelTotals): string => `${totals.provider} ${totals.model}`;
 
 const modelLabel = (model: string): string => {
   if (!model.startsWith("claude-")) return model;
@@ -689,6 +686,8 @@ const modelLabel = (model: string): string => {
   const name = `${family.charAt(0).toUpperCase()}${family.slice(1)}`;
   return version.length === 0 ? name : `${name} ${version.join(".")}`;
 };
+
+const repoLabel = (repo: string): string => (repo === "" ? "global" : repo.replace(/^repo:github\.com\//, ""));
 
 const NOTHING: TokenCounts = {
   prompts: 0,
@@ -710,11 +709,13 @@ const totalled = (rows: TokenCounts[]): TokenCounts =>
     NOTHING,
   );
 
-const daySpan = (now: number, days: number): string[] =>
-  Array.from({ length: days }, (_, index) => usageDay(now - (days - 1 - index) * DAY_MS));
+const countedTokens = (counts: TokenCounts): number =>
+  counts.inputTokens + counts.outputTokens + counts.cacheWriteTokens + counts.cacheReadTokens;
 
 const within = (rows: ModelDay[], from: string, to: string): ModelDay[] =>
   rows.filter((row) => row.day >= from && row.day <= to);
+
+const onDay = (rows: ModelDay[], day: string): ModelDay[] => rows.filter((row) => row.day === day);
 
 const byModel = (rows: ModelDay[]): ModelTotals[] => {
   const merged = new Map<string, ModelDay[]>();
@@ -728,6 +729,7 @@ const byModel = (rows: ModelDay[]): ModelTotals[] => {
 };
 
 interface Band {
+  kind: "model" | "other";
   key: string;
   label: string;
   color: string;
@@ -735,48 +737,54 @@ interface Band {
 
 const bandsOf = (models: ModelTotals[]): Band[] => {
   const top = models.slice(0, 3).map((model, index) => ({
+    kind: "model" as const,
     key: keyOf(model),
     label: modelLabel(model.model),
-    color: SERIES_COLORS[index] ?? SERIES_COLORS[0] ?? "var(--s1)",
+    color: SERIES_COLORS[index] ?? "var(--s1)",
   }));
   if (models.length <= 3) return top;
-  return [...top, { key: OTHER, label: "Other", color: SERIES_COLORS[3] ?? "var(--s4)" }];
+  return [...top, { kind: "other" as const, key: "other", label: "Other", color: SERIES_COLORS[3] ?? "var(--s4)" }];
 };
 
-const costSeries = (rows: ModelDay[], days: string[], bands: Band[]): Series[] => {
-  const named = new Set(bands.map((band) => band.key));
-  return bands.map((band) => ({
+// Other holds every model no band of its own names. The test is written once, so the donut, the
+// stacks and the table cannot disagree about which slice a model falls in.
+const inBand = (band: Band, bands: Band[], totals: ModelTotals): boolean =>
+  band.kind === "model"
+    ? band.key === keyOf(totals)
+    : !bands.some((other) => other.kind === "model" && other.key === keyOf(totals));
+
+const bandCost = (band: Band, bands: Band[], models: ModelTotals[]): number =>
+  models.filter((model) => inBand(band, bands, model)).reduce((sum, model) => sum + (costOf(model) ?? 0), 0);
+
+const costSeries = (rows: ModelDay[], days: string[], bands: Band[]): Series[] =>
+  bands.map((band) => ({
     label: band.label,
     color: band.color,
-    values: days.map((day) =>
-      rows
-        .filter((row) => row.day === day && (band.key === OTHER ? !named.has(keyOf(row)) : keyOf(row) === band.key))
-        .reduce((sum, row) => sum + (costOf(row) ?? 0), 0),
-    ),
+    values: days.map((day) => bandCost(band, bands, onDay(rows, day))),
   }));
-};
 
 const perDay = (rows: ModelDay[], days: string[], pick: (counts: TokenCounts) => number): number[] =>
-  days.map((day) => rows.filter((row) => row.day === day).reduce((sum, row) => sum + pick(row), 0));
+  days.map((day) => onDay(rows, day).reduce((sum, row) => sum + pick(row), 0));
 
 const cacheHit = (counts: TokenCounts): number => {
   const fresh = counts.inputTokens + counts.cacheReadTokens;
   return fresh === 0 ? 0 : counts.cacheReadTokens / fresh;
 };
 
-const trend = (current: number, baseline: number, against: string): string => {
-  if (baseline === 0) return "nothing earlier to compare";
-  const change = (current - baseline) / baseline;
+// A null change means there is nothing earlier to divide by, which the strip says plainly rather
+// than dressing a first week up as growth.
+const trend = (change: number | null, against: string, size: (change: number) => string): string => {
+  if (change === null) return "nothing earlier to compare";
   const rising = change >= 0;
-  return `<span class="${rising ? "up" : "down"}">${rising ? "▲" : "▼"} ${Math.abs(change * 100).toFixed(0)}%</span> ${escapeHtml(against)}`;
+  return `<span class="${rising ? "up" : "down"}">${rising ? "▲" : "▼"} ${escapeHtml(size(Math.abs(change)))}</span> ${escapeHtml(against)}`;
 };
 
-const pointsTrend = (current: number, baseline: number, against: string): string => {
-  if (baseline === 0) return "nothing earlier to compare";
-  const change = (current - baseline) * 100;
-  const rising = change >= 0;
-  return `<span class="${rising ? "up" : "down"}">${rising ? "▲" : "▼"} ${Math.abs(change).toFixed(1)}pt</span> ${escapeHtml(against)}`;
-};
+const relative = (current: number, baseline: number): number | null =>
+  baseline === 0 ? null : (current - baseline) / baseline;
+
+const asPercent = (change: number): string => `${(change * 100).toFixed(0)}%`;
+
+const asPoints = (change: number): string => `${(change * 100).toFixed(1)}pt`;
 
 const kpi = (label: string, value: string, note: string): string =>
   `<div class="kpi"><span class="kl">${escapeHtml(label)}</span><span class="kv">${value}</span><span class="kd">${note}</span></div>`;
@@ -789,17 +797,21 @@ const legend = (bands: Band[]): string =>
     .map((band) => `<em><i style="background:${band.color}"></i>${escapeHtml(band.label)}</em>`)
     .join("")}</p>`;
 
-const mixRows = (models: ModelTotals[], bands: Band[], total: number): string => {
-  const colors = new Map(bands.map((band) => [band.key, band.color]));
-  return models
+const mixRows = (models: ModelTotals[], bands: Band[], total: number): string =>
+  models
     .map((model) => {
       const cost = costOf(model);
-      const counted = model.inputTokens + model.outputTokens + model.cacheWriteTokens + model.cacheReadTokens;
-      const swatch = colors.get(keyOf(model)) ?? SERIES_COLORS[3];
+      const swatch = bands.find((band) => inBand(band, bands, model))?.color ?? SERIES_COLORS[3];
       const share = cost === null || total === 0 ? "—" : percent(cost / total, 0);
-      return `<tr><td><em style="background:${swatch}"></em>${escapeHtml(modelLabel(model.model))}</td><td class="r">${tokens(counted)}</td><td class="r">${cost === null ? "unpriced" : dollars(cost)}</td><td class="r">${share}</td></tr>`;
+      return `<tr><td><em style="background:${swatch}"></em>${escapeHtml(modelLabel(model.model))}</td><td class="r">${tokens(countedTokens(model))}</td><td class="r">${cost === null ? "unpriced" : dollars(cost)}</td><td class="r">${share}</td></tr>`;
     })
     .join("");
+
+// A row whose models are all unpriced must not read as free, and one that mixes priced and unpriced
+// models is marked as the floor it is rather than a total.
+const splitCost = (cost: number, priced: number, models: number): string => {
+  if (priced === 0) return "unpriced";
+  return priced === models ? money(cost) : `≈ ${money(cost)}`;
 };
 
 const splitTable = (heading: string, field: UsageSplitField, splits: UsageSplit[]): string => {
@@ -807,14 +819,18 @@ const splitTable = (heading: string, field: UsageSplitField, splits: UsageSplit[
   for (const row of splits.filter((split) => split.field === field)) {
     grouped.set(row.value, [...(grouped.get(row.value) ?? []), row]);
   }
-  const counted = (entry: TokenCounts): number =>
-    entry.inputTokens + entry.outputTokens + entry.cacheWriteTokens + entry.cacheReadTokens;
   const body = [...grouped.entries()]
-    .map(([value, entries]) => ({ value, counts: totalled(entries), cost: spent(entries) }))
-    .sort((left, right) => counted(right.counts) - counted(left.counts))
+    .map(([value, entries]) => ({
+      value,
+      counts: totalled(entries),
+      cost: spent(entries),
+      priced: entries.filter((entry) => priceOf(entry.provider, entry.model) !== null).length,
+      models: entries.length,
+    }))
+    .sort((left, right) => countedTokens(right.counts) - countedTokens(left.counts))
     .map(
       (row) =>
-        `<tr><td>${escapeHtml(row.value === "" ? "global" : row.value)}</td><td class="r">${tokens(counted(row.counts))}</td><td class="r">${money(row.cost)}</td></tr>`,
+        `<tr><td>${escapeHtml(row.value === "" ? "global" : row.value)}</td><td class="r">${tokens(countedTokens(row.counts))}</td><td class="r">${escapeHtml(splitCost(row.cost, row.priced, row.models))}</td></tr>`,
     )
     .join("");
   return `<table class="mixtable"><tr><th>${escapeHtml(heading)}</th><th class="r">Tokens</th><th class="r">Cost</th></tr>${body}</table>`;
@@ -823,28 +839,16 @@ const splitTable = (heading: string, field: UsageSplitField, splits: UsageSplit[
 const unpricedNotice = (models: ModelTotals[]): string => {
   const missing = models.filter((model) => priceOf(model.provider, model.model) === null);
   if (missing.length === 0) return "";
-  const counted = missing.reduce(
-    (sum, model) => sum + model.inputTokens + model.outputTokens + model.cacheWriteTokens + model.cacheReadTokens,
-    0,
-  );
+  const counted = missing.reduce((sum, model) => sum + countedTokens(model), 0);
   const names = missing.map((model) => model.model).join(", ");
   return `<div class="notice"><b>${tokens(counted)} tokens carry no price.</b>
 <p>${escapeHtml(names)} ${missing.length === 1 ? "has" : "have"} no entry in the price table, so ${missing.length === 1 ? "its" : "their"} tokens are counted and ${missing.length === 1 ? "its" : "their"} cost is left out rather than guessed.</p></div>`;
 };
 
-export interface StatsInput {
-  usage: ModelDay[];
-  splits: UsageSplit[];
-  sessions: DaySessions[];
-}
-
-export const statsPage = (email: string, live: Live, stats: StatsInput, now: number): Response => {
-  const month = daySpan(now, USAGE_MONTH_DAYS);
-  const fortnight = daySpan(now, USAGE_CHART_DAYS);
-  const week = daySpan(now, USAGE_WEEK_DAYS);
+export const statsPage = (email: string, live: Live, stats: Stats, now: number): Response => {
+  const { month, fortnight, week, prior } = stats.windows;
   const today = usageDay(now);
-  const first = month[0] ?? today;
-  const meta = `${first} → ${today}`;
+  const meta = `${month.from} → ${month.to}`;
   if (stats.usage.length === 0) {
     return shell(
       email,
@@ -859,51 +863,50 @@ export const statsPage = (email: string, live: Live, stats: StatsInput, now: num
     );
   }
 
-  const monthRows = within(stats.usage, first, today);
-  const monthModels = byModel(monthRows);
+  const monthModels = byModel(stats.usage);
   const bands = bandsOf(monthModels);
   const monthCost = spent(monthModels);
 
-  const todayCounts = totalled(within(stats.usage, today, today));
-  const todayCost = spent(byModel(within(stats.usage, today, today)));
-  const weekRows = within(stats.usage, week[0] ?? today, today);
+  const todayRows = onDay(stats.usage, today);
+  const todayCounts = totalled(todayRows);
+  const todayCost = spent(byModel(todayRows));
+  const weekRows = within(stats.usage, week.from, week.to);
   const weekCounts = totalled(weekRows);
   const weekCost = spent(byModel(weekRows));
-  const priorFrom = usageDay(now - (USAGE_CHART_DAYS - 1) * DAY_MS);
-  const priorTo = usageDay(now - USAGE_WEEK_DAYS * DAY_MS);
-  const priorRows = within(stats.usage, priorFrom, priorTo);
+  const weekHit = cacheHit(weekCounts);
+  const priorRows = within(stats.usage, prior.from, prior.to);
   const priorCost = spent(byModel(priorRows));
   const priorHit = cacheHit(totalled(priorRows));
 
+  const sessionsIn = (window: DayWindow): number =>
+    stats.sessions
+      .filter((day) => window.from <= day.day && day.day <= window.to)
+      .reduce((sum, day) => sum + day.sessions, 0);
   const sessionsToday = stats.sessions.filter((day) => day.day === today).reduce((sum, day) => sum + day.sessions, 0);
-  const sessionsWeek = stats.sessions
-    .filter((day) => (week[0] ?? today) <= day.day && day.day <= today)
-    .reduce((sum, day) => sum + day.sessions, 0);
+  const sessionsWeek = sessionsIn(week);
 
   const kpis = `<div class="kpis">
-${kpi("Cost today", money(todayCost), trend(todayCost, weekCost / USAGE_WEEK_DAYS, "vs 7d avg"))}
-${kpi(`Cost · ${USAGE_WEEK_DAYS} days`, money(weekCost), trend(weekCost, priorCost, "vs prior 7d"))}
+${kpi("Cost today", money(todayCost), trend(relative(todayCost, weekCost / USAGE_WEEK_DAYS), "vs 7d avg", asPercent))}
+${kpi(`Cost · ${USAGE_WEEK_DAYS} days`, money(weekCost), trend(relative(weekCost, priorCost), "vs prior 7d", asPercent))}
 ${kpi("Tokens today", `${tokens(todayCounts.inputTokens)} <small>in</small>`, escapeHtml(`${tokens(todayCounts.outputTokens)} out · ${tokens(todayCounts.cacheReadTokens)} cached`))}
-${kpi("Cache hit · 7d", `${percent(cacheHit(weekCounts), 0)}`, pointsTrend(cacheHit(weekCounts), priorHit, "vs prior 7d"))}
-${kpi("Sessions today", String(sessionsToday), trend(sessionsToday, sessionsWeek / USAGE_WEEK_DAYS, "vs 7d avg"))}
+${kpi("Cache hit · 7d", percent(weekHit, 0), trend(priorHit === 0 ? null : weekHit - priorHit, "vs prior 7d", asPoints))}
+${kpi("Sessions today", String(sessionsToday), trend(relative(sessionsToday, sessionsWeek / USAGE_WEEK_DAYS), "vs 7d avg", asPercent))}
 </div>`;
 
-  const fortnightRows = within(stats.usage, fortnight[0] ?? today, today);
-  const dailyCost = fortnight.map((day) => spent(byModel(within(stats.usage, day, day))));
-  const peak = dailyCost.reduce(
-    (best, cost, index) => (cost > best.cost ? { cost, day: fortnight[index] ?? today } : best),
-    { cost: 0, day: today },
-  );
+  const fortnightRows = within(stats.usage, fortnight.from, fortnight.to);
+  const peak = fortnight.days
+    .map((day) => ({ day, cost: spent(byModel(onDay(stats.usage, day))) }))
+    .reduce((best, entry) => (entry.cost > best.cost ? entry : best), { cost: 0, day: today });
   const costBars = frame(
     "Cost per day",
     `${USAGE_CHART_DAYS} days`,
-    `${legend(bands)}${stackedBars(fortnight, costSeries(fortnightRows, fortnight, bands), "Cost per day, stacked by model", money)}
+    `${legend(bands)}${stackedBars(fortnight.days, costSeries(fortnightRows, fortnight.days, bands), "Cost per day, stacked by model", money)}
 <p class="cfoot">${escapeHtml(`list price · peak ${peak.day} ${money(peak.cost)}`)}</p>`,
   );
   const costArea = frame(
     `Cost · ${USAGE_MONTH_DAYS} days`,
     "stacked by model",
-    stackedArea(month, costSeries(monthRows, month, bands), "Cost over 30 days, stacked by model", money),
+    stackedArea(month.days, costSeries(stats.usage, month.days, bands), "Cost over 30 days, stacked by model", money),
   );
   const mix = frame(
     "Model mix",
@@ -912,11 +915,7 @@ ${kpi("Sessions today", String(sessionsToday), trend(sessionsToday, sessionsWeek
       bands.map((band) => ({
         label: band.label,
         color: band.color,
-        value: monthModels
-          .filter((model) =>
-            band.key === OTHER ? !bands.some((other) => other.key === keyOf(model)) : keyOf(model) === band.key,
-          )
-          .reduce((sum, model) => sum + (costOf(model) ?? 0), 0),
+        value: bandCost(band, bands, monthModels),
       })),
       dollars(monthCost),
       `${USAGE_MONTH_DAYS} days`,
@@ -925,13 +924,13 @@ ${kpi("Sessions today", String(sessionsToday), trend(sessionsToday, sessionsWeek
 <table class="mixtable"><tr><th>Model</th><th class="r">Tokens</th><th class="r">Cost</th><th class="r">Share</th></tr>${mixRows(monthModels, bands, monthCost)}</table>`,
   );
 
-  const inputs = perDay(fortnightRows, fortnight, (counts) => counts.inputTokens);
-  const outputs = perDay(fortnightRows, fortnight, (counts) => counts.outputTokens);
-  const reads = perDay(fortnightRows, fortnight, (counts) => counts.cacheReadTokens);
+  const inputs = perDay(fortnightRows, fortnight.days, (counts) => counts.inputTokens);
+  const outputs = perDay(fortnightRows, fortnight.days, (counts) => counts.outputTokens);
+  const reads = perDay(fortnightRows, fortnight.days, (counts) => counts.cacheReadTokens);
   const small = `<div class="charts trio">
-${frame("Tokens in", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight, inputs, "Input tokens per day", tokens(inputs.at(-1) ?? 0))}<p class="cfoot">fresh input, excluding cache reads</p>`)}
-${frame("Tokens out", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight, outputs, "Output tokens per day", tokens(outputs.at(-1) ?? 0))}<p class="cfoot">completion tokens</p>`)}
-${frame("Cache read", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight, reads, "Cache reads per day", tokens(reads.at(-1) ?? 0))}<p class="cfoot">priced at a tenth of fresh input</p>`)}
+${frame("Tokens in", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight.days, inputs, "Input tokens per day", tokens(inputs.at(-1) ?? 0))}<p class="cfoot">fresh input, excluding cache reads</p>`)}
+${frame("Tokens out", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight.days, outputs, "Output tokens per day", tokens(outputs.at(-1) ?? 0))}<p class="cfoot">completion tokens</p>`)}
+${frame("Cache read", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight.days, reads, "Cache reads per day", tokens(reads.at(-1) ?? 0))}<p class="cfoot">priced at a tenth of fresh input</p>`)}
 </div>`;
 
   const perPrompt = weekCounts.prompts === 0 ? null : weekCost / weekCounts.prompts;
@@ -945,7 +944,7 @@ ${frame("Cache read", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight, reads, 
 <li><span class="in">Cost per session</span><span class="iv">${perSession === null ? "—" : money(perSession)}</span></li>
 <li><span class="in">Tokens per prompt</span><span class="iv">${weekCounts.prompts === 0 ? "—" : tokens(Math.round((weekCounts.inputTokens + weekCounts.outputTokens) / weekCounts.prompts))}</span></li>
 <li><span class="in">Output per input</span><span class="iv">${ratio === null ? "—" : `1 : ${(1 / ratio).toFixed(0)}`}</span></li>
-<li><span class="in">Cache hit</span><span class="iv">${percent(cacheHit(weekCounts), 1)}</span></li>
+<li><span class="in">Cache hit</span><span class="iv">${percent(weekHit, 1)}</span></li>
 </ul>`,
   );
 
@@ -986,18 +985,9 @@ const insightList = (items: Array<{ name: string; value: string; warn: boolean }
     )
     .join("")}</ul>`;
 
-export interface InsightsInput {
-  usage: ModelDay[];
-  working: WorkingSet;
-  stale: GoingStale;
-  repos: RepoHours[];
-  rhythm: RhythmCell[];
-}
-
-export const insightsPage = (email: string, live: Live, insights: InsightsInput, now: number): Response => {
-  const fortnight = daySpan(now, USAGE_CHART_DAYS);
-  const fortnightRows = within(insights.usage, fortnight[0] ?? usageDay(now), usageDay(now));
-  const counts = totalled(fortnightRows);
+export const insightsPage = (email: string, live: Live, insights: Insights, now: number): Response => {
+  const { fortnight } = insights;
+  const counts = totalled(insights.usage);
 
   const working =
     insights.working.entries.length === 0
@@ -1034,36 +1024,46 @@ export const insightsPage = (email: string, live: Live, insights: InsightsInput,
         )}
 <p class="callout"><strong>${insights.stale.atRisk} of ${insights.stale.total}</strong> memories are at risk. Prune them or fold them into the ones that do get recalled — a smaller store ranks better.</p>`;
 
-  const savings = fortnightRows.reduce((sum, row) => {
+  const savings = insights.usage.reduce((sum, row) => {
     const price = priceOf(row.provider, row.model);
     return price === null ? sum : sum + (row.cacheReadTokens * (price.input - price.cacheRead)) / MILLION;
   }, 0);
-  const hitByDay = fortnight
-    .map((day) => ({ day, hit: cacheHit(totalled(within(insights.usage, day, day))) }))
-    .filter((entry) => entry.hit > 0);
-  const best = hitByDay.reduce((top, entry) => (entry.hit > top.hit ? entry : top), { day: "", hit: 0 });
-  const worst = hitByDay.reduce((low, entry) => (entry.hit < low.hit ? entry : low), best);
+  // A day that read nothing out of cache is a real zero and belongs in the ranking; a day with no
+  // input at all has no ratio to rank. One graded day is both the best and the worst, which says
+  // nothing, so the pair appears only once there are two days to tell apart.
+  const graded = fortnight.days
+    .map((day) => ({ day, counts: totalled(onDay(insights.usage, day)) }))
+    .filter((entry) => entry.counts.inputTokens + entry.counts.cacheReadTokens > 0)
+    .map((entry) => ({ day: entry.day, hit: cacheHit(entry.counts) }))
+    .sort((left, right) => left.hit - right.hit);
+  const worst = graded[0];
+  const best = graded.at(-1);
+  const extremes =
+    best === undefined || worst === undefined || best.day === worst.day
+      ? []
+      : [
+          { name: "Best day", value: `${best.day} · ${percent(best.hit, 1)}`, warn: false },
+          { name: "Worst day", value: `${worst.day} · ${percent(worst.hit, 1)}`, warn: true },
+        ];
   const cache =
     counts.cacheReadTokens === 0
       ? emptyState("No cache read is recorded yet.", "Cache economics appear once a session reuses a prompt prefix.")
       : `${insightList([
           { name: "Cache reads", value: `${tokens(counts.cacheReadTokens)} tokens`, warn: false },
           { name: "Saved vs fresh input", value: `≈ ${money(savings)}`, warn: false },
-          { name: "Best day", value: `${best.day} · ${percent(best.hit, 1)}`, warn: false },
-          { name: "Worst day", value: `${worst.day} · ${percent(worst.hit, 1)}`, warn: true },
+          ...extremes,
         ])}
 <p class="callout"><strong>${percent(cacheHit(counts), 0)}</strong> of the fortnight's input came back out of the cache, at a tenth of the price of a fresh read.</p>`;
 
-  const hourCells = insights.rhythm;
-  const busiest = hourCells.reduce((top, cell) => (cell.sessions > top.sessions ? cell : top), {
+  const busiest = insights.rhythm.reduce((top, cell) => (cell.sessions > top.sessions ? cell : top), {
     weekday: 0,
     hour: 0,
     sessions: 0,
   });
   const rhythm =
-    hourCells.length === 0
+    insights.rhythm.length === 0
       ? emptyState("No session has been recorded yet.", "The week fills in as sessions sync from your hosts.")
-      : `${heatmap(hourCells, "Sessions by hour of day and weekday")}
+      : `${heatmap(insights.rhythm, "Sessions by hour of day and weekday")}
 <p class="heatleg">fewer <i style="background:var(--h0)"></i><i style="background:var(--h1)"></i><i style="background:var(--h2)"></i><i style="background:var(--h3)"></i><i style="background:var(--h4)"></i><i style="background:var(--h5)"></i> more</p>
 <p class="callout">The busiest hour is <strong>${escapeHtml(`${String(busiest.hour).padStart(2, "0")}:00`)}</strong> on ${escapeHtml(WEEKDAY_NAMES[busiest.weekday] ?? "")}, with ${busiest.sessions} ${busiest.sessions === 1 ? "session" : "sessions"} started.</p>`;
 
@@ -1071,16 +1071,17 @@ export const insightsPage = (email: string, live: Live, insights: InsightsInput,
   const leader = insights.repos[0];
   const hours =
     insights.repos.length === 0
-      ? emptyState("No session has ended in this window.", "A session's span lands here as soon as it syncs.")
+      ? emptyState("No session ran in this window.", "A session's span lands here as soon as it syncs.")
       : `${horizontalBars(
           insights.repos.map((repo) => ({
-            label: repo.repo === "" ? "global" : repo.repo,
+            label: repoLabel(repo.repo),
+            title: repo.repo === "" ? "global" : repo.repo,
             value: repo.ms,
             text: roundHours(repo.ms),
           })),
-          "Session hours by repo",
+          "Session time by repo",
         )}
-<p class="callout"><strong>${escapeHtml(leader?.repo === "" ? "global" : (leader?.repo ?? ""))}</strong> took ${escapeHtml(roundHours(leader?.ms ?? 0))} of the fortnight's ${escapeHtml(roundHours(totalMs))}.</p>`;
+<p class="callout"><strong>${escapeHtml(repoLabel(leader?.repo ?? ""))}</strong> took ${escapeHtml(roundHours(leader?.ms ?? 0))} of the fortnight's ${escapeHtml(roundHours(totalMs))} of session time.</p>`;
 
   return shell(
     email,
