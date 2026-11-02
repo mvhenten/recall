@@ -105,8 +105,7 @@ test("a session registers one document the daemon and recall sessions both read"
     transcriptPath,
     usageHighWater: 0,
     usagePrompts: 0,
-    usageOffset: statSync(transcriptPath).size,
-    usageMessageId: "",
+    usageFiles: { main: { offset: statSync(transcriptPath).size, messageId: "" } },
   });
   assert.equal(Math.abs(Date.now() - stored.startedAt) < 60_000, true, "the start is epoch milliseconds");
   assert.equal(sessionPid(env), 42, "a registered session takes its pid from the socket name");
@@ -234,23 +233,30 @@ test("the record says where in the transcript this host's counting has reached",
   const session = { cwd: "/tmp", repo: REPO, permissionMode: "default", transcriptPath };
 
   record("s-6", { state: "off" }, session, env);
-  assert.equal(read().usageOffset, 200, "a session with nothing posted starts at the end of the file it inherits");
+  assert.deepEqual(
+    read().usageFiles,
+    { main: { offset: 200, messageId: "" } },
+    "a session with nothing posted starts at the end of the file it inherits",
+  );
   assert.equal(read().transcriptPath, transcriptPath);
 
   const counting = () => ({
-    offset: read().usageOffset,
-    messageId: read().usageMessageId,
+    files: read().usageFiles,
     highWater: read().usageHighWater,
     prompts: read().usagePrompts,
     pending: read().usagePending,
   });
-  const reached = { offset: 120, messageId: "msg-2", highWater: 4000, prompts: 0, pending: { seq: 4000 } };
+  const reached = {
+    files: { main: { offset: 120, messageId: "msg-2" } },
+    highWater: 4000,
+    prompts: 0,
+    pending: { seq: 4000 },
+  };
   writeRecord(
     "s-6",
     {
       ...read(),
-      usageOffset: 120,
-      usageMessageId: "msg-2",
+      usageFiles: { main: { offset: 120, messageId: "msg-2" } },
       usageHighWater: 4000,
       usagePrompts: 7,
       usagePending: { seq: 4000 },
@@ -273,8 +279,7 @@ test("the record says where in the transcript this host's counting has reached",
   );
 
   record("s-6", { state: "off" }, { ...session, transcriptPath: path.join(dir, "s-6-other.jsonl") }, env);
-  assert.equal(read().usageOffset, 0, "another transcript is another count");
-  assert.equal(read().usageMessageId, "");
+  assert.deepEqual(read().usageFiles, { main: { offset: 0, messageId: "" } }, "another transcript is another count");
   assert.equal(read().usageHighWater, 4000, "the chunk numbers already spent are the session's, not the file's");
 
   rmSync(dir, { recursive: true, force: true });

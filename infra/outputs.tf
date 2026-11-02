@@ -2,6 +2,10 @@ output "d1_database_id" {
   value = cloudflare_d1_database.recall.id
 }
 
+output "transcript_bucket" {
+  value = cloudflare_r2_bucket.transcripts.name
+}
+
 output "hostname" {
   value = var.hostname
 }

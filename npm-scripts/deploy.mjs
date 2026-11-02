@@ -211,13 +211,16 @@ const deployConfig = {
   ...base,
   $schema: undefined,
   d1_databases: base.d1_databases.map((database) => ({ ...database, database_id: output("d1_database_id") })),
+  // The transcript archive is bound on every deployment; the artifact bucket only where pages
+  // are published, so a deployment without an artifact hostname needs no bucket for them.
+  r2_buckets: [
+    { binding: "TRANSCRIPTS", bucket_name: output("transcript_bucket") },
+    ...(artifactHostname === "" ? [] : [{ binding: "ARTIFACTS", bucket_name: output("artifact_bucket") }]),
+  ],
   routes: [
     { pattern: hostname, custom_domain: true, zone_id: zoneId },
     ...(artifactHostname === "" ? [] : [{ pattern: artifactHostname, custom_domain: true, zone_id: zoneId }]),
   ],
-  ...(artifactHostname === ""
-    ? {}
-    : { r2_buckets: [{ binding: "ARTIFACTS", bucket_name: output("artifact_bucket") }] }),
   vars: {
     ACCESS_TEAM_DOMAIN: output("access_team_domain"),
     ACCESS_AUD: output("access_aud"),

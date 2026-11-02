@@ -127,16 +127,17 @@ const database =
   (await create(`D1 database ${name}`, () => cf("POST", `${account}/d1/database`, { name })));
 const databaseId = database?.uuid ?? database?.id ?? "00000000-0000-0000-0000-000000000000";
 
-// R2 is touched only when pages are published, so an account without R2 enabled still sets up.
-const bucketName = `${name}-artifacts`;
-if (artifactHostname !== "") {
-  const existing = await cf("GET", `${account}/r2/buckets/${bucketName}`, undefined, { optional: true });
-  if (!existing) {
-    await create(`R2 bucket ${bucketName}`, () =>
-      cf("POST", `${account}/r2/buckets`, { name: bucketName, locationHint: "weur" }),
-    );
-  }
-}
+const ensureBucket = async (bucket) => {
+  if (await cf("GET", `${account}/r2/buckets/${bucket}`, undefined, { optional: true })) return bucket;
+  await create(`R2 bucket ${bucket}`, () =>
+    cf("POST", `${account}/r2/buckets`, { name: bucket, locationHint: "weur" }),
+  );
+  return bucket;
+};
+
+const transcriptBucket = await ensureBucket(`${name}-transcripts`);
+// The artifact bucket is touched only when pages are published.
+const artifactBucket = artifactHostname === "" ? "" : await ensureBucket(`${name}-artifacts`);
 
 const otp =
   (await list(`${account}/access/identity_providers`)).find((idp) => idp.type === "onetimepin") ??
@@ -261,11 +262,14 @@ const config = {
     database_id: databaseId,
     migrations_dir: join(ROOT, db.migrations_dir),
   })),
+  r2_buckets: [
+    { binding: "TRANSCRIPTS", bucket_name: transcriptBucket },
+    ...(artifactBucket === "" ? [] : [{ binding: "ARTIFACTS", bucket_name: artifactBucket }]),
+  ],
   routes: [
     { pattern: hostname, custom_domain: true, zone_id: zone.id },
     ...(artifactZone ? [{ pattern: artifactHostname, custom_domain: true, zone_id: artifactZone.id }] : []),
   ],
-  ...(artifactHostname === "" ? {} : { r2_buckets: [{ binding: "ARTIFACTS", bucket_name: bucketName }] }),
   vars: {
     ACCESS_TEAM_DOMAIN: teamDomain,
     ACCESS_AUD: browserApp.aud,

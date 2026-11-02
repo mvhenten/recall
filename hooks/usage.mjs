@@ -2,7 +2,7 @@ import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs"
 import { homedir } from "node:os";
 import path from "node:path";
 import { firstLine } from "./lib.mjs";
-import { readRecord, writeRecord } from "./messaging.mjs";
+import { MAIN, readRecord, transcriptFiles, writeRecord } from "./messaging.mjs";
 
 export const PROVIDER = "claude";
 
@@ -128,37 +128,81 @@ function owed(stored) {
   return counted >= sent ? counted - sent : counted;
 }
 
-// Fixes the stretch before anything is sent: its end, its models and the prompts it answers go
-// into the record, and only a delta that landed moves the record past them. A retry sends the
-// stretch that is already there, never a re-read to the end of the file.
+// What several files spent, by model. A model that answered both in a session's own transcript
+// and in one of its delegated turns spent on one session, and the service takes one event per
+// model.
+function fold(models, counted) {
+  for (const model of counted) {
+    const found = models.get(model.model);
+    if (!found) {
+      models.set(model.model, { ...model });
+      continue;
+    }
+    for (const key of COUNTERS) found[key] += model[key];
+    found.at = Math.max(found.at, model.at);
+  }
+}
+
+// A record written before the files were read apart carries one mark, for the session's own
+// transcript. Carrying it across is what keeps the upgrade from counting that file over again,
+// and it is the only reading of the old field: its chunk numbers counted bytes, and a byte count
+// standing in for a chunk number would land among the ones a whole-file reading spends.
+function carried(stored) {
+  if (stored.usageFiles) return stored.usageFiles;
+  if (!Number.isInteger(stored.usageOffset)) return {};
+  return { [MAIN]: { offset: stored.usageOffset, messageId: stored.usageMessageId ?? "" } };
+}
+
+// Fixes the stretch before anything is sent: where each of the session's transcript files now
+// reaches, the models that answered in them and the prompts the stretch answers go into the
+// record, and only a delta that landed moves the record past them. A retry sends the stretch that
+// is already there, never a re-read to the end of the files.
 export function prepareUsage(sessionId, transcriptPath, env = process.env, uid = process.getuid(), now = Date.now()) {
   const stored = readRecord(sessionId, env, uid);
   if (!stored) return "unregistered";
   if (stored.usagePending?.events?.length) return "retry";
   if (!transcriptPath) return "no-transcript";
-  const offset = Number.isInteger(stored.usageOffset) ? stored.usageOffset : 0;
-  const found = tail(transcriptPath, offset);
-  if (found.missing) return "no-transcript";
-  if (found.reset !== undefined) {
-    writeRecord(sessionId, { ...stored, transcriptPath, usageOffset: found.reset, usageMessageId: "" }, env, uid);
-    return "reset";
+  const marks = { ...carried(stored) };
+  const stretches = [];
+  let readable = 0;
+  let reset = false;
+  for (const source of transcriptFiles(transcriptPath)) {
+    const mark = marks[source.file] ?? { offset: 0, messageId: "" };
+    const found = tail(source.path, mark.offset);
+    if (found.missing) continue;
+    readable += 1;
+    if (found.reset !== undefined) {
+      marks[source.file] = { offset: found.reset, messageId: "" };
+      reset = true;
+      continue;
+    }
+    stretches.push({ file: source.file, text: found.text, offset: found.end, messageId: mark.messageId });
   }
+  if (readable === 0) return "no-transcript";
   const on = account(env.HOME);
   if (!on) return "no-account";
-  const { models, messageId } = aggregate(found.text, stored.usageMessageId ?? "");
+  const models = new Map();
+  const taken = {};
+  for (const stretch of stretches) {
+    const counted = aggregate(stretch.text, stretch.messageId);
+    taken[stretch.file] = { offset: stretch.offset, messageId: counted.messageId };
+    fold(models, counted.models);
+  }
   // A stretch with no answer in it yet is left where it is, so the prompts it holds are counted
   // with the tokens they paid for rather than ahead of them.
-  if (models.length === 0) return "none";
-  // A transcript rewritten shorter leaves the reader behind the chunk numbers already spent, and
-  // those may never be reused.
-  const seq = Math.max(offset, stored.usageHighWater ?? 0);
+  if (models.size === 0) {
+    if (reset) writeRecord(sessionId, { ...stored, transcriptPath, usageFiles: marks }, env, uid);
+    return reset ? "reset" : "none";
+  }
+  // Chunk numbers climb and are never reused, whatever the files do under them.
+  const seq = stored.usageHighWater ?? 0;
+  const counted = events([...models.values()], { seq, now, prompts: owed(stored), account: on });
   const pending = {
     seq,
-    end: found.end,
-    highWater: seq + (found.end - offset),
-    messageId,
+    highWater: seq + counted.length,
     prompts: stored.prompts ?? 0,
-    events: events(models, { seq, now, prompts: owed(stored), account: on }),
+    files: { ...marks, ...taken },
+    events: counted,
   };
   writeRecord(sessionId, { ...stored, transcriptPath, usagePending: pending }, env, uid);
   return "pending";

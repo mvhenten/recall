@@ -799,6 +799,21 @@ export const sessionOnDevice = async (
   return row !== null;
 };
 
+// Whether this account has the session at all, running or long over. A transcript outlives the
+// device that wrote it — a host signs in again and carries a new device id — so what a stretch is
+// checked against is the account, and the object key it lands under is the caller's own.
+export const sessionOnRecord = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+  const row = await db
+    .prepare(
+      `SELECT session_id FROM sessions WHERE user_id = ?1 AND session_id = ?2
+       UNION ALL
+       SELECT session_id FROM session_history WHERE user_id = ?1 AND session_id = ?2`,
+    )
+    .bind(userId, sessionId)
+    .first<{ session_id: string }>();
+  return row !== null;
+};
+
 const USAGE_SUMS =
   "prompts = usage_daily.prompts + excluded.prompts, " +
   "input_tokens = usage_daily.input_tokens + excluded.input_tokens, " +
@@ -844,12 +859,42 @@ export const recordUsage = async (
     db
       .prepare(
         `INSERT OR IGNORE INTO usage_events (user_id, session_id, seq, provider, account, model, prompts,
-           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, at, recorded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
+           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, at, recorded_at, durable)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
       )
-      .bind(userId, sessionId, input.seq, input.provider, input.account, input.model, ...counters, input.at, now),
-    db.prepare("DELETE FROM usage_events WHERE user_id = ? AND recorded_at < ?").bind(userId, now - USAGE_RETENTION_MS),
+      .bind(
+        userId,
+        sessionId,
+        input.seq,
+        input.provider,
+        input.account,
+        input.model,
+        ...counters,
+        input.at,
+        now,
+        input.durable ? 1 : 0,
+      ),
+    db
+      .prepare("DELETE FROM usage_events WHERE user_id = ? AND recorded_at < ? AND durable = 0")
+      .bind(userId, now - USAGE_RETENTION_MS),
+    ...input.files.map((file) =>
+      db
+        .prepare("INSERT OR IGNORE INTO counted_files (user_id, session_id, file) VALUES (?, ?, ?)")
+        .bind(userId, sessionId, file),
+    ),
   ]);
+};
+
+// The transcript files of one session whose tokens have been counted, whoever counted them: the
+// hooks as the session ran, or a run reading the file back long after. It is the only thing a
+// later reading can ask, since the raw events are swept at two weeks and never said which file
+// they read.
+export const countedFiles = async (db: D1Database, userId: string, sessionId: string): Promise<string[]> => {
+  const { results } = await db
+    .prepare("SELECT file FROM counted_files WHERE user_id = ? AND session_id = ? ORDER BY file")
+    .bind(userId, sessionId)
+    .all<{ file: string }>();
+  return results.map((row) => row.file);
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {

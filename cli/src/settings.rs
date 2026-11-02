@@ -15,6 +15,38 @@ pub enum Mode {
 }
 
 pub const MESSAGING_ENABLED_KEY: &str = "RECALL_MESSAGING_ENABLED";
+pub const ARCHIVE_INTERVAL_KEY: &str = "RECALL_ARCHIVE_INTERVAL_SECONDS";
+
+/// How often the listener carries a running session's newest transcript lines to the service.
+/// The floor is what keeps a host from hammering it: a pass costs one call per live session plus
+/// one per file that grew, and below this the calls cost more than the lines are worth.
+pub const DEFAULT_ARCHIVE_INTERVAL_SECONDS: u64 = 10;
+pub const MIN_ARCHIVE_INTERVAL_SECONDS: u64 = 2;
+pub const MAX_ARCHIVE_INTERVAL_SECONDS: u64 = 3600;
+
+fn in_range(seconds: u64) -> Result<u64, String> {
+    if (MIN_ARCHIVE_INTERVAL_SECONDS..=MAX_ARCHIVE_INTERVAL_SECONDS).contains(&seconds) {
+        return Ok(seconds);
+    }
+    Err(format!(
+        "archive.interval.seconds must be a whole number of seconds from {MIN_ARCHIVE_INTERVAL_SECONDS} to {MAX_ARCHIVE_INTERVAL_SECONDS}"
+    ))
+}
+
+fn archive_interval(raw: &str) -> Result<u64, String> {
+    in_range(raw.parse().map_err(|_| {
+        format!(
+            "archive.interval.seconds must be a whole number of seconds from {MIN_ARCHIVE_INTERVAL_SECONDS} to {MAX_ARCHIVE_INTERVAL_SECONDS}"
+        )
+    })?)
+}
+
+fn deserialize_archive_interval<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    match Option::<u64>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(seconds) => in_range(seconds).map(Some).map_err(serde::de::Error::custom),
+    }
+}
 
 /// Settings read from ~/.config/recall/config.json, overridden by the environment and these flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args, Serialize, Deserialize, JsonSchema)]
@@ -28,6 +60,14 @@ pub struct Settings {
     #[arg(long, value_name = "BOOL", env = MESSAGING_ENABLED_KEY)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messaging_enabled: Option<bool>,
+    /// Seconds between the passes that carry a running session's newest transcript lines up.
+    #[arg(long, value_name = "SECONDS", value_parser = archive_interval, env = ARCHIVE_INTERVAL_KEY)]
+    #[schemars(range(min = 2, max = 3600))]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_archive_interval"
+    )]
+    pub archive_interval_seconds: Option<u64>,
 }
 
 impl Settings {
@@ -39,17 +79,25 @@ impl Settings {
         self.messaging_enabled.unwrap_or(false)
     }
 
+    pub fn archive_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.archive_interval_seconds
+                .unwrap_or(DEFAULT_ARCHIVE_INTERVAL_SECONDS),
+        )
+    }
+
     pub fn defaults() -> Settings {
         let empty = Settings::default();
         Settings {
             mode: Some(empty.mode()),
             messaging_enabled: Some(empty.messaging_enabled()),
+            archive_interval_seconds: Some(DEFAULT_ARCHIVE_INTERVAL_SECONDS),
         }
     }
 }
 
 pub fn drop_empty_env() {
-    for name in [config::MODE_KEY, MESSAGING_ENABLED_KEY] {
+    for name in [config::MODE_KEY, MESSAGING_ENABLED_KEY, ARCHIVE_INTERVAL_KEY] {
         if std::env::var_os(name).is_some_and(|value| value.is_empty()) {
             unsafe { std::env::remove_var(name) };
         }
@@ -104,7 +152,7 @@ fn migrated_mode() -> Result<Map<String, Value>> {
     })?;
     Ok(to_object(&Settings {
         mode: Some(mode),
-        messaging_enabled: None,
+        ..Settings::default()
     }))
 }
 
@@ -296,7 +344,10 @@ mod tests {
         let resolved = resolved(&Settings::default()).unwrap();
         assert_eq!(scalar(get(&resolved, "mode").unwrap()), "tools");
         assert_eq!(scalar(get(&resolved, "messaging.enabled").unwrap()), "true");
-        assert_eq!(lines(&resolved), vec!["messaging.enabled=true", "mode=tools"]);
+        assert_eq!(
+            lines(&resolved),
+            vec!["archive.interval.seconds=10", "messaging.enabled=true", "mode=tools"]
+        );
         assert!(get(&resolved, "listening").is_err());
     }
 
@@ -318,6 +369,32 @@ mod tests {
         std::fs::remove_file(config_file()).unwrap();
         let error = format!("{:#}", load(&Settings::default()).unwrap_err());
         assert!(error.contains("unknown mode \"sideways\""), "{error}");
+    }
+
+    #[test]
+    fn an_archive_interval_outside_its_bounds_is_refused() {
+        let sandbox = Sandbox::new("interval");
+        assert_eq!(
+            load(&sandbox.flags(&[])).unwrap().archive_interval(),
+            std::time::Duration::from_secs(DEFAULT_ARCHIVE_INTERVAL_SECONDS)
+        );
+
+        let (_, settings) = set("archive.interval.seconds", "2").unwrap();
+        assert_eq!(settings.archive_interval(), std::time::Duration::from_secs(2));
+
+        for refused in ["0", "1", "-5", "3601", "soon"] {
+            let error = format!("{:#}", set("archive.interval.seconds", refused).unwrap_err());
+            assert!(error.contains("archive.interval.seconds cannot be set to"), "{error}");
+        }
+        assert_eq!(
+            load(&sandbox.flags(&[])).unwrap().archive_interval(),
+            std::time::Duration::from_secs(2),
+            "a refused value leaves the one on record alone"
+        );
+
+        sandbox.write_config("{\"archive_interval_seconds\": 0}");
+        let error = format!("{:#}", load(&Settings::default()).unwrap_err());
+        assert!(error.contains("from 2 to 3600"), "{error}");
     }
 
     #[test]

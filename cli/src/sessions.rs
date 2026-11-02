@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
@@ -56,18 +56,27 @@ pub struct Focus {
     pub latest: String,
 }
 
+/// How far into one of a session's transcript files the hooks have counted, and the last message
+/// they counted there. A session writes one file of its own and one per delegated turn, and each
+/// is read on its own: the message ids of one say nothing about another.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageFile {
+    pub offset: i64,
+    pub message_id: String,
+}
+
 /// The stretch of transcript the hooks read and have not seen land. Each event is one model's
 /// share of the delta, and it is sent as the hooks wrote it: the reading is theirs, and nothing
-/// here parses or recomputes it. `end`, `high_water`, `prompts` and `message_id` are where the
-/// next stretch starts, and they move only once every event has been taken.
+/// here parses or recomputes it. `files`, `high_water` and `prompts` are where the next stretch
+/// starts, and they move only once every event has been taken.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsagePending {
     pub seq: i64,
-    pub end: i64,
     pub high_water: i64,
     pub prompts: i64,
-    pub message_id: String,
+    pub files: BTreeMap<String, UsageFile>,
     pub events: Vec<serde_json::Value>,
 }
 
@@ -79,8 +88,9 @@ pub struct UsagePending {
 /// `pid` is the Claude process that owns the session, whatever the state, so a record outliving a
 /// session that never reached session end is removed on the next pass. `syncStartedAt`, which the
 /// hooks use to throttle their own syncing, is theirs alone and is not read back here, and so are
-/// `transcriptPath`, `usageOffset`, `usageHighWater`, `usagePrompts` and `usageMessageId`, which
-/// say how far into the session's transcript the usage this host sent has reached.
+/// `usageFiles`, `usageHighWater` and `usagePrompts`, which say how far into each of the session's
+/// transcript files the usage this host sent has reached. The archive keeps a mark of its own, on
+/// the service, so neither reading can skip or replay the other.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
@@ -97,6 +107,9 @@ pub struct Record {
     pub focus: Focus,
     pub mode: String,
     pub permission_mode: String,
+    /// Absent on a record written before the archive existed, which simply has nothing to send.
+    #[serde(default)]
+    pub transcript_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_pending: Option<UsagePending>,
     #[serde(flatten)]
@@ -145,6 +158,7 @@ pub struct Ended {
     pub session_id: String,
     pub host: String,
     pub repo: String,
+    pub transcript_path: PathBuf,
     pub usage_pending: Option<UsagePending>,
 }
 
@@ -185,6 +199,7 @@ pub fn scan(dir: &Path) -> Scan {
                 session_id: status.session_id,
                 host: status.record.host,
                 repo: status.record.repo,
+                transcript_path: status.record.transcript_path,
                 usage_pending: status.record.usage_pending,
             });
             continue;
@@ -217,6 +232,26 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
     scan(dir).live
 }
 
+/// The transcript each record in the registry names, read and nothing more. The sweep that
+/// unlinks the record of a session whose process is gone belongs to one pass; a second pass
+/// sweeping as well would take those records away before the notices they owe the service had
+/// gone out with them.
+pub fn transcript_paths(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .filter_map(|path| read(&path))
+        .map(|status| (status.session_id, status.record.transcript_path))
+        .filter(|(_, path)| !path.as_os_str().is_empty())
+        .collect();
+    found.sort();
+    found
+}
+
 /// The record this host wrote for one session, whatever state the hook left it in.
 pub fn record(dir: &Path, session_id: &str) -> Option<Record> {
     read(&record_path(dir, session_id)).map(|status| status.record)
@@ -246,10 +281,9 @@ pub fn commit_usage(dir: &Path, session_id: &str, pending: &UsagePending) -> Res
     let Some(fields) = document.as_object_mut() else {
         bail!("the record of session {session_id} is not a JSON object");
     };
-    fields.insert("usageOffset".to_string(), pending.end.into());
+    fields.insert("usageFiles".to_string(), serde_json::to_value(&pending.files)?);
     fields.insert("usageHighWater".to_string(), pending.high_water.into());
     fields.insert("usagePrompts".to_string(), pending.prompts.into());
-    fields.insert("usageMessageId".to_string(), pending.message_id.clone().into());
     fields.remove("usagePending");
     std::fs::write(&path, format!("{}\n", serde_json::to_string(&document)?))
         .with_context(|| format!("writing the record of session {session_id}"))
@@ -424,7 +458,7 @@ pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut tick: im
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
@@ -462,6 +496,7 @@ mod tests {
                 },
                 mode: "interactive".to_string(),
                 permission_mode: "default".to_string(),
+                transcript_path: PathBuf::new(),
                 usage_pending: None,
                 state,
             };
@@ -867,19 +902,20 @@ mod tests {
       "mode": "interactive",
       "permissionMode": "default",
       "transcriptPath": "/home/you/.claude/projects/recall/s-usage.jsonl",
-      "usageOffset": 1200,
-      "usageHighWater": 1200,
+      "usageFiles": { "main": { "offset": 1200, "messageId": "msg-1" } },
+      "usageHighWater": 6,
       "usagePrompts": 1,
-      "usageMessageId": "msg-1",
       "usagePending": {
-        "seq": 1200,
-        "end": 4800,
-        "highWater": 4800,
+        "seq": 6,
+        "highWater": 8,
         "prompts": 2,
-        "messageId": "msg-3",
+        "files": {
+          "main": { "offset": 4800, "messageId": "msg-3" },
+          "agent-7f21": { "offset": 900, "messageId": "msg-9" }
+        },
         "events": [
           {
-            "seq": 1200,
+            "seq": 6,
             "provider": "claude",
             "account": "you@example.com",
             "model": "claude-opus-4",
@@ -891,7 +927,7 @@ mod tests {
             "cacheReadTokens": 44
           },
           {
-            "seq": 1201,
+            "seq": 7,
             "provider": "claude",
             "account": "you@example.com",
             "model": "claude-haiku-4",
@@ -913,11 +949,18 @@ mod tests {
 
         let record = record(&sandbox.sessions(), "s-usage").expect("the record parses");
         let pending = record.usage_pending.expect("the pending delta parses");
+        assert_eq!((pending.seq, pending.high_water, pending.prompts), (6, 8, 2));
         assert_eq!(
-            (pending.seq, pending.end, pending.high_water, pending.prompts),
-            (1200, 4800, 4800, 2)
+            pending.files["main"],
+            UsageFile {
+                offset: 4800,
+                message_id: "msg-3".to_string(),
+            }
         );
-        assert_eq!(pending.message_id, "msg-3");
+        assert_eq!(
+            pending.files["agent-7f21"].offset, 900,
+            "a delegated turn is read and marked on its own"
+        );
         assert_eq!(
             pending.events.iter().map(|event| &event["model"]).collect::<Vec<_>>(),
             vec!["claude-opus-4", "claude-haiku-4"],
@@ -936,13 +979,16 @@ mod tests {
         commit_usage(&sandbox.sessions(), "s-usage", &pending).unwrap();
 
         let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written["usageOffset"], 4800);
-        assert_eq!(written["usageHighWater"], 4800);
+        assert_eq!(
+            written["usageFiles"]["main"],
+            json!({ "offset": 4800, "messageId": "msg-3" })
+        );
+        assert_eq!(written["usageFiles"]["agent-7f21"]["offset"], 900);
+        assert_eq!(written["usageHighWater"], 8);
         assert_eq!(
             written["usagePrompts"], 2,
             "the prompts this delta carried are marked spent"
         );
-        assert_eq!(written["usageMessageId"], "msg-3");
         assert!(
             written.get("usagePending").is_none(),
             "a delta that landed is not sent again"

@@ -5,7 +5,10 @@
   "d1_databases": [
     { "binding": "DB", "database_name": "recall", "database_id": "00000000-0000-0000-0000-000000000000" }
   ],
-  "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "recall-artifacts" }],
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "recall-artifacts" },
+    { "binding": "TRANSCRIPTS", "bucket_name": "recall-transcripts" }
+  ],
   "durable_objects": {
     "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
   },

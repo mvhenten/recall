@@ -298,6 +298,9 @@ pub struct SessionBody<'a> {
 struct UsageBody<'a> {
     host: &'a str,
     repo: &'a str,
+    /// The transcript files this delta read. It is what says their tokens are counted, which a
+    /// run reading the same files back long after has nothing else to ask.
+    files: &'a [String],
     #[serde(flatten)]
     event: &'a serde_json::Value,
 }
@@ -312,6 +315,26 @@ struct Sessions {
 struct HistoryIds {
     session_ids: Vec<String>,
     next_cursor: String,
+}
+
+/// How far into one of a session's transcript files the service has been written. It is the only
+/// mark an archive resumes from, so nothing a host keeps locally can put the two out of step.
+#[derive(Deserialize)]
+struct HeldFile {
+    file: String,
+    bytes: i64,
+}
+
+#[derive(Deserialize)]
+struct HeldFiles {
+    files: Vec<HeldFile>,
+    #[serde(default)]
+    counted: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct Extent {
+    offset: i64,
 }
 
 /// The device a message is queued against, and the one session on it the message is for; an empty
@@ -562,17 +585,77 @@ impl Client {
 
     /// Sends every event of one stretch. The events are the hooks' own: nothing here reads inside
     /// one, so a counter the hooks learn to read needs no change in this binary.
-    pub fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[serde_json::Value]) -> Result<usize> {
+    pub fn post_usage(
+        &self,
+        session_id: &str,
+        host: &str,
+        repo: &str,
+        files: &[String],
+        events: &[serde_json::Value],
+    ) -> Result<usize> {
         for event in events {
             let response = self
                 .authed(
                     self.agent
                         .post(self.url(&format!("{}/usage", Self::session_path(session_id)))),
                 )
-                .send_json(UsageBody { host, repo, event })?;
+                .send_json(UsageBody {
+                    host,
+                    repo,
+                    files,
+                    event,
+                })?;
             check(response, &format!("sending usage for session {session_id}"))?;
         }
         Ok(events.len())
+    }
+
+    /// What the service holds of one session: how far into each transcript file it has been
+    /// written, and which files have had their tokens counted. It answers only for a session the
+    /// account already has on record.
+    pub fn transcript_held(&self, session_id: &str) -> Result<crate::transcripts::Held> {
+        let response = self
+            .authed(
+                self.agent
+                    .get(self.url(&format!("{}/transcript", Self::session_path(session_id)))),
+            )
+            .call()?;
+        let held: HeldFiles = check(response, &format!("reading the archive of session {session_id}"))?
+            .body_mut()
+            .read_json()?;
+        Ok(crate::transcripts::Held {
+            bytes: held.files.into_iter().map(|file| (file.file, file.bytes)).collect(),
+            counted: held.counted.into_iter().collect(),
+        })
+    }
+
+    /// Appends one stretch to one of a session's transcript files. The store takes a stretch only
+    /// where the file already ends, so a stretch that landed already is refused rather than
+    /// written a second time, and the refusal carries the end to read on from.
+    pub fn append_transcript(
+        &self,
+        session_id: &str,
+        file: &str,
+        offset: i64,
+        bytes: &[u8],
+    ) -> Result<crate::transcripts::Appended> {
+        let path = format!(
+            "{}/transcript?file={}&offset={offset}",
+            Self::session_path(session_id),
+            encode(file)
+        );
+        let mut response = self
+            .authed(self.agent.put(self.url(&path)))
+            .header("content-type", "application/x-ndjson")
+            .send(bytes)?;
+        if response.status().as_u16() == 409 {
+            let extent: Extent = response.body_mut().read_json()?;
+            return Ok(crate::transcripts::Appended::Behind(extent.offset));
+        }
+        let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
+            .body_mut()
+            .read_json()?;
+        Ok(crate::transcripts::Appended::Wrote(extent.offset))
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {

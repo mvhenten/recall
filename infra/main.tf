@@ -23,6 +23,16 @@ resource "cloudflare_r2_bucket" "artifacts" {
   location   = "weur"
 }
 
+resource "cloudflare_r2_bucket" "transcripts" {
+  account_id = var.account_id
+  name       = "recall-transcripts"
+  location   = "weur"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
 resource "cloudflare_zero_trust_access_policy" "bypass" {
   account_id = var.account_id
   name       = "recall api"

@@ -4,6 +4,7 @@ use crate::config;
 use crate::seen::Seen;
 use crate::sessions;
 use crate::settings::Settings;
+use crate::transcripts;
 use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
@@ -237,12 +238,19 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
             let id = &session.session_id;
             if let Some(pending) = session.usage_pending.as_ref() {
                 let started = Instant::now();
-                let outcome = match client.post_usage(id, &session.host, &session.repo, &pending.events) {
+                let files: Vec<String> = pending.files.keys().cloned().collect();
+                let outcome = match client.post_usage(id, &session.host, &session.repo, &files, &pending.events) {
                     Ok(sent) => format!("sessions:usage:{id}:{sent}"),
                     Err(error) => format!("sessions:usage-failed:{id}:{error:#}"),
                 };
                 log(&outcome, started.elapsed());
             }
+            archive(
+                &mut transcripts::Archive::default(),
+                &client,
+                id,
+                &session.transcript_path,
+            );
             let started = Instant::now();
             let outcome = match client.end_session(id) {
                 Ok(true) => format!("sessions:ended:{id}"),
@@ -252,6 +260,49 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
             log(&outcome, started.elapsed());
         }
     });
+}
+
+/// One session's transcript files, caught up with the service. A failure is reported and the pass
+/// carries on: what is not sent now is sent by the next pass, or by `recall backfill` long after.
+fn archive(archive: &mut transcripts::Archive, client: &Client, session_id: &str, transcript: &Path) {
+    let started = Instant::now();
+    match archive.send(client, session_id, transcript) {
+        Ok(0) => {}
+        Ok(bytes) => log(&format!("sessions:archived:{session_id}:{bytes}"), started.elapsed()),
+        Err(error) => log(
+            &format!("sessions:archive-failed:{session_id}:{error:#}"),
+            started.elapsed(),
+        ),
+    }
+}
+
+/// The transcripts of the sessions still running, on a beat of its own. A session works for
+/// minutes between prompts and writes the whole time, while the hook that would carry its lines up
+/// only fires on a prompt, so without this a long turn reaches the archive only once it is over.
+///
+/// The beat is `archive.interval.seconds` and not the registry sweep's: the sweep ends dead
+/// sessions and runs adoption, which a host wanting its newest lines sooner has no reason to
+/// hurry. The registry is read and never swept here, since a second sweeper would unlink the dead
+/// records before the tick that owes the service their notice had seen them. One pass runs at a
+/// time: the next beat waits on the one before it rather than piling up behind it.
+async fn archive_loop(client: Arc<Client>, sessions_dir: PathBuf, every: Duration) {
+    let mut beat = tokio::time::interval(every);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pass = transcripts::Archive::default();
+    loop {
+        beat.tick().await;
+        let live = sessions::transcript_paths(&sessions_dir);
+        let client = Arc::clone(&client);
+        pass = tokio::task::spawn_blocking(move || {
+            pass.retain(&live.iter().map(|(session_id, _)| session_id.as_str()).collect());
+            for (session_id, path) in &live {
+                archive(&mut pass, &client, session_id, path);
+            }
+            pass
+        })
+        .await
+        .unwrap_or_default();
+    }
 }
 
 /// One adoption pass at a time, whatever the tick does: a pass reads transcripts and then waits on
@@ -299,7 +350,7 @@ fn adopt_running(client: &Arc<Client>, scope: &Arc<adopt::Scope>, running: &Arc<
     });
 }
 
-async fn serve() -> Result<()> {
+async fn serve(archive_every: Duration) -> Result<()> {
     let config = config::load()?;
     let url = ws::listen_url(&config.endpoint)?;
     let sessions_dir = sessions_dir();
@@ -317,6 +368,7 @@ async fn serve() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
+        _ = archive_loop(Arc::clone(&client), sessions_dir.clone(), archive_every) => Ok(()),
         _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
             report_ended(&client, ended);
             if let Ok(scope) = scope.as_ref() {
@@ -447,7 +499,7 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
     };
     let _ = std::fs::write(pid_path(), format!("{}\n", std::process::id()));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let outcome = runtime.block_on(serve());
+    let outcome = runtime.block_on(serve(settings.archive_interval()));
     log(
         &match &outcome {
             Ok(()) => "listen:stopped".to_string(),
@@ -568,6 +620,7 @@ mod tests {
                 focus: sessions::Focus::default(),
                 mode: "interactive".to_string(),
                 permission_mode: "default".to_string(),
+                transcript_path: PathBuf::new(),
                 usage_pending: None,
                 state,
             },

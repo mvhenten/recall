@@ -155,7 +155,10 @@ export interface LabelTargets {
 }
 
 // Raw events are detail and the daily rollup is the long window, so events past two weeks are
-// dropped and every window wider than that reads only usage_daily.
+// dropped and every window wider than that reads only usage_daily. A durable event is the
+// exception: its chunk number is derived from the transcript it was read out of, so the same
+// reading arrives again whenever that host backfills, and the row is the only thing that can tell
+// the rollup it has already counted it. One row per model, day and file is small enough to keep.
 export const USAGE_RETENTION_MS = 1_209_600_000;
 export const MAX_USAGE_TOKENS = 1_000_000_000;
 
@@ -177,6 +180,8 @@ export interface UsageInput {
   cacheWriteTokens: number;
   cacheReadTokens: number;
   at: number;
+  durable: boolean;
+  files: string[];
 }
 
 export const DAY_MS = 86_400_000;
@@ -480,6 +485,43 @@ const isText = (value: unknown, max: number): value is string => typeof value ==
 export const parseSessionId = (value: string): Parsed<string> =>
   SESSION_ID.test(value) ? { ok: true, value } : fail("the session id may hold 1 to 100 letters, digits, - and _");
 
+const TRANSCRIPT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
+
+// A session delegates plenty of turns, and each writes a file; far past this the delta is not one
+// this service wrote the rules for.
+export const MAX_COUNTED_FILES = 500;
+
+// Which of a session's transcript files a stretch belongs to: `main` for the session's own, and one
+// name per delegated turn. It becomes part of an object key, so a name that could reach out of the
+// session's own prefix is refused.
+export const parseTranscriptFile = (value: string | null): Parsed<string> =>
+  value !== null && TRANSCRIPT_FILE.test(value)
+    ? { ok: true, value }
+    : fail("file must open with a letter or digit and hold at most 101 of letters, digits, . _ and -");
+
+// The transcript files one delta read, which is what says their tokens are counted. A delta that
+// names none is one from a client that does not read them apart, and counts for no file.
+export const parseCountedFiles = (value: unknown): Parsed<string[]> => {
+  if (value === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(value) || value.length > MAX_COUNTED_FILES) {
+    return fail(`files must be an array of at most ${MAX_COUNTED_FILES} transcript file names`);
+  }
+  const files = new Set<string>();
+  for (const raw of value) {
+    const file = parseTranscriptFile(typeof raw === "string" ? raw : null);
+    if (!file.ok) return file;
+    files.add(file.value);
+  }
+  return { ok: true, value: [...files] };
+};
+
+export const parseChunkOffset = (value: string | null): Parsed<number> => {
+  const offset = Number(value);
+  return value !== null && value !== "" && isInteger(offset, 0, Number.MAX_SAFE_INTEGER)
+    ? { ok: true, value: offset }
+    : fail("offset must be a whole number of bytes into the file");
+};
+
 const parseFocus = (value: unknown): Parsed<Focus> => {
   if (!isRecord(value) || !isText(value.first, MAX_FOCUS_CHARS) || !isText(value.latest, MAX_FOCUS_CHARS)) {
     return fail(`focus must be {first, latest}, each a string of at most ${MAX_FOCUS_CHARS} characters`);
@@ -531,8 +573,11 @@ export const parseSession = (body: unknown): Parsed<SessionInput> => {
 
 export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
-  const { seq, host, repo, provider, account, model, prompts, at } = body;
+  const { seq, host, repo, provider, account, model, prompts, at, durable } = body;
   const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
+  if (durable !== undefined && typeof durable !== "boolean") return fail("durable must be true or false");
+  const files = parseCountedFiles(body.files);
+  if (!files.ok) return files;
   if (!isInteger(seq, 0, Number.MAX_SAFE_INTEGER)) return fail("seq must be the whole number of a delta in a session");
   if (!isText(host, MAX_SESSION_TEXT_CHARS) || host.length < 1) {
     return fail(`host must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
@@ -574,6 +619,8 @@ export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
       outputTokens,
       cacheWriteTokens,
       cacheReadTokens,
+      durable: durable === true,
+      files: files.value,
     },
   };
 };

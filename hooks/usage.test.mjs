@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -147,7 +147,11 @@ test("the range is fixed before the post and re-sent unchanged until it lands", 
   assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_000_000), "pending");
   const fixed = readRecord("s-1", env, UID).usagePending;
   assert.equal(fixed.seq, 0);
-  assert.equal(fixed.end, statSync(transcript).size, "the end is fixed at the last complete line");
+  assert.equal(
+    fixed.files.main.offset,
+    statSync(transcript).size,
+    "the end of each file is fixed at its last complete line",
+  );
   assert.deepEqual(
     fixed.events.map(({ seq, model, inputTokens, cacheReadTokens }) => ({ seq, model, inputTokens, cacheReadTokens })),
     [{ seq: 0, model: OPUS, inputTokens: 10, cacheReadTokens: 40 }],
@@ -167,14 +171,8 @@ test("the range is fixed before the post and re-sent unchanged until it lands", 
 // What `recall sessions --sync` writes back once the service has taken every event of a range.
 function landed(sessionId, env) {
   const stored = readRecord(sessionId, env, UID);
-  const { end, highWater, prompts, messageId } = stored.usagePending;
-  const posted = {
-    ...stored,
-    usageOffset: end,
-    usageHighWater: highWater,
-    usagePrompts: prompts,
-    usageMessageId: messageId,
-  };
+  const { files, highWater, prompts } = stored.usagePending;
+  const posted = { ...stored, usageFiles: files, usageHighWater: highWater, usagePrompts: prompts };
   delete posted.usagePending;
   writeRecord(sessionId, posted, env, UID);
   return stored.usagePending;
@@ -196,7 +194,7 @@ test("the next range starts where the one that landed ended", () => {
   );
   assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_200_000), "pending");
   const next = readRecord("s-1", env, UID).usagePending;
-  assert.equal(next.seq, first.end, "the chunk number is the offset the range started from");
+  assert.equal(next.seq, first.highWater, "the chunk numbers carry on where the range before them stopped");
   assert.deepEqual(
     next.events.map(({ model, inputTokens }) => ({ model, inputTokens })),
     [{ model: HAIKU, inputTokens: 1 }],
@@ -250,7 +248,7 @@ test("chunk numbers climb past a transcript that was rewritten shorter", () => {
 
   writeFileSync(transcript, lines(answer("msg-2", OPUS, [1, 1, 1, 1])));
   assert.equal(prepareUsage("s-1", transcript, env, UID), "reset");
-  assert.equal(readRecord("s-1", env, UID).usageOffset, statSync(transcript).size);
+  assert.equal(readRecord("s-1", env, UID).usageFiles.main.offset, statSync(transcript).size);
 
   appendFileSync(transcript, lines(answer("msg-3", HAIKU, [2, 2, 2, 2])));
   assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_200_000), "pending");
@@ -276,18 +274,73 @@ test("a transcript that is gone, unreadable or rewritten shorter never fails a s
   assert.equal(prepareUsage("s-1", transcript, env, UID), "no-transcript", "a transcript not written yet owes nothing");
 
   writeFileSync(transcript, lines([prompt("count this")]));
-  writeRecord("s-1", { ...readRecord("s-1", env, UID), usageOffset: 9000, usageMessageId: "msg-1" }, env, UID);
+  const marked = (offset, messageId) => ({
+    ...readRecord("s-1", env, UID),
+    usageFiles: { main: { offset, messageId } },
+  });
+  writeRecord("s-1", marked(9000, "msg-1"), env, UID);
   assert.equal(prepareUsage("s-1", transcript, env, UID), "reset");
   assert.deepEqual(
-    { offset: readRecord("s-1", env, UID).usageOffset, messageId: readRecord("s-1", env, UID).usageMessageId },
+    readRecord("s-1", env, UID).usageFiles.main,
     { offset: statSync(transcript).size, messageId: "" },
     "a transcript shorter than the offset is another file: counting starts at its end",
   );
 
-  writeRecord("s-1", { ...readRecord("s-1", env, UID), usageOffset: 0 }, env, UID);
+  writeRecord("s-1", marked(0, ""), env, UID);
   assert.equal(prepareUsage("s-1", transcript, env, UID), "none", "prompts wait for the answer they paid for");
   assert.equal(readRecord("s-1", env, UID).usagePending, undefined);
-  assert.equal(readRecord("s-1", env, UID).usageOffset, 0, "the prompt stays in the range its answer will join");
+  assert.equal(
+    readRecord("s-1", env, UID).usageFiles.main.offset,
+    0,
+    "the prompt stays in the range its answer will join",
+  );
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a delegated turn is counted with the session that delegated it", () => {
+  const { dir, env, transcript } = sandbox();
+  withAccount(dir);
+  const delegated = path.join(dir, "session", "subagents", "agent-7f21.jsonl");
+  mkdirSync(path.dirname(delegated), { recursive: true });
+  writeFileSync(transcript, lines([prompt("delegate it")]));
+  record("s-1", { state: "off" }, session(dir, transcript), env);
+  writeFileSync(delegated, lines(answer("msg-a1", OPUS, [700, 70, 0, 0])));
+  appendFileSync(transcript, lines(answer("msg-1", OPUS, [10, 20, 30, 40])));
+
+  assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_000_000), "pending");
+
+  const pending = readRecord("s-1", env, UID).usagePending;
+  assert.deepEqual(
+    pending.events.map(({ model, inputTokens }) => ({ model, inputTokens })),
+    [{ model: OPUS, inputTokens: 710 }],
+    "one model answering in both files spends once on the session",
+  );
+  assert.equal(pending.files["agent-7f21"].offset, statSync(delegated).size);
+  assert.equal(pending.files.main.offset, statSync(transcript).size);
+
+  landed("s-1", env);
+  assert.equal(prepareUsage("s-1", transcript, env, UID), "none", "neither file owes anything twice");
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a delegated turn opened after the session started is counted from nothing", () => {
+  const { dir, env, transcript } = sandbox();
+  withAccount(dir);
+  writeFileSync(transcript, lines([prompt("start")]));
+  record("s-1", { state: "off" }, session(dir, transcript), env);
+  const delegated = path.join(dir, "session", "subagents", "agent-7f21.jsonl");
+  mkdirSync(path.dirname(delegated), { recursive: true });
+  writeFileSync(delegated, lines(answer("msg-a1", OPUS, [700, 70, 0, 0])));
+
+  assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_000_000), "pending");
+
+  assert.equal(
+    readRecord("s-1", env, UID).usagePending.events[0].inputTokens,
+    700,
+    "a file the session opens after it starts is read whole",
+  );
 
   rmSync(dir, { recursive: true, force: true });
 });
