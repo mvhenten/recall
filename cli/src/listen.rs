@@ -165,11 +165,18 @@ async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
         log(&format!("message:replayed:{}", message.message_id), started.elapsed());
         return;
     }
-    let fanout = sessions::fanout(sessions_dir, &message.body).await;
+    let (target, fanout) = if message.to_session_id.is_empty() {
+        ("host".to_string(), sessions::fanout(sessions_dir, &message.body).await)
+    } else {
+        (
+            format!("session:{}", message.to_session_id),
+            sessions::to_session(sessions_dir, &message.to_session_id, &message.body).await,
+        )
+    };
     seen.record(&message.message_id);
     log(
         &format!(
-            "message:{}:{}:{}/{}",
+            "message:{}:{}:{target}:{}/{}",
             message.from_device_id, message.message_id, fanout.delivered, fanout.pruned
         ),
         started.elapsed(),

@@ -28,8 +28,30 @@ const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.ge
 const queued = (userId: string, toDeviceId: string, now: number): Promise<Message[]> =>
   runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => mailbox.list(toDeviceId, now));
 
-const send = (client: Client, toDeviceId: string, body: string): Promise<Response> =>
-  client.request("POST", "/v1/messages", { toDeviceId, body });
+const send = (client: Client, toDeviceId: string, body: string, toSessionId = ""): Promise<Response> =>
+  client.request("POST", "/v1/messages", { toDeviceId, toSessionId, body });
+
+const sync = (client: Client, sessionId: string): Promise<Response> =>
+  client.request("PUT", `/v1/sessions/${sessionId}`, {
+    host: "desktop",
+    cwd: "/home/you/src/recall",
+    repo: "repo:github.com/mvhenten/recall",
+    branch: "work",
+    commit: "feat(messaging): address one session",
+    startedAt: 1_700_000_000_000,
+    lastActivityAt: 1_700_000_060_000,
+    prompts: 3,
+    focus: { first: "address one session", latest: "why is the worker test red" },
+    mode: "interactive",
+    permissionMode: "default",
+    pid: 4242,
+  });
+
+const sentMessage = async (response: Response): Promise<Message> => {
+  expect(response.status).toBe(201);
+  const body: { message: Message } = await response.json();
+  return body.message;
+};
 
 describe("messages", () => {
   it("queues a sent message against the target device only, until that device acks it", async () => {
@@ -39,13 +61,34 @@ describe("messages", () => {
     const laptopId = await deviceId(laptop, "laptop");
     const desktopId = await deviceId(laptop, "desktop");
 
-    const sent = await send(laptop, desktopId, "the release is green");
-    expect(sent.status).toBe(201);
-    const { message }: { message: Message } = await sent.json();
-    expect(message).toMatchObject({ toDeviceId: desktopId, fromDeviceId: laptopId, body: "the release is green" });
+    const message = await sentMessage(await send(laptop, desktopId, "the release is green"));
+    expect(message).toMatchObject({
+      toDeviceId: desktopId,
+      toSessionId: "",
+      fromDeviceId: laptopId,
+      body: "the release is green",
+    });
     expect(message.expiresAt).toBe(message.createdAt + MESSAGE_TTL_MS);
 
     expect(await queued(userId, desktopId, h.now())).toEqual([message]);
+    expect(await queued(userId, laptopId, h.now())).toEqual([]);
+  });
+
+  it("queues a message for the one session named, and only on that session's own device", async () => {
+    const h = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const { laptop, desktop } = await account(h, userId);
+    const laptopId = await deviceId(laptop, "laptop");
+    const desktopId = await deviceId(laptop, "desktop");
+    expect((await sync(desktop, "9f8a1b2c")).status).toBe(204);
+
+    const message = await sentMessage(await send(laptop, desktopId, "only you", "9f8a1b2c"));
+    expect(message).toMatchObject({ toDeviceId: desktopId, toSessionId: "9f8a1b2c" });
+    expect(await queued(userId, desktopId, h.now())).toEqual([message]);
+
+    expect((await send(laptop, laptopId, "the wrong host", "9f8a1b2c")).status).toBe(404);
+    expect((await send(laptop, desktopId, "a session that ended", "gone")).status).toBe(404);
+    expect((await send(laptop, desktopId, "malformed", "two words")).status).toBe(400);
     expect(await queued(userId, laptopId, h.now())).toEqual([]);
   });
 
@@ -60,7 +103,7 @@ describe("messages", () => {
     await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
       for (let index = 0; index < MAX_QUEUED_MESSAGES; index += 1) {
         await mailbox.enqueue(
-          { toDeviceId: desktopId, body: `queued ${index}` },
+          { toDeviceId: desktopId, toSessionId: "", body: `queued ${index}` },
           { userId, deviceId: desktopId },
           h.now(),
         );

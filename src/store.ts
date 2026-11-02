@@ -8,6 +8,7 @@ import {
   type Session,
   type SessionInput,
   type SessionMode,
+  sessionHandle,
 } from "./model";
 
 interface MemoryRow {
@@ -190,7 +191,7 @@ export const describeMemories = async (db: D1Database, userId: string, memoryIds
 
 interface SessionRow {
   session_id: string;
-  name: string;
+  device_name: string;
   device_id: string;
   host: string;
   cwd: string;
@@ -209,7 +210,7 @@ interface SessionRow {
 
 const toSession = (row: SessionRow, caller: Caller): Session => ({
   sessionId: row.session_id,
-  name: row.name,
+  name: sessionHandle(row.device_name, row.session_id),
   deviceId: row.device_id,
   host: row.host,
   cwd: row.cwd,
@@ -284,7 +285,7 @@ export const listSessions = async (db: D1Database, caller: Caller, now: number):
     expireSessions(db, caller.userId, now),
     db
       .prepare(
-        `SELECT s.session_id, COALESCE(d.name, '') AS name, s.device_id, s.host, s.cwd, s.repo, s.branch,
+        `SELECT s.session_id, COALESCE(d.name, '') AS device_name, s.device_id, s.host, s.cwd, s.repo, s.branch,
            s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest, s.mode,
            s.permission_mode, s.pid
          FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
@@ -293,6 +294,23 @@ export const listSessions = async (db: D1Database, caller: Caller, now: number):
       .bind(caller.userId),
   ]);
   return (listed?.results ?? []).map((row) => toSession(row, caller));
+};
+
+export const sessionOnDevice = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  deviceId: string,
+  now: number,
+): Promise<boolean> => {
+  const row = await db
+    .prepare(
+      `SELECT session_id FROM sessions
+       WHERE user_id = ? AND session_id = ? AND device_id = ? AND last_activity_at > ?`,
+    )
+    .bind(userId, sessionId, deviceId, now - SESSION_TTL_MS)
+    .first<{ session_id: string }>();
+  return row !== null;
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {

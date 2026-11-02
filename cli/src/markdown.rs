@@ -158,9 +158,9 @@ pub fn repo_at_branch(repo: &str, branch: &str) -> String {
     }
 }
 
-/// One line per session: host, the name `recall send` takes, repo@branch, age, state and what the
-/// session is working on. Every column but the last is padded to its widest value, so the focus
-/// lines start together.
+/// One line per session: host, the handle `recall send` takes to reach that session, repo@branch,
+/// age, state and what the session is working on. Every column but the last is padded to its
+/// widest value, so the focus lines start together.
 pub fn render_sessions(sessions: &[Session], now: i64) -> String {
     let rows: Vec<Vec<String>> = sessions
         .iter()

@@ -39,7 +39,7 @@ const account = async (h: Harness): Promise<{ laptop: Client; tower: Client }> =
 };
 
 describe("sessions", () => {
-  it("lists every host's sessions, newest activity first, each addressable by its device name", async () => {
+  it("lists every host's sessions, newest activity first, each addressable by its handle", async () => {
     const h = await harness();
     const { laptop, tower } = await account(h);
     const stranger = await h.user("stranger");
@@ -52,8 +52,8 @@ describe("sessions", () => {
 
     const sessions = await listed(laptop);
     expect(sessions.map((session) => [session.host, session.name, session.repo, session.current])).toEqual([
-      ["tower", "tower", "", false],
-      ["laptop", "laptop", "repo:github.com/mvhenten/recall", true],
+      ["tower", "tower-stow", "", false],
+      ["laptop", "laptop-slap", "repo:github.com/mvhenten/recall", true],
     ]);
     expect(sessions[1]).toMatchObject({
       sessionId: "s-laptop",
@@ -68,6 +68,18 @@ describe("sessions", () => {
       pid: 4242,
     });
     expect(await listed(stranger)).toHaveLength(1);
+  });
+
+  it("names each session by its device and the head of its session id, whatever else is live", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+
+    await sync(laptop, "9f8a1b2c", { lastActivityAt: h.now() });
+    await sync(laptop, "c4e21a99", { lastActivityAt: h.now() - 1000 });
+    expect((await listed(laptop)).map((session) => session.name)).toEqual(["laptop-9f8a", "laptop-c4e2"]);
+
+    expect((await laptop.request("DELETE", "/v1/sessions/9f8a1b2c")).status).toBe(204);
+    expect((await listed(laptop)).map((session) => session.name)).toEqual(["laptop-c4e2"]);
   });
 
   it("keeps one document per session, so a refreshed focus replaces the last one", async () => {

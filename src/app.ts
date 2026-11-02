@@ -44,6 +44,7 @@ import {
   putSession,
   recall,
   saveMemory,
+  sessionOnDevice,
   textCandidates,
   vectorCandidates,
 } from "./store";
@@ -207,8 +208,10 @@ export const createApp = (deps: Deps): App => {
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
-    if (!(await hasDevice(env.DB, caller.userId, input.value.toDeviceId))) {
-      return error(404, `no device ${input.value.toDeviceId}`);
+    const { toDeviceId, toSessionId } = input.value;
+    if (!(await hasDevice(env.DB, caller.userId, toDeviceId))) return error(404, `no device ${toDeviceId}`);
+    if (toSessionId !== "" && !(await sessionOnDevice(env.DB, caller.userId, toSessionId, toDeviceId, deps.now()))) {
+      return error(404, `no session ${toSessionId} on device ${toDeviceId}`);
     }
     const message = await mailboxFor(env, caller.userId).enqueue(input.value, caller, deps.now());
     if (message === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);

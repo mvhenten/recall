@@ -115,7 +115,7 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    const MESSAGE: &str = r#"{"type":"message","message":{"messageId":"m-1","toDeviceId":"d-here","fromDeviceId":"d-there","body":"ship it","createdAt":1,"expiresAt":2}}"#;
+    const MESSAGE: &str = r#"{"type":"message","message":{"messageId":"m-1","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"ship it","createdAt":1,"expiresAt":2}}"#;
 
     #[test]
     fn the_endpoint_becomes_the_listen_url() {

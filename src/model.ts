@@ -80,6 +80,15 @@ export interface Session extends SessionInput {
   current: boolean;
 }
 
+// The handle that addresses one session: its device name and the head of its session id. It is a
+// function of the session alone, so it names the same session for as long as that session runs and
+// never moves to another one.
+export const sessionHandle = (deviceName: string, sessionId: string): string =>
+  `${deviceName}-${sessionId
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .slice(0, 4)}`;
+
 export type Verification = { ok: true; email: string } | { ok: false; reason: string };
 
 export type Verify = (assertion: string) => Promise<Verification>;

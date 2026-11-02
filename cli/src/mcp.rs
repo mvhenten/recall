@@ -120,9 +120,10 @@ pub struct EditParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SendParams {
-    /// The host to reach, named as recall devices shows it, or a device id.
-    pub host: String,
-    /// The message to deliver to the Claude Code sessions on that host.
+    /// The session to reach, named by the handle recall sessions shows, or a host named as recall
+    /// devices shows it to reach every session on that host.
+    pub to: String,
+    /// The message to deliver there.
     pub message: String,
 }
 
@@ -340,14 +341,18 @@ impl Recall {
 
     #[tool(
         name = "recall_send",
-        description = "Message the Claude Code sessions running on another host signed in as this user. Name the host as recall devices shows it; the message arrives as a user turn there."
+        description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named as recall devices shows it. The message arrives as a user turn there."
     )]
     async fn send(&self, Parameters(params): Parameters<SendParams>) -> Result<String, String> {
         blocking(move || {
             let client = client()?;
-            let to_device_id = api::resolve_host(&client.devices()?, &params.host)?;
-            let sent = client.send(&to_device_id, &params.message)?;
-            to_json(&serde_json::json!({ "messageId": sent.message_id, "toDeviceId": sent.to_device_id }))
+            let target = api::resolve_target(&client.devices()?, || client.sessions(), &params.to)?;
+            let sent = client.send(&target, &params.message)?;
+            to_json(&serde_json::json!({
+                "messageId": sent.message_id,
+                "toDeviceId": sent.to_device_id,
+                "toSessionId": sent.to_session_id,
+            }))
         })
         .await
     }
@@ -464,7 +469,7 @@ mod tests {
     #[test]
     fn serves_recall_send_only_when_messaging_is_enabled() {
         assert!(names(true).contains(&SEND_TOOL.to_string()));
-        assert_eq!(required("recall_send"), ["host", "message"]);
+        assert_eq!(required("recall_send"), ["message", "to"]);
     }
 
     #[test]

@@ -174,11 +174,14 @@ struct Devices {
     devices: Vec<Device>,
 }
 
+/// `to_session_id` is the one session the message is addressed to, or empty for every session the
+/// host has registered.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub message_id: String,
     pub to_device_id: String,
+    pub to_session_id: String,
     pub from_device_id: String,
     pub body: String,
     pub created_at: i64,
@@ -191,7 +194,8 @@ struct Sent {
 }
 
 /// One Claude Code session on one of the hosts signed in as this user, as the service holds it.
-/// `name` is the device name `recall send` takes, so the listing doubles as an address book.
+/// `name` is the handle `recall send` takes to reach this one session, so the listing doubles as
+/// an address book.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -235,18 +239,47 @@ struct Sessions {
     sessions: Vec<Session>,
 }
 
-pub fn resolve_host(devices: &[Device], host: &str) -> Result<String> {
-    if devices.iter().any(|device| device.device_id == host) {
-        return Ok(host.to_string());
+/// The device a message is queued against, and the one session on it the message is for; an empty
+/// `session_id` reaches every session that host has registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub device_id: String,
+    pub session_id: String,
+}
+
+/// `to` is a device id or device name, which reaches every session on that host, or a session
+/// handle or session id, which reaches that one session. A device answers first, so `sessions` is
+/// called only for a target no device claims and an ordinary host send costs no listing.
+pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<Session>>, to: &str) -> Result<Target> {
+    let host = |device_id: &str| {
+        Ok(Target {
+            device_id: device_id.to_string(),
+            session_id: String::new(),
+        })
+    };
+    if devices.iter().any(|device| device.device_id == to) {
+        return host(to);
     }
-    let named: Vec<&Device> = devices.iter().filter(|device| device.name == host).collect();
-    match named.as_slice() {
-        [device] => Ok(device.device_id.clone()),
-        [] => bail!("no host named {host}; recall devices lists the hosts signed in as you"),
+    if let Some(device) = devices.iter().find(|device| device.name == to) {
+        return host(&device.device_id);
+    }
+    let listed = sessions()?;
+    let addressed: Vec<&Session> = listed
+        .iter()
+        .filter(|session| session.name == to || session.session_id == to)
+        .collect();
+    match addressed.as_slice() {
+        [session] => Ok(Target {
+            device_id: session.device_id.clone(),
+            session_id: session.session_id.clone(),
+        }),
+        [] => bail!(
+            "no host or session named {to}; recall devices lists the hosts signed in as you and recall sessions the handle of each live session"
+        ),
         many => {
-            let ids: Vec<&str> = many.iter().map(|device| device.device_id.as_str()).collect();
+            let ids: Vec<&str> = many.iter().map(|session| session.session_id.as_str()).collect();
             bail!(
-                "{} hosts are named {host}; pass one of these ids instead: {}",
+                "ambiguous target {to}: {} sessions answer to it; pass one of these session ids instead: {}",
                 many.len(),
                 ids.join(", ")
             )
@@ -418,11 +451,15 @@ impl Client {
         Ok(true)
     }
 
-    pub fn send(&self, to_device_id: &str, body: &str) -> Result<Message> {
+    pub fn send(&self, target: &Target, body: &str) -> Result<Message> {
         let response = self
             .authed(self.agent.post(self.url("/v1/messages")))
-            .send_json(serde_json::json!({ "toDeviceId": to_device_id, "body": body }))?;
-        let sent: Sent = check(response, &format!("sending to {to_device_id}"))?
+            .send_json(serde_json::json!({
+                "toDeviceId": target.device_id,
+                "toSessionId": target.session_id,
+                "body": body,
+            }))?;
+        let sent: Sent = check(response, &format!("sending to {}", target.device_id))?
             .body_mut()
             .read_json()?;
         Ok(sent.message)
@@ -443,25 +480,100 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_host_resolves_by_device_name() {
-        let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
-        assert_eq!(resolve_host(&devices, "desktop").unwrap(), "d-2");
-        let error = resolve_host(&devices, "deskstop").unwrap_err().to_string();
-        assert!(error.contains("no host named deskstop"), "{error}");
+    fn session(session_id: &str, name: &str, device_id: &str) -> Session {
+        Session {
+            session_id: session_id.to_string(),
+            name: name.to_string(),
+            device_id: device_id.to_string(),
+            host: "laptop".to_string(),
+            cwd: "/home/you/src/recall".to_string(),
+            repo: "repo:github.com/mvhenten/recall".to_string(),
+            branch: "work".to_string(),
+            commit: "feat(messaging): address one session".to_string(),
+            started_at: 1_762_000_000_000,
+            last_activity_at: 1_762_000_060_000,
+            prompts: 2,
+            focus: crate::sessions::Focus::default(),
+            mode: "interactive".to_string(),
+            permission_mode: "default".to_string(),
+            pid: 4242,
+            current: false,
+        }
+    }
+
+    fn host(device_id: &str) -> Target {
+        Target {
+            device_id: device_id.to_string(),
+            session_id: String::new(),
+        }
     }
 
     #[test]
-    fn two_hosts_of_the_same_name_name_their_ids() {
-        let devices = [device("d-1", "ubuntu"), device("d-2", "ubuntu")];
-        let error = resolve_host(&devices, "ubuntu").unwrap_err().to_string();
-        assert!(error.contains("2 hosts are named ubuntu"), "{error}");
-        assert!(error.contains("d-1, d-2"), "{error}");
+    fn a_host_resolves_by_device_name_without_listing_the_sessions() {
+        let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
+        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+
+        assert_eq!(resolve_target(&devices, refuse, "desktop").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
+        let error = resolve_target(&devices, || Ok(Vec::new()), "deskstop")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no host or session named deskstop"), "{error}");
+    }
+
+    #[test]
+    fn a_handle_or_a_session_id_resolves_to_the_one_session_it_names() {
+        let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
+        let sessions = || {
+            Ok(vec![
+                session("9f8a1b2c", "desktop-9f8a", "d-2"),
+                session("c4e21a99", "laptop-c4e2", "d-1"),
+            ])
+        };
+        let desktop_session = Target {
+            device_id: "d-2".to_string(),
+            session_id: "9f8a1b2c".to_string(),
+        };
+
+        assert_eq!(
+            resolve_target(&devices, sessions, "desktop-9f8a").unwrap(),
+            desktop_session
+        );
+        assert_eq!(resolve_target(&devices, sessions, "9f8a1b2c").unwrap(), desktop_session);
+        let error = resolve_target(&devices, sessions, "desktop-9f8b")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no host or session named desktop-9f8b"), "{error}");
     }
 
     #[test]
     fn a_device_id_passes_through_even_when_it_is_also_a_name() {
         let devices = [device("d-1", "laptop"), device("d-2", "d-1")];
-        assert_eq!(resolve_host(&devices, "d-1").unwrap(), "d-1");
+        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+        assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
+    }
+
+    #[test]
+    fn a_device_answers_before_a_session_handle_that_reads_the_same() {
+        let devices = [device("d-1", "laptop"), device("d-2", "laptop-c4e2")];
+        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+        assert_eq!(resolve_target(&devices, refuse, "laptop-c4e2").unwrap(), host("d-2"));
+    }
+
+    #[test]
+    fn two_sessions_that_answer_to_one_handle_are_refused() {
+        let devices = [device("d-1", "laptop")];
+        let sessions = || {
+            Ok(vec![
+                session("c4e21a99", "laptop-c4e2", "d-1"),
+                session("c4e2ff00", "laptop-c4e2", "d-1"),
+            ])
+        };
+
+        let error = resolve_target(&devices, sessions, "laptop-c4e2")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous target laptop-c4e2"), "{error}");
+        assert!(error.contains("c4e21a99, c4e2ff00"), "{error}");
     }
 }
