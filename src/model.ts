@@ -46,20 +46,17 @@ export interface MemoryHit {
   score: number;
 }
 
-export interface TypeCount {
-  type: MemoryType;
-  count: number;
-}
-
 export interface MemoryCounts {
   total: number;
   recalled: number;
   fresh: number;
-  byType: TypeCount[];
+  byType: Array<{ type: MemoryType; count: number }>;
 }
 
-export const FRESH_WINDOW_MS = 2_592_000_000;
-export const MAX_QUERY_CHARS = 2_000;
+export const FRESH_WINDOW_DAYS = 30;
+export const FRESH_WINDOW_MS = FRESH_WINDOW_DAYS * 86_400_000;
+export const DEFAULT_MIN_SCORE = 0.55;
+const MAX_QUERY_CHARS = 2_000;
 
 export interface Embedder {
   embed(text: string): Promise<Float32Array>;
@@ -190,9 +187,10 @@ export const parseTypes = (values: string[]): Parsed<MemoryType[]> => {
 };
 
 export const parseList = (params: URLSearchParams): Parsed<ListInput> => {
-  const tags = parseTags(params.getAll("tag"));
+  const given = (name: string): string[] => params.getAll(name).filter((value) => value !== "");
+  const tags = parseTags(given("tag"));
   if (!tags.ok) return tags;
-  const types = parseTypes(params.getAll("type"));
+  const types = parseTypes(given("type"));
   if (!types.ok) return types;
   const since = Number(params.get("since") ?? 0);
   const limit = Number(params.get("limit") ?? 20);

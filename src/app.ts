@@ -2,7 +2,6 @@ import {
   dashboardNotice,
   dashboardPage,
   MEMORY_TAB,
-  type MemoryFilters,
   memoriesPage,
   memoryBodyPage,
   memorySearchPage,
@@ -32,12 +31,11 @@ import {
 } from "./device";
 import { DEVICE_HEADER, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, NOW_HEADER, parseSend } from "./mailbox";
 import {
+  DEFAULT_MIN_SCORE,
   type Embedder,
   FRESH_WINDOW_MS,
-  type ListInput,
-  MAX_QUERY_CHARS,
-  type Memory,
   type MemoryHit,
+  type MemoryType,
   parseList,
   parseName,
   parseSave,
@@ -102,10 +100,6 @@ const GRANT_ERRORS = {
 } as const;
 
 const ELSEWHERE_LIMIT = 3;
-
-// The --min-score default of recall search, so the dashboard keeps or drops a vector match the way
-// the CLI does.
-const BROWSE_MIN_SCORE = 0.55;
 
 type Ranking = Array<[string, number]>;
 
@@ -302,8 +296,6 @@ export const createApp = (deps: Deps): App => {
     return memoryBodyPage(email, memory, deps.now());
   };
 
-  // The tab reads with getMemory and describeMemories, never recall, so browsing never counts as a
-  // recall: the distinction the CLI and the tools draw holds in the browser too.
   const memoryTab = async (
     url: URL,
     db: D1Database,
@@ -311,57 +303,30 @@ export const createApp = (deps: Deps): App => {
     email: string,
     lost: Refusal,
   ): Promise<Response> => {
-    const params = new URLSearchParams();
-    for (const [key, value] of url.searchParams) if (value !== "") params.append(key, value);
-    const filters: MemoryFilters = {
-      query: params.get("q") ?? "",
-      tag: params.get("tag") ?? "",
-      type: params.get("type") ?? "",
-    };
-    if (filters.query.length > MAX_QUERY_CHARS) {
-      return lost(400, "Search too long", `A search holds at most ${MAX_QUERY_CHARS} characters.`);
-    }
-    const input = parseList(params);
+    const input = parseList(url.searchParams);
     if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
+    const filter = input.value;
     const now = deps.now();
     const counts = await memoryCounts(db, userId, now - FRESH_WINDOW_MS);
-    if (filters.query === "") {
-      const cursor = decodeCursor(input.value.cursor);
+    const query = url.searchParams.get("q") ?? "";
+    if (query === "") {
+      const cursor = decodeCursor(filter.cursor);
       if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the Memory tab.");
-      const page = await listMemories(db, userId, input.value, cursor);
-      return memoriesPage(email, filters, counts, page.memories, page.nextCursor, now);
+      const page = await listMemories(db, userId, filter, cursor);
+      return memoriesPage(email, url, filter, counts, page.memories, page.nextCursor, now);
     }
-    const hits = await searchMemories(db, userId, filters.query, input.value);
-    return memorySearchPage(email, filters, counts, hits, now);
-  };
-
-  const searchMemories = async (
-    db: D1Database,
-    userId: string,
-    query: string,
-    filter: ListInput,
-  ): Promise<MemoryHit[]> => {
-    const rankings = await rank(db, userId, {
+    const searched = parseSearch({
       query,
       tags: filter.tags,
+      any: filter.tags.length === 0,
       limit: filter.limit,
-      minScore: BROWSE_MIN_SCORE,
+      minScore: DEFAULT_MIN_SCORE,
       mode: "hybrid",
     });
-    const top = rankings.inScope.slice(0, filter.limit);
-    if (top.length === 0) return [];
-    const described = await describeMemories(
-      db,
-      userId,
-      top.map(([id]) => id),
-    );
-    const byId = new Map(described.map((memory) => [memory.memoryId, memory]));
-    return top.flatMap(([id, score]) => {
-      const memory = byId.get(id);
-      if (!memory) return [];
-      if (filter.types.length > 0 && !filter.types.includes(memory.type)) return [];
-      return [{ memory, score }];
-    });
+    if (!searched.ok) return lost(400, "Search refused", `${searched.error}.`);
+    const rankings = await rank(db, userId, searched.value, filter.types);
+    const found = await hits(db, userId, rankings.inScope, searched.value.limit);
+    return memorySearchPage(email, url, filter, counts, found, now);
   };
 
   const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
@@ -418,11 +383,16 @@ export const createApp = (deps: Deps): App => {
     return json(await listMemories(db, userId, input.value, cursor));
   };
 
-  const vectorRankings = async (db: D1Database, userId: string, input: SearchInput): Promise<Rankings> => {
+  const vectorRankings = async (
+    db: D1Database,
+    userId: string,
+    input: SearchInput,
+    types: MemoryType[],
+  ): Promise<Rankings> => {
     const vector = await deps.embedder.embed(input.query);
     const inScope: Ranking = [];
     const elsewhere: Ranking = [];
-    for (const candidate of await vectorCandidates(db, userId, input.tags)) {
+    for (const candidate of await vectorCandidates(db, userId, input.tags, types)) {
       const score = dot(vector, candidate.embedding);
       if (score >= input.minScore) (candidate.inScope ? inScope : elsewhere).push([candidate.memoryId, score]);
     }
@@ -434,22 +404,26 @@ export const createApp = (deps: Deps): App => {
     db: D1Database,
     userId: string,
     input: SearchInput,
+    types: MemoryType[],
   ): Promise<{ inScope: string[]; elsewhere: string[] }> => {
     const match = ftsQuery(input.query);
-    const candidates = match ? await textCandidates(db, userId, input.tags, match) : [];
+    const candidates = match ? await textCandidates(db, userId, input.tags, types, match) : [];
     return {
       inScope: candidates.filter((candidate) => candidate.inScope).map((candidate) => candidate.memoryId),
       elsewhere: candidates.filter((candidate) => !candidate.inScope).map((candidate) => candidate.memoryId),
     };
   };
 
-  const rank = async (db: D1Database, userId: string, input: SearchInput): Promise<Rankings> => {
-    if (input.mode === "vector") return vectorRankings(db, userId, input);
+  const rank = async (db: D1Database, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
+    if (input.mode === "vector") return vectorRankings(db, userId, input, types);
     if (input.mode === "text") {
-      const text = await textRankings(db, userId, input);
+      const text = await textRankings(db, userId, input, types);
       return { inScope: reciprocalRankFusion([text.inScope]), elsewhere: reciprocalRankFusion([text.elsewhere]) };
     }
-    const [vector, text] = await Promise.all([vectorRankings(db, userId, input), textRankings(db, userId, input)]);
+    const [vector, text] = await Promise.all([
+      vectorRankings(db, userId, input, types),
+      textRankings(db, userId, input, types),
+    ]);
     const ids = (ranking: Ranking): string[] => ranking.map(([id]) => id);
     return {
       inScope: reciprocalRankFusion([ids(vector.inScope), text.inScope]),
@@ -457,44 +431,38 @@ export const createApp = (deps: Deps): App => {
     };
   };
 
+  const hits = async (db: D1Database, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
+    const top = ranking.slice(0, limit);
+    if (top.length === 0) return [];
+    const described = await describeMemories(
+      db,
+      userId,
+      top.map(([id]) => id),
+    );
+    const byId = new Map(described.map((memory) => [memory.memoryId, memory]));
+    return top.flatMap(([id, score]) => {
+      const memory = byId.get(id);
+      return memory ? [{ memory, score }] : [];
+    });
+  };
+
   const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
     const parsed = parseSearch(await readJson(request));
     if (!parsed.ok) return error(400, parsed.error);
     const input = parsed.value;
-    const rankings = await rank(db, userId, input);
-    const top = rankings.inScope.slice(0, input.limit);
-    const nearby = rankings.elsewhere.slice(0, ELSEWHERE_LIMIT);
-    const [shown, described] = await Promise.all([
-      top.length > 0
-        ? describeMemories(
-            db,
-            userId,
-            top.map(([id]) => id),
-          )
-        : [],
-      nearby.length > 0
-        ? describeMemories(
-            db,
-            userId,
-            nearby.map(([id]) => id),
-          )
-        : [],
+    const rankings = await rank(db, userId, input, []);
+    const [shown, nearby] = await Promise.all([
+      hits(db, userId, rankings.inScope, input.limit),
+      hits(db, userId, rankings.elsewhere, ELSEWHERE_LIMIT),
     ]);
-    const byId = (memories: Memory[]): Map<string, Memory> =>
-      new Map(memories.map((memory) => [memory.memoryId, memory]));
-    const shownById = byId(shown);
-    const describedById = byId(described);
-    const hits = top.flatMap(([id, score]) => {
-      const memory = shownById.get(id);
-      return memory ? [{ score, memory }] : [];
-    });
-    const elsewhere = nearby.flatMap(([id, score]) => {
-      const memory = describedById.get(id);
-      return memory
-        ? [{ score, name: memory.name, type: memory.type, tags: memory.tags, description: memory.description }]
-        : [];
-    });
-    return json({ hits, elsewhere });
+    const elsewhere = nearby.map(({ memory, score }) => ({
+      score,
+      name: memory.name,
+      type: memory.type,
+      tags: memory.tags,
+      description: memory.description,
+    }));
+    return json({ hits: shown, elsewhere });
   };
 
   const route = async (request: Request, env: AppEnv): Promise<Response> => {

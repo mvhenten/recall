@@ -194,8 +194,6 @@ const withMemories = async (h: Harness, label = "owner"): Promise<Owner> => {
   };
 };
 
-// The tab is read as a reader reads it: tags out, whitespace collapsed, so an assertion names the
-// sentence on the page instead of the markup that carries it.
 const plain = (html: string): string => html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
 
 const memoryTab = async (h: Harness, owner: Owner, search = ""): Promise<string> => {
@@ -265,27 +263,36 @@ describe("the memory tab", () => {
     expect(plain(await refused.text())).toContain("type must be one of user, feedback, project, reference");
   });
 
-  it("follows the cursor to the older page, keeping the filter", async () => {
+  it("takes the empty form as no filter at all", async () => {
     const h = await harness();
     const owner = await withMemories(h);
-    for (const name of ["first-note", "second-note", "third-note"]) {
+    await owner.client.save("kept-note", {});
+    expect(await memoryTab(h, owner, "?q=&tag=&type=")).toContain("kept-note");
+  });
+
+  it("follows the cursor to the older page, keeping the tag and the page size", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    for (const name of ["first-note", "second-note", "third-note", "fourth-note", "fifth-note"]) {
       await owner.client.save(name, { tags: ["global"] });
       h.tick(1_000);
     }
+    await owner.client.save("other-note", { tags: ["repo:github.com/acme/app"] });
 
     const response = await open(h, "/dashboard/memory?tag=global&limit=2", owner.assertion);
     const markup = await response.text();
     const first = plain(markup);
-    expect(first).toContain("third-note");
-    expect(first).toContain("second-note");
-    expect(first).not.toContain("first-note");
+    expect(first).toContain("fifth-note");
+    expect(first).toContain("fourth-note");
+    expect(first).not.toContain("third-note");
 
     const page = await open(h, older(markup), owner.assertion);
     expect(page.status).toBe(200);
     const second = plain(await page.text());
-    expect(second).toContain("first-note");
-    expect(second).not.toContain("third-note");
-    expect(second).not.toContain("Older memories");
+    expect(second).toContain("third-note");
+    expect(second).toContain("second-note");
+    expect(second).not.toContain("first-note");
+    expect(second).not.toContain("other-note");
   });
 
   it("narrows to the memories a search matches, with a score, and says so when none do", async () => {
@@ -302,6 +309,19 @@ describe("the memory tab", () => {
     const nothing = await memoryTab(h, owner, "?q=kombucha");
     expect(nothing).toContain("No memory matches this search.");
     expect(nothing).not.toContain("coffee-order");
+  });
+
+  it("narrows a search by type however deep the match ranks", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    for (let note = 0; note < 21; note++) {
+      await owner.client.save(`deploy-note-${note}`, { type: "project", body: "deploy the pipeline" });
+    }
+    await owner.client.save("deploy-archive", { type: "reference", body: "deploy the pipeline" });
+
+    const html = await memoryTab(h, owner, "?q=deploy&type=reference");
+    expect(html).toContain("deploy-archive");
+    expect(html).not.toContain("deploy-note-");
   });
 
   it("says so when nothing is saved yet", async () => {

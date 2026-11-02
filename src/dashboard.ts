@@ -1,7 +1,8 @@
 import {
   type Focus,
-  FRESH_WINDOW_MS,
+  FRESH_WINDOW_DAYS,
   IDLE_AFTER_MS,
+  type ListInput,
   type Memory,
   type MemoryCounts,
   type MemoryHit,
@@ -25,18 +26,11 @@ export const TABS: Tab[] = [
   { path: "/dashboard/insights", label: "Insights" },
 ];
 
-export interface MemoryFilters {
-  query: string;
-  tag: string;
-  type: string;
-}
-
 const PLACEHOLDER = "Nothing to show here yet.";
 const NO_SESSIONS = "No session is running on any of your hosts.";
 const NO_MEMORIES = "No memory is saved yet. Save one with recall save.";
 const NO_MATCHES = "No memory matches this search.";
 const FOCUS_FIRST_CHARS = 80;
-const FRESH_WINDOW_DAYS = FRESH_WINDOW_MS / 86_400_000;
 
 export const tabForPath = (pathname: string): Tab | null =>
   TABS.find((tab) => tab.path === pathname.replace(/\/$/, "")) ?? null;
@@ -162,17 +156,18 @@ export const dashboardPage = (email: string, tab: Tab): Response =>
 export const sessionsPage = (email: string, sessions: Session[], now: number): Response =>
   shell(email, SESSIONS_TAB, SESSIONS_TAB.label, feed(sessions, now));
 
-const link = (params: Array<[string, string]>): string => {
-  const search = new URLSearchParams(params.filter(([, value]) => value !== "")).toString();
-  return escapeHtml(search === "" ? MEMORY_TAB.path : `${MEMORY_TAB.path}?${search}`);
+const olderLink = (url: URL, cursor: string): string => {
+  const next = new URLSearchParams(url.searchParams);
+  next.set("cursor", cursor);
+  return escapeHtml(`${MEMORY_TAB.path}?${next}`);
 };
 
-const findForm = (filters: MemoryFilters): string =>
+const findForm = (url: URL, filter: ListInput): string =>
   `<form class="find" method="get" action="${MEMORY_TAB.path}">
-<input type="search" name="q" value="${escapeHtml(filters.query)}" placeholder="Search memories" aria-label="Search memories">
-<input name="tag" value="${escapeHtml(filters.tag)}" placeholder="tag" aria-label="Filter by tag">
+<input type="search" name="q" value="${escapeHtml(url.searchParams.get("q") ?? "")}" placeholder="Search memories" aria-label="Search memories">
+<input name="tag" value="${escapeHtml(filter.tags[0] ?? "")}" placeholder="tag" aria-label="Filter by tag">
 <select name="type" aria-label="Filter by type"><option value="">any type</option>${memoryTypes
-    .map((type) => `<option value="${type}"${type === filters.type ? " selected" : ""}>${type}</option>`)
+    .map((type) => `<option value="${type}"${type === filter.types[0] ? " selected" : ""}>${type}</option>`)
     .join("")}</select>
 <button type="submit">Find</button></form>`;
 
@@ -204,25 +199,20 @@ const memoryFeed = (cards: string[], empty: string): string =>
 
 export const memoriesPage = (
   email: string,
-  filters: MemoryFilters,
+  url: URL,
+  filter: ListInput,
   counts: MemoryCounts,
   memories: Memory[],
   nextCursor: string,
   now: number,
 ): Response => {
   const older =
-    nextCursor === ""
-      ? ""
-      : `<p class="more"><a href="${link([
-          ["tag", filters.tag],
-          ["type", filters.type],
-          ["cursor", nextCursor],
-        ])}">Older memories</a></p>`;
+    nextCursor === "" ? "" : `<p class="more"><a href="${olderLink(url, nextCursor)}">Older memories</a></p>`;
   return shell(
     email,
     MEMORY_TAB,
     MEMORY_TAB.label,
-    `${findForm(filters)}${countsStrip(counts)}${memoryFeed(
+    `${findForm(url, filter)}${countsStrip(counts)}${memoryFeed(
       memories.map((memory) => memoryCard(memory, now, "")),
       NO_MEMORIES,
     )}${older}`,
@@ -231,7 +221,8 @@ export const memoriesPage = (
 
 export const memorySearchPage = (
   email: string,
-  filters: MemoryFilters,
+  url: URL,
+  filter: ListInput,
   counts: MemoryCounts,
   hits: MemoryHit[],
   now: number,
@@ -240,7 +231,7 @@ export const memorySearchPage = (
     email,
     MEMORY_TAB,
     MEMORY_TAB.label,
-    `${findForm(filters)}${countsStrip(counts)}${memoryFeed(
+    `${findForm(url, filter)}${countsStrip(counts)}${memoryFeed(
       hits.map((hit) => memoryCard(hit.memory, now, hit.score.toFixed(3))),
       NO_MATCHES,
     )}`,
