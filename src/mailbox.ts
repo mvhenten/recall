@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { type Caller, listDevices } from "./device";
-import type { Parsed } from "./model";
+import { type Parsed, parseSessionId } from "./model";
 
 export const MESSAGE_TTL_MS = 259_200_000;
 export const MAX_QUEUED_MESSAGES = 1_000;
@@ -13,9 +13,12 @@ export const NOW_HEADER = "x-recall-now";
 export const CLOSE_BAD_FRAME = 4000;
 export const CLOSE_REVOKED = 4001;
 
+export type Delivery = { to: "host" } | { to: "session"; sessionId: string };
+
 export interface Message {
   messageId: string;
   toDeviceId: string;
+  delivery: Delivery;
   fromDeviceId: string;
   body: string;
   createdAt: number;
@@ -24,6 +27,7 @@ export interface Message {
 
 export interface SendInput {
   toDeviceId: string;
+  delivery: Delivery;
   body: string;
 }
 
@@ -44,6 +48,7 @@ export interface MailboxEnv {
 interface MessageRow extends Record<string, string | number> {
   message_id: string;
   to_device_id: string;
+  to_session_id: string;
   from_device_id: string;
   body: string;
   created_at: number;
@@ -54,14 +59,34 @@ interface Attachment {
   deviceId: string;
 }
 
+// A row names the one session the message is addressed to, and holds no session id when it is
+// addressed to the host, which the daemon there fans out to every session it has registered.
+const toDelivery = (sessionId: string): Delivery => (sessionId === "" ? { to: "host" } : { to: "session", sessionId });
+
+const sessionColumn = (delivery: Delivery): string => (delivery.to === "session" ? delivery.sessionId : "");
+
 const toMessage = (row: MessageRow): Message => ({
   messageId: row.message_id,
   toDeviceId: row.to_device_id,
+  delivery: toDelivery(row.to_session_id),
   fromDeviceId: row.from_device_id,
   body: row.body,
   createdAt: row.created_at,
   expiresAt: row.expires_at,
 });
+
+const DELIVERY_SHAPE = 'delivery must be {"to":"host"} or {"to":"session","sessionId":"<session id>"}';
+
+const parseDelivery = (value: unknown): Parsed<Delivery> => {
+  if (value === undefined) return { ok: true, value: { to: "host" } };
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return { ok: false, error: DELIVERY_SHAPE };
+  const { to, sessionId } = value as Record<string, unknown>;
+  if (to === "host") return { ok: true, value: { to: "host" } };
+  if (to !== "session" || typeof sessionId !== "string") return { ok: false, error: DELIVERY_SHAPE };
+  const parsed = parseSessionId(sessionId);
+  if (!parsed.ok) return parsed;
+  return { ok: true, value: { to: "session", sessionId: parsed.value } };
+};
 
 export const parseSend = (input: unknown): Parsed<SendInput> => {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
@@ -72,7 +97,9 @@ export const parseSend = (input: unknown): Parsed<SendInput> => {
     return { ok: false, error: "toDeviceId must be the id of a device on this account; see GET /v1/devices" };
   }
   if (typeof body !== "string" || body.length < 1) return { ok: false, error: "body must hold at least one character" };
-  return { ok: true, value: { toDeviceId, body } };
+  const delivery = parseDelivery((input as Record<string, unknown>).delivery);
+  if (!delivery.ok) return delivery;
+  return { ok: true, value: { toDeviceId, delivery: delivery.value, body } };
 };
 
 const readJson = (raw: string): unknown => {
@@ -110,12 +137,17 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       `CREATE TABLE IF NOT EXISTS messages (
          message_id TEXT PRIMARY KEY,
          to_device_id TEXT NOT NULL,
+         to_session_id TEXT NOT NULL DEFAULT '',
          from_device_id TEXT NOT NULL,
          body TEXT NOT NULL,
          created_at INTEGER NOT NULL,
          expires_at INTEGER NOT NULL
        )`,
     );
+    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(messages)").toArray();
+    if (!columns.some((column) => column.name === "to_session_id")) {
+      this.sql.exec("ALTER TABLE messages ADD COLUMN to_session_id TEXT NOT NULL DEFAULT ''");
+    }
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
   }
 
@@ -163,16 +195,18 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     const message: Message = {
       messageId: crypto.randomUUID(),
       toDeviceId: input.toDeviceId,
+      delivery: input.delivery,
       fromDeviceId: from.deviceId,
       body: input.body,
       createdAt: now,
       expiresAt: now + MESSAGE_TTL_MS,
     };
     this.sql.exec(
-      `INSERT INTO messages (message_id, to_device_id, from_device_id, body, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (message_id, to_device_id, to_session_id, from_device_id, body, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       message.messageId,
       message.toDeviceId,
+      sessionColumn(message.delivery),
       message.fromDeviceId,
       message.body,
       message.createdAt,
@@ -187,7 +221,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     this.expire(now);
     return this.sql
       .exec<MessageRow>(
-        `SELECT message_id, to_device_id, from_device_id, body, created_at, expires_at FROM messages
+        `SELECT message_id, to_device_id, to_session_id, from_device_id, body, created_at, expires_at FROM messages
          WHERE to_device_id = ? ORDER BY created_at, rowid`,
         toDeviceId,
       )

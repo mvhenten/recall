@@ -1,4 +1,4 @@
-use crate::api::{Client, Message};
+use crate::api::{Client, Delivery, Message};
 use crate::config;
 use crate::seen::Seen;
 use crate::sessions;
@@ -165,11 +165,17 @@ async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
         log(&format!("message:replayed:{}", message.message_id), started.elapsed());
         return;
     }
-    let fanout = sessions::fanout(sessions_dir, &message.body).await;
+    let (target, fanout) = match &message.delivery {
+        Delivery::Host => ("host".to_string(), sessions::fanout(sessions_dir, &message.body).await),
+        Delivery::Session { session_id } => (
+            format!("session:{session_id}"),
+            sessions::to_session(sessions_dir, session_id, &message.body).await,
+        ),
+    };
     seen.record(&message.message_id);
     log(
         &format!(
-            "message:{}:{}:{}/{}",
+            "message:{}:{}:{target}:{}/{}",
             message.from_device_id, message.message_id, fanout.delivered, fanout.pruned
         ),
         started.elapsed(),

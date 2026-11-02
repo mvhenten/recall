@@ -34,6 +34,22 @@ const wordEmbedder: Embedder = {
   },
 };
 
+export const sessionDocument = (fields: Record<string, unknown> = {}): Record<string, unknown> => ({
+  host: "laptop",
+  cwd: "/home/you/src/recall",
+  repo: "repo:github.com/mvhenten/recall",
+  branch: "feat/sessions-list",
+  commit: "feat(sessions): list every host's sessions",
+  startedAt: 1_700_000_000_000,
+  lastActivityAt: 1_700_000_060_000,
+  prompts: 3,
+  focus: { first: "list every host's sessions", latest: "why is the worker test red" },
+  mode: "interactive",
+  permissionMode: "default",
+  pid: 4242,
+  ...fields,
+});
+
 export type Mode = "hybrid" | "vector" | "text";
 
 export interface Hit {

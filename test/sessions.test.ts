@@ -1,27 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session } from "../src/model";
-import { type Client, harness } from "./harness";
+import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session, sessionHandles } from "../src/model";
+import { type Client, harness, sessionDocument } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
-const document = (fields: Record<string, unknown> = {}): Record<string, unknown> => ({
-  host: "laptop",
-  cwd: "/home/you/src/recall",
-  repo: "repo:github.com/mvhenten/recall",
-  branch: "feat/sessions-list",
-  commit: "feat(sessions): list every host's sessions",
-  startedAt: 1_700_000_000_000,
-  lastActivityAt: 1_700_000_060_000,
-  prompts: 3,
-  focus: { first: "list every host's sessions", latest: "why is the worker test red" },
-  mode: "interactive",
-  permissionMode: "default",
-  pid: 4242,
-  ...fields,
-});
-
 const sync = (client: Client, sessionId: string, fields: Record<string, unknown> = {}): Promise<Response> =>
-  client.request("PUT", `/v1/sessions/${sessionId}`, document(fields));
+  client.request("PUT", `/v1/sessions/${sessionId}`, sessionDocument(fields));
 
 const listed = async (client: Client): Promise<Session[]> => {
   const response = await client.request("GET", "/v1/sessions");
@@ -39,7 +23,7 @@ const account = async (h: Harness): Promise<{ laptop: Client; tower: Client }> =
 };
 
 describe("sessions", () => {
-  it("lists every host's sessions, newest activity first, each addressable by its device name", async () => {
+  it("lists every host's sessions, newest activity first, each addressable by its handle", async () => {
     const h = await harness();
     const { laptop, tower } = await account(h);
     const stranger = await h.user("stranger");
@@ -52,8 +36,8 @@ describe("sessions", () => {
 
     const sessions = await listed(laptop);
     expect(sessions.map((session) => [session.host, session.name, session.repo, session.current])).toEqual([
-      ["tower", "tower", "", false],
-      ["laptop", "laptop", "repo:github.com/mvhenten/recall", true],
+      ["tower", "tower-st", "", false],
+      ["laptop", "laptop-sl", "repo:github.com/mvhenten/recall", true],
     ]);
     expect(sessions[1]).toMatchObject({
       sessionId: "s-laptop",
@@ -68,6 +52,20 @@ describe("sessions", () => {
       pid: 4242,
     });
     expect(await listed(stranger)).toHaveLength(1);
+  });
+
+  it("tells two sessions on one host apart by growing the handle suffix", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+
+    await sync(laptop, "9f8a1b", { lastActivityAt: h.now() });
+    await sync(laptop, "9f8c2d", { lastActivityAt: h.now() - 1000 });
+
+    const sessions = await listed(laptop);
+    expect(sessions.map((session) => [session.sessionId, session.name])).toEqual([
+      ["9f8a1b", "laptop-9f"],
+      ["9f8c2d", "laptop-9f8"],
+    ]);
   });
 
   it("keeps one document per session, so a refreshed focus replaces the last one", async () => {
@@ -126,5 +124,30 @@ describe("sessions", () => {
     expect((await sync(laptop, "s-1", { prompts: -1 })).status).toBe(400);
     expect((await sync(laptop, "s 1")).status).toBe(400);
     expect((await laptop.request("POST", "/v1/sessions")).status).toBe(405);
+  });
+});
+
+describe("session handles", () => {
+  const live = [
+    { sessionId: "9f8c2d", deviceName: "laptop" },
+    { sessionId: "9f8a1b", deviceName: "laptop" },
+    { sessionId: "c4e2", deviceName: "tower" },
+    { sessionId: "9f8a1b-child", deviceName: "tower" },
+    { sessionId: "__", deviceName: "tower" },
+  ];
+
+  it("takes the device name and as much of the session id as it takes to stand alone", () => {
+    expect([...sessionHandles(live)]).toEqual([
+      ["9f8a1b", "laptop-9f"],
+      ["9f8a1b-child", "tower-9f"],
+      ["9f8c2d", "laptop-9f8"],
+      ["__", "tower-se"],
+      ["c4e2", "tower-c4"],
+    ]);
+  });
+
+  it("derives the same handles however the live sessions are ordered", () => {
+    const reversed = sessionHandles([...live].reverse());
+    expect([...reversed].sort()).toEqual([...sessionHandles(live)].sort());
   });
 });

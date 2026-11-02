@@ -134,9 +134,21 @@ describe("messages listen", () => {
     const orphanId = crypto.randomUUID();
 
     const live = await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
-      await mailbox.enqueue({ toDeviceId: laptopId, body: "past the TTL" }, from, now - MESSAGE_TTL_MS - 1);
-      await mailbox.enqueue({ toDeviceId: orphanId, body: "nobody holds this device" }, from, now);
-      return mailbox.enqueue({ toDeviceId: laptopId, body: "still within the TTL" }, from, now);
+      await mailbox.enqueue(
+        { toDeviceId: laptopId, delivery: { to: "host" }, body: "past the TTL" },
+        from,
+        now - MESSAGE_TTL_MS - 1,
+      );
+      await mailbox.enqueue(
+        { toDeviceId: orphanId, delivery: { to: "host" }, body: "nobody holds this device" },
+        from,
+        now,
+      );
+      return mailbox.enqueue(
+        { toDeviceId: laptopId, delivery: { to: "host" }, body: "still within the TTL" },
+        from,
+        now,
+      );
     });
     if (!live) throw new Error("the mailbox refused the message it had room for");
 

@@ -142,10 +142,13 @@ enum Command {
         )]
         end: Option<String>,
     },
-    #[command(about = "Send a message to the Claude Code sessions on another host signed in as you")]
+    #[command(about = "Send a message to another host signed in as you, or to one session on it")]
     Send {
-        #[arg(value_name = "HOST", help = "Device name from recall devices, or a device id")]
-        host: String,
+        #[arg(
+            value_name = "TO",
+            help = "Session handle from recall sessions for one session, or a device name or id from recall devices for every session on that host"
+        )]
+        to: String,
         #[arg(
             value_name = "MESSAGE",
             num_args = 1..,
@@ -537,16 +540,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 );
             }
         }
-        Command::Send { host, message } => {
+        Command::Send { to, message } => {
             require_messaging(&settings::load(&cli.settings)?)?;
             let body = message_body(&message)?;
             let client = client()?;
-            let to_device_id = api::resolve_host(&client.devices()?, &host)?;
-            let sent = client.send(&to_device_id, &body)?;
+            let target = api::resolve_target(&client.devices()?, &client.sessions()?, &to)?;
+            let sent = client.send(&target, &body)?;
             if cli.json {
                 print_json(&sent)?;
             } else {
-                println!("sent {} to {host}", sent.message_id);
+                println!("sent {} to {to}", sent.message_id);
             }
         }
         Command::Logout => {

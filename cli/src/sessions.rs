@@ -277,10 +277,20 @@ async fn write_frames(registered: &Registered, body: &str) -> Result<()> {
         })?
 }
 
-/// Delivers a message body to every live session, once per inbox socket: a child session shares
-/// its parent's socket, and the newest registration on a socket names the session Claude accepts.
 /// A socket that refuses the write loses its registration; the message is acked either way,
 /// because the mailbox has no better host to hand it to.
+async fn write_or_prune(registered: &Registered, body: &str, fanout: &mut Fanout) {
+    match write_frames(registered, body).await {
+        Ok(()) => fanout.delivered += 1,
+        Err(_) => {
+            let _ = std::fs::remove_file(&registered.path);
+            fanout.pruned += 1;
+        }
+    }
+}
+
+/// Delivers a message body to every live session, once per inbox socket: a child session shares
+/// its parent's socket, and the newest registration on a socket names the session Claude accepts.
 pub async fn fanout(dir: &Path, body: &str) -> Fanout {
     let mut sockets = HashSet::new();
     let mut fanout = Fanout::default();
@@ -288,14 +298,23 @@ pub async fn fanout(dir: &Path, body: &str) -> Fanout {
         if !sockets.insert(registered.inbox.socket.clone()) {
             continue;
         }
-        match write_frames(&registered, body).await {
-            Ok(()) => fanout.delivered += 1,
-            Err(_) => {
-                let _ = std::fs::remove_file(&registered.path);
-                fanout.pruned += 1;
-            }
-        }
+        write_or_prune(&registered, body, &mut fanout).await;
     }
+    fanout
+}
+
+/// Delivers a message body to the one session named, so a handle reaches that session and nothing
+/// else sharing its socket. A session this host no longer has registered takes nothing: the send
+/// resolved against a listing the service held, and the session has since ended or lost its inbox.
+pub async fn to_session(dir: &Path, session_id: &str, body: &str) -> Fanout {
+    let mut fanout = Fanout::default();
+    let Some(registered) = registered(dir)
+        .into_iter()
+        .find(|registered| registered.session_id == session_id)
+    else {
+        return fanout;
+    };
+    write_or_prune(&registered, body, &mut fanout).await;
     fanout
 }
 
@@ -433,6 +452,78 @@ mod tests {
             frames[1]
         );
         assert_eq!(frames.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_handle_reaches_one_session_where_a_host_send_reaches_them_all() {
+        let sandbox = Sandbox::new("to-session");
+        let dir = sandbox.sessions();
+        let mine = std::process::id() as i32;
+        let here = sandbox.dir.join("here.sock");
+        let there = sandbox.dir.join("there.sock");
+        let addressed = UnixListener::bind(&here).unwrap();
+        let passed_over = UnixListener::bind(&there).unwrap();
+        sandbox.register("s-here", &here, mine);
+        sandbox.register("s-there", &there, mine);
+
+        let delivery = tokio::spawn(async move { read_frames(&addressed).await });
+        let one = to_session(&dir, "s-here", "only you").await;
+
+        assert_eq!(
+            one,
+            Fanout {
+                delivered: 1,
+                pruned: 0
+            }
+        );
+        let frames = delivery.await.unwrap();
+        assert_eq!(frames[1]["session_id"], "s-here");
+        assert_eq!(
+            frames[1]["message"],
+            serde_json::json!({ "role": "user", "content": "only you" })
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), passed_over.accept())
+                .await
+                .is_err(),
+            "the other session on this host must hear nothing of a message addressed to one handle"
+        );
+
+        assert_eq!(
+            to_session(&dir, "s-gone", "nobody").await,
+            Fanout::default(),
+            "a handle this host no longer has registered takes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_send_reaches_every_socket_on_this_host() {
+        let sandbox = Sandbox::new("fanout-sockets");
+        let mine = std::process::id() as i32;
+        let here = sandbox.dir.join("here.sock");
+        let there = sandbox.dir.join("there.sock");
+        let left = UnixListener::bind(&here).unwrap();
+        let right = UnixListener::bind(&there).unwrap();
+        sandbox.register("s-here", &here, mine);
+        sandbox.register("s-there", &there, mine);
+
+        let delivery = tokio::spawn(async move { (read_frames(&left).await, read_frames(&right).await) });
+        let fanout = fanout(&sandbox.sessions(), "all of you").await;
+
+        assert_eq!(
+            fanout,
+            Fanout {
+                delivered: 2,
+                pruned: 0
+            }
+        );
+        let (first, second) = delivery.await.unwrap();
+        for frames in [first, second] {
+            assert_eq!(
+                frames[1]["message"],
+                serde_json::json!({ "role": "user", "content": "all of you" })
+            );
+        }
     }
 
     #[test]
