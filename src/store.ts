@@ -799,6 +799,21 @@ export const sessionOnDevice = async (
   return row !== null;
 };
 
+// Whether this account has the session at all, running or long over. A transcript outlives the
+// device that wrote it — a host signs in again and carries a new device id — so what a stretch is
+// checked against is the account, and the object key it lands under is the caller's own.
+export const sessionOnRecord = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+  const row = await db
+    .prepare(
+      `SELECT session_id FROM sessions WHERE user_id = ?1 AND session_id = ?2
+       UNION ALL
+       SELECT session_id FROM session_history WHERE user_id = ?1 AND session_id = ?2`,
+    )
+    .bind(userId, sessionId)
+    .first<{ session_id: string }>();
+  return row !== null;
+};
+
 const USAGE_SUMS =
   "prompts = usage_daily.prompts + excluded.prompts, " +
   "input_tokens = usage_daily.input_tokens + excluded.input_tokens, " +

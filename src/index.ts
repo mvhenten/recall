@@ -12,6 +12,7 @@ export interface Env {
   DB: D1Database;
   AI: Ai;
   MAILBOX: DurableObjectNamespace<Mailbox>;
+  TRANSCRIPTS: R2Bucket;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
   // The three arrive together, or not at all: a deployment that publishes no pages binds none.

@@ -9,6 +9,7 @@ mod repo;
 mod seen;
 mod sessions;
 mod settings;
+mod transcripts;
 mod ws;
 
 use anyhow::{Context, Result, bail};
@@ -436,6 +437,9 @@ fn message_body(words: &[String]) -> Result<String> {
 
 /// One sync carries both halves of what a host knows about a session: the document, and the usage
 /// delta the hooks fixed since the last one. Nothing here reads the transcript.
+/// The record, then the delta it carries, then the transcript itself. The archive goes last so
+/// that a file the service holds bytes of is a file whose tokens were counted: the backfill reads
+/// it that way, and sending the bytes first would have it count a stretch twice.
 fn sync_session(session_id: &str) -> Result<()> {
     let dir = listen::sessions_dir();
     let Some(record) = sessions::record(&dir, session_id) else {
@@ -444,12 +448,15 @@ fn sync_session(session_id: &str) -> Result<()> {
     let client = Client::new(config::load()?);
     client.sync_record(session_id, &record)?;
     println!("synced {session_id}");
-    let Some(pending) = record.usage_pending.as_ref() else {
-        return Ok(());
-    };
-    let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
-    sessions::commit_usage(&dir, session_id, pending)?;
-    println!("sent {sent} usage deltas for {session_id}");
+    if let Some(pending) = record.usage_pending.as_ref() {
+        let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
+        sessions::commit_usage(&dir, session_id, pending)?;
+        println!("sent {sent} usage deltas for {session_id}");
+    }
+    let archived = transcripts::send_session(&client, session_id, &record.transcript_path)?;
+    if archived > 0 {
+        println!("archived {archived} transcript bytes for {session_id}");
+    }
     Ok(())
 }
 
@@ -460,11 +467,15 @@ fn end_session(session_id: &str) -> Result<()> {
     let dir = listen::sessions_dir();
     let record = sessions::record(&dir, session_id);
     let client = Client::new(config::load()?);
-    if let Some(record) = record.as_ref()
-        && let Some(pending) = record.usage_pending.as_ref()
-    {
-        let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
-        println!("sent {sent} usage deltas for {session_id}");
+    if let Some(record) = record.as_ref() {
+        if let Some(pending) = record.usage_pending.as_ref() {
+            let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
+            println!("sent {sent} usage deltas for {session_id}");
+        }
+        let archived = transcripts::send_session(&client, session_id, &record.transcript_path)?;
+        if archived > 0 {
+            println!("archived {archived} transcript bytes for {session_id}");
+        }
     }
     let ended = client.end_session(session_id)?;
     sessions::forget(&dir, session_id);
@@ -517,6 +528,16 @@ fn adopt_sessions() -> Result<ExitCode> {
     Ok(ExitCode::from(2))
 }
 
+impl transcripts::Store for Client {
+    fn held(&self, session_id: &str) -> Result<std::collections::HashMap<String, i64>> {
+        self.transcript_held(session_id)
+    }
+
+    fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<transcripts::Appended> {
+        self.append_transcript(session_id, file, offset, bytes)
+    }
+}
+
 impl backfill::Service for Client {
     fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[serde_json::Value]) -> Result<usize> {
         Client::post_usage(self, session_id, host, repo, events)
@@ -531,23 +552,33 @@ impl backfill::Service for Client {
     }
 }
 
-/// Every past session this host holds a transcript for, sent as the session it was. The sessions
-/// the service already holds on record are read back first and passed over, so one session that
-/// cannot be sent fails the run and the next run picks the span up where this one stopped.
+/// Every past session this host holds a transcript for, sent as the session it was: its history,
+/// the tokens nothing has counted yet, and the transcript files themselves. The sessions the
+/// service already holds on record are read back first, so a session it has keeps its row and is
+/// visited only for what it still owes. One session that cannot be sent fails the run, and the
+/// next run picks the span up where this one stopped.
 fn backfill_sessions() -> Result<ExitCode> {
     let scope = adopt::Scope::here()?;
     let account = backfill::account_here()?;
     let client = Client::new(config::load()?);
     let on_record = client.session_history_ids()?;
-    let past = backfill::past(&scope, &account, &on_record)?;
+    let past = backfill::past(&scope, &on_record)?;
     if past.is_empty() {
         println!("no past session needs backfilling");
         return Ok(ExitCode::SUCCESS);
     }
-    backfill::send(&client, &past, |session_id, sent| {
-        println!("backfilled {session_id} with {sent} usage deltas");
+    let mut touched = 0;
+    backfill::send(&client, &past, &account, |session_id, sent| {
+        if sent.events == 0 && sent.bytes == 0 {
+            return;
+        }
+        touched += 1;
+        println!(
+            "backfilled {session_id} with {} usage deltas and {} transcript bytes",
+            sent.events, sent.bytes
+        );
     })?;
-    println!("backfilled {} past sessions", past.len());
+    println!("backfilled {touched} of {} past sessions", past.len());
     Ok(ExitCode::SUCCESS)
 }
 

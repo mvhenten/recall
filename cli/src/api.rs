@@ -1,7 +1,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 use ureq::http::Response;
@@ -314,6 +314,24 @@ struct HistoryIds {
     next_cursor: String,
 }
 
+/// How far into one of a session's transcript files the service has been written. It is the only
+/// mark an archive resumes from, so nothing a host keeps locally can put the two out of step.
+#[derive(Deserialize)]
+struct HeldFile {
+    file: String,
+    bytes: i64,
+}
+
+#[derive(Deserialize)]
+struct HeldFiles {
+    files: Vec<HeldFile>,
+}
+
+#[derive(Deserialize)]
+struct Extent {
+    offset: i64,
+}
+
 /// The device a message is queued against, and the one session on it the message is for; an empty
 /// `session_id` reaches every session that host has registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -573,6 +591,50 @@ impl Client {
             check(response, &format!("sending usage for session {session_id}"))?;
         }
         Ok(events.len())
+    }
+
+    /// How far into each of a session's transcript files the service has been written. A file it
+    /// holds nothing of is simply absent.
+    pub fn transcript_held(&self, session_id: &str) -> Result<HashMap<String, i64>> {
+        let response = self
+            .authed(
+                self.agent
+                    .get(self.url(&format!("{}/transcript", Self::session_path(session_id)))),
+            )
+            .call()?;
+        let held: HeldFiles = check(response, &format!("reading the archive of session {session_id}"))?
+            .body_mut()
+            .read_json()?;
+        Ok(held.files.into_iter().map(|file| (file.file, file.bytes)).collect())
+    }
+
+    /// Appends one stretch to one of a session's transcript files. The store takes a stretch only
+    /// where the file already ends, so a stretch that landed already is refused rather than
+    /// written a second time, and the refusal carries the end to read on from.
+    pub fn append_transcript(
+        &self,
+        session_id: &str,
+        file: &str,
+        offset: i64,
+        bytes: &[u8],
+    ) -> Result<crate::transcripts::Appended> {
+        let path = format!(
+            "{}/transcript?file={}&offset={offset}",
+            Self::session_path(session_id),
+            encode(file)
+        );
+        let mut response = self
+            .authed(self.agent.put(self.url(&path)))
+            .header("content-type", "application/x-ndjson")
+            .send(bytes)?;
+        if response.status().as_u16() == 409 {
+            let extent: Extent = response.body_mut().read_json()?;
+            return Ok(crate::transcripts::Appended::Behind(extent.offset));
+        }
+        let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
+            .body_mut()
+            .read_json()?;
+        Ok(crate::transcripts::Appended::Wrote(extent.offset))
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {

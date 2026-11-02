@@ -55,6 +55,7 @@ import {
   type Live,
   type MemoryHit,
   type MemoryType,
+  parseChunkOffset,
   parseHistory,
   parseLabels,
   parseList,
@@ -64,6 +65,7 @@ import {
   parseSession,
   parseSessionId,
   parseSessionScope,
+  parseTranscriptFile,
   parseUsage,
   type SearchInput,
   type StatsWindows,
@@ -96,10 +98,12 @@ import {
   saveMemory,
   sessionHistoryFilters,
   sessionOnDevice,
+  sessionOnRecord,
   textCandidates,
   vectorCandidates,
   writeLabels,
 } from "./store";
+import { appendChunk, MAX_CHUNK_BYTES, transcriptFiles } from "./transcripts";
 
 export interface ArtifactHost {
   hostname: string;
@@ -118,6 +122,7 @@ export interface Deps {
 export interface AppEnv {
   DB: D1Database;
   MAILBOX: DurableObjectNamespace<Mailbox>;
+  TRANSCRIPTS: R2Bucket;
 }
 
 export interface App {
@@ -240,11 +245,12 @@ export const createApp = (deps: Deps): App => {
   const sessions = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    env: AppEnv,
     caller: Caller,
     rawSessionId: string | undefined,
     subresource: string | undefined,
   ): Promise<Response> => {
+    const db = env.DB;
     if (rawSessionId === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
       const scope = parseSessionScope(url.searchParams.get("scope"));
@@ -258,8 +264,9 @@ export const createApp = (deps: Deps): App => {
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);
     if (subresource !== undefined) {
-      if (subresource !== "usage") return error(404, "not found");
-      return usage(request, db, caller, sessionId.value);
+      if (subresource === "usage") return usage(request, db, caller, sessionId.value);
+      if (subresource !== "transcript") return error(404, "not found");
+      return transcript(request, url, env, caller, sessionId.value);
     }
     if (request.method === "PUT") {
       const input = parseSession(await readJson(request));
@@ -282,6 +289,42 @@ export const createApp = (deps: Deps): App => {
     if (!input.ok) return error(400, input.error);
     await recordUsage(db, caller.userId, sessionId, input.value, now);
     return new Response(null, { status: 204 });
+  };
+
+  // A session's transcript, read back as the stretches already written and appended to one stretch
+  // at a time. The host that holds the file asks where it left off and sends on from there; it is
+  // its own mark, so what the usage counter has read of the same file moves apart from it.
+  const transcript = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET" && request.method !== "PUT") return error(405, "method not allowed");
+    if (!(await sessionOnRecord(env.DB, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    if (request.method === "GET") {
+      return json({ files: await transcriptFiles(env.TRANSCRIPTS, caller.userId, sessionId) });
+    }
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    const offset = parseChunkOffset(url.searchParams.get("offset"));
+    if (!offset.ok) return error(400, offset.error);
+    const tooLarge = error(413, `a transcript stretch must hold at most ${MAX_CHUNK_BYTES} bytes`);
+    if (Number(request.headers.get("content-length") ?? 0) > MAX_CHUNK_BYTES) return tooLarge;
+    const body = await request.arrayBuffer();
+    if (body.byteLength > MAX_CHUNK_BYTES) return tooLarge;
+    const appended = await appendChunk(env.TRANSCRIPTS, caller.userId, sessionId, file.value, offset.value, body);
+    if (!appended.ok) {
+      return json(
+        {
+          error: `${file.value} holds ${appended.offset} bytes; send the stretch starting there`,
+          offset: appended.offset,
+        },
+        409,
+      );
+    }
+    return json({ file: file.value, offset: appended.offset });
   };
 
   const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
@@ -693,7 +736,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
-    if (collection === "sessions") return sessions(request, url, env.DB, caller, rawName, subresource);
+    if (collection === "sessions") return sessions(request, url, env, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {
         if (request.method !== "GET") return error(405, "method not allowed");

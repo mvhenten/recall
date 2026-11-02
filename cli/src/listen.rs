@@ -4,6 +4,7 @@ use crate::config;
 use crate::seen::Seen;
 use crate::sessions;
 use crate::settings::Settings;
+use crate::transcripts;
 use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
@@ -243,6 +244,7 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
                 };
                 log(&outcome, started.elapsed());
             }
+            archive(&client, id, &session.transcript_path);
             let started = Instant::now();
             let outcome = match client.end_session(id) {
                 Ok(true) => format!("sessions:ended:{id}"),
@@ -250,6 +252,44 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
                 Err(error) => format!("sessions:end-failed:{id}:{error:#}"),
             };
             log(&outcome, started.elapsed());
+        }
+    });
+}
+
+/// One session's transcript files, caught up with the service. A failure is reported and the pass
+/// carries on: what is not sent now is sent by the next tick, or by `recall backfill` long after.
+fn archive(client: &Client, session_id: &str, transcript: &Path) {
+    let started = Instant::now();
+    match transcripts::send_session(client, session_id, transcript) {
+        Ok(0) => {}
+        Ok(bytes) => log(&format!("sessions:archived:{session_id}:{bytes}"), started.elapsed()),
+        Err(error) => log(
+            &format!("sessions:archive-failed:{session_id}:{error:#}"),
+            started.elapsed(),
+        ),
+    }
+}
+
+/// The transcripts of the sessions still running, on the tick that already sweeps the registry. A
+/// session works for minutes between prompts and writes the whole time, while the hook that would
+/// carry its lines up only fires on a prompt, so without this a long turn reaches the archive only
+/// once it is over.
+fn archive_running(client: &Arc<Client>, scan: &sessions::Scan, running: &Arc<AtomicBool>) {
+    if running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let pass = Pass(Arc::clone(running));
+    let client = Arc::clone(client);
+    let live: Vec<(String, PathBuf)> = scan
+        .live
+        .iter()
+        .map(|(_, status)| (status.session_id.clone(), status.record.transcript_path.clone()))
+        .filter(|(_, path)| !path.as_os_str().is_empty())
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let _pass = pass;
+        for (session_id, path) in live {
+            archive(&client, &session_id, &path);
         }
     });
 }
@@ -309,6 +349,7 @@ async fn serve() -> Result<()> {
         log(&format!("sessions:adopt-failed:{error:#}"), Duration::ZERO);
     }
     let adopting = Arc::new(AtomicBool::new(false));
+    let archiving = Arc::new(AtomicBool::new(false));
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -317,8 +358,9 @@ async fn serve() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
-        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
-            report_ended(&client, ended);
+        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |scan| {
+            archive_running(&client, scan, &archiving);
+            report_ended(&client, scan.ended.clone());
             if let Ok(scope) = scope.as_ref() {
                 adopt_running(&client, scope, &adopting);
             }
@@ -568,6 +610,7 @@ mod tests {
                 focus: sessions::Focus::default(),
                 mode: "interactive".to_string(),
                 permission_mode: "default".to_string(),
+                transcript_path: PathBuf::new(),
                 usage_pending: None,
                 state,
             },

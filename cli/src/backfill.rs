@@ -8,11 +8,13 @@ use crate::adopt::{self, Reading};
 use crate::api::SessionBody;
 use crate::repo;
 use crate::sessions::Focus;
+use crate::transcripts::{self, MAIN, Source};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 /// Mirrors PROVIDER in hooks/usage.mjs.
@@ -20,10 +22,44 @@ const PROVIDER: &str = "claude";
 
 const DAY_MS: i64 = 86_400_000;
 
+/// How many chunk numbers one transcript file's reading may spend. Each file is read into a block
+/// of its own, so what one file's spans land on does not move when another file is read beside
+/// it. A file would need a million model-and-day pairs to reach past its block.
+const SPANS_PER_FILE: i64 = 1_000_000;
+
+/// How far into a transcript the first entry naming a directory may sit.
+const CWD_WITHIN_LINES: usize = 50;
+
+/// One transcript file of one past session, and the block of chunk numbers its reading spends.
+/// The session's own transcript is always block zero, so a reading sent before the delegated turns
+/// were ever read lands on exactly the numbers the service already holds and is ignored. The
+/// delegated turns take the blocks after it in name order, and a session that is over opens no
+/// more of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    pub source: Source,
+    pub block: i64,
+}
+
+impl Part {
+    /// What the models answering this one file spent, numbered inside its block. It is read here
+    /// rather than when the session was found, so a file the service is already level with costs
+    /// nothing to pass over.
+    pub fn events(&self, account: &str, prompts: i64) -> Result<Vec<Value>> {
+        let text = std::fs::read_to_string(&self.source.path)
+            .with_context(|| format!("reading {}", self.source.path.display()))?;
+        Ok(events(&aggregate(&text), account, prompts, self.block))
+    }
+}
+
 /// One past session, as its transcript gives it back. `mode` and the commit subject are left to the
 /// API's empty readings: a transcript says neither whether the session was interactive nor which
 /// commit its directory sat on, and inventing either would make the history row say more than the
 /// host knows.
+///
+/// `on_record` says the service already holds the session. This run writes it no history row and
+/// recounts nothing its own transcript spent, since the run that put it on record counted that;
+/// the fields the row is built from are read only for a session the service has never seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Past {
     pub session_id: String,
@@ -36,7 +72,8 @@ pub struct Past {
     pub prompts: i64,
     pub focus: Focus,
     pub permission_mode: String,
-    pub events: Vec<Value>,
+    pub on_record: bool,
+    pub parts: Vec<Part>,
 }
 
 impl Past {
@@ -217,15 +254,16 @@ fn aggregate(text: &str) -> Vec<(String, Counted)> {
 }
 
 /// One event per model and day, each with a chunk number of its own; mirrors events() in
-/// hooks/usage.mjs. The whole transcript is one stretch, so the numbers start where a first hook
-/// pass over it would have started and the prompts it answers all ride on the first event.
-fn events(spans: &[(String, Counted)], account: &str, prompts: i64) -> Vec<Value> {
+/// hooks/usage.mjs. The whole file is one stretch, numbered inside the block it was read into, so
+/// the session's own transcript starts where a first hook pass over it would have started and the
+/// prompts it answers all ride on its first event.
+fn events(spans: &[(String, Counted)], account: &str, prompts: i64, block: i64) -> Vec<Value> {
     spans
         .iter()
         .enumerate()
         .map(|(index, (model, spent))| {
             json!({
-                "seq": index as i64,
+                "seq": block * SPANS_PER_FILE + index as i64,
                 "provider": PROVIDER,
                 "account": account,
                 "model": model,
@@ -240,10 +278,39 @@ fn events(spans: &[(String, Counted)], account: &str, prompts: i64) -> Vec<Value
         .collect()
 }
 
+/// The directory one session ran in, off the first entry that names one. It is all a session
+/// already on record is read for: its row is written, and the repo tag is the only thing about it
+/// that the usage this run still owes rides on.
+fn first_cwd(path: &Path) -> String {
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .take(CWD_WITHIN_LINES)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .find_map(|entry| entry["cwd"].as_str().filter(|cwd| !cwd.is_empty()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// The transcript files one past session is made of, each in the block its reading is numbered in.
+fn parts(transcript: &Path) -> Vec<Part> {
+    transcripts::sources(transcript)
+        .into_iter()
+        .enumerate()
+        .map(|(block, source)| Part {
+            source,
+            block: block as i64,
+        })
+        .collect()
+}
+
 /// One past session read out of its transcript, or nothing for a transcript that holds neither a
 /// prompt nor an answer. A `claude -p` that failed to start and a session closed before its first
 /// prompt both leave one of those behind, and sending it would put a row on the history with
-/// nothing in it that no later pass ever revisits.
+/// nothing in it that no later pass ever revisits. A session already on record is past that test:
+/// the row it would have written is there already.
 ///
 /// The whole file is read once, for both readers: the record's reader counts what the user typed
 /// and the usage reader what the models answered, and the two never read the same entries. A
@@ -253,28 +320,46 @@ fn synthesize(
     scope: &adopt::Scope,
     session_id: &str,
     path: &Path,
-    account: &str,
+    on_record: bool,
     tags: &mut HashMap<PathBuf, String>,
 ) -> Result<Option<Past>> {
+    let tagged = |cwd: &str, tags: &mut HashMap<PathBuf, String>| {
+        let dir = PathBuf::from(cwd);
+        match dir.as_os_str().is_empty() {
+            true => String::new(),
+            false => tags
+                .entry(dir.clone())
+                .or_insert_with(|| repo::repo_tag(&dir).unwrap_or_default())
+                .clone(),
+        }
+    };
+    if on_record {
+        let cwd = first_cwd(path);
+        return Ok(Some(Past {
+            session_id: session_id.to_string(),
+            host: scope.host.clone(),
+            repo: tagged(&cwd, tags),
+            cwd,
+            branch: String::new(),
+            started_at: 0,
+            last_activity_at: 0,
+            prompts: 0,
+            focus: Focus::default(),
+            permission_mode: String::new(),
+            on_record: true,
+            parts: parts(path),
+        }));
+    }
     let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let reading = adopt::read_text(&text, Reading::default());
-    let spans = aggregate(&text);
-    if reading.prompts == 0 && spans.is_empty() {
+    if reading.prompts == 0 && aggregate(&text).is_empty() {
         return Ok(None);
     }
-    let cwd = PathBuf::from(&reading.cwd);
-    let repo = match cwd.as_os_str().is_empty() {
-        true => String::new(),
-        false => tags
-            .entry(cwd.clone())
-            .or_insert_with(|| repo::repo_tag(&cwd).unwrap_or_default())
-            .clone(),
-    };
     Ok(Some(Past {
         session_id: session_id.to_string(),
         host: scope.host.clone(),
-        repo,
+        repo: tagged(&reading.cwd, tags),
         cwd: reading.cwd,
         branch: reading.git_branch,
         started_at: match reading.started_at {
@@ -288,23 +373,31 @@ fn synthesize(
         prompts: reading.prompts,
         focus: reading.focus,
         permission_mode: reading.permission_mode,
-        events: events(&spans, account, reading.prompts),
+        on_record: false,
+        parts: parts(path),
     }))
 }
 
-/// Every past session this host holds a transcript for that the service does not already have,
-/// oldest first. A session the registry still names is live and adoption's to take on, not this
-/// pass's.
-pub fn past(scope: &adopt::Scope, account: &str, on_record: &HashSet<String>) -> Result<Vec<Past>> {
+/// Every past session this host holds a transcript for, oldest first, whether or not the service
+/// already has it: a session on record still owes the archive its files, and the delegated turns
+/// of every session that ran before this reader existed were counted nowhere. A session the
+/// registry still names is live and adoption's to take on, not this pass's.
+pub fn past(scope: &adopt::Scope, on_record: &HashSet<String>) -> Result<Vec<Past>> {
     let found = transcripts(&scope.projects)?;
     let live = adopt::registry(&scope.sessions).sessions;
     let mut tags: HashMap<PathBuf, String> = HashMap::new();
     let mut sessions = Vec::new();
     for (session_id, path) in &found {
-        if on_record.contains(session_id) || live.contains(session_id) {
+        if live.contains(session_id) {
             continue;
         }
-        sessions.extend(synthesize(scope, session_id, path, account, &mut tags)?);
+        sessions.extend(synthesize(
+            scope,
+            session_id,
+            path,
+            on_record.contains(session_id),
+            &mut tags,
+        )?);
     }
     sessions.sort_by(|left, right| {
         left.started_at
@@ -315,24 +408,50 @@ pub fn past(scope: &adopt::Scope, account: &str, on_record: &HashSet<String>) ->
 }
 
 /// What a run asks of the service for one past session.
-pub trait Service {
+pub trait Service: transcripts::Store {
     fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[Value]) -> Result<usize>;
     fn sync(&self, session_id: &str, body: &SessionBody) -> Result<()>;
     fn end(&self, session_id: &str) -> Result<()>;
 }
 
-/// Sends each past session: the tokens first, then the record that writes the history row, then the
-/// end. The order is what makes an interrupted run safe to repeat. The row is what the next run
-/// reads as already sent, so it may not land ahead of the tokens it stands for — a run that dies
-/// between the two leaves the session off the record and the next one sends it again, where every
-/// event already posted is a chunk number the service holds and ignores.
-pub fn send(service: &impl Service, past: &[Past], mut sent: impl FnMut(&str, usize)) -> Result<()> {
+/// What one run did for one session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sent {
+    pub events: usize,
+    pub bytes: i64,
+}
+
+/// Sends each past session, file by file: the tokens of a file first, then the file itself, and
+/// for a session the service has never seen the record that writes the history row and then the
+/// end. The order is what makes an interrupted run safe to repeat, and it is what a later run
+/// reads the archive as.
+///
+/// A file the service holds any of is a file whose tokens were counted, because nothing writes a
+/// byte of it before the events for it have landed. So a file it holds nothing of is counted now,
+/// and every other file is only caught up on its bytes — which is what keeps a host that has
+/// backfilled before from counting its own transcripts a second time, and still lets it count the
+/// delegated turns no run before this one ever read. The session's own transcript of a session
+/// already on record is never recounted at all: the run that put it on record counted it.
+pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl FnMut(&str, Sent)) -> Result<()> {
     for session in past {
         let id = &session.session_id;
-        let events = service.post_usage(id, &session.host, &session.repo, &session.events)?;
-        service.sync(id, &session.body())?;
-        service.end(id)?;
-        sent(id, events);
+        let held = service.held(id)?;
+        let mut done = Sent::default();
+        for part in &session.parts {
+            let have = held.get(&part.source.file).copied().unwrap_or(0);
+            let counted = session.on_record && part.source.file == MAIN;
+            if have == 0 && !counted {
+                let prompts = if part.source.file == MAIN { session.prompts } else { 0 };
+                let events = part.events(account, prompts)?;
+                done.events += service.post_usage(id, &session.host, &session.repo, &events)?;
+            }
+            done.bytes += transcripts::send_file(service, id, &part.source, have)?;
+        }
+        if !session.on_record {
+            service.sync(id, &session.body())?;
+            service.end(id)?;
+        }
+        sent(id, done);
     }
     Ok(())
 }
@@ -388,9 +507,10 @@ mod tests {
             path
         }
 
-        /// A subagent's transcript, which sits a level below the project directory.
-        fn subagent(&self, project: &str, session_id: &str, lines: &[String]) {
-            self.transcript(&format!("{project}/subagents"), session_id, lines);
+        /// A delegated turn's transcript, which Claude Code writes under the session's own
+        /// directory and which is no session of its own.
+        fn subagent(&self, project: &str, session_id: &str, file: &str, lines: &[String]) {
+            self.transcript(&format!("{project}/{session_id}/subagents"), file, lines);
         }
 
         fn registered(&self, session_id: &str) {
@@ -402,7 +522,7 @@ mod tests {
         }
 
         fn found(&self, on_record: &HashSet<String>) -> Vec<Past> {
-            past(&self.scope, ACCOUNT, on_record).unwrap()
+            past(&self.scope, on_record).unwrap()
         }
     }
 
@@ -413,11 +533,17 @@ mod tests {
     }
 
     /// The service as a run can see it: events kept by the first write for a chunk number, the
-    /// history rows a sync wrote, and the sessions ended. `fail_sync` is the session whose sync
-    /// fails, which is where an interrupted run stops.
+    /// rollup those events add into, the archive the stretches land in, the history rows a sync
+    /// wrote, and the sessions ended. `fail_sync` is the session whose sync fails, which is where
+    /// an interrupted run stops.
+    ///
+    /// The rollup accumulates, as `usage_daily` does, and only for a chunk number the service did
+    /// not already hold; that is what a run repeating itself is measured against.
     #[derive(Debug, Default)]
     struct Fake {
         events: RefCell<HashMap<(String, i64), Value>>,
+        daily: RefCell<HashMap<(i64, String), i64>>,
+        archive: RefCell<HashMap<(String, String), Vec<u8>>>,
         history: RefCell<HashSet<String>>,
         ended: RefCell<Vec<String>>,
         fail_sync: String,
@@ -434,6 +560,43 @@ mod tests {
         fn on_record(&self) -> HashSet<String> {
             self.history.borrow().clone()
         }
+
+        fn rollup(&self) -> HashMap<(i64, String), i64> {
+            self.daily.borrow().clone()
+        }
+
+        fn archived(&self, session_id: &str, file: &str) -> String {
+            String::from_utf8(
+                self.archive
+                    .borrow()
+                    .get(&(session_id.to_string(), file.to_string()))
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .unwrap()
+        }
+    }
+
+    impl transcripts::Store for Fake {
+        fn held(&self, session_id: &str) -> Result<HashMap<String, i64>> {
+            Ok(self
+                .archive
+                .borrow()
+                .iter()
+                .filter(|((held, _), _)| held == session_id)
+                .map(|((_, file), body)| (file.clone(), body.len() as i64))
+                .collect())
+        }
+
+        fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<transcripts::Appended> {
+            let mut archive = self.archive.borrow_mut();
+            let body = archive.entry((session_id.to_string(), file.to_string())).or_default();
+            if offset != body.len() as i64 {
+                return Ok(transcripts::Appended::Behind(body.len() as i64));
+            }
+            body.extend_from_slice(bytes);
+            Ok(transcripts::Appended::Wrote(body.len() as i64))
+        }
     }
 
     impl Service for Fake {
@@ -441,10 +604,16 @@ mod tests {
             assert_eq!(host, "laptop", "a delta carries the host that spent the tokens");
             for event in events {
                 let seq = event["seq"].as_i64().expect("every event carries a chunk number");
-                self.events
-                    .borrow_mut()
-                    .entry((session_id.to_string(), seq))
-                    .or_insert_with(|| event.clone());
+                let mut held = self.events.borrow_mut();
+                if held.contains_key(&(session_id.to_string(), seq)) {
+                    continue;
+                }
+                held.insert((session_id.to_string(), seq), event.clone());
+                let key = (
+                    day(event["at"].as_i64().unwrap_or_default()),
+                    event["model"].as_str().unwrap_or_default().to_string(),
+                );
+                *self.daily.borrow_mut().entry(key).or_default() += event["inputTokens"].as_i64().unwrap_or_default();
             }
             Ok(events.len())
         }
@@ -540,7 +709,7 @@ mod tests {
         assert_eq!(body.mode, "", "and cannot tell interactive from headless");
         assert_eq!(body.pid, 0);
         assert_eq!(
-            session.events,
+            session.parts[0].events(ACCOUNT, session.prompts).unwrap(),
             vec![
                 json!({
                     "seq": 0,
@@ -585,7 +754,8 @@ mod tests {
             ],
         );
 
-        let events = sandbox.found(&nothing()).remove(0).events;
+        let found = sandbox.found(&nothing()).remove(0);
+        let events = found.parts[0].events(ACCOUNT, found.prompts).unwrap();
 
         let landed: Vec<(i64, &str, i64, i64)> = events
             .iter()
@@ -660,7 +830,8 @@ mod tests {
             ],
         );
 
-        let events = sandbox.found(&nothing()).remove(0).events;
+        let found = sandbox.found(&nothing()).remove(0);
+        let events = found.parts[0].events(ACCOUNT, found.prompts).unwrap();
 
         let landed: Vec<(i64, i64, i64)> = events
             .iter()
@@ -690,7 +861,7 @@ mod tests {
 
         let first = sandbox.found(&dying.on_record());
         assert!(
-            send(&dying, &first, |_, _| {}).is_err(),
+            send(&dying, &first, ACCOUNT, |_, _| {}).is_err(),
             "a sync the service refuses fails the run"
         );
         let posted = dying.events.borrow().clone();
@@ -701,7 +872,7 @@ mod tests {
         let resumed = Fake::holding(posted.clone());
         let again = sandbox.found(&resumed.on_record());
         assert_eq!(again, first, "nothing is on record, so the same session is sent again");
-        send(&resumed, &again, |_, _| {}).unwrap();
+        send(&resumed, &again, ACCOUNT, |_, _| {}).unwrap();
 
         assert_eq!(
             *resumed.events.borrow(),
@@ -736,12 +907,96 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_transcript_is_no_session_of_its_own() {
+    fn a_delegated_turn_is_a_file_of_its_session_and_no_session_of_its_own() {
         let sandbox = Sandbox::new("subagent");
         sandbox.transcript("-home-you-recall", "s-old", &session());
-        sandbox.subagent("-home-you-recall", "s-subagent", &session());
+        sandbox.subagent("-home-you-recall", "s-old", "agent-7f21", &session());
 
-        assert_eq!(ids(&sandbox.found(&nothing())), vec!["s-old".to_string()]);
+        let found = sandbox.found(&nothing());
+
+        assert_eq!(ids(&found), vec!["s-old".to_string()]);
+        assert_eq!(
+            found[0]
+                .parts
+                .iter()
+                .map(|part| (part.source.file.as_str(), part.block))
+                .collect::<Vec<_>>(),
+            vec![("main", 0), ("agent-7f21", 1)],
+            "the session's own transcript keeps block zero whatever joins it"
+        );
+        let delegated = found[0].parts[1].events(ACCOUNT, 0).unwrap();
+        assert_eq!(
+            delegated[0]["seq"], SPANS_PER_FILE,
+            "and a delegated turn is numbered apart"
+        );
+        assert_eq!(delegated[0]["prompts"], 0, "no prompt is counted twice for it");
+    }
+
+    /// What one delegated turn of `session()` answered, in a model and on a day it already counted
+    /// under, so a reading that counted the file twice would be invisible in the model and the day
+    /// and show only in the total.
+    fn delegated() -> Vec<String> {
+        vec![answer("2026-10-01T10:05:00.000Z", "msg-a1", "claude-opus-4", 700, 70)]
+    }
+
+    fn spent(service: &Fake, model: &str) -> i64 {
+        service
+            .rollup()
+            .get(&(day(1_790_850_605_000), model.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_run_repeated_adds_nothing_the_run_before_it_did_not() {
+        let sandbox = Sandbox::new("twice");
+        sandbox.transcript("-home-you-recall", "s-old", &session());
+        sandbox.subagent("-home-you-recall", "s-old", "agent-7f21", &delegated());
+        let service = Fake::default();
+
+        send(&service, &sandbox.found(&nothing()), ACCOUNT, |_, _| {}).unwrap();
+        let once = service.rollup();
+        send(&service, &sandbox.found(&service.on_record()), ACCOUNT, |_, _| {}).unwrap();
+
+        assert_eq!(
+            spent(&service, "claude-opus-4"),
+            850,
+            "the session and its delegated turn"
+        );
+        assert_eq!(service.rollup(), once, "and a run that repeats adds none of it again");
+        assert_eq!(
+            service.archived("s-old", "agent-7f21"),
+            format!("{}\n", delegated().join("\n")),
+            "the delegated turn's transcript is held once and whole"
+        );
+    }
+
+    #[test]
+    fn a_host_that_backfilled_before_counts_the_delegated_turns_and_its_own_transcripts_no_twice() {
+        let sandbox = Sandbox::new("already");
+        sandbox.transcript("-home-you-recall", "s-old", &session());
+        let service = Fake::default();
+        send(&service, &sandbox.found(&nothing()), ACCOUNT, |_, _| {}).unwrap();
+        assert_eq!(spent(&service, "claude-opus-4"), 150);
+
+        // The run above is the one a host made before any of this existed: it archived nothing,
+        // and the raw events it posted have since aged out of the window the rollup is deduped
+        // against, so nothing but the reading itself can keep it from counting twice.
+        service.archive.borrow_mut().clear();
+        service.events.borrow_mut().clear();
+        sandbox.subagent("-home-you-recall", "s-old", "agent-7f21", &delegated());
+
+        send(&service, &sandbox.found(&service.on_record()), ACCOUNT, |_, _| {}).unwrap();
+
+        assert_eq!(
+            spent(&service, "claude-opus-4"),
+            850,
+            "the delegated turn is counted and the session's own transcript is not counted again"
+        );
+        assert_eq!(spent(&service, "claude-haiku-4"), 5);
+        let caught_up = service.rollup();
+        send(&service, &sandbox.found(&service.on_record()), ACCOUNT, |_, _| {}).unwrap();
+        assert_eq!(service.rollup(), caught_up, "and the run after it adds nothing at all");
     }
 
     #[test]
@@ -761,7 +1016,7 @@ mod tests {
         std::fs::write(&sandbox.scope.projects, "not a directory").unwrap();
 
         assert!(
-            past(&sandbox.scope, ACCOUNT, &nothing()).is_err(),
+            past(&sandbox.scope, &nothing()).is_err(),
             "a host that could not look must not report a host with nothing to send"
         );
     }

@@ -480,6 +480,23 @@ const isText = (value: unknown, max: number): value is string => typeof value ==
 export const parseSessionId = (value: string): Parsed<string> =>
   SESSION_ID.test(value) ? { ok: true, value } : fail("the session id may hold 1 to 100 letters, digits, - and _");
 
+const TRANSCRIPT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
+
+// Which of a session's transcript files a stretch belongs to: `main` for the session's own, and one
+// name per delegated turn. It becomes part of an object key, so a name that could reach out of the
+// session's own prefix is refused.
+export const parseTranscriptFile = (value: string | null): Parsed<string> =>
+  value !== null && TRANSCRIPT_FILE.test(value)
+    ? { ok: true, value }
+    : fail("file must open with a letter or digit and hold at most 101 of letters, digits, . _ and -");
+
+export const parseChunkOffset = (value: string | null): Parsed<number> => {
+  const offset = Number(value);
+  return value !== null && value !== "" && isInteger(offset, 0, Number.MAX_SAFE_INTEGER)
+    ? { ok: true, value: offset }
+    : fail("offset must be a whole number of bytes into the file");
+};
+
 const parseFocus = (value: unknown): Parsed<Focus> => {
   if (!isRecord(value) || !isText(value.first, MAX_FOCUS_CHARS) || !isText(value.latest, MAX_FOCUS_CHARS)) {
     return fail(`focus must be {first, latest}, each a string of at most ${MAX_FOCUS_CHARS} characters`);

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -141,24 +141,45 @@ function size(file) {
   }
 }
 
-// Where the usage reader picks the transcript up. A session carried on in the same file — a resume,
-// a restart, a clear — keeps the offset this host already counted from. Anything else starts at
-// the file's end: what came before was counted by the run that wrote it. The chunk numbers already
-// spent come along whatever the transcript, since they are the session's and may never be reused,
-// and the prompt mark starts at nothing because the prompt count does.
+export const MAIN = "main";
+
+// Mirrors sources() in cli/src/transcripts.rs: a session's own transcript, and the file Claude
+// Code writes for each delegated turn under `<session id>/subagents/`. The delegated turns carry
+// most of what a session spends, so reading the one file counts a fraction of the tokens.
+export function transcriptFiles(transcriptPath) {
+  const own = { file: MAIN, path: transcriptPath };
+  const dir = path.join(path.dirname(transcriptPath), path.basename(transcriptPath, ".jsonl"), "subagents");
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [own];
+  }
+  const delegated = entries
+    .filter((entry) => entry.endsWith(".jsonl"))
+    .map((entry) => ({ file: entry.slice(0, -".jsonl".length), path: path.join(dir, entry) }))
+    .sort((left, right) => (left.file < right.file ? -1 : 1));
+  return [own, ...delegated];
+}
+
+// Where the usage reader picks each of a session's transcript files up. A session carried on in
+// the same file — a resume, a restart, a clear — keeps the marks this host already counted from.
+// Every other file that exists now starts at its end: what came before was counted by the run
+// that wrote it, and a file this session opens later starts at nothing, which is where its own
+// count begins. The chunk numbers already spent come along whatever the transcript, since they are
+// the session's and may never be reused, and the prompt mark starts at nothing because the prompt
+// count does.
 function transcript(stored, transcriptPath) {
   const spent = { usageHighWater: stored?.usageHighWater ?? 0, usagePrompts: 0 };
-  if (!transcriptPath) return { ...spent, transcriptPath: "", usageOffset: 0, usageMessageId: "" };
-  if (stored?.transcriptPath === transcriptPath && Number.isInteger(stored.usageOffset)) {
-    return {
-      ...spent,
-      transcriptPath,
-      usageOffset: stored.usageOffset,
-      usageMessageId: stored.usageMessageId ?? "",
-      usagePending: stored.usagePending,
-    };
+  if (!transcriptPath) return { ...spent, transcriptPath: "", usageFiles: {} };
+  const resumed = stored?.transcriptPath === transcriptPath;
+  const usageFiles = { ...(resumed ? (stored.usageFiles ?? {}) : {}) };
+  for (const source of transcriptFiles(transcriptPath)) {
+    if (usageFiles[source.file]) continue;
+    usageFiles[source.file] = { offset: size(source.path), messageId: "" };
   }
-  return { ...spent, transcriptPath, usageOffset: size(transcriptPath), usageMessageId: "" };
+  if (!resumed) return { ...spent, transcriptPath, usageFiles };
+  return { ...spent, transcriptPath, usageFiles, usagePending: stored.usagePending };
 }
 
 // The registry is the one record of what became of a session, so a session the hook passed over

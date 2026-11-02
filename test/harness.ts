@@ -51,6 +51,8 @@ export interface Client {
   search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
+  archive(sessionId: string, file: string, offset: number, body: BodyInit): Promise<Response>;
+  transcript(sessionId: string): Promise<Response>;
 }
 
 const SESSION_DOCUMENT: Record<string, unknown> = {
@@ -230,6 +232,16 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
       },
       usage(sessionId, fields = {}) {
         return request("POST", `/v1/sessions/${sessionId}/usage`, { ...USAGE_DELTA, ...fields });
+      },
+      archive(sessionId, file, offset, body) {
+        return send(`/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${offset}`, {
+          method: "PUT",
+          headers: { ...headers, "content-type": "application/x-ndjson" },
+          body,
+        });
+      },
+      transcript(sessionId) {
+        return request("GET", `/v1/sessions/${sessionId}/transcript`);
       },
       async search(query, tags, mode = "hybrid") {
         const response = await request("POST", "/v1/search", {

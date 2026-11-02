@@ -21,6 +21,7 @@ use crate::config;
 use crate::listen;
 use crate::repo;
 use crate::sessions::Focus;
+use crate::transcripts;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -96,7 +97,6 @@ struct Transcript {
     path: PathBuf,
     born: SystemTime,
     modified: SystemTime,
-    size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +252,6 @@ fn transcripts(projects: &Path, cwd: &Path) -> Vec<Transcript> {
                 session_id: path.file_stem()?.to_str()?.to_string(),
                 born: birth(&path, &metadata)?,
                 modified: metadata.modified().ok()?,
-                size: metadata.len(),
                 path,
             })
         })
@@ -564,9 +563,18 @@ fn refresh(scope: &Scope, session_id: &str, stored: &Value) -> Result<Option<Ado
     }))
 }
 
-/// Writes the record one running session is missing. The usage marks start at the end of the
-/// transcript: nothing has counted the tokens spent before this pass, and the hook that takes the
-/// record over must not count them twice.
+/// Every transcript file this session has now, marked at its end. Nothing has counted the tokens
+/// spent before this pass, so the hook that takes the record over must not count them twice; a
+/// file the session opens after it starts at nothing, which is where its own count begins.
+fn usage_marks(transcript: &Path) -> Value {
+    let marks: serde_json::Map<String, Value> = transcripts::sources(transcript)
+        .into_iter()
+        .map(|source| (source.file, json!({ "offset": source.size, "messageId": "" })))
+        .collect();
+    Value::Object(marks)
+}
+
+/// Writes the record one running session is missing.
 fn take_on(scope: &Scope, claim: &Claim) -> Result<Adoption> {
     let session_id = &claim.transcript.session_id;
     let reading = read_on(&claim.transcript.path, Reading::default());
@@ -592,10 +600,9 @@ fn take_on(scope: &Scope, claim: &Claim) -> Result<Adoption> {
         "permissionMode": reading.permission_mode,
         "transcriptPath": claim.transcript.path,
         "adoptedOffset": reading.offset,
-        "usageOffset": claim.transcript.size,
+        "usageFiles": usage_marks(&claim.transcript.path),
         "usageHighWater": 0,
         "usagePrompts": 0,
-        "usageMessageId": "",
     });
     write(&record_path(scope, session_id), &document)?;
     Ok(Adoption {
@@ -793,7 +800,7 @@ mod tests {
         );
         let size = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
-            record["usageOffset"], size,
+            record["usageFiles"]["main"]["offset"], size,
             "nothing counted the tokens spent before this pass, so none of them are counted now"
         );
         assert_eq!(record["adoptedOffset"], size, "the prompts read reach the file's end");
@@ -899,7 +906,7 @@ mod tests {
             second["startedAt"], first["startedAt"],
             "the session still started when it did"
         );
-        assert_eq!(second["usageOffset"], first["usageOffset"], "the usage marks stay put");
+        assert_eq!(second["usageFiles"], first["usageFiles"], "the usage marks stay put");
         assert_eq!(
             second["usagePending"], owned["usagePending"],
             "a delta the hooks fixed is still waiting after the pass"
