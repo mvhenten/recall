@@ -35,10 +35,28 @@ export interface SearchInput {
 
 export interface ListInput {
   tags: string[];
+  types: MemoryType[];
   since: number;
   cursor: string;
   limit: number;
 }
+
+export interface MemoryHit {
+  memory: Memory;
+  score: number;
+}
+
+export interface MemoryCounts {
+  total: number;
+  recalled: number;
+  fresh: number;
+  byType: Array<{ type: MemoryType; count: number }>;
+}
+
+export const FRESH_WINDOW_DAYS = 30;
+export const FRESH_WINDOW_MS = FRESH_WINDOW_DAYS * 86_400_000;
+export const DEFAULT_MIN_SCORE = 0.55;
+const MAX_QUERY_CHARS = 2_000;
 
 export interface Embedder {
   embed(text: string): Promise<Float32Array>;
@@ -145,8 +163,8 @@ export const parseSave = (body: unknown): Parsed<SaveInput> => {
 export const parseSearch = (body: unknown): Parsed<SearchInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
   const { query, any, limit, minScore, mode } = body;
-  if (typeof query !== "string" || query.length < 1 || query.length > 2_000) {
-    return fail("query must hold 1 to 2000 characters");
+  if (typeof query !== "string" || query.length < 1 || query.length > MAX_QUERY_CHARS) {
+    return fail(`query must hold 1 to ${MAX_QUERY_CHARS} characters`);
   }
   const tags = parseTags(body.tags);
   if (!tags.ok) return tags;
@@ -159,14 +177,29 @@ export const parseSearch = (body: unknown): Parsed<SearchInput> => {
   return { ok: true, value: { query, tags: tags.value, limit, minScore, mode } };
 };
 
+export const parseTypes = (values: string[]): Parsed<MemoryType[]> => {
+  const types = new Set<MemoryType>();
+  for (const value of values) {
+    if (!isOneOf(memoryTypes, value)) return fail(`type must be one of ${memoryTypes.join(", ")}`);
+    types.add(value);
+  }
+  return { ok: true, value: [...types] };
+};
+
 export const parseList = (params: URLSearchParams): Parsed<ListInput> => {
-  const tags = parseTags(params.getAll("tag"));
+  const given = (name: string): string[] => params.getAll(name).filter((value) => value !== "");
+  const tags = parseTags(given("tag"));
   if (!tags.ok) return tags;
+  const types = parseTypes(given("type"));
+  if (!types.ok) return types;
   const since = Number(params.get("since") ?? 0);
   const limit = Number(params.get("limit") ?? 20);
   if (!isInteger(since, 0, Number.MAX_SAFE_INTEGER)) return fail("since must be a whole number of epoch milliseconds");
   if (!isInteger(limit, 1, 100)) return fail("limit must be a whole number from 1 to 100");
-  return { ok: true, value: { tags: tags.value, since, cursor: params.get("cursor") ?? "", limit } };
+  return {
+    ok: true,
+    value: { tags: tags.value, types: types.value, since, cursor: params.get("cursor") ?? "", limit },
+  };
 };
 
 const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/;

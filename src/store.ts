@@ -2,6 +2,7 @@ import type { Caller } from "./device";
 import {
   type ListInput,
   type Memory,
+  type MemoryCounts,
   type MemoryType,
   type SaveInput,
   SESSION_TTL_MS,
@@ -32,6 +33,9 @@ const MEMORY_COLUMNS = `m.memory_id, m.user_id, m.name, m.description, m.type, m
 const TAG_FILTER = `(json_array_length(?2) = 0 OR EXISTS (
   SELECT 1 FROM memory_tags t
   WHERE t.memory_id = m.memory_id AND t.tag IN (SELECT value FROM json_each(?2))))`;
+
+const typeFilter = (slot: number): string =>
+  `(json_array_length(?${slot}) = 0 OR m.type IN (SELECT value FROM json_each(?${slot})))`;
 
 const toMemory = (row: MemoryRow): Memory => ({
   memoryId: row.memory_id,
@@ -119,17 +123,46 @@ export const listMemories = async (
   const { results } = await db
     .prepare(
       `SELECT ${MEMORY_COLUMNS} FROM memories m
-       WHERE m.user_id = ?1 AND ${TAG_FILTER} AND m.created_at >= ?3
+       WHERE m.user_id = ?1 AND ${TAG_FILTER} AND ${typeFilter(7)} AND m.created_at >= ?3
          AND (m.created_at < ?4 OR (m.created_at = ?4 AND m.memory_id < ?5))
        ORDER BY m.created_at DESC, m.memory_id DESC
        LIMIT ?6`,
     )
-    .bind(userId, JSON.stringify(input.tags), input.since, cursorCreatedAt, cursorId, input.limit + 1)
+    .bind(
+      userId,
+      JSON.stringify(input.tags),
+      input.since,
+      cursorCreatedAt,
+      cursorId,
+      input.limit + 1,
+      JSON.stringify(input.types),
+    )
     .all<MemoryRow>();
   const memories = results.slice(0, input.limit).map(toMemory);
   const last = memories.at(-1);
   const nextCursor = results.length > input.limit && last ? encodeCursor(last) : "";
   return { memories, nextCursor };
+};
+
+export const memoryCounts = async (db: D1Database, userId: string, since: number): Promise<MemoryCounts> => {
+  const { results } = await db
+    .prepare(
+      `SELECT m.type AS type, COUNT(*) AS total,
+         SUM(CASE WHEN m.recall_count > 0 THEN 1 ELSE 0 END) AS recalled,
+         SUM(CASE WHEN m.created_at >= ?2 THEN 1 ELSE 0 END) AS fresh
+       FROM memories m WHERE m.user_id = ?1
+       GROUP BY m.type ORDER BY total DESC, m.type`,
+    )
+    .bind(userId, since)
+    .all<{ type: MemoryType; total: number; recalled: number; fresh: number }>();
+  const sum = (pick: (row: { total: number; recalled: number; fresh: number }) => number): number =>
+    results.reduce((running, row) => running + pick(row), 0);
+  return {
+    total: sum((row) => row.total),
+    recalled: sum((row) => row.recalled),
+    fresh: sum((row) => row.fresh),
+    byType: results.map((row) => ({ type: row.type, count: row.total })),
+  };
 };
 
 const toBytes = (value: unknown): Uint8Array => {
@@ -150,10 +183,18 @@ export interface TextCandidate {
   inScope: boolean;
 }
 
-export const vectorCandidates = async (db: D1Database, userId: string, tags: string[]): Promise<VectorCandidate[]> => {
+export const vectorCandidates = async (
+  db: D1Database,
+  userId: string,
+  tags: string[],
+  types: MemoryType[],
+): Promise<VectorCandidate[]> => {
   const rows = await db
-    .prepare(`SELECT m.memory_id, m.embedding, ${TAG_FILTER} AS in_scope FROM memories m WHERE m.user_id = ?1`)
-    .bind(userId, JSON.stringify(tags))
+    .prepare(
+      `SELECT m.memory_id, m.embedding, ${TAG_FILTER} AS in_scope FROM memories m
+       WHERE m.user_id = ?1 AND ${typeFilter(3)}`,
+    )
+    .bind(userId, JSON.stringify(tags), JSON.stringify(types))
     .raw<[string, unknown, number]>();
   return rows.map(([memoryId, embedding, inScope]) => ({
     memoryId,
@@ -166,15 +207,16 @@ export const textCandidates = async (
   db: D1Database,
   userId: string,
   tags: string[],
+  types: MemoryType[],
   query: string,
 ): Promise<TextCandidate[]> => {
   const { results } = await db
     .prepare(
       `SELECT m.memory_id, ${TAG_FILTER} AS in_scope FROM memories_fts f JOIN memories m ON m.memory_seq = f.rowid
-       WHERE memories_fts MATCH ?3 AND m.user_id = ?1
+       WHERE memories_fts MATCH ?3 AND m.user_id = ?1 AND ${typeFilter(4)}
        ORDER BY in_scope DESC, bm25(memories_fts, 5.0, 2.0, 1.0) LIMIT 50`,
     )
-    .bind(userId, JSON.stringify(tags), query)
+    .bind(userId, JSON.stringify(tags), query, JSON.stringify(types))
     .all<{ memory_id: string; in_scope: number }>();
   return results.map((row) => ({ memoryId: row.memory_id, inScope: row.in_scope === 1 }));
 };

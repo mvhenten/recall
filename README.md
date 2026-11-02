@@ -190,24 +190,26 @@ State is read, never stored. A session prompted within the last five minutes is 
 
 The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and `/v1/sessions` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
 
-| Method   | Path                                      |                                                                                                                                     |
-| -------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `PUT`    | `/v1/memories/:name`                      | create or replace `{description, type, body, tags}`                                                                                 |
-| `GET`    | `/v1/memories/:name`                      | read one                                                                                                                            |
-| `DELETE` | `/v1/memories/:name`                      | delete one                                                                                                                          |
-| `GET`    | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first                                                                                                                |
-| `POST`   | `/v1/search`                              | `{query, tags, any, limit, minScore, mode}`; each hit is a recall                                                                   |
-| `GET`    | `/v1/devices`                             | the caller's devices                                                                                                                |
-| `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                                                                                   |
-| `POST`   | `/v1/messages`                            | `{toDeviceId, toSessionId, body}`; queues a message for one session, or for every session on the device when `toSessionId` is empty |
-| `GET`    | `/v1/messages/listen`                     | WebSocket only; pushes the caller's queue and takes ack frames                                                                      |
-| `PUT`    | `/v1/sessions/:sessionId`                 | create or replace one session document                                                                                              |
-| `GET`    | `/v1/sessions`                            | the account's sessions, newest activity first                                                                                       |
-| `DELETE` | `/v1/sessions/:sessionId`                 | the session is over; every host stops listing it                                                                                    |
+| Method   | Path                                            |                                                                                                                                     |
+| -------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `PUT`    | `/v1/memories/:name`                            | create or replace `{description, type, body, tags}`                                                                                 |
+| `GET`    | `/v1/memories/:name`                            | read one                                                                                                                            |
+| `DELETE` | `/v1/memories/:name`                            | delete one                                                                                                                          |
+| `GET`    | `/v1/memories?tag=&type=&since=&cursor=&limit=` | newest created first; `tag` and `type` repeat, and each narrows the page                                                            |
+| `POST`   | `/v1/search`                                    | `{query, tags, any, limit, minScore, mode}`; each hit is a recall                                                                   |
+| `GET`    | `/v1/devices`                                   | the caller's devices                                                                                                                |
+| `DELETE` | `/v1/devices/:deviceId`                         | revoke a device; `current` names the caller's own                                                                                   |
+| `POST`   | `/v1/messages`                                  | `{toDeviceId, toSessionId, body}`; queues a message for one session, or for every session on the device when `toSessionId` is empty |
+| `GET`    | `/v1/messages/listen`                           | WebSocket only; pushes the caller's queue and takes ack frames                                                                      |
+| `PUT`    | `/v1/sessions/:sessionId`                       | create or replace one session document                                                                                              |
+| `GET`    | `/v1/sessions`                                  | the account's sessions, newest activity first                                                                                       |
+| `DELETE` | `/v1/sessions/:sessionId`                       | the session is over; every host stops listing it                                                                                    |
 
 The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` and the dashboard at `/dashboard` are the paths behind an Access login; the approve and deny form checks the Access JWT, the origin and a CSRF token.
 
 Opening the hostname in a browser answers `303 /dashboard`; a client that does not ask for `text/html` still gets the 404 JSON. Both answers carry `Vary: Accept`. The dashboard is server-rendered, reads the same Access JWT as `/device` through the one application that covers both paths, and refuses an email that is not invited. Its tabs are `/dashboard`, `/dashboard/memory`, `/dashboard/stats` and `/dashboard/insights`.
+
+`/dashboard/memory` lists memories newest created first and pages on the same cursor `/v1/memories` answers. A form narrows the page by tag and by type, and a search there runs the hybrid ranking the CLI runs, at the same `--min-score` default of 0.55, showing the fusion score of each hit. Query, filters and cursor live in the URL, so a search is a link. `/dashboard/memory/<name>` renders one memory's body. Both read without recalling: browsing never moves a memory's recall count or the time it was last recalled. The strip above the listing counts the memories, how many were ever recalled, how many never were, how many are less than 30 days old, and the total per type. The dashboard never writes: saving, editing and deleting stay with the CLI and the tools.
 
 ## Deploying from CI
 
