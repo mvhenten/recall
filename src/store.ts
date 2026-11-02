@@ -421,7 +421,7 @@ export const listSessionHistory = async (
   return { sessions, nextCursor };
 };
 
-export const SESSION_IDS_PAGE = 100;
+const SESSION_IDS_PAGE = 100;
 
 // Which sessions the account has on record, and nothing else about them. A host reading its own
 // past sessions back out of its transcripts needs only to know which ones are already here, and

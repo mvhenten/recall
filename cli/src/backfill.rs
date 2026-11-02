@@ -6,7 +6,6 @@
 
 use crate::adopt::{self, Reading};
 use crate::api::SessionBody;
-use crate::config;
 use crate::repo;
 use crate::sessions::Focus;
 use anyhow::{Context, Result, bail};
@@ -76,13 +75,16 @@ pub fn account(claude_json: &Path) -> String {
         .to_string()
 }
 
-/// The subscription this host is signed in as. A host that names none cannot have its tokens
-/// counted against anything, and the run says so rather than sending events the service refuses.
+/// The subscription this host is signed in as. The file sits in the home directory and not beside
+/// the transcripts, as hooks/usage.mjs reads it: a host with `CLAUDE_CONFIG_DIR` set keeps its
+/// transcripts elsewhere and its account here, and reading the wrong one refuses every run.
+///
+/// A host that names no account cannot have its tokens counted against anything, and the run says
+/// so rather than sending events the service refuses.
 pub fn account_here() -> Result<String> {
-    let claude_json = config::claude_dir()
-        .context("neither CLAUDE_CONFIG_DIR nor HOME is set, so this host names no account")?
-        .parent()
-        .context("the Claude Code directory has no parent, so there is no .claude.json beside it")?
+    let claude_json = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set, so this host names no account")?
         .join(".claude.json");
     let named = account(&claude_json);
     if named.is_empty() {
@@ -153,7 +155,14 @@ fn day(at: i64) -> i64 {
 /// The day is part of the key because a hook pass covers minutes while this one covers a whole
 /// transcript: a session that ran past midnight, or was resumed over weeks, would otherwise land
 /// every token it ever spent on the day of its last answer, and its months would read as one spike.
-fn aggregate(text: &str, now: i64) -> Vec<(String, Counted)> {
+///
+/// An answer carrying no time this can read is passed over rather than dated from the clock. The
+/// day it falls in is part of the key the chunk numbers are handed out in order of, so a clock
+/// standing in for a missing time would number the same transcript differently on a later run, and
+/// the service keeps the first event it saw for a chunk number — the second reading would land
+/// beside the first instead of being ignored. Claude Code stamps every entry, so what this skips is
+/// an entry too corrupt to date.
+fn aggregate(text: &str) -> Vec<(String, Counted)> {
     let mut spans: Vec<((String, i64), Counted)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for line in text.lines() {
@@ -173,11 +182,13 @@ fn aggregate(text: &str, now: i64) -> Vec<(String, Counted)> {
             continue;
         };
         let usage = &message["usage"];
-        let at = entry["timestamp"]
+        let Some(at) = entry["timestamp"]
             .as_str()
             .and_then(|at| at.parse::<Timestamp>().ok())
             .map(|at| at.as_millisecond())
-            .unwrap_or(now);
+        else {
+            continue;
+        };
         let spent = Counted {
             at,
             input_tokens: counter(usage, "input_tokens"),
@@ -244,12 +255,11 @@ fn synthesize(
     path: &Path,
     account: &str,
     tags: &mut HashMap<PathBuf, String>,
-    now: i64,
 ) -> Result<Option<Past>> {
     let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let reading = adopt::read_text(&text, Reading::default());
-    let spans = aggregate(&text, now);
+    let spans = aggregate(&text);
     if reading.prompts == 0 && spans.is_empty() {
         return Ok(None);
     }
@@ -285,7 +295,7 @@ fn synthesize(
 /// Every past session this host holds a transcript for that the service does not already have,
 /// oldest first. A session the registry still names is live and adoption's to take on, not this
 /// pass's.
-pub fn past(scope: &adopt::Scope, account: &str, on_record: &HashSet<String>, now: i64) -> Result<Vec<Past>> {
+pub fn past(scope: &adopt::Scope, account: &str, on_record: &HashSet<String>) -> Result<Vec<Past>> {
     let found = transcripts(&scope.projects)?;
     let live = adopt::registry(&scope.sessions).sessions;
     let mut tags: HashMap<PathBuf, String> = HashMap::new();
@@ -294,7 +304,7 @@ pub fn past(scope: &adopt::Scope, account: &str, on_record: &HashSet<String>, no
         if on_record.contains(session_id) || live.contains(session_id) {
             continue;
         }
-        sessions.extend(synthesize(scope, session_id, path, account, &mut tags, now)?);
+        sessions.extend(synthesize(scope, session_id, path, account, &mut tags)?);
     }
     sessions.sort_by(|left, right| {
         left.started_at
@@ -332,7 +342,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    const NOW: i64 = 1_793_700_000_000;
     const ACCOUNT: &str = "you@example.com";
 
     /// A service holding no session on record, which is every host's first run.
@@ -393,7 +402,7 @@ mod tests {
         }
 
         fn found(&self, on_record: &HashSet<String>) -> Vec<Past> {
-            past(&self.scope, ACCOUNT, on_record, NOW).unwrap()
+            past(&self.scope, ACCOUNT, on_record).unwrap()
         }
     }
 
@@ -609,7 +618,7 @@ mod tests {
 
         let first = sandbox.found(&nothing());
         assert_eq!(
-            past(&sandbox.scope, ACCOUNT, &nothing(), NOW + 60_000).unwrap(),
+            sandbox.found(&nothing()),
             first,
             "the same transcript regenerates the same chunk numbers, whenever it is read"
         );
@@ -618,6 +627,55 @@ mod tests {
             sandbox.found(&on_record(&["s-old"])),
             Vec::new(),
             "a session the service already holds on record is passed over"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_dated_is_counted_on_no_day_at_all() {
+        let sandbox = Sandbox::new("undatable");
+        let undatable = json!({
+            "type": "assistant",
+            "cwd": "/home/you/recall",
+            "message": {
+                "id": "msg-undatable",
+                "model": "claude-opus-4",
+                "usage": { "input_tokens": 999_999, "output_tokens": 999_999 },
+            },
+        })
+        .to_string();
+        sandbox.transcript(
+            "-home-you-recall",
+            "s-mixed",
+            &[
+                human("2026-10-01T10:00:00.000Z", "count what you can date"),
+                answer("2026-10-01T10:00:10.000Z", "msg-1", "claude-opus-4", 100, 20),
+                undatable.clone(),
+                json!({
+                    "type": "assistant",
+                    "timestamp": "not a time at all",
+                    "message": { "id": "msg-2", "model": "claude-opus-4", "usage": { "input_tokens": 999_999 } },
+                })
+                .to_string(),
+                answer("2026-10-02T10:00:10.000Z", "msg-3", "claude-opus-4", 200, 40),
+            ],
+        );
+
+        let events = sandbox.found(&nothing()).remove(0).events;
+
+        let landed: Vec<(i64, i64, i64)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event["seq"].as_i64().unwrap(),
+                    event["at"].as_i64().unwrap(),
+                    event["inputTokens"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            landed,
+            vec![(0, 1_790_848_810_000, 100), (1, 1_790_935_210_000, 200)],
+            "an undated answer takes no chunk number, so the ones the dated answers take never move"
         );
     }
 
@@ -703,7 +761,7 @@ mod tests {
         std::fs::write(&sandbox.scope.projects, "not a directory").unwrap();
 
         assert!(
-            past(&sandbox.scope, ACCOUNT, &nothing(), NOW).is_err(),
+            past(&sandbox.scope, ACCOUNT, &nothing()).is_err(),
             "a host that could not look must not report a host with nothing to send"
         );
     }

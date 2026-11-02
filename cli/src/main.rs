@@ -529,7 +529,7 @@ fn backfill_sessions() -> Result<ExitCode> {
     let account = backfill::account_here()?;
     let client = Client::new(config::load()?);
     let on_record = client.session_history_ids()?;
-    let past = backfill::past(&scope, &account, &on_record, Timestamp::now().as_millisecond())?;
+    let past = backfill::past(&scope, &account, &on_record)?;
     if past.is_empty() {
         println!("no past session needs backfilling");
         return Ok(ExitCode::SUCCESS);
