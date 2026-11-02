@@ -7,6 +7,7 @@ Per-user semantic memory for coding agents. recall keeps the notes an agent lear
 - `recall mcp` serves the same operations as MCP tools over stdio, for any harness that speaks MCP.
 - A Claude Code plugin gives Claude the recall tools, adds matching memories to each prompt, and either syncs Claude's auto-memory files to recall or replaces auto-memory outright.
 - An opt-in add-on carries messages between the Claude Code sessions on the hosts signed in as you.
+- A dashboard in the browser reads the same store: live sessions, the session history, the memories and what the tokens cost.
 
 ## Install
 
@@ -190,6 +191,31 @@ The count covers the session's own thread. A subagent writes its own transcript,
 
 State is read, never stored. A session prompted within the last five minutes is `busy` and one quiet since is `idle`. A session that is gone is one its own host dropped: nothing ends a session on another host's behalf. The `recall sessions --end` the session end hook starts drops it, once the delta the record carries has gone out, and so does the listener's own thirty second tick, which deletes the session whose Claude process it finds gone — the `recall listen --status` sweep and the service's copy come out together. Only a host that dies with no listener running leaves a record behind, and that one expires a day after its last prompt. `name` is the handle that addresses the session, so the listing doubles as the address book for messaging.
 
+## Dashboard
+
+Opening the hostname in a browser answers `303 /dashboard`; a client that does not ask for `text/html` still gets the 404 JSON. Both answers carry `Vary: Accept`.
+
+The dashboard is server-rendered, with no client-side JavaScript. It reads the same Access JWT as `/device`, from the one Access application that covers both paths. It refuses an email that is not invited. `npm run setup` and the OpenTofu config under `infra/` each add `<hostname>/dashboard` to that application as a second public destination. A self-hoster who deploys the Worker another way adds that destination by hand. The dashboard answers a `GET` and never writes; saving, editing and deleting stay with the CLI and the tools.
+
+Every page carries the signed-in email and a line on now: the live and busy session counts, today's cost and today's sessions. The tabs are Sessions, History, Memory, Stats and Insights.
+
+- `/dashboard` lists the live sessions of every host as a ledger, newest activity first: state, handle, `repo@branch`, the focus line, age and prompt count. Beside it sits one line per host with its live and busy counts, and the oldest idle session.
+- `/dashboard/history` reads the session history: every session of the last 180 days grouped by UTC day, newest day first, each row carrying its handle, host, `repo@branch`, the span from the first prompt to the last activity, the prompt count and the focus line. A session that is still running is marked and stays in the list. `host` and `repo` narrow the page as links built from the hosts and repos the page holds, and the page walks back on the same cursor shape the memory listing uses.
+- `/dashboard/memory` lists memories newest created first and pages on the same cursor `/v1/memories` answers. A form narrows the page by tag and by type, and a search there runs the hybrid ranking the CLI runs, at the same `--min-score` default of 0.55, showing the fusion score of each hit. Query, filters and cursor live in the URL, so a search is a link. `/dashboard/memory/<name>` renders one memory's body. Both read without recalling: browsing never moves a memory's recall count or the time it was last recalled. The strip above the listing counts the memories, the ever recalled, the never recalled and the ones saved in the last 30 days, and each type chip carries its own count.
+- `/dashboard/stats` prices the usage. Five tiles show today's cost against the seven day average, the seven day cost against the week before it, today's tokens, the seven day cache hit rate and today's session count. Under them: cost per day stacked by model, over 14 days and over 30 days, and the model mix as a donut and a table. Input, output and cache-read tokens each get a bar per day. An efficiency list over seven days gives cost per prompt, cost per session, tokens per prompt, output against input and cache hit, and the last three tables split the 30 days by account, by host and by repo.
+- `/dashboard/insights` reads the last 14 days. The working set is the top five memories by recall count over the last 30 days, with the share of every recall they carry. Going stale lists five of the memories at risk, which are the ones last recalled over 60 days ago and the ones never recalled and saved over 14 days ago. Cache economics counts the fortnight's cache reads, what they saved against fresh input, and its best and worst day. The rhythm is a heat map of sessions by weekday and hour, and the last card ranks five repos by session time.
+
+The prices are Anthropic's published list, in US dollars per million tokens, with a cache write at 1.25 times input and a cache read at a tenth of it. A model the table does not name has its tokens counted and its cost left out, and the page names that model and the tokens it spent. A total mixing priced and unpriced models is marked `≈`.
+
+How far back each page reads:
+
+| Record                | Kept                                 |
+| --------------------- | ------------------------------------ |
+| a live session        | 24 hours past its last activity      |
+| a session history row | 180 days                             |
+| a raw usage event     | 14 days past the server recording it |
+| a daily usage rollup  | for good                             |
+
 ## API
 
 The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and `/v1/sessions` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
@@ -210,15 +236,11 @@ The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and
 | `DELETE` | `/v1/sessions/:sessionId`                       | the session is over; every host stops listing it                                                                                         |
 | `POST`   | `/v1/sessions/:sessionId/usage`                 | one token delta `{seq, host, repo, provider, account, model, prompts, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens, at}` |
 
-A usage delta counts the tokens a session spent since the one before it. `seq` is the client's chunk number, the insert ignores a `seq` it already holds, and the same batch adds the delta into that UTC day's `usage_daily` row, keyed by day, host, repo, account, provider and model — all taken from the delta itself, so a session that already ended still gets its tail counted. Tokens are stored and money never is: cost is computed on read, so correcting a price needs no backfill. Raw events are swept 14 days after the server recorded them; the daily rollup stays.
+A usage delta counts the tokens a session spent since the one before it. `seq` is the client's chunk number, the insert ignores a `seq` it already holds, and the same batch adds the delta into that UTC day's `usage_daily` row, keyed by day, host, repo, account, provider and model — all taken from the delta itself, so a session that already ended still gets its tail counted. Tokens are stored and money never is: cost is computed on read, so correcting a price needs no backfill.
 
-The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` and the dashboard at `/dashboard` are the paths behind an Access login; the approve and deny form checks the Access JWT, the origin and a CSRF token.
+`provider`, `account` and `model` are the columns a second provider fills. The hooks send `claude` and the subscription the host is signed in as, and those three values are the whole record of where the tokens went. A delta from OpenRouter's usage API, or from Codex's local session logs, fills the same fields with its own provider, account and models. No integration ships here, and the schema takes one as it stands.
 
-Opening the hostname in a browser answers `303 /dashboard`; a client that does not ask for `text/html` still gets the 404 JSON. Both answers carry `Vary: Accept`. The dashboard is server-rendered, reads the same Access JWT as `/device` through the one application that covers both paths, and refuses an email that is not invited. Its tabs are `/dashboard`, `/dashboard/history`, `/dashboard/memory`, `/dashboard/stats` and `/dashboard/insights`.
-
-`/dashboard/history` reads the session history: every session of the last 180 days grouped by UTC day, newest day first, each row carrying its handle, host, `repo@branch`, the span from the first prompt to the last activity, the prompt count and the focus line. A session that is still running is marked and stays in the list. `host` and `repo` narrow the page as links built from the hosts and repos the page holds, and the page walks back on the same cursor shape the memory listing uses.
-
-`/dashboard/memory` lists memories newest created first and pages on the same cursor `/v1/memories` answers. A form narrows the page by tag and by type, and a search there runs the hybrid ranking the CLI runs, at the same `--min-score` default of 0.55, showing the fusion score of each hit. Query, filters and cursor live in the URL, so a search is a link. `/dashboard/memory/<name>` renders one memory's body. Both read without recalling: browsing never moves a memory's recall count or the time it was last recalled. The strip above the listing counts the memories, how many were ever recalled, how many never were, how many are less than 30 days old, and the total per type. The dashboard never writes: saving, editing and deleting stay with the CLI and the tools.
+The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` sits behind an Access login; the approve and deny form checks the Access JWT, the origin and a CSRF token.
 
 ## Deploying from CI
 
