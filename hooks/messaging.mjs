@@ -43,16 +43,23 @@ function inbox(env = process.env) {
   return { socket, token, pid };
 }
 
-export function register(sessionId, cwd, env = process.env, uid = process.getuid()) {
-  const session = inbox(env);
-  if (!session) return false;
+// The registry is the one record of what became of a session, so a session the hook passed over
+// gets a file too, carrying the state and no inbox. `recall listen --status` reads them all; the
+// daemon delivers only to the ones carrying a socket.
+export function record(sessionId, state, cwd, env = process.env, uid = process.getuid()) {
   const dir = sessionsDir(env, uid);
   mkdirSync(dir, { recursive: true });
   chmodSync(dir, 0o700);
   const file = registryPath(sessionId, env, uid);
-  writeFileSync(file, `${JSON.stringify({ ...session, cwd })}\n`);
+  writeFileSync(file, `${JSON.stringify({ ...state, cwd })}\n`);
   chmodSync(file, 0o600);
-  return true;
+}
+
+export function register(sessionId, cwd, env = process.env, uid = process.getuid()) {
+  const session = inbox(env);
+  const state = session ? { state: "registered", ...session } : { state: "no-inbox" };
+  record(sessionId, state, cwd, env, uid);
+  return state.state;
 }
 
 export function unregister(sessionId, env = process.env, uid = process.getuid()) {

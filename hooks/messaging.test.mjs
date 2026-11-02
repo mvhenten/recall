@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { messagingEnabled, register, registryPath, runtimeDir, sessionsDir, unregister } from "./messaging.mjs";
+import { messagingEnabled, record, register, registryPath, runtimeDir, sessionsDir, unregister } from "./messaging.mjs";
 
 const INBOX = {
   CLAUDE_CODE_MESSAGING_SOCKET: "/run/user/1000/cc-socks/42.sock",
@@ -42,9 +42,10 @@ test("a session registers into the directory the daemon reads", () => {
   assert.equal(sessionsDir(env), path.join(env.XDG_RUNTIME_DIR, "recall", "sessions"));
   assert.equal(runtimeDir({}, 1000), path.join(tmpdir(), "recall-1000"));
 
-  assert.equal(register("s-1", "/home/you/src/recall", env), true);
+  assert.equal(register("s-1", "/home/you/src/recall", env), "registered");
   const file = registryPath("s-1", env);
   assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), {
+    state: "registered",
     socket: INBOX.CLAUDE_CODE_MESSAGING_SOCKET,
     token: INBOX.CLAUDE_CODE_MESSAGING_TOKEN,
     pid: 42,
@@ -56,8 +57,32 @@ test("a session registers into the directory the daemon reads", () => {
   unregister("s-1", env);
   assert.equal(existsSync(file), false);
   unregister("s-1", env);
-  assert.equal(register("s-2", "/tmp", { XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }), false);
-  assert.equal(register("s-3", "/tmp", { ...env, CLAUDE_CODE_MESSAGING_SOCKET: "/run/cc-socks/parent.sock" }), false);
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a session the hook passed over is recorded with the reason and no inbox", () => {
+  const { dir, env } = sandbox();
+
+  assert.equal(register("s-2", "/tmp", { XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR }), "no-inbox");
+  assert.deepEqual(JSON.parse(readFileSync(registryPath("s-2", env), "utf8")), {
+    state: "no-inbox",
+    cwd: "/tmp",
+  });
+
+  const parentSocket = { ...env, CLAUDE_CODE_MESSAGING_SOCKET: "/run/cc-socks/parent.sock" };
+  assert.equal(register("s-3", "/tmp", parentSocket), "no-inbox");
+
+  record("s-4", { state: "off" }, "/tmp", env);
+  assert.deepEqual(JSON.parse(readFileSync(registryPath("s-4", env), "utf8")), { state: "off", cwd: "/tmp" });
+
+  record("s-5", { state: "failed", error: "EACCES, permission denied" }, "/tmp", env);
+  assert.deepEqual(JSON.parse(readFileSync(registryPath("s-5", env), "utf8")), {
+    state: "failed",
+    error: "EACCES, permission denied",
+    cwd: "/tmp",
+  });
+  assert.equal(statSync(registryPath("s-5", env)).mode & 0o777, 0o600);
 
   rmSync(dir, { recursive: true, force: true });
 });

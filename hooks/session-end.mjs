@@ -1,8 +1,9 @@
 import { firstLine, logRun, readInput } from "./lib.mjs";
-import { messagingEnabled, unregister } from "./messaging.mjs";
+import { unregister } from "./messaging.mjs";
 
+// The record comes out whatever messaging.enabled now says: the setting can change mid-session,
+// and a record left behind would have `recall listen --status` reporting a session that is gone.
 function run(input) {
-  if (!messagingEnabled()) return "messaging:off";
   if (!input.session_id) return "messaging:no-session";
   unregister(input.session_id);
   return "messaging:unregistered";

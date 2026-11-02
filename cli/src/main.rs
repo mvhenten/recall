@@ -441,14 +441,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
         Command::Listen { ensure, status } => {
             let settings = settings::load(&cli.settings)?;
-            if !status {
-                listen::run(&settings, ensure)?;
-            } else if cli.json {
-                print_json(&listen::status(&settings))?;
-            } else {
-                for line in listen::status(&settings).lines() {
-                    println!("{line}");
+            if status {
+                let report = listen::status(&settings)?;
+                if cli.json {
+                    print_json(&report)?;
+                } else {
+                    for line in report.lines() {
+                        println!("{line}");
+                    }
                 }
+            } else {
+                listen::run(&settings, ensure)?;
             }
         }
         Command::Send { host, message } => {

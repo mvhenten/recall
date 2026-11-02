@@ -59,10 +59,6 @@ pub fn seen_path() -> PathBuf {
     runtime_dir().join("seen.json")
 }
 
-pub fn log_path() -> PathBuf {
-    state_dir().join("hooks.log")
-}
-
 /// An exclusive flock held for the daemon's lifetime. It is both the mutual exclusion and the
 /// liveness check, so a lockfile a killed daemon left behind needs no staleness handling.
 pub struct Lock {
@@ -224,17 +220,24 @@ async fn serve() -> Result<()> {
     }
 }
 
-/// How many skipped sessions `--status` prints before it points at the log for the rest. Every
-/// session still holding a registration is printed whatever its age.
-pub const STATUS_SESSIONS: usize = 10;
+pub const MESSAGING_OFF: &str = "messaging is off; run recall config set messaging.enabled true to turn it on";
+pub const NO_INBOX: &str =
+    "Claude set no CLAUDE_CODE_MESSAGING_SOCKET or CLAUDE_CODE_MESSAGING_TOKEN, so this session has no inbox";
 
-/// Why messaging reached, or did not reach, the sessions on this host.
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub messaging_enabled: bool,
     pub listener_running: bool,
-    pub log: PathBuf,
     pub sessions: Vec<sessions::Status>,
+}
+
+fn reason(state: &sessions::State) -> String {
+    match state {
+        sessions::State::Registered(inbox) => format!("registered, pid {}", inbox.pid),
+        sessions::State::Off => MESSAGING_OFF.to_string(),
+        sessions::State::NoInbox => NO_INBOX.to_string(),
+        sessions::State::Failed { error } => format!("writing the registration failed: {error}"),
+    }
 }
 
 impl Report {
@@ -243,7 +246,7 @@ impl Report {
             if self.messaging_enabled {
                 "messaging is on".to_string()
             } else {
-                sessions::MESSAGING_OFF.to_string()
+                MESSAGING_OFF.to_string()
             },
             if self.listener_running {
                 "a listener is running on this host".to_string()
@@ -252,46 +255,35 @@ impl Report {
             },
         ];
         if self.sessions.is_empty() {
-            lines.push(format!("no session is recorded in {}", self.log.display()));
+            lines.push("no session is running on this host".to_string());
             return lines;
         }
-        let mut shown = 0;
-        let mut hidden = 0;
         for status in &self.sessions {
-            if status.registration.is_none() && shown >= STATUS_SESSIONS {
-                hidden += 1;
-                continue;
-            }
-            shown += 1;
             lines.push(format!(
-                "{}  {}  {}  {}",
-                status.at, status.session_id, status.state, status.reason
+                "{}  {}  {}",
+                status.session_id,
+                status.record.cwd.display(),
+                reason(&status.record.state)
             ));
-        }
-        if hidden > 0 {
-            lines.push(format!("and {hidden} older sessions in {}", self.log.display()));
         }
         lines
     }
 }
 
-/// A held lock is the daemon's liveness check, so failing to take it means one is already running.
-fn listener_running() -> bool {
-    matches!(Lock::acquire(&lock_path()), Ok(None))
-}
-
-pub fn status(settings: &Settings) -> Report {
-    Report {
+pub fn status(settings: &Settings) -> Result<Report> {
+    Ok(Report {
         messaging_enabled: settings.messaging_enabled(),
-        listener_running: listener_running(),
-        log: log_path(),
-        sessions: sessions::status(&sessions_dir(), &log_path()),
-    }
+        listener_running: Lock::acquire(&lock_path())?.is_none(),
+        sessions: sessions::status(&sessions_dir())
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect(),
+    })
 }
 
 pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
     if !settings.messaging_enabled() {
-        eprintln!("recall: {}", sessions::MESSAGING_OFF);
+        eprintln!("recall: {MESSAGING_OFF}");
         return Ok(());
     }
     let path = lock_path();
@@ -349,43 +341,83 @@ mod tests {
     }
 
     #[test]
-    fn a_registered_session_is_always_printed_however_many_were_skipped() {
-        let mut sessions: Vec<sessions::Status> = (0..STATUS_SESSIONS + 5)
-            .map(|minute| sessions::Status {
-                session_id: format!("s-skipped-{minute}"),
-                at: format!("2026-11-02T09:{minute:02}:00.000Z"),
-                state: "off".to_string(),
-                reason: sessions::MESSAGING_OFF.to_string(),
-                registration: None,
-            })
-            .collect();
-        sessions.push(sessions::Status {
-            session_id: "s-live".to_string(),
-            at: "2026-11-01T08:00:00.000Z".to_string(),
-            state: "registered".to_string(),
-            reason: "registered, pid 42 in /src".to_string(),
-            registration: Some(sessions::Live {
-                pid: 42,
-                cwd: PathBuf::from("/src"),
-            }),
-        });
+    fn each_running_session_prints_the_reason_the_hook_gave() {
+        let sessions = vec![
+            sessions::Status {
+                session_id: "s-live".to_string(),
+                record: sessions::Record {
+                    cwd: PathBuf::from("/src/recall"),
+                    state: sessions::State::Registered(sessions::Inbox {
+                        socket: PathBuf::from("/run/user/1000/cc-socks/42.sock"),
+                        token: "t-inbox".to_string(),
+                        pid: 42,
+                    }),
+                },
+            },
+            sessions::Status {
+                session_id: "s-off".to_string(),
+                record: sessions::Record {
+                    cwd: PathBuf::from("/src/other"),
+                    state: sessions::State::Off,
+                },
+            },
+            sessions::Status {
+                session_id: "s-no-inbox".to_string(),
+                record: sessions::Record {
+                    cwd: PathBuf::from("/src/third"),
+                    state: sessions::State::NoInbox,
+                },
+            },
+            sessions::Status {
+                session_id: "s-failed".to_string(),
+                record: sessions::Record {
+                    cwd: PathBuf::from("/src/fourth"),
+                    state: sessions::State::Failed {
+                        error: "EACCES, permission denied".to_string(),
+                    },
+                },
+            },
+        ];
         let report = Report {
-            messaging_enabled: false,
+            messaging_enabled: true,
             listener_running: false,
-            log: PathBuf::from("/state/hooks.log"),
             sessions,
         };
 
         let lines = report.lines();
 
-        assert_eq!(lines[0], sessions::MESSAGING_OFF);
-        assert_eq!(lines[1], "no listener is running on this host");
         assert_eq!(
-            lines.iter().filter(|line| line.contains("s-skipped-")).count(),
-            STATUS_SESSIONS
+            lines,
+            vec![
+                "messaging is on".to_string(),
+                "no listener is running on this host".to_string(),
+                "s-live  /src/recall  registered, pid 42".to_string(),
+                format!("s-off  /src/other  {MESSAGING_OFF}"),
+                format!("s-no-inbox  /src/third  {NO_INBOX}"),
+                "s-failed  /src/fourth  writing the registration failed: EACCES, permission denied".to_string(),
+            ]
         );
-        assert!(lines.iter().any(|line| line.contains("s-live")), "{lines:?}");
-        assert_eq!(lines.last().unwrap(), "and 5 older sessions in /state/hooks.log");
+        assert!(
+            !format!("{report:?}").contains("t-inbox"),
+            "the inbox token never reaches a log line"
+        );
+    }
+
+    #[test]
+    fn an_empty_registry_says_no_session_is_running() {
+        let report = Report {
+            messaging_enabled: false,
+            listener_running: true,
+            sessions: Vec::new(),
+        };
+        assert_eq!(
+            report.lines(),
+            vec![
+                MESSAGING_OFF.to_string(),
+                "a listener is running on this host".to_string(),
+                "no session is running on this host".to_string(),
+            ]
+        );
     }
 
     #[test]
