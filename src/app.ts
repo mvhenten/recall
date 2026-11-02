@@ -50,6 +50,7 @@ import {
   parseSearch,
   parseSession,
   parseSessionId,
+  parseSessionScope,
   parseUsage,
   type SearchInput,
   type StatsWindows,
@@ -68,6 +69,7 @@ import {
   getMemory,
   listMemories,
   listSessionHistory,
+  listSessionHistoryIds,
   listSessions,
   liveTally,
   memoryCounts,
@@ -214,6 +216,7 @@ export const createApp = (deps: Deps): App => {
 
   const sessions = async (
     request: Request,
+    url: URL,
     db: D1Database,
     caller: Caller,
     rawSessionId: string | undefined,
@@ -221,6 +224,9 @@ export const createApp = (deps: Deps): App => {
   ): Promise<Response> => {
     if (rawSessionId === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
+      const scope = parseSessionScope(url.searchParams.get("scope"));
+      if (!scope.ok) return error(400, scope.error);
+      if (scope.value === "history") return sessionHistoryIds(url, db, caller);
       const listed = await listSessions(db, caller.userId, deps.now());
       return json({
         sessions: listed.map((session) => ({ ...session, current: session.deviceId === caller.deviceId })),
@@ -242,6 +248,9 @@ export const createApp = (deps: Deps): App => {
     if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
     return new Response(null, { status: 204 });
   };
+
+  const sessionHistoryIds = async (url: URL, db: D1Database, caller: Caller): Promise<Response> =>
+    json(await listSessionHistoryIds(db, caller.userId, url.searchParams.get("cursor") ?? ""));
 
   const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
     if (request.method !== "POST") return error(405, "method not allowed");
@@ -572,7 +581,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
-    if (collection === "sessions") return sessions(request, env.DB, caller, rawName, subresource);
+    if (collection === "sessions") return sessions(request, url, env.DB, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {
         if (request.method !== "GET") return error(405, "method not allowed");

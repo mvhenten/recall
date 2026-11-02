@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Mirrors FOCUS_PART_CHARS in hooks/messaging.mjs.
 const FOCUS_PART_CHARS: usize = 72;
 const CLAUDE: &str = "claude";
-const TRANSCRIPT: &str = "jsonl";
+pub const TRANSCRIPT: &str = "jsonl";
 const HEAD: usize = 8192;
 const ADOPTED: &str = "adopted";
 
@@ -113,7 +113,7 @@ pub struct Adoption {
     pub outcome: &'static str,
 }
 
-fn millis(time: SystemTime) -> i64 {
+pub fn millis(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|since| since.as_millis() as i64)
         .unwrap_or_default()
@@ -226,7 +226,7 @@ fn opened(path: &Path) -> Option<i64> {
 /// write says when a session was busy and not when it began, and matching on that is what hands a
 /// live session the id of one that ended. A transcript that can say neither is one no running
 /// session is matched to at all.
-fn birth(path: &Path, metadata: &std::fs::Metadata) -> Option<SystemTime> {
+pub fn birth(path: &Path, metadata: &std::fs::Metadata) -> Option<SystemTime> {
     if let Ok(created) = metadata.created() {
         return Some(created);
     }
@@ -264,8 +264,8 @@ fn transcripts(projects: &Path, cwd: &Path) -> Vec<Transcript> {
 /// alone, parsed or not — the hooks write one with a single write and no rename, so a record read
 /// mid-write does not parse, and overwriting that session would throw away the inbox it carries.
 #[derive(Debug, Default)]
-struct Registry {
-    sessions: HashSet<String>,
+pub struct Registry {
+    pub sessions: HashSet<String>,
     pids: HashSet<i32>,
     adopted: Vec<(String, Value)>,
 }
@@ -274,7 +274,7 @@ fn parsed(path: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-fn registry(dir: &Path) -> Registry {
+pub fn registry(dir: &Path) -> Registry {
     let mut registry = Registry::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return registry;
@@ -355,13 +355,21 @@ fn claims(scope: &Scope, registry: &Registry) -> Vec<Claim> {
 /// What a transcript says about its session, and how far into it this reading has reached. It goes
 /// into the next pass as it stands, so a stretch with no prompt in it leaves the count and the
 /// focus where they are.
+///
+/// `cwd` and `git_branch` are what the entries themselves carry, taken from the last one that
+/// names either: a session that moved between directories or branches ended where it ended. A
+/// running session has both from its own process and its own `git log` instead, so only a session
+/// read back long after it ended has anything to take from here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Reading {
-    offset: u64,
-    started_at: i64,
-    prompts: i64,
-    focus: Focus,
-    permission_mode: String,
+pub struct Reading {
+    pub offset: u64,
+    pub started_at: i64,
+    pub last_at: i64,
+    pub prompts: i64,
+    pub focus: Focus,
+    pub permission_mode: String,
+    pub cwd: String,
+    pub git_branch: String,
 }
 
 /// A prompt cut to what one terminal row holds, as hooks/messaging.mjs cuts it.
@@ -423,7 +431,7 @@ fn typed(entry: &Value) -> Option<String> {
 /// line: an entry still being written is never half-read, and the next pass takes it whole. A file
 /// shorter than the mark is a different transcript under the same name, and is read again from its
 /// start.
-fn read_on(path: &Path, carried: Reading) -> Reading {
+pub fn read_on(path: &Path, carried: Reading) -> Reading {
     let Ok(mut file) = std::fs::File::open(path) else {
         return carried;
     };
@@ -443,12 +451,28 @@ fn read_on(path: &Path, carried: Reading) -> Reading {
         return reading;
     };
     reading.offset = from + cut as u64 + 1;
-    for line in String::from_utf8_lossy(&bytes[..cut]).lines() {
+    read_text(&String::from_utf8_lossy(&bytes[..cut]), reading)
+}
+
+/// What a stretch of transcript says, for a caller that already holds it. A line that does not
+/// parse is skipped, which is also what an entry still being written leaves behind.
+pub fn read_text(stretch: &str, carried: Reading) -> Reading {
+    let mut reading = carried;
+    for line in stretch.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if reading.started_at == 0 {
-            reading.started_at = timestamp(&entry).unwrap_or_default();
+        if let Some(at) = timestamp(&entry) {
+            if reading.started_at == 0 {
+                reading.started_at = at;
+            }
+            reading.last_at = at;
+        }
+        for (field, into) in [("cwd", &mut reading.cwd), ("gitBranch", &mut reading.git_branch)] {
+            let found = text(&entry, field);
+            if !found.is_empty() {
+                *into = found;
+            }
         }
         let Some(prompt) = typed(&entry) else {
             continue;
@@ -523,6 +547,7 @@ fn refresh(scope: &Scope, session_id: &str, stored: &Value) -> Result<Option<Ado
                 latest: text(&stored["focus"], "latest"),
             },
             permission_mode: text(stored, "permissionMode"),
+            ..Reading::default()
         },
     );
     let mut document = stored.clone();

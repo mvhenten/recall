@@ -16,6 +16,12 @@ const listed = async (client: Client): Promise<ListedSession[]> => {
   return body.sessions;
 };
 
+const ids = async (client: Client, query: string): Promise<{ sessionIds: string[]; nextCursor: string }> => {
+  const response = await client.request("GET", `/v1/sessions?${query}`);
+  expect(response.status).toBe(200);
+  return await response.json();
+};
+
 const account = async (h: Harness): Promise<{ laptop: Client; tower: Client }> => {
   const email = await h.invite(`sessions-${crypto.randomUUID()}@example.com`);
   return {
@@ -186,5 +192,52 @@ describe("session history", () => {
       { branch: "feat/session-history", prompts: 9, focus_latest: "ship it" },
       expect.objectContaining({ branch: "feat/stranger-session" }),
     ]);
+  });
+
+  it("lists the ids it holds, in id order, and only the caller's", async () => {
+    const h = await harness();
+    const { laptop, tower } = await account(h);
+    const stranger = await h.user("stranger");
+
+    await laptop.sync("s-oldest", { lastActivityAt: h.now() });
+    await tower.sync("s-middle", { host: "tower", lastActivityAt: h.tick(60_000) });
+    await laptop.sync("s-newest", { lastActivityAt: h.tick(60_000) });
+    expect((await laptop.request("DELETE", "/v1/sessions/s-newest")).status).toBe(204);
+    await stranger.sync("s-stranger", { lastActivityAt: h.now() });
+
+    expect(await ids(laptop, "scope=history")).toEqual({
+      sessionIds: ["s-middle", "s-newest", "s-oldest"],
+      nextCursor: "",
+    });
+    expect(await ids(stranger, "scope=history")).toEqual({ sessionIds: ["s-stranger"], nextCursor: "" });
+  });
+
+  it("pages from the last id it gave, so a session syncing under the page is still listed", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+
+    await laptop.sync("s-middle", { lastActivityAt: h.now() });
+    await laptop.sync("s-newest", { lastActivityAt: h.now() });
+    await laptop.sync("s-oldest", { lastActivityAt: h.now() });
+
+    await laptop.sync("s-newest", { lastActivityAt: h.tick(3_600_000) });
+
+    expect(await ids(laptop, "scope=history&cursor=s-middle")).toEqual({
+      sessionIds: ["s-newest", "s-oldest"],
+      nextCursor: "",
+    });
+  });
+
+  it("refuses a scope it does not know", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+    await laptop.sync("s-held");
+
+    const refused = await laptop.request("GET", "/v1/sessions?scope=past");
+    expect(refused.status).toBe(400);
+
+    const live = await laptop.request("GET", "/v1/sessions?scope=live");
+    expect(live.status).toBe(200);
+    expect(await live.json()).toMatchObject({ sessions: [expect.objectContaining({ sessionId: "s-held" })] });
   });
 });

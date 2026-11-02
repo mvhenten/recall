@@ -1,5 +1,6 @@
 mod adopt;
 mod api;
+mod backfill;
 mod config;
 mod listen;
 mod markdown;
@@ -148,6 +149,12 @@ enum Command {
             help = "Write and sync a record for every running session this host's hooks never registered"
         )]
         adopt: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["sync", "end", "adopt"],
+            help = "Send the history and usage of every past session this host holds a transcript for"
+        )]
+        backfill: bool,
     },
     #[command(about = "Send a message to another host signed in as you, or to one session on it")]
     Send {
@@ -430,7 +437,7 @@ fn sync_session(session_id: &str) -> Result<()> {
     let Some(pending) = record.usage_pending.as_ref() else {
         return Ok(());
     };
-    let sent = client.post_usage(session_id, &record.host, &record.repo, pending)?;
+    let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
     sessions::commit_usage(&dir, session_id, pending)?;
     println!("sent {sent} usage deltas for {session_id}");
     Ok(())
@@ -446,7 +453,7 @@ fn end_session(session_id: &str) -> Result<()> {
     if let Some(record) = record.as_ref()
         && let Some(pending) = record.usage_pending.as_ref()
     {
-        let sent = client.post_usage(session_id, &record.host, &record.repo, pending)?;
+        let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
         println!("sent {sent} usage deltas for {session_id}");
     }
     let ended = client.end_session(session_id)?;
@@ -498,6 +505,40 @@ fn adopt_sessions() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     Ok(ExitCode::from(2))
+}
+
+impl backfill::Service for Client {
+    fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[serde_json::Value]) -> Result<usize> {
+        Client::post_usage(self, session_id, host, repo, events)
+    }
+
+    fn sync(&self, session_id: &str, body: &api::SessionBody) -> Result<()> {
+        self.sync_session(session_id, body)
+    }
+
+    fn end(&self, session_id: &str) -> Result<()> {
+        self.end_session(session_id).map(|_| ())
+    }
+}
+
+/// Every past session this host holds a transcript for, sent as the session it was. The sessions
+/// the service already holds on record are read back first and passed over, so one session that
+/// cannot be sent fails the run and the next run picks the span up where this one stopped.
+fn backfill_sessions() -> Result<ExitCode> {
+    let scope = adopt::Scope::here()?;
+    let account = backfill::account_here()?;
+    let client = Client::new(config::load()?);
+    let on_record = client.session_history_ids()?;
+    let past = backfill::past(&scope, &account, &on_record)?;
+    if past.is_empty() {
+        println!("no past session needs backfilling");
+        return Ok(ExitCode::SUCCESS);
+    }
+    backfill::send(&client, &past, |session_id, sent| {
+        println!("backfilled {session_id} with {sent} usage deltas");
+    })?;
+    println!("backfilled {} past sessions", past.len());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn require_messaging(settings: &Settings) -> Result<()> {
@@ -585,7 +626,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 listen::run(&settings, ensure)?;
             }
         }
-        Command::Sessions { sync, end, adopt } => {
+        Command::Sessions {
+            sync,
+            end,
+            adopt,
+            backfill,
+        } => {
             if let Some(id) = sync {
                 return Ok(logged("synced", "sync-failed", &id, || sync_session(&id)));
             }
@@ -594,6 +640,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if adopt {
                 return adopt_sessions();
+            }
+            if backfill {
+                return backfill_sessions();
             }
             let client = client()?;
             let listed = client.sessions()?;

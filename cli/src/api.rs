@@ -1,6 +1,7 @@
 use crate::config::Config;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use ureq::http::Response;
 use ureq::{Agent, RequestBuilder};
@@ -251,6 +252,13 @@ struct Sessions {
     sessions: Vec<Session>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryIds {
+    session_ids: Vec<String>,
+    next_cursor: String,
+}
+
 /// The device a message is queued against, and the one session on it the message is for; an empty
 /// `session_id` reaches every session that host has registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,6 +452,29 @@ impl Client {
         Ok(listed.sessions)
     }
 
+    /// Every session this account has on record, read to the last page. A host sending its past
+    /// sessions back needs the whole set before it starts, since a transcript says nothing about
+    /// whether the service already holds the session it describes.
+    pub fn session_history_ids(&self) -> Result<HashSet<String>> {
+        let mut held = HashSet::new();
+        let mut cursor = String::new();
+        loop {
+            let mut query = "/v1/sessions?scope=history".to_string();
+            if !cursor.is_empty() {
+                query.push_str(&format!("&cursor={}", encode(&cursor)));
+            }
+            let response = self.authed(self.agent.get(self.url(&query))).call()?;
+            let page: HistoryIds = check(response, "listing the sessions on record")?
+                .body_mut()
+                .read_json()?;
+            held.extend(page.session_ids);
+            if page.next_cursor.is_empty() {
+                return Ok(held);
+            }
+            cursor = page.next_cursor;
+        }
+    }
+
     pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<()> {
         let response = self
             .authed(self.agent.put(self.url(&Self::session_path(session_id))))
@@ -476,14 +507,8 @@ impl Client {
 
     /// Sends every event of one stretch. The events are the hooks' own: nothing here reads inside
     /// one, so a counter the hooks learn to read needs no change in this binary.
-    pub fn post_usage(
-        &self,
-        session_id: &str,
-        host: &str,
-        repo: &str,
-        pending: &crate::sessions::UsagePending,
-    ) -> Result<usize> {
-        for event in &pending.events {
+    pub fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[serde_json::Value]) -> Result<usize> {
+        for event in events {
             let response = self
                 .authed(
                     self.agent
@@ -492,7 +517,7 @@ impl Client {
                 .send_json(UsageBody { host, repo, event })?;
             check(response, &format!("sending usage for session {session_id}"))?;
         }
-        Ok(pending.events.len())
+        Ok(events.len())
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {

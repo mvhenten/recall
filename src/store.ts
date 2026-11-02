@@ -421,6 +421,37 @@ export const listSessionHistory = async (
   return { sessions, nextCursor };
 };
 
+const SESSION_IDS_PAGE = 100;
+
+// Which sessions the account has on record, and nothing else about them. A host reading its own
+// past sessions back out of its transcripts needs only to know which ones are already here, and
+// the ids alone page far cheaper than the rows the history tab draws.
+//
+// The page walks the session id and not the activity time the history tab orders by: a live session
+// syncing while a caller pages rewrites its own last activity, and a row whose time moves under an
+// ordering keyed on it hops across the cursor and is never read. An id never moves.
+export const listSessionHistoryIds = async (
+  db: D1Database,
+  userId: string,
+  cursor: string,
+): Promise<{ sessionIds: string[]; nextCursor: string }> => {
+  const { results } = await db
+    .prepare(
+      `SELECT session_id FROM session_history
+       WHERE user_id = ?1 AND session_id > ?2
+       ORDER BY session_id
+       LIMIT ?3`,
+    )
+    .bind(userId, cursor, SESSION_IDS_PAGE + 1)
+    .all<{ session_id: string }>();
+  const page = results.slice(0, SESSION_IDS_PAGE);
+  const last = page.at(-1);
+  return {
+    sessionIds: page.map((row) => row.session_id),
+    nextCursor: results.length > SESSION_IDS_PAGE && last ? last.session_id : "",
+  };
+};
+
 export const sessionHistoryFilters = async (db: D1Database, userId: string): Promise<HistoryFilters> => {
   const { results } = await db
     .prepare(
