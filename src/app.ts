@@ -1,14 +1,16 @@
 import {
   dashboardNotice,
-  dashboardPage,
   HISTORY_TAB,
   historyPage,
+  INSIGHTS_TAB,
+  insightsPage,
   MEMORY_TAB,
   memoriesPage,
   memoryBodyPage,
   memorySearchPage,
-  SESSIONS_TAB,
+  STATS_TAB,
   sessionsPage,
+  statsPage,
   tabForPath,
 } from "./dashboard";
 import {
@@ -33,7 +35,9 @@ import {
 } from "./device";
 import { DEVICE_HEADER, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, NOW_HEADER, parseSend } from "./mailbox";
 import {
+  DAY_MS,
   DEFAULT_MIN_SCORE,
+  dayWindow,
   type Embedder,
   FRESH_WINDOW_MS,
   type Live,
@@ -48,6 +52,10 @@ import {
   parseSessionId,
   parseUsage,
   type SearchInput,
+  type StatsWindows,
+  USAGE_CHART_DAYS,
+  USAGE_MONTH_DAYS,
+  USAGE_WEEK_DAYS,
   type Verify,
 } from "./model";
 import { CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
@@ -61,14 +69,16 @@ import {
   listMemories,
   listSessionHistory,
   listSessions,
+  liveTally,
   memoryCounts,
   putSession,
+  readInsights,
+  readStats,
   recall,
   recordUsage,
   saveMemory,
   sessionHistoryFilters,
   sessionOnDevice,
-  sessionTally,
   textCandidates,
   vectorCandidates,
 } from "./store";
@@ -293,7 +303,7 @@ export const createApp = (deps: Deps): App => {
     }
     const tab = tabForPath(url.pathname);
     const now = deps.now();
-    const live = await sessionTally(db, userId, now);
+    const live = await liveTally(db, userId, now);
     if (tab === null) {
       const prefix = `${MEMORY_TAB.path}/`;
       if (!url.pathname.startsWith(prefix)) {
@@ -303,9 +313,35 @@ export const createApp = (deps: Deps): App => {
     }
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
-    if (tab.path === SESSIONS_TAB.path) return sessionsPage(email, live, await listSessions(db, userId, now), now);
-    return dashboardPage(email, tab, live);
+    if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
+    if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
+    return sessionsPage(email, live, await listSessions(db, userId, now), now);
   };
+
+  const statsTab = async (
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    now: number,
+  ): Promise<Response> => {
+    const windows: StatsWindows = {
+      month: dayWindow(now, USAGE_MONTH_DAYS),
+      fortnight: dayWindow(now, USAGE_CHART_DAYS),
+      week: dayWindow(now, USAGE_WEEK_DAYS),
+      prior: dayWindow(now - USAGE_WEEK_DAYS * DAY_MS, USAGE_WEEK_DAYS),
+    };
+    return statsPage(email, live, await readStats(db, userId, windows), now);
+  };
+
+  const insightsTab = async (
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    now: number,
+  ): Promise<Response> =>
+    insightsPage(email, live, await readInsights(db, userId, dayWindow(now, USAGE_CHART_DAYS), now), now);
 
   const historyTab = async (
     url: URL,

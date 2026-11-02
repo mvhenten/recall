@@ -105,6 +105,8 @@ export interface Session extends SessionInput {
 export interface Live {
   sessions: number;
   busy: number;
+  sessionsToday: number;
+  today: ModelTotals[];
 }
 
 export interface PastSession {
@@ -152,7 +154,129 @@ export interface UsageInput {
   at: number;
 }
 
+export const DAY_MS = 86_400_000;
+
 export const usageDay = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
+export const usageDayStart = (at: number): number => at - (at % DAY_MS);
+
+// The three windows the stats page answers over. Today is the UTC day the rollup keys on; the
+// wider two are inclusive of today, so seven days means today and the six before it.
+export const USAGE_WEEK_DAYS = 7;
+export const USAGE_CHART_DAYS = 14;
+export const USAGE_MONTH_DAYS = 30;
+export const STALE_AFTER_DAYS = 60;
+export const NEVER_RECALLED_AFTER_DAYS = 14;
+
+// One window, derived once and read everywhere: the UTC days the rollup is keyed by and the epoch
+// bounds the session tables are keyed by, so a page never slices usage by one day and sessions by
+// another.
+export interface DayWindow {
+  days: string[];
+  from: string;
+  to: string;
+  since: number;
+  until: number;
+}
+
+export const dayWindow = (now: number, days: number): DayWindow => {
+  const since = usageDayStart(now) - (days - 1) * DAY_MS;
+  const span = Array.from({ length: days }, (_, index) => usageDay(since + index * DAY_MS));
+  return {
+    days: span,
+    from: span[0] ?? usageDay(now),
+    to: span.at(-1) ?? usageDay(now),
+    since,
+    until: now,
+  };
+};
+
+export interface TokenCounts {
+  prompts: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+}
+
+export interface ModelTotals extends TokenCounts {
+  provider: string;
+  model: string;
+}
+
+export interface ModelDay extends ModelTotals {
+  day: string;
+}
+
+export type UsageSplitField = "host" | "repo" | "account";
+
+export interface UsageSplit extends ModelTotals {
+  field: UsageSplitField;
+  value: string;
+}
+
+export interface DaySessions {
+  day: string;
+  sessions: number;
+}
+
+export interface RepoHours {
+  repo: string;
+  ms: number;
+  sessions: number;
+}
+
+export interface RhythmCell {
+  weekday: number;
+  hour: number;
+  sessions: number;
+}
+
+export interface RecalledMemory {
+  name: string;
+  recalls: number;
+}
+
+export interface WorkingSet {
+  entries: RecalledMemory[];
+  recalls: number;
+}
+
+export interface StaleMemory {
+  name: string;
+  recalled: boolean;
+  lastRecalledAt: number;
+  createdAt: number;
+}
+
+export interface GoingStale {
+  entries: StaleMemory[];
+  atRisk: number;
+  total: number;
+}
+
+export interface StatsWindows {
+  month: DayWindow;
+  fortnight: DayWindow;
+  week: DayWindow;
+  prior: DayWindow;
+}
+
+export interface Stats {
+  windows: StatsWindows;
+  usage: ModelDay[];
+  splits: UsageSplit[];
+  sessions: DaySessions[];
+}
+
+export interface Insights {
+  fortnight: DayWindow;
+  usage: ModelDay[];
+  working: WorkingSet;
+  stale: GoingStale;
+  repos: RepoHours[];
+  rhythm: RhythmCell[];
+}
 
 // The handle that addresses one session: its device name and the head of its session id. It is a
 // function of the session alone, so it names the same session for as long as that session runs and
