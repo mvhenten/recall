@@ -147,7 +147,7 @@ main{padding:1rem;display:grid;gap:.7rem;align-content:start}
 .tags span{font:400 .68rem/1 var(--mono);color:var(--dim);background:var(--surface2);border-radius:4px;padding:.25rem .4rem;overflow-wrap:anywhere}
 .mfoot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.6rem;font:400 .7rem/1.4 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
 .mfoot .never{color:var(--warn);font-weight:600}
-.toolrow{display:flex;gap:.9rem;align-items:center;flex-wrap:wrap}
+.toolrow{display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;min-width:0}
 .find{display:flex;gap:.5rem;flex:1;min-width:0;max-width:30rem;margin:0}
 .find input{flex:1 1 7rem;font:inherit;font-size:.9rem;padding:.5rem .75rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--ink);min-width:0}
 .find input::placeholder{color:var(--faint)}
