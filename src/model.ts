@@ -132,6 +132,28 @@ export interface HistoryInput {
   limit: number;
 }
 
+export const labelKinds = ["host", "account"] as const;
+
+export type LabelKind = (typeof labelKinds)[number];
+
+export interface Label {
+  kind: LabelKind;
+  value: string;
+  label: string;
+}
+
+// The friendly name a user gave a raw host or account, looked up by the raw value. A value with no
+// label is absent rather than held as a blank, so every page falls back to the raw value.
+export interface Labels {
+  hosts: Map<string, string>;
+  accounts: Map<string, string>;
+}
+
+export interface LabelTargets {
+  hosts: string[];
+  accounts: string[];
+}
+
 // Raw events are detail and the daily rollup is the long window, so events past two weeks are
 // dropped and every window wider than that reads only usage_daily.
 export const USAGE_RETENTION_MS = 1_209_600_000;
@@ -415,6 +437,28 @@ export const parseHistory = (params: URLSearchParams): Parsed<HistoryInput> => {
   const limit = Number(params.get("limit") ?? 20);
   if (!isInteger(limit, 1, 100)) return fail("limit must be a whole number from 1 to 100");
   return { ok: true, value: { host, repo, cursor: params.get("cursor") ?? "", limit } };
+};
+
+// The labels form names each field for the raw value it labels, as <kind>:<value>, so a submission
+// carries no ordering the parser has to trust and the form's own fields are skipped by name. An
+// empty label clears the one on record rather than storing a blank.
+export const parseLabels = (form: URLSearchParams): Parsed<Label[]> => {
+  const labels: Label[] = [];
+  for (const [field, text] of form) {
+    const colon = field.indexOf(":");
+    const kind = colon === -1 ? "" : field.slice(0, colon);
+    if (!isOneOf(labelKinds, kind)) continue;
+    const value = field.slice(colon + 1);
+    if (value.length < 1 || value.length > MAX_SESSION_TEXT_CHARS) {
+      return fail(`a ${kind} must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
+    }
+    const label = text.trim();
+    if (label.length > MAX_SESSION_TEXT_CHARS) {
+      return fail(`a label must hold at most ${MAX_SESSION_TEXT_CHARS} characters`);
+    }
+    labels.push({ kind, value, label });
+  }
+  return { ok: true, value: labels };
 };
 
 export const sessionScopes = ["live", "history"] as const;

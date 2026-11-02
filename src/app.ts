@@ -4,6 +4,8 @@ import {
   historyPage,
   INSIGHTS_TAB,
   insightsPage,
+  LABELS_TAB,
+  labelsPage,
   MEMORY_TAB,
   memoriesPage,
   memoryBodyPage,
@@ -44,6 +46,7 @@ import {
   type MemoryHit,
   type MemoryType,
   parseHistory,
+  parseLabels,
   parseList,
   parseName,
   parseSave,
@@ -67,6 +70,7 @@ import {
   describeMemories,
   endSession,
   getMemory,
+  labelTargets,
   listMemories,
   listSessionHistory,
   listSessionHistoryIds,
@@ -75,6 +79,7 @@ import {
   memoryCounts,
   putSession,
   readInsights,
+  readLabels,
   readStats,
   recall,
   recordUsage,
@@ -83,6 +88,7 @@ import {
   sessionOnDevice,
   textCandidates,
   vectorCandidates,
+  writeLabels,
 } from "./store";
 
 export interface Deps {
@@ -304,14 +310,18 @@ export const createApp = (deps: Deps): App => {
       dashboardNotice(status, title, text, "Back to the dashboard");
     const signIn = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Sign in again");
-    if (request.method !== "GET") return lost(405, "Not allowed", "The dashboard only answers a GET.");
+    const tab = tabForPath(url.pathname);
+    const saving = request.method === "POST" && tab?.path === LABELS_TAB.path;
+    if (request.method !== "GET" && !saving) {
+      return lost(405, "Not allowed", "The dashboard only answers a GET, and the Labels tab its own POST.");
+    }
     const email = await approver(request, signIn);
     if (email instanceof Response) return email;
     const userId = await userForEmail(db, email);
     if (userId === null) {
       return signIn(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
     }
-    const tab = tabForPath(url.pathname);
+    if (saving) return saveLabels(request, url, db, userId, lost);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (tab === null) {
@@ -325,7 +335,33 @@ export const createApp = (deps: Deps): App => {
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
     if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
     if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
-    return sessionsPage(email, live, await listSessions(db, userId, now), now);
+    if (tab.path === LABELS_TAB.path) return labelsTab(db, userId, email, live);
+    const [sessions, labels] = await Promise.all([listSessions(db, userId, now), readLabels(db, userId)]);
+    return sessionsPage(email, live, sessions, labels, now);
+  };
+
+  const labelsTab = async (db: D1Database, userId: string, email: string, live: Live): Promise<Response> => {
+    const [targets, labels] = await Promise.all([labelTargets(db, userId), readLabels(db, userId)]);
+    return labelsPage(email, live, targets, labels, randomToken());
+  };
+
+  const saveLabels = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    userId: string,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const form = new URLSearchParams(await request.text());
+    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
+    const csrf = form.get("csrf") ?? "";
+    if (request.headers.get("origin") !== url.origin || cookie === null || !sameSecret(cookie, csrf)) {
+      return lost(403, "Request refused", "The form did not come from this page. Reload it and try again.");
+    }
+    const labels = parseLabels(form);
+    if (!labels.ok) return lost(400, "Labels refused", `${labels.error}.`);
+    await writeLabels(db, userId, labels.value);
+    return new Response(null, { status: 303, headers: { location: LABELS_TAB.path } });
   };
 
   const statsTab = async (
@@ -341,7 +377,8 @@ export const createApp = (deps: Deps): App => {
       week: dayWindow(now, USAGE_WEEK_DAYS),
       prior: dayWindow(now - USAGE_WEEK_DAYS * DAY_MS, USAGE_WEEK_DAYS),
     };
-    return statsPage(email, live, await readStats(db, userId, windows), now);
+    const [stats, labels] = await Promise.all([readStats(db, userId, windows), readLabels(db, userId)]);
+    return statsPage(email, live, stats, labels, now);
   };
 
   const insightsTab = async (
@@ -366,8 +403,8 @@ export const createApp = (deps: Deps): App => {
     const cursor = decodeCursor(input.value.cursor);
     if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the History tab.");
     const page = await listSessionHistory(db, userId, input.value, cursor, deps.now());
-    const known = await sessionHistoryFilters(db, userId);
-    return historyPage(email, live, url, input.value, known, page.sessions, page.nextCursor);
+    const [known, labels] = await Promise.all([sessionHistoryFilters(db, userId), readLabels(db, userId)]);
+    return historyPage(email, live, url, input.value, known, page.sessions, page.nextCursor, labels);
   };
 
   const memoryBody = async (

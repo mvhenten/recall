@@ -9,9 +9,13 @@ import {
   type HistoryInput,
   IDLE_AFTER_MS,
   type Insights,
+  type LabelKind,
+  type Labels,
+  type LabelTargets,
   LIST_PARAMS,
   type ListInput,
   type Live,
+  MAX_SESSION_TEXT_CHARS,
   type Memory,
   type MemoryCounts,
   type MemoryHit,
@@ -33,7 +37,7 @@ import {
   usageDay,
   usageMonth,
 } from "./model";
-import { escapeHtml, htmlPage } from "./page";
+import { CSRF_COOKIE, escapeHtml, htmlPage } from "./page";
 
 export interface Tab {
   path: string;
@@ -46,6 +50,7 @@ const CLOCK = '<circle cx="10" cy="10" r="7"/><path d="M10 6.2v3.8l2.6 2"/>';
 const BOOKMARK = '<path d="M6 3.5h8v13l-4-3.1-4 3.1z"/>';
 const BARS = '<path d="M5.5 16V10.5M10 16V5.5M14.5 16V8.5M3.5 16h13"/>';
 const SPARK = '<path d="M10 3l1.7 5.1L17 10l-5.3 1.9L10 17l-1.7-5.1L3 10l5.3-1.9z"/>';
+const TAG = '<path d="M3.3 10.6 10.6 3.3h6.1v6.1L9.4 16.7z"/><circle cx="13.4" cy="6.6" r="1.2"/>';
 
 export const SESSIONS_TAB: Tab = { path: "/dashboard", label: "Sessions", icon: DISC };
 export const HISTORY_TAB: Tab = { path: "/dashboard/history", label: "History", icon: CLOCK };
@@ -53,8 +58,9 @@ export const MEMORY_TAB: Tab = { path: "/dashboard/memory", label: "Memory", ico
 
 export const STATS_TAB: Tab = { path: "/dashboard/stats", label: "Stats", icon: BARS };
 export const INSIGHTS_TAB: Tab = { path: "/dashboard/insights", label: "Insights", icon: SPARK };
+export const LABELS_TAB: Tab = { path: "/dashboard/labels", label: "Labels", icon: TAG };
 
-export const TABS: Tab[] = [SESSIONS_TAB, HISTORY_TAB, MEMORY_TAB, STATS_TAB, INSIGHTS_TAB];
+export const TABS: Tab[] = [SESSIONS_TAB, HISTORY_TAB, MEMORY_TAB, STATS_TAB, INSIGHTS_TAB, LABELS_TAB];
 
 const FOCUS_FIRST_CHARS = 80;
 
@@ -94,7 +100,7 @@ a{color:var(--accent)}
 .brand i{flex:none;width:.55rem;height:.55rem;border-radius:2px;background:var(--accent);margin-right:.45rem}
 .swho{margin:0;font:400 .72rem/1.4 var(--mono);color:var(--faint);overflow-wrap:anywhere}
 .ssum{display:none}
-.snav{position:fixed;inset:auto 0 0 0;z-index:1;display:grid;grid-template-columns:repeat(5,1fr);border-top:1px solid var(--line);background:var(--surface)}
+.snav{position:fixed;inset:auto 0 0 0;z-index:1;display:grid;grid-template-columns:repeat(6,1fr);border-top:1px solid var(--line);background:var(--surface)}
 .snav a{display:grid;gap:.18rem;justify-items:center;padding:.5rem .15rem .55rem;font-size:.62rem;letter-spacing:.02em;color:var(--dim);text-decoration:none}
 .snav a svg{width:1.25rem;height:1.25rem;stroke:currentcolor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 .snav a[aria-current]{color:var(--accent);font-weight:600}
@@ -205,6 +211,15 @@ svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .heatleg{display:flex;align-items:center;gap:.3rem;margin:0;font:400 .68rem/1 var(--mono);color:var(--faint)}
 .heatleg i{flex:none;width:.75rem;height:.75rem;border-radius:3px}
 .wide{overflow-x:auto}
+.labels{display:grid;gap:.7rem}
+.lrows{list-style:none;margin:0;padding:0;display:grid;gap:.6rem}
+.lrows li{display:grid;gap:.25rem}
+.lrows .lv{font:400 .74rem/1.4 var(--mono);color:var(--faint);overflow-wrap:anywhere}
+.lrows input{width:100%;min-width:0;font:inherit;font-size:.9rem;padding:.5rem .75rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--ink)}
+.lrows input::placeholder{color:var(--faint)}
+.lrows input:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.lsave{margin:0}
+.lsave button{font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
 .noticewrap{max-width:34rem;margin:0 auto;padding:3rem 1.25rem;display:grid;gap:1.1rem}
 .notice{display:grid;gap:.45rem;padding:1rem 1.1rem;background:var(--surface);border:1px solid var(--line2);border-left:3px solid var(--warn);border-radius:8px}
 .notice h1,.notice b{margin:0;font-size:.92rem}
@@ -262,6 +277,7 @@ main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
 .statrow{grid-template-columns:1fr 1fr 24rem}
 .trio{grid-template-columns:repeat(3,1fr)}
 .rhythm{grid-template-columns:2fr 1fr}
+.lrows li{grid-template-columns:16rem minmax(0,1fr);align-items:center;gap:.9rem}
 }`;
 
 const navigation = (current: Tab): string =>
@@ -382,7 +398,15 @@ const summary = (live: Live): string => {
 <p><strong>${money(spent(live.today))}</strong> today · ${sessions}</p></div>`;
 };
 
-const shell = (email: string, tab: Tab, live: Live, heading: string, meta: string, main: string): Response =>
+const shell = (
+  email: string,
+  tab: Tab,
+  live: Live,
+  heading: string,
+  meta: string,
+  main: string,
+  headers: Record<string, string> = {},
+): Response =>
   htmlPage(
     200,
     `recall ${heading.toLowerCase()}`,
@@ -392,13 +416,18 @@ ${navigation(tab)}
 ${summary(live)}
 <p class="swho">${escapeHtml(email)}</p></header>
 <main><div class="pagehead"><h1>${escapeHtml(heading)}</h1><span>${escapeHtml(meta)}</span></div>${main}</main></div>`,
+    headers,
   );
 
-const sessionRow = (session: Session, now: number): string => {
+// The name a page prints for a raw host or account. Filtering and grouping stay on the raw value;
+// only what the reader sees changes.
+const labelled = (labels: Map<string, string>, value: string): string => labels.get(value) ?? value;
+
+const sessionRow = (session: Session, labels: Labels, now: number): string => {
   const busy = isBusy(session, now);
   const state = busy ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
   const focus = focusHtml(session.focus);
-  return `<li class="srow${busy ? "" : " idle"}"><p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(session.host)}</span></p>
+  return `<li class="srow${busy ? "" : " idle"}"><p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span></p>
 <p class="${busy ? "state busy" : "state"}"><span class="dot"></span>${state}</p>
 <p class="fc">${focus}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${age(session.startedAt, now)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
@@ -409,10 +438,10 @@ const LEDGER_HEAD =
 
 // listSessions answers newest activity first, which already floats every busy session above the
 // idle ones.
-const ledger = (sessions: Session[], now: number): string =>
-  `<ol class="sessions" role="list">${LEDGER_HEAD}${sessions.map((session) => sessionRow(session, now)).join("")}</ol>`;
+const ledger = (sessions: Session[], labels: Labels, now: number): string =>
+  `<ol class="sessions" role="list">${LEDGER_HEAD}${sessions.map((session) => sessionRow(session, labels, now)).join("")}</ol>`;
 
-const hostsCard = (sessions: Session[], now: number): string => {
+const hostsCard = (sessions: Session[], labels: Labels, now: number): string => {
   const hosts = new Map<string, { live: number; busy: number }>();
   for (const session of sessions) {
     const tally = hosts.get(session.host) ?? { live: 0, busy: 0 };
@@ -421,7 +450,7 @@ const hostsCard = (sessions: Session[], now: number): string => {
   const lines = [...hosts]
     .map(
       ([host, tally]) =>
-        `<p><strong>${escapeHtml(host)}</strong> · ${tally.live} ${tally.live === 1 ? "session" : "sessions"} · ${tally.busy} busy</p>`,
+        `<p><strong>${escapeHtml(labelled(labels.hosts, host))}</strong> · ${tally.live} ${tally.live === 1 ? "session" : "sessions"} · ${tally.busy} busy</p>`,
     )
     .join("");
   return `<div class="rk"><b>Hosts</b>${lines}</div>`;
@@ -434,14 +463,14 @@ const oldestIdleCard = (sessions: Session[], now: number): string => {
   return `<div class="rk"><b>Oldest idle</b><p><strong>${escapeHtml(oldest.name)}</strong> · idle ${age(oldest.lastActivityAt, now)} on ${escapeHtml(repoAtBranch(oldest.repo, oldest.branch))}</p><p>Started ${age(oldest.startedAt, now)} ago · ${oldest.prompts} ${oldest.prompts === 1 ? "prompt" : "prompts"}.</p></div>`;
 };
 
-export const sessionsPage = (email: string, live: Live, sessions: Session[], now: number): Response => {
+export const sessionsPage = (email: string, live: Live, sessions: Session[], labels: Labels, now: number): Response => {
   const main =
     sessions.length === 0
       ? emptyState(
           "No session is running on any of your hosts.",
           "A session appears here within a minute of its first prompt.",
         )
-      : `<div class="withrail">${ledger(sessions, now)}<div class="rail">${hostsCard(sessions, now)}${oldestIdleCard(sessions, now)}</div></div>`;
+      : `<div class="withrail">${ledger(sessions, labels, now)}<div class="rail">${hostsCard(sessions, labels, now)}${oldestIdleCard(sessions, now)}</div></div>`;
   return shell(email, SESSIONS_TAB, live, SESSIONS_TAB.label, `${live.sessions} live · ${live.busy} busy`, main);
 };
 
@@ -474,14 +503,14 @@ const byDay = (sessions: PastSession[]): DayGroup[] => {
 const dayHead = (group: DayGroup): string =>
   `<p class="dayhead"><b>${escapeHtml(group.day)} · ${WEEKDAYS[new Date(`${group.day}T00:00:00Z`).getUTCDay()] ?? ""}</b></p>`;
 
-const historyRow = (session: PastSession): string =>
+const historyRow = (session: PastSession, labels: Labels): string =>
   `<li class="srow hrow"><p class="tm">${clock(session.startedAt)}–${clock(session.lastActivityAt)}</p>
-<p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(session.host)}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
+<p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
 <p class="fc">${focusHtml(session.focus)}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${span(session.lastActivityAt - session.startedAt)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
 
-const dayBlock = (group: DayGroup): string =>
-  `<section class="day">${dayHead(group)}<ol class="sessions" role="list">${group.sessions.map(historyRow).join("")}</ol></section>`;
+const dayBlock = (group: DayGroup, labels: Labels): string =>
+  `<section class="day">${dayHead(group)}<ol class="sessions" role="list">${group.sessions.map((session) => historyRow(session, labels)).join("")}</ol></section>`;
 
 const tabLink = (tab: Tab, keep: readonly string[], url: URL, changes: Record<string, string>): string => {
   const next = new URLSearchParams();
@@ -500,10 +529,18 @@ const tabLink = (tab: Tab, keep: readonly string[], url: URL, changes: Record<st
 const historyLink = (url: URL, changes: Record<string, string>): string =>
   tabLink(HISTORY_TAB, HISTORY_PARAMS, url, changes);
 
-const historyChips = (url: URL, name: string, label: string, all: string, active: string, values: string[]): string => {
+const historyChips = (
+  url: URL,
+  name: string,
+  label: string,
+  all: string,
+  active: string,
+  values: string[],
+  names: Map<string, string>,
+): string => {
   const chip = (value: string, text: string): string =>
     `<a href="${historyLink(url, { [name]: value })}"${value === active ? ' aria-current="page"' : ""}>${escapeHtml(text)}</a>`;
-  return `<nav class="chips" aria-label="${escapeHtml(label)}">${chip("", all)}${values.map((value) => chip(value, value)).join("")}</nav>`;
+  return `<nav class="chips" aria-label="${escapeHtml(label)}">${chip("", all)}${values.map((value) => chip(value, labelled(names, value))).join("")}</nav>`;
 };
 
 const offered = (values: string[], active: string): string[] => {
@@ -520,6 +557,7 @@ export const historyPage = (
   known: HistoryFilters,
   sessions: PastSession[],
   nextCursor: string,
+  labels: Labels,
 ): Response => {
   const filtered = filter.host !== "" || filter.repo !== "";
   const groups = byDay(sessions);
@@ -535,8 +573,8 @@ export const historyPage = (
             ? "Clear the filter to read every host and every repo."
             : "A session lands here as soon as it syncs, and stays forever.",
         )
-      : `<div class="hist">${groups.map(dayBlock).join("")}</div>${older}`;
-  const filters = `<div class="toolrow">${historyChips(url, "host", "Filter by host", "All hosts", filter.host, offered(known.hosts, filter.host))}${historyChips(url, "repo", "Filter by repo", "All repos", filter.repo, offered(known.repos, filter.repo))}</div>`;
+      : `<div class="hist">${groups.map((group) => dayBlock(group, labels)).join("")}</div>${older}`;
+  const filters = `<div class="toolrow">${historyChips(url, "host", "Filter by host", "All hosts", filter.host, offered(known.hosts, filter.host), labels.hosts)}${historyChips(url, "repo", "Filter by repo", "All repos", filter.repo, offered(known.repos, filter.repo), new Map())}</div>`;
   return shell(email, HISTORY_TAB, live, HISTORY_TAB.label, "kept forever", `${filters}${listing}`);
 };
 
@@ -828,7 +866,12 @@ const splitCost = (cost: number, priced: number, models: number): string => {
 
 const totalCost = (models: ModelTotals[]): string => splitCost(spent(models), pricedIn(models), models.length);
 
-const splitTable = (heading: string, field: UsageSplitField, splits: UsageSplit[]): string => {
+const splitTable = (
+  heading: string,
+  field: UsageSplitField,
+  splits: UsageSplit[],
+  names: Map<string, string>,
+): string => {
   const grouped = new Map<string, UsageSplit[]>();
   for (const row of splits.filter((split) => split.field === field)) {
     grouped.set(row.value, [...(grouped.get(row.value) ?? []), row]);
@@ -844,7 +887,7 @@ const splitTable = (heading: string, field: UsageSplitField, splits: UsageSplit[
     .sort((left, right) => countedTokens(right.counts) - countedTokens(left.counts))
     .map(
       (row) =>
-        `<tr><td>${escapeHtml(row.value === "" ? "global" : row.value)}</td><td class="r">${tokens(countedTokens(row.counts))}</td><td class="r">${escapeHtml(splitCost(row.cost, row.priced, row.models))}</td></tr>`,
+        `<tr><td>${escapeHtml(row.value === "" ? "global" : labelled(names, row.value))}</td><td class="r">${tokens(countedTokens(row.counts))}</td><td class="r">${escapeHtml(splitCost(row.cost, row.priced, row.models))}</td></tr>`,
     )
     .join("");
   return `<table class="mixtable"><tr><th>${escapeHtml(heading)}</th><th class="r">Tokens</th><th class="r">Cost</th></tr>${body}</table>`;
@@ -859,7 +902,7 @@ const unpricedNotice = (models: ModelTotals[]): string => {
 <p>${escapeHtml(names)} ${missing.length === 1 ? "has" : "have"} no entry in the price table, so ${missing.length === 1 ? "its" : "their"} tokens are counted and ${missing.length === 1 ? "its" : "their"} cost is left out rather than guessed.</p></div>`;
 };
 
-export const statsPage = (email: string, live: Live, stats: Stats, now: number): Response => {
+export const statsPage = (email: string, live: Live, stats: Stats, labels: Labels, now: number): Response => {
   const { month, fortnight, week, prior } = stats.windows;
   const today = usageDay(now);
   const meta = `${month.from} → ${month.to}`;
@@ -964,10 +1007,10 @@ ${frame("Cache read", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight.days, re
 
   const splits = `<div class="charts trio">
 ${efficiency}
-${frame("By account", `${USAGE_MONTH_DAYS} days`, splitTable("Account", "account", stats.splits))}
-${frame("By host", `${USAGE_MONTH_DAYS} days`, splitTable("Host", "host", stats.splits))}
+${frame("By account", `${USAGE_MONTH_DAYS} days`, splitTable("Account", "account", stats.splits, labels.accounts))}
+${frame("By host", `${USAGE_MONTH_DAYS} days`, splitTable("Host", "host", stats.splits, labels.hosts))}
 </div>
-${frame("By repo", `${USAGE_MONTH_DAYS} days`, splitTable("Repo", "repo", stats.splits))}`;
+${frame("By repo", `${USAGE_MONTH_DAYS} days`, splitTable("Repo", "repo", stats.splits, new Map()))}`;
 
   return shell(
     email,
@@ -1192,6 +1235,42 @@ ${insightCard("Busiest repos", "session time · every session on record", busies
 ${insightCard("Cache drift", "hit rate by month · every month on record", cacheDrift(horizon))}
 </div>`,
   );
+};
+
+const labelRows = (kind: LabelKind, values: string[], names: Map<string, string>): string =>
+  `<ul class="lrows" role="list">${values
+    .map(
+      (value) =>
+        `<li><span class="lv">${escapeHtml(value)}</span><input name="${escapeHtml(`${kind}:${value}`)}" value="${escapeHtml(names.get(value) ?? "")}" maxlength="${MAX_SESSION_TEXT_CHARS}" placeholder="${escapeHtml(value)}" aria-label="${escapeHtml(`Label for ${kind} ${value}`)}"></li>`,
+    )
+    .join("")}</ul>`;
+
+const labelCard = (title: string, kind: LabelKind, values: string[], names: Map<string, string>): string =>
+  values.length === 0
+    ? ""
+    : `<div class="cframe"><div class="ch"><b>${escapeHtml(title)}</b><span>${values.length} on record</span></div>${labelRows(kind, values, names)}</div>`;
+
+export const labelsPage = (
+  email: string,
+  live: Live,
+  targets: LabelTargets,
+  labels: Labels,
+  csrf: string,
+): Response => {
+  const main =
+    targets.hosts.length + targets.accounts.length === 0
+      ? emptyState(
+          "No host or account is on record yet.",
+          "A host lands here as soon as one of its sessions syncs, and an account as soon as a session reports what it spent.",
+        )
+      : `<form class="labels" method="post" action="${LABELS_TAB.path}">
+<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+${labelCard("Hosts", "host", targets.hosts, labels.hosts)}
+${labelCard("Accounts", "account", targets.accounts, labels.accounts)}
+<p class="lsave"><button type="submit">Save labels</button></p></form>`;
+  return shell(email, LABELS_TAB, live, LABELS_TAB.label, "display only", main, {
+    "set-cookie": `${CSRF_COOKIE}=${csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict`,
+  });
 };
 
 export const dashboardNotice = (status: number, title: string, text: string, action: string): Response =>
