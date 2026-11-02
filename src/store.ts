@@ -8,7 +8,7 @@ import {
   type Session,
   type SessionInput,
   type SessionMode,
-  sessionHandles,
+  sessionHandle,
 } from "./model";
 
 interface MemoryRow {
@@ -208,9 +208,9 @@ interface SessionRow {
   pid: number;
 }
 
-const toSession = (row: SessionRow, caller: Caller, handle: string): Session => ({
+const toSession = (row: SessionRow, caller: Caller): Session => ({
   sessionId: row.session_id,
-  name: handle,
+  name: sessionHandle(row.device_name, row.session_id),
   deviceId: row.device_id,
   host: row.host,
   cwd: row.cwd,
@@ -293,13 +293,7 @@ export const listSessions = async (db: D1Database, caller: Caller, now: number):
       )
       .bind(caller.userId),
   ]);
-  const rows = listed?.results ?? [];
-  const handles = sessionHandles(rows.map((row) => ({ sessionId: row.session_id, deviceName: row.device_name })));
-  return rows.map((row) => {
-    const handle = handles.get(row.session_id);
-    if (handle === undefined) throw new Error(`session ${row.session_id} came back without a handle`);
-    return toSession(row, caller, handle);
-  });
+  return (listed?.results ?? []).map((row) => toSession(row, caller));
 };
 
 export const sessionOnDevice = async (
@@ -307,10 +301,14 @@ export const sessionOnDevice = async (
   userId: string,
   sessionId: string,
   deviceId: string,
+  now: number,
 ): Promise<boolean> => {
   const row = await db
-    .prepare("SELECT session_id FROM sessions WHERE user_id = ? AND session_id = ? AND device_id = ?")
-    .bind(userId, sessionId, deviceId)
+    .prepare(
+      `SELECT session_id FROM sessions
+       WHERE user_id = ? AND session_id = ? AND device_id = ? AND last_activity_at > ?`,
+    )
+    .bind(userId, sessionId, deviceId, now - SESSION_TTL_MS)
     .first<{ session_id: string }>();
   return row !== null;
 };

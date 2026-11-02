@@ -346,12 +346,12 @@ impl Recall {
     async fn send(&self, Parameters(params): Parameters<SendParams>) -> Result<String, String> {
         blocking(move || {
             let client = client()?;
-            let target = api::resolve_target(&client.devices()?, &client.sessions()?, &params.to)?;
+            let target = api::resolve_target(&client.devices()?, || client.sessions(), &params.to)?;
             let sent = client.send(&target, &params.message)?;
             to_json(&serde_json::json!({
                 "messageId": sent.message_id,
                 "toDeviceId": sent.to_device_id,
-                "delivery": sent.delivery,
+                "toSessionId": sent.to_session_id,
             }))
         })
         .await

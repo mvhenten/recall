@@ -146,15 +146,15 @@ A Claude Code session on one host can message one session, or every session, run
 recall config set messaging.enabled true
 recall devices                                        # the host names you can address
 recall sessions                                       # the session handles you can address
-recall send desktop-9f "pull main and rerun the migration"
+recall send desktop-9f8a "pull main and rerun the migration"
 recall send desktop "pull main and rerun the migration"
 echo "the build is green" | recall send desktop
 recall listen --status                                # who can receive here, and who cannot
 ```
 
-`<to>` is a session handle as `recall sessions` prints it, which reaches that one session, or a device name as `recall devices` prints it, or a device id, each of which reaches every live session on that host. A device name wins over a handle that reads the same, and a name two devices share is an error. The message arrives as a user turn. Claude addresses the same hosts and sessions through the `recall_send` MCP tool, registered only while messaging is on.
+`<to>` is a session handle as `recall sessions` prints it, which reaches that one session, or a device name as `recall devices` prints it, or a device id, each of which reaches every live session on that host. The message arrives as a user turn. Claude addresses the same hosts and sessions through the `recall_send` MCP tool, registered only while messaging is on.
 
-A handle is the host's device name and as much of the session id as it takes to stand apart from the other live sessions on that host, so `desktop-9f` names one session and `desktop` the whole host. The service derives it from the synced session records, so a send from any host resolves it the same way; the message carries the session it is addressed to, and the daemon there writes it into that one inbox.
+A handle is the host's device name, a dash and the first four characters of the session id, so `desktop-9f8a` names one session and `desktop` the whole host. It is a function of the session alone, so it never moves to another session; a string that names both a host and a session is refused rather than resolved. The service derives it from the synced session records, so a send from any host resolves it the same way: the message carries the session it is addressed to, and the daemon there writes it into that one inbox.
 
 The plugin runs the listener. At session start the hook writes `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json`, carrying the session's `state`, the pid of its Claude process and, when it registered, the inbox socket and token, then runs `recall listen --ensure`. That starts a background daemon unless one already holds an exclusive `flock` on `$XDG_RUNTIME_DIR/recall/listen.lock`. The daemon holds one WebSocket to the Worker, reconnects with a backoff that doubles from a second to a minute, and writes each message it receives into the inbox of the session it names, or into every registered socket when it names the host. Session end removes the registry file, and the daemon exits once the registry has stood empty for five minutes; the next session start brings it back. Each thirty second tick also unlinks the record of any session whose Claude process is gone and tells the service that session is over. It writes its own `listen:…`, `message:…` and `sessions:…` lines to the hooks log.
 
@@ -176,8 +176,8 @@ recall --json sessions   # the whole document of each
 ```
 
 ```
-laptop  laptop-9f  repo:github.com/mvhenten/recall@feat/sessions-list  12m  busy  list every host's sessions → why is the worker test red
-tower   tower-c4   global                                              3h   idle  draft the release notes
+laptop  laptop-9f8a  repo:github.com/mvhenten/recall@feat/sessions-list  12m  busy  list every host's sessions → why is the worker test red
+tower   tower-c4e2   global                                              3h   idle  draft the release notes
 ```
 
 The session's registry record is the document. Beside the state the hook left it in, it carries the host, the repo tag, the branch and the last commit subject, the start and last-activity times in epoch milliseconds, a prompt count, the focus, the permission mode Claude reports on the hook's stdin, and whether the session is interactive or headless. Nothing in it costs a model call: the focus line is the session's first prompt and its latest, each cut to 72 characters, and the branch and subject come from one `git log` in the session's directory.
@@ -190,20 +190,20 @@ State is read, never stored. A session prompted within the last five minutes is 
 
 The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and `/v1/sessions` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
 
-| Method   | Path                                      |                                                                                                                        |
-| -------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `PUT`    | `/v1/memories/:name`                      | create or replace `{description, type, body, tags}`                                                                    |
-| `GET`    | `/v1/memories/:name`                      | read one                                                                                                               |
-| `DELETE` | `/v1/memories/:name`                      | delete one                                                                                                             |
-| `GET`    | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first                                                                                                   |
-| `POST`   | `/v1/search`                              | `{query, tags, any, limit, minScore, mode}`; each hit is a recall                                                      |
-| `GET`    | `/v1/devices`                             | the caller's devices                                                                                                   |
-| `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                                                                      |
-| `POST`   | `/v1/messages`                            | `{toDeviceId, delivery, body}`; queues a message for a device, for every session on it or for the one `delivery` names |
-| `GET`    | `/v1/messages/listen`                     | WebSocket only; pushes the caller's queue and takes ack frames                                                         |
-| `PUT`    | `/v1/sessions/:sessionId`                 | create or replace one session document                                                                                 |
-| `GET`    | `/v1/sessions`                            | the account's sessions, newest activity first                                                                          |
-| `DELETE` | `/v1/sessions/:sessionId`                 | the session is over; every host stops listing it                                                                       |
+| Method   | Path                                      |                                                                                                                                     |
+| -------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `PUT`    | `/v1/memories/:name`                      | create or replace `{description, type, body, tags}`                                                                                 |
+| `GET`    | `/v1/memories/:name`                      | read one                                                                                                                            |
+| `DELETE` | `/v1/memories/:name`                      | delete one                                                                                                                          |
+| `GET`    | `/v1/memories?tag=&since=&cursor=&limit=` | newest created first                                                                                                                |
+| `POST`   | `/v1/search`                              | `{query, tags, any, limit, minScore, mode}`; each hit is a recall                                                                   |
+| `GET`    | `/v1/devices`                             | the caller's devices                                                                                                                |
+| `DELETE` | `/v1/devices/:deviceId`                   | revoke a device; `current` names the caller's own                                                                                   |
+| `POST`   | `/v1/messages`                            | `{toDeviceId, toSessionId, body}`; queues a message for one session, or for every session on the device when `toSessionId` is empty |
+| `GET`    | `/v1/messages/listen`                     | WebSocket only; pushes the caller's queue and takes ack frames                                                                      |
+| `PUT`    | `/v1/sessions/:sessionId`                 | create or replace one session document                                                                                              |
+| `GET`    | `/v1/sessions`                            | the account's sessions, newest activity first                                                                                       |
+| `DELETE` | `/v1/sessions/:sessionId`                 | the session is over; every host stops listing it                                                                                    |
 
 The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` is the only path behind an Access login; its approve and deny form checks the Access JWT, the origin and a CSRF token.
 

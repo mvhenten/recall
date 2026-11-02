@@ -13,12 +13,12 @@ export const NOW_HEADER = "x-recall-now";
 export const CLOSE_BAD_FRAME = 4000;
 export const CLOSE_REVOKED = 4001;
 
-export type Delivery = { to: "host" } | { to: "session"; sessionId: string };
-
+// `toSessionId` is the one session the message is addressed to, or empty for every session the
+// host has registered.
 export interface Message {
   messageId: string;
   toDeviceId: string;
-  delivery: Delivery;
+  toSessionId: string;
   fromDeviceId: string;
   body: string;
   createdAt: number;
@@ -27,7 +27,7 @@ export interface Message {
 
 export interface SendInput {
   toDeviceId: string;
-  delivery: Delivery;
+  toSessionId: string;
   body: string;
 }
 
@@ -59,47 +59,36 @@ interface Attachment {
   deviceId: string;
 }
 
-// A row names the one session the message is addressed to, and holds no session id when it is
-// addressed to the host, which the daemon there fans out to every session it has registered.
-const toDelivery = (sessionId: string): Delivery => (sessionId === "" ? { to: "host" } : { to: "session", sessionId });
-
-const sessionColumn = (delivery: Delivery): string => (delivery.to === "session" ? delivery.sessionId : "");
-
 const toMessage = (row: MessageRow): Message => ({
   messageId: row.message_id,
   toDeviceId: row.to_device_id,
-  delivery: toDelivery(row.to_session_id),
+  toSessionId: row.to_session_id,
   fromDeviceId: row.from_device_id,
   body: row.body,
   createdAt: row.created_at,
   expiresAt: row.expires_at,
 });
 
-const DELIVERY_SHAPE = 'delivery must be {"to":"host"} or {"to":"session","sessionId":"<session id>"}';
-
-const parseDelivery = (value: unknown): Parsed<Delivery> => {
-  if (value === undefined) return { ok: true, value: { to: "host" } };
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return { ok: false, error: DELIVERY_SHAPE };
-  const { to, sessionId } = value as Record<string, unknown>;
-  if (to === "host") return { ok: true, value: { to: "host" } };
-  if (to !== "session" || typeof sessionId !== "string") return { ok: false, error: DELIVERY_SHAPE };
-  const parsed = parseSessionId(sessionId);
-  if (!parsed.ok) return parsed;
-  return { ok: true, value: { to: "session", sessionId: parsed.value } };
+const parseToSessionId = (value: unknown): Parsed<string> => {
+  if (value === undefined || value === "") return { ok: true, value: "" };
+  if (typeof value !== "string") {
+    return { ok: false, error: "toSessionId must be a session id, or empty for every session on the host" };
+  }
+  return parseSessionId(value);
 };
 
 export const parseSend = (input: unknown): Parsed<SendInput> => {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return { ok: false, error: "body must be a JSON object" };
   }
-  const { toDeviceId, body } = input as Record<string, unknown>;
+  const { toDeviceId, toSessionId, body } = input as Record<string, unknown>;
   if (typeof toDeviceId !== "string" || toDeviceId.length < 1) {
     return { ok: false, error: "toDeviceId must be the id of a device on this account; see GET /v1/devices" };
   }
   if (typeof body !== "string" || body.length < 1) return { ok: false, error: "body must hold at least one character" };
-  const delivery = parseDelivery((input as Record<string, unknown>).delivery);
-  if (!delivery.ok) return delivery;
-  return { ok: true, value: { toDeviceId, delivery: delivery.value, body } };
+  const session = parseToSessionId(toSessionId);
+  if (!session.ok) return session;
+  return { ok: true, value: { toDeviceId, toSessionId: session.value, body } };
 };
 
 const readJson = (raw: string): unknown => {
@@ -137,18 +126,20 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       `CREATE TABLE IF NOT EXISTS messages (
          message_id TEXT PRIMARY KEY,
          to_device_id TEXT NOT NULL,
-         to_session_id TEXT NOT NULL DEFAULT '',
          from_device_id TEXT NOT NULL,
          body TEXT NOT NULL,
          created_at INTEGER NOT NULL,
          expires_at INTEGER NOT NULL
        )`,
     );
+    this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
+    // A mailbox older than per-session addressing has no to_session_id, and its queued messages are
+    // all for the whole host. `PRAGMA user_version` is one of the pragmas a Durable Object refuses,
+    // so the column itself is the version marker.
     const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(messages)").toArray();
     if (!columns.some((column) => column.name === "to_session_id")) {
       this.sql.exec("ALTER TABLE messages ADD COLUMN to_session_id TEXT NOT NULL DEFAULT ''");
     }
-    this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -195,7 +186,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     const message: Message = {
       messageId: crypto.randomUUID(),
       toDeviceId: input.toDeviceId,
-      delivery: input.delivery,
+      toSessionId: input.toSessionId,
       fromDeviceId: from.deviceId,
       body: input.body,
       createdAt: now,
@@ -206,7 +197,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       message.messageId,
       message.toDeviceId,
-      sessionColumn(message.delivery),
+      message.toSessionId,
       message.fromDeviceId,
       message.body,
       message.createdAt,

@@ -289,26 +289,32 @@ async fn write_or_prune(registered: &Registered, body: &str, fanout: &mut Fanout
     }
 }
 
-/// Delivers a message body to every live session, once per inbox socket: a child session shares
-/// its parent's socket, and the newest registration on a socket names the session Claude accepts.
-pub async fn fanout(dir: &Path, body: &str) -> Fanout {
+/// The one session Claude accepts a message for on each inbox socket: a child session shares its
+/// parent's socket, and only the newest registration on a socket names a session Claude still
+/// takes, so anything behind it is not addressable at all.
+fn addressable(dir: &Path) -> Vec<Registered> {
     let mut sockets = HashSet::new();
+    registered(dir)
+        .into_iter()
+        .filter(|registered| sockets.insert(registered.inbox.socket.clone()))
+        .collect()
+}
+
+/// Delivers a message body to every live session, once per inbox socket.
+pub async fn fanout(dir: &Path, body: &str) -> Fanout {
     let mut fanout = Fanout::default();
-    for registered in registered(dir) {
-        if !sockets.insert(registered.inbox.socket.clone()) {
-            continue;
-        }
+    for registered in addressable(dir) {
         write_or_prune(&registered, body, &mut fanout).await;
     }
     fanout
 }
 
 /// Delivers a message body to the one session named, so a handle reaches that session and nothing
-/// else sharing its socket. A session this host no longer has registered takes nothing: the send
-/// resolved against a listing the service held, and the session has since ended or lost its inbox.
+/// else sharing its socket. A session this host cannot address takes nothing: it has ended, lost
+/// its inbox, or sits behind a newer registration on its socket, which Claude would discard.
 pub async fn to_session(dir: &Path, session_id: &str, body: &str) -> Fanout {
     let mut fanout = Fanout::default();
-    let Some(registered) = registered(dir)
+    let Some(registered) = addressable(dir)
         .into_iter()
         .find(|registered| registered.session_id == session_id)
     else {
@@ -493,6 +499,32 @@ mod tests {
             to_session(&dir, "s-gone", "nobody").await,
             Fanout::default(),
             "a handle this host no longer has registered takes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_behind_a_newer_registration_on_its_socket_takes_nothing() {
+        let sandbox = Sandbox::new("shared-socket");
+        let dir = sandbox.sessions();
+        let mine = std::process::id() as i32;
+        let socket = sandbox.dir.join("inbox.sock");
+        let listening = UnixListener::bind(&socket).unwrap();
+        sandbox.register("s-parent", &socket, mine);
+        sandbox.register("s-child", &socket, mine);
+
+        let newest = registered(&dir).remove(0).session_id;
+        let behind = if newest == "s-parent" { "s-child" } else { "s-parent" };
+
+        assert_eq!(
+            to_session(&dir, behind, "the frame Claude would discard").await,
+            Fanout::default(),
+            "only the newest registration on a socket names a session Claude still accepts"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listening.accept())
+                .await
+                .is_err(),
+            "a session Claude would not accept must not be written to at all"
         );
     }
 

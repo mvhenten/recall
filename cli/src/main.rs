@@ -544,7 +544,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             require_messaging(&settings::load(&cli.settings)?)?;
             let body = message_body(&message)?;
             let client = client()?;
-            let target = api::resolve_target(&client.devices()?, &client.sessions()?, &to)?;
+            let target = api::resolve_target(&client.devices()?, || client.sessions(), &to)?;
             let sent = client.send(&target, &body)?;
             if cli.json {
                 print_json(&sent)?;

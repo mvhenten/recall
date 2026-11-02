@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use ureq::http::Response;
@@ -174,24 +174,14 @@ struct Devices {
     devices: Vec<Device>,
 }
 
-/// Where a message lands on the host that takes it: every session registered there, or the one
-/// session the handle named.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "to", rename_all = "kebab-case")]
-pub enum Delivery {
-    Host,
-    Session {
-        #[serde(rename = "sessionId")]
-        session_id: String,
-    },
-}
-
+/// `to_session_id` is the one session the message is addressed to, or empty for every session the
+/// host has registered.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub message_id: String,
     pub to_device_id: String,
-    pub delivery: Delivery,
+    pub to_session_id: String,
     pub from_device_id: String,
     pub body: String,
     pub created_at: i64,
@@ -249,51 +239,62 @@ struct Sessions {
     sessions: Vec<Session>,
 }
 
-/// The device a message is queued against, and where it lands once that host takes it.
+/// The device a message is queued against, and the one session on it the message is for; an empty
+/// `session_id` reaches every session that host has registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub device_id: String,
-    pub delivery: Delivery,
+    pub session_id: String,
+}
+
+/// A handle is a device name, a dash and four characters of a session id, so a name shaped like
+/// one is the only name that could be both a host and a session.
+fn handle_shaped(to: &str) -> bool {
+    to.rsplit_once('-').is_some_and(|(host, suffix)| {
+        !host.is_empty()
+            && suffix.len() == 4
+            && suffix
+                .chars()
+                .all(|char| char.is_ascii_lowercase() || char.is_ascii_digit())
+    })
 }
 
 /// `to` is a device id or device name, which reaches every session on that host, or a session
-/// handle as `recall sessions` prints it, which reaches that one session. A device name wins over
-/// a handle that reads the same, so naming a host keeps fanning out.
-pub fn resolve_target(devices: &[Device], sessions: &[Session], to: &str) -> Result<Target> {
+/// handle as `recall sessions` prints it, which reaches that one session. `sessions` is called only
+/// when `to` is shaped like a handle, so an ordinary host send costs no listing.
+pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<Session>>, to: &str) -> Result<Target> {
     let host = |device_id: &str| Target {
         device_id: device_id.to_string(),
-        delivery: Delivery::Host,
+        session_id: String::new(),
     };
-    if devices.iter().any(|device| device.device_id == to) {
-        return Ok(host(to));
-    }
-    let named: Vec<&Device> = devices.iter().filter(|device| device.name == to).collect();
-    if let [device] = named.as_slice() {
-        return Ok(host(&device.device_id));
-    }
-    if named.len() > 1 {
-        let ids: Vec<&str> = named.iter().map(|device| device.device_id.as_str()).collect();
-        bail!(
-            "{} hosts are named {to}; pass one of these ids instead: {}",
-            named.len(),
-            ids.join(", ")
-        );
-    }
-    let handled: Vec<&Session> = sessions.iter().filter(|session| session.name == to).collect();
-    match handled.as_slice() {
-        [session] => Ok(Target {
-            device_id: session.device_id.clone(),
-            delivery: Delivery::Session {
-                session_id: session.session_id.clone(),
-            },
-        }),
-        [] => bail!(
+    let unknown = || {
+        anyhow!(
             "no host or session named {to}; recall devices lists the hosts signed in as you and recall sessions the handle of each live session"
+        )
+    };
+    let device = devices
+        .iter()
+        .find(|device| device.device_id == to || device.name == to);
+    if !handle_shaped(to) {
+        return device.map(|device| host(&device.device_id)).ok_or_else(unknown);
+    }
+    let listed = sessions()?;
+    let handled: Vec<&Session> = listed.iter().filter(|session| session.name == to).collect();
+    match (device, handled.as_slice()) {
+        (Some(device), []) => Ok(host(&device.device_id)),
+        (Some(device), _) => bail!(
+            "ambiguous target {to}: it names both device {} and a live session; pass the device id to reach the host, or the session's own id is in recall --json sessions",
+            device.device_id
         ),
-        many => {
+        (None, [session]) => Ok(Target {
+            device_id: session.device_id.clone(),
+            session_id: session.session_id.clone(),
+        }),
+        (None, []) => Err(unknown()),
+        (None, many) => {
             let ids: Vec<&str> = many.iter().map(|session| session.session_id.as_str()).collect();
             bail!(
-                "{} sessions answer to {to}: {}; re-run recall sessions for the handles that tell them apart",
+                "ambiguous target {to}: {} sessions answer to it: {}",
                 many.len(),
                 ids.join(", ")
             )
@@ -470,7 +471,7 @@ impl Client {
             .authed(self.agent.post(self.url("/v1/messages")))
             .send_json(serde_json::json!({
                 "toDeviceId": target.device_id,
-                "delivery": target.delivery,
+                "toSessionId": target.session_id,
                 "body": body,
             }))?;
         let sent: Sent = check(response, &format!("sending to {}", target.device_id))?
@@ -518,61 +519,70 @@ mod tests {
     fn host(device_id: &str) -> Target {
         Target {
             device_id: device_id.to_string(),
-            delivery: Delivery::Host,
+            session_id: String::new(),
         }
     }
 
     #[test]
-    fn a_host_resolves_by_device_name_and_fans_out() {
+    fn a_host_resolves_by_device_name_without_listing_the_sessions() {
         let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
-        assert_eq!(resolve_target(&devices, &[], "desktop").unwrap(), host("d-2"));
-        let error = resolve_target(&devices, &[], "deskstop").unwrap_err().to_string();
+        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+
+        assert_eq!(resolve_target(&devices, refuse, "desktop").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
+        let error = resolve_target(&devices, refuse, "deskstop").unwrap_err().to_string();
         assert!(error.contains("no host or session named deskstop"), "{error}");
     }
 
     #[test]
     fn a_handle_resolves_to_the_one_session_it_names() {
         let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
-        let sessions = [
-            session("s-9f8a", "desktop-9f", "d-2"),
-            session("s-9f8b", "desktop-9f8b", "d-2"),
-            session("s-aa", "laptop-aa", "d-1"),
-        ];
+        let sessions = || {
+            Ok(vec![
+                session("9f8a1b2c", "desktop-9f8a", "d-2"),
+                session("c4e21a99", "laptop-c4e2", "d-1"),
+            ])
+        };
 
         assert_eq!(
-            resolve_target(&devices, &sessions, "desktop-9f8b").unwrap(),
+            resolve_target(&devices, sessions, "desktop-9f8a").unwrap(),
             Target {
                 device_id: "d-2".to_string(),
-                delivery: Delivery::Session {
-                    session_id: "s-9f8b".to_string()
-                },
+                session_id: "9f8a1b2c".to_string(),
             }
         );
-        assert_eq!(resolve_target(&devices, &sessions, "desktop").unwrap(), host("d-2"));
-        let error = resolve_target(&devices, &sessions, "desktop-9f8c")
+        let error = resolve_target(&devices, sessions, "desktop-9f8b")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("no host or session named desktop-9f8c"), "{error}");
+        assert!(error.contains("no host or session named desktop-9f8b"), "{error}");
     }
 
     #[test]
-    fn a_device_name_wins_over_a_handle_that_reads_the_same() {
-        let devices = [device("d-1", "laptop"), device("d-2", "laptop-aa")];
-        let sessions = [session("s-aa", "laptop-aa", "d-1")];
-        assert_eq!(resolve_target(&devices, &sessions, "laptop-aa").unwrap(), host("d-2"));
+    fn a_string_that_names_both_a_device_and_a_session_is_refused() {
+        let devices = [device("d-1", "laptop"), device("d-2", "laptop-c4e2")];
+        let sessions = || Ok(vec![session("c4e21a99", "laptop-c4e2", "d-1")]);
+
+        let error = resolve_target(&devices, sessions, "laptop-c4e2")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous target laptop-c4e2"), "{error}");
+        assert!(error.contains("d-2"), "{error}");
     }
 
     #[test]
-    fn two_hosts_of_the_same_name_name_their_ids() {
-        let devices = [device("d-1", "ubuntu"), device("d-2", "ubuntu")];
-        let error = resolve_target(&devices, &[], "ubuntu").unwrap_err().to_string();
-        assert!(error.contains("2 hosts are named ubuntu"), "{error}");
-        assert!(error.contains("d-1, d-2"), "{error}");
-    }
+    fn two_sessions_that_answer_to_one_handle_are_refused() {
+        let devices = [device("d-1", "laptop")];
+        let sessions = || {
+            Ok(vec![
+                session("c4e21a99", "laptop-c4e2", "d-1"),
+                session("c4e2ff00", "laptop-c4e2", "d-1"),
+            ])
+        };
 
-    #[test]
-    fn a_device_id_passes_through_even_when_it_is_also_a_name() {
-        let devices = [device("d-1", "laptop"), device("d-2", "d-1")];
-        assert_eq!(resolve_target(&devices, &[], "d-1").unwrap(), host("d-1"));
+        let error = resolve_target(&devices, sessions, "laptop-c4e2")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous target laptop-c4e2"), "{error}");
+        assert!(error.contains("c4e21a99, c4e2ff00"), "{error}");
     }
 }

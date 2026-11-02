@@ -80,40 +80,14 @@ export interface Session extends SessionInput {
   current: boolean;
 }
 
-export const HANDLE_SUFFIX_CHARS = 2;
-
-export interface Handled {
-  sessionId: string;
-  deviceName: string;
-}
-
-const handleSuffix = (sessionId: string): string => sessionId.toLowerCase().replace(/[^a-z0-9]/g, "") || "session";
-
-const freeHandle = (taken: Set<string>, deviceName: string, suffix: string): string => {
-  for (let chars = Math.min(HANDLE_SUFFIX_CHARS, suffix.length); chars <= suffix.length; chars += 1) {
-    const handle = `${deviceName}-${suffix.slice(0, chars)}`;
-    if (!taken.has(handle)) return handle;
-  }
-  for (let index = 2; ; index += 1) {
-    const handle = `${deviceName}-${suffix}-${index}`;
-    if (!taken.has(handle)) return handle;
-  }
-};
-
-// The handle that addresses one session: its device name, then as much of its session id as it
-// takes to stand apart from the other live sessions on that device. The claim runs in session id
-// order, so the same set of live sessions always derives the same handles, however it is listed.
-export const sessionHandles = (sessions: Handled[]): Map<string, string> => {
-  const taken = new Set<string>();
-  const handles = new Map<string, string>();
-  const ordered = [...sessions].sort((left, right) => (left.sessionId < right.sessionId ? -1 : 1));
-  for (const session of ordered) {
-    const handle = freeHandle(taken, session.deviceName, handleSuffix(session.sessionId));
-    taken.add(handle);
-    handles.set(session.sessionId, handle);
-  }
-  return handles;
-};
+// The handle that addresses one session: its device name and the head of its session id. It is a
+// function of the session alone, so it names the same session for as long as that session runs and
+// never moves to another one.
+export const sessionHandle = (deviceName: string, sessionId: string): string =>
+  `${deviceName}-${sessionId
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .slice(0, 4)}`;
 
 export type Verification = { ok: true; email: string } | { ok: false; reason: string };
 
