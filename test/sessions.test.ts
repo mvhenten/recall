@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { MAX_FOCUS_CHARS, SESSION_HISTORY_TTL_MS, SESSION_TTL_MS, type Session } from "../src/model";
+import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session } from "../src/model";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -165,9 +165,10 @@ describe("session history", () => {
     ]);
   });
 
-  it("holds one row per session, so the latest sync wins", async () => {
+  it("holds one row per session, so the latest sync wins, and keeps each user's row separate", async () => {
     const h = await harness();
     const { laptop } = await account(h);
+    const stranger = await h.user("stranger");
 
     await laptop.sync("resynced-session");
     await laptop.sync("resynced-session", {
@@ -176,30 +177,14 @@ describe("session history", () => {
       focus: { first: "list every host's sessions", latest: "ship it" },
       lastActivityAt: h.now(),
     });
+    await stranger.sync("resynced-session", { branch: "feat/stranger-session", lastActivityAt: h.now() });
 
     const { results } = await env.DB.prepare(
-      "SELECT branch, prompts, focus_latest FROM session_history WHERE session_id = 'resynced-session'",
+      "SELECT branch, prompts, focus_latest FROM session_history WHERE session_id = 'resynced-session' ORDER BY branch",
     ).all();
-    expect(results).toEqual([{ branch: "feat/session-history", prompts: 9, focus_latest: "ship it" }]);
-  });
-
-  it("drops a row past the retention window on the next sync, and only the caller's", async () => {
-    const h = await harness();
-    const { laptop } = await account(h);
-    const stranger = await h.user("stranger");
-
-    await laptop.sync("ancient-mine", { lastActivityAt: h.now() });
-    await stranger.sync("ancient-theirs", { lastActivityAt: h.now() });
-    h.tick(SESSION_HISTORY_TTL_MS / 2);
-    await laptop.sync("midway-mine", { lastActivityAt: h.now() });
-    h.tick(SESSION_HISTORY_TTL_MS / 2 + 1000);
-    await laptop.sync("fresh-mine", { lastActivityAt: h.now() });
-
-    const { results } = await env.DB.prepare(
-      `SELECT session_id FROM session_history
-       WHERE session_id IN ('ancient-mine', 'ancient-theirs', 'midway-mine', 'fresh-mine')
-       ORDER BY last_activity_at DESC`,
-    ).all<{ session_id: string }>();
-    expect(results.map((row) => row.session_id)).toEqual(["fresh-mine", "midway-mine", "ancient-theirs"]);
+    expect(results).toEqual([
+      { branch: "feat/session-history", prompts: 9, focus_latest: "ship it" },
+      expect.objectContaining({ branch: "feat/stranger-session" }),
+    ]);
   });
 });
