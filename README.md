@@ -293,7 +293,7 @@ The build reads the instance from build variables and stops with a message namin
 | `RECALL_HOSTNAME`   | `recall.example.com`                           |
 | `RECALL_USERS`      | `{"alice": {"emails": ["alice@example.com"]}}` |
 
-`RECALL_ARTIFACT_HOSTNAME` is the one optional variable. Setting it to a second hostname in the same zone, such as `artifact.recall.example.com`, turns on [artifacts](#artifacts): OpenTofu then creates the R2 bucket and that hostname's Access application, and the Worker takes the hostname as a second custom domain. Leaving it out deploys exactly as before.
+`RECALL_ARTIFACT_HOSTNAME` is the one optional variable. Setting it to a second hostname in the same zone, such as `artifact.recall.example.com`, turns on [artifacts](#artifacts): OpenTofu then creates the R2 bucket and that hostname's Access application, and the Worker takes the hostname as a second custom domain. Leaving it out deploys exactly as before. The Workers Builds variables API refuses account-owned API tokens, so it can also be set as an object named `RECALL_ARTIFACT_HOSTNAME` in the `recall-builder-secrets` bucket, holding the hostname; the build variable wins when both are present.
 
 The account needs an R2 bucket `recall-tfstate` for the OpenTofu state, and a private R2 bucket `recall-builder-secrets` holding three objects: `CLOUDFLARE_TOFU_TOKEN` (an API token with the permissions above), and `TFSTATE_ACCESS_KEY_ID` and `TFSTATE_SECRET_ACCESS_KEY` (R2 S3 credentials for the state bucket). Each email in `RECALL_USERS` may approve devices and signs in as that user id; adding a person is one entry. Removing a user signs out all their devices.
 

@@ -40,11 +40,6 @@ const buildsToken = process.env.CLOUDFLARE_API_TOKEN;
 const accountId = process.env.RECALL_ACCOUNT_ID;
 const zoneId = process.env.RECALL_ZONE_ID;
 const hostname = process.env.RECALL_HOSTNAME;
-// Optional. Unset leaves artifact publishing off and the deployment as it was.
-const artifactHostname = process.env.RECALL_ARTIFACT_HOSTNAME ?? "";
-if (artifactHostname === hostname) {
-  die("RECALL_ARTIFACT_HOSTNAME serves published pages on a second host, so it cannot be RECALL_HOSTNAME");
-}
 
 const isStrings = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
 const isUsers = (value) =>
@@ -68,22 +63,43 @@ const emailOwners = Object.entries(users).flatMap(([userId, user]) =>
 const duplicate = emailOwners.find(([email], index) => emailOwners.findIndex(([other]) => other === email) !== index);
 if (duplicate) die(`RECALL_USERS lists ${duplicate[0]} under more than one user`);
 
-const builderObject = async (key) => {
-  const path = `/accounts/${accountId}/r2/buckets/${BUILDER_BUCKET}/objects/${encodeURIComponent(key)}`;
-  const response = await fetch(`${API}${path}`, {
+const builderObjectPath = (key) =>
+  `/accounts/${accountId}/r2/buckets/${BUILDER_BUCKET}/objects/${encodeURIComponent(key)}`;
+const getBuilderObject = (key) =>
+  fetch(`${API}${builderObjectPath(key)}`, {
     headers: { authorization: `Bearer ${buildsToken}` },
     signal: AbortSignal.timeout(30_000),
   });
+
+const builderObject = async (key) => {
+  const response = await getBuilderObject(key);
   if (!response.ok)
     die(
-      `GET ${path} returned ${response.status}; it must hold CLOUDFLARE_TOFU_TOKEN, TFSTATE_ACCESS_KEY_ID and TFSTATE_SECRET_ACCESS_KEY (see README, Deploying from CI)`,
+      `GET ${builderObjectPath(key)} returned ${response.status}; it must hold CLOUDFLARE_TOFU_TOKEN, TFSTATE_ACCESS_KEY_ID and TFSTATE_SECRET_ACCESS_KEY (see README, Deploying from CI)`,
     );
+  return (await response.text()).trim();
+};
+
+// An absent object means the caller's feature is off; anything else is a failure.
+const optionalBuilderObject = async (key) => {
+  const response = await getBuilderObject(key);
+  if (response.status === 404) return "";
+  if (!response.ok) die(`GET ${builderObjectPath(key)} returned ${response.status}`);
   return (await response.text()).trim();
 };
 
 const tofuToken = await builderObject("CLOUDFLARE_TOFU_TOKEN");
 const stateKeyId = await builderObject("TFSTATE_ACCESS_KEY_ID");
 const stateSecret = await builderObject("TFSTATE_SECRET_ACCESS_KEY");
+
+// Optional. Unset leaves artifact publishing off and the deployment as it was.
+// The Workers Builds variables API refuses account-owned tokens, so the value
+// may live as an object in the builder bucket instead of as a build variable.
+const artifactHostname =
+  process.env.RECALL_ARTIFACT_HOSTNAME ?? (await optionalBuilderObject("RECALL_ARTIFACT_HOSTNAME"));
+if (artifactHostname === hostname) {
+  die("RECALL_ARTIFACT_HOSTNAME serves published pages on a second host, so it cannot be RECALL_HOSTNAME");
+}
 
 const run = (command, args, { env = {}, cwd = ROOT, capture = false, allowFailure = false } = {}) => {
   const result = spawnSync(command, args, {
