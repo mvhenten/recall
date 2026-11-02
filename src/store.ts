@@ -208,7 +208,7 @@ interface SessionRow {
   pid: number;
 }
 
-const toSession = (row: SessionRow, caller: Caller): Session => ({
+const toSession = (row: SessionRow): Session => ({
   sessionId: row.session_id,
   name: sessionHandle(row.device_name, row.session_id),
   deviceId: row.device_id,
@@ -224,7 +224,6 @@ const toSession = (row: SessionRow, caller: Caller): Session => ({
   mode: row.mode,
   permissionMode: row.permission_mode,
   pid: row.pid,
-  current: row.device_id === caller.deviceId,
 });
 
 const expireSessions = (db: D1Database, userId: string, now: number): D1PreparedStatement =>
@@ -280,9 +279,9 @@ export const endSession = async (db: D1Database, userId: string, sessionId: stri
   return result.meta.changes === 1;
 };
 
-export const listSessions = async (db: D1Database, caller: Caller, now: number): Promise<Session[]> => {
+export const listSessions = async (db: D1Database, userId: string, now: number): Promise<Session[]> => {
   const [, listed] = await db.batch<SessionRow>([
-    expireSessions(db, caller.userId, now),
+    expireSessions(db, userId, now),
     db
       .prepare(
         `SELECT s.session_id, COALESCE(d.name, '') AS device_name, s.device_id, s.host, s.cwd, s.repo, s.branch,
@@ -291,9 +290,9 @@ export const listSessions = async (db: D1Database, caller: Caller, now: number):
          FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
          WHERE s.user_id = ? ORDER BY s.last_activity_at DESC, s.session_id`,
       )
-      .bind(caller.userId),
+      .bind(userId),
   ]);
-  return (listed?.results ?? []).map((row) => toSession(row, caller));
+  return (listed?.results ?? []).map(toSession);
 };
 
 export const sessionOnDevice = async (

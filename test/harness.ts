@@ -46,7 +46,23 @@ export interface Client {
   save(name: string, fields: Partial<Pick<Memory, "description" | "type" | "body" | "tags">>): Promise<Memory>;
   get(name: string): Promise<Memory>;
   search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
+  sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
 }
+
+const SESSION_DOCUMENT: Record<string, unknown> = {
+  host: "laptop",
+  cwd: "/home/you/src/recall",
+  repo: "repo:github.com/mvhenten/recall",
+  branch: "feat/sessions-list",
+  commit: "feat(sessions): list every host's sessions",
+  startedAt: 1_700_000_000_000,
+  lastActivityAt: 1_700_000_060_000,
+  prompts: 3,
+  focus: { first: "list every host's sessions", latest: "why is the worker test red" },
+  mode: "interactive",
+  permissionMode: "default",
+  pid: 4242,
+};
 
 export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
@@ -175,6 +191,9 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
         if (response.status !== 200) throw new Error(`get ${name}: ${response.status} ${await response.text()}`);
         const found: { memory: Memory } = await response.json();
         return found.memory;
+      },
+      sync(sessionId, fields = {}) {
+        return request("PUT", `/v1/sessions/${sessionId}`, { ...SESSION_DOCUMENT, ...fields });
       },
       async search(query, tags, mode = "hybrid") {
         const response = await request("POST", "/v1/search", {

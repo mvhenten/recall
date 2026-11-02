@@ -6,10 +6,10 @@ export interface Tab {
   label: string;
 }
 
-export const SESSIONS_TAB = "/dashboard";
+export const SESSIONS_TAB: Tab = { path: "/dashboard", label: "Sessions" };
 
 export const TABS: Tab[] = [
-  { path: SESSIONS_TAB, label: "Sessions" },
+  SESSIONS_TAB,
   { path: "/dashboard/memory", label: "Memory" },
   { path: "/dashboard/stats", label: "Stats" },
   { path: "/dashboard/insights", label: "Insights" },
@@ -65,6 +65,8 @@ const navigation = (current: Tab): string =>
     (tab) => `<a href="${tab.path}"${tab === current ? ' aria-current="page"' : ""}>${escapeHtml(tab.label)}</a>`,
   ).join("")}</nav>`;
 
+// repoAtBranch, age and focusHtml port markdown::repo_at_branch, sessions::age and
+// sessions::focus_line from cli/src, so a browser reads a session the way a terminal does.
 const repoAtBranch = (repo: string, branch: string): string => {
   if (repo === "") return "global";
   return branch === "" ? repo : `${repo}@${branch}`;
@@ -85,7 +87,6 @@ const age = (since: number, now: number): string => {
 const shorten = (text: string, limit: number): string =>
   text.length <= limit ? text : `${text.slice(0, limit).trimEnd()}…`;
 
-// The latest prompt stays whole; the one that opened the session gives way to it.
 const focusHtml = (focus: Focus): string => {
   if (focus.first === "") return escapeHtml(focus.latest);
   if (focus.latest === "" || focus.latest === focus.first) return escapeHtml(focus.first);
@@ -102,7 +103,7 @@ const card = (session: Session, now: number): string => {
     `${session.prompts} ${session.prompts === 1 ? "prompt" : "prompts"}`,
   ];
   return `<li class="card"><p class="handle">${escapeHtml(session.name)} <span class="host">${escapeHtml(session.host)}</span></p>
-<p class="${busy ? "state busy" : "state"}"><span class="dot"></span>${escapeHtml(state)}</p>
+<p class="${busy ? "state busy" : "state"}"><span class="dot"></span>${state}</p>
 ${focus === "" ? "" : `<p class="focus">${focus}</p>`}
 <p class="meta">${meta.map(escapeHtml).join(" · ")}</p></li>`;
 };
@@ -112,19 +113,23 @@ ${focus === "" ? "" : `<p class="focus">${focus}</p>`}
 const feed = (sessions: Session[], now: number): string =>
   sessions.length === 0
     ? `<p class="empty">${NO_SESSIONS}</p>`
-    : `<ol class="feed">${sessions.map((session) => card(session, now)).join("")}</ol>`;
+    : `<ol class="feed" role="list">${sessions.map((session) => card(session, now)).join("")}</ol>`;
 
-export const dashboardPage = (email: string, tab: Tab, sessions: Session[], now: number): Response =>
+const shell = (email: string, tab: Tab, main: string): Response =>
   htmlPage(
     200,
     `recall ${tab.label.toLowerCase()}`,
     STYLE,
     `<header class="bar"><h1>recall</h1><p class="who">${escapeHtml(email)}</p></header>
 ${navigation(tab)}
-<main><h2>${escapeHtml(tab.label)}</h2>${
-      tab.path === SESSIONS_TAB ? feed(sessions, now) : `<p class="empty">${PLACEHOLDER}</p>`
-    }</main>`,
+<main><h2>${escapeHtml(tab.label)}</h2>${main}</main>`,
   );
+
+export const dashboardPage = (email: string, tab: Tab): Response =>
+  shell(email, tab, `<p class="empty">${PLACEHOLDER}</p>`);
+
+export const sessionsPage = (email: string, sessions: Session[], now: number): Response =>
+  shell(email, SESSIONS_TAB, feed(sessions, now));
 
 export const dashboardNotice = (status: number, title: string, text: string, action: string): Response =>
   htmlPage(
