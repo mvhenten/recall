@@ -181,6 +181,7 @@ export interface UsageInput {
   cacheReadTokens: number;
   at: number;
   durable: boolean;
+  files: string[];
 }
 
 export const DAY_MS = 86_400_000;
@@ -486,6 +487,10 @@ export const parseSessionId = (value: string): Parsed<string> =>
 
 const TRANSCRIPT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
 
+// A session delegates plenty of turns, and each writes a file; far past this the delta is not one
+// this service wrote the rules for.
+export const MAX_COUNTED_FILES = 500;
+
 // Which of a session's transcript files a stretch belongs to: `main` for the session's own, and one
 // name per delegated turn. It becomes part of an object key, so a name that could reach out of the
 // session's own prefix is refused.
@@ -493,6 +498,22 @@ export const parseTranscriptFile = (value: string | null): Parsed<string> =>
   value !== null && TRANSCRIPT_FILE.test(value)
     ? { ok: true, value }
     : fail("file must open with a letter or digit and hold at most 101 of letters, digits, . _ and -");
+
+// The transcript files one delta read, which is what says their tokens are counted. A delta that
+// names none is one from a client that does not read them apart, and counts for no file.
+export const parseCountedFiles = (value: unknown): Parsed<string[]> => {
+  if (value === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(value) || value.length > MAX_COUNTED_FILES) {
+    return fail(`files must be an array of at most ${MAX_COUNTED_FILES} transcript file names`);
+  }
+  const files = new Set<string>();
+  for (const raw of value) {
+    const file = parseTranscriptFile(typeof raw === "string" ? raw : null);
+    if (!file.ok) return file;
+    files.add(file.value);
+  }
+  return { ok: true, value: [...files] };
+};
 
 export const parseChunkOffset = (value: string | null): Parsed<number> => {
   const offset = Number(value);
@@ -555,6 +576,8 @@ export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
   const { seq, host, repo, provider, account, model, prompts, at, durable } = body;
   const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
   if (durable !== undefined && typeof durable !== "boolean") return fail("durable must be true or false");
+  const files = parseCountedFiles(body.files);
+  if (!files.ok) return files;
   if (!isInteger(seq, 0, Number.MAX_SAFE_INTEGER)) return fail("seq must be the whole number of a delta in a session");
   if (!isText(host, MAX_SESSION_TEXT_CHARS) || host.length < 1) {
     return fail(`host must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
@@ -597,6 +620,7 @@ export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
       cacheWriteTokens,
       cacheReadTokens,
       durable: durable === true,
+      files: files.value,
     },
   };
 };

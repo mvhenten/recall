@@ -14,6 +14,12 @@ const held = async (response: Response): Promise<Record<string, number>> => {
   return Object.fromEntries(files.map(({ file, bytes }) => [file, bytes]));
 };
 
+const counted = async (response: Response): Promise<string[]> => {
+  expect(response.status).toBe(200);
+  const { counted: files } = (await response.json()) as { counted: string[] };
+  return files;
+};
+
 const rollup = async (userId: string): Promise<Array<Record<string, unknown>>> => {
   const { results } = await env.DB.prepare(
     "SELECT day, model, prompts, input_tokens FROM usage_daily WHERE user_id = ? ORDER BY day, model",
@@ -103,8 +109,8 @@ describe("transcript archive", () => {
   };
 
   const READING = [
-    { seq: BACKFILL_BASE, model: "claude-opus-4", inputTokens: 150, prompts: 2, durable: true },
-    { seq: BACKFILL_BASE + 1, model: "claude-haiku-4", inputTokens: 5, prompts: 0, durable: true },
+    { seq: BACKFILL_BASE, model: "claude-opus-4", inputTokens: 150, prompts: 2, durable: true, files: ["main"] },
+    { seq: BACKFILL_BASE + 1, model: "claude-haiku-4", inputTokens: 5, prompts: 0, durable: true, files: ["main"] },
   ];
 
   it("takes a backfill of a session it has never seen, from the first call to the archive", async () => {
@@ -155,6 +161,38 @@ describe("transcript archive", () => {
     expect((await client.usage("s-live", delta)).status).toBe(204);
 
     expect(await rollup(userId)).not.toEqual(once);
+  });
+
+  // The half the archive exists for. A host that backfilled before the counter read delegated
+  // turns has its own transcripts counted and those files counted nowhere, and that is most of
+  // what its sessions spent. The run that recovers them asks which files are counted, which is a
+  // usage fact and not an archive one.
+  it("recovers the delegated turns of a session on record, and counts them once", async () => {
+    const h = await harness();
+    const userId = `recoverer-${crypto.randomUUID()}`;
+    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
+    await backfill(client, "s-old", READING);
+    const before = await rollup(userId);
+    expect(await counted(await client.transcript("s-old"))).toEqual(["main"]);
+
+    const turn = {
+      seq: BACKFILL_BASE + 7 * 2 ** 16,
+      model: "claude-opus-4",
+      inputTokens: 700,
+      prompts: 0,
+      durable: true,
+      files: ["agent-7f21"],
+    };
+    expect((await client.usage("s-old", turn)).status).toBe(204);
+
+    expect(await counted(await client.transcript("s-old"))).toEqual(["agent-7f21", "main"]);
+    const recovered = await rollup(userId);
+    expect(recovered).not.toEqual(before);
+    // Two weeks on, a run that sends it again regardless lands on the rows already there.
+    h.tick(USAGE_RETENTION_MS + DAY_MS);
+    expect((await client.usage("s-old", turn)).status).toBe(204);
+    expect((await client.usage("s-old", turn)).status).toBe(204);
+    expect(await rollup(userId)).toEqual(recovered);
   });
 
   it("keeps a session's files once its row has moved to the history", async () => {

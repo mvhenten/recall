@@ -440,6 +440,11 @@ fn message_body(words: &[String]) -> Result<String> {
 /// The record, then the delta it carries, then the transcript itself. The archive goes last so
 /// that a file the service holds bytes of is a file whose tokens were counted: the backfill reads
 /// it that way, and sending the bytes first would have it count a stretch twice.
+/// The transcript files one pending delta read, which is what says their tokens are counted.
+fn read(pending: &sessions::UsagePending) -> Vec<String> {
+    pending.files.keys().cloned().collect()
+}
+
 fn sync_session(session_id: &str) -> Result<()> {
     let dir = listen::sessions_dir();
     let Some(record) = sessions::record(&dir, session_id) else {
@@ -449,7 +454,7 @@ fn sync_session(session_id: &str) -> Result<()> {
     client.sync_record(session_id, &record)?;
     println!("synced {session_id}");
     if let Some(pending) = record.usage_pending.as_ref() {
-        let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
+        let sent = client.post_usage(session_id, &record.host, &record.repo, &read(pending), &pending.events)?;
         sessions::commit_usage(&dir, session_id, pending)?;
         println!("sent {sent} usage deltas for {session_id}");
     }
@@ -469,7 +474,7 @@ fn end_session(session_id: &str) -> Result<()> {
     let client = Client::new(config::load()?);
     if let Some(record) = record.as_ref() {
         if let Some(pending) = record.usage_pending.as_ref() {
-            let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
+            let sent = client.post_usage(session_id, &record.host, &record.repo, &read(pending), &pending.events)?;
             println!("sent {sent} usage deltas for {session_id}");
         }
         let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path)?;
@@ -529,7 +534,7 @@ fn adopt_sessions() -> Result<ExitCode> {
 }
 
 impl transcripts::Store for Client {
-    fn held(&self, session_id: &str) -> Result<std::collections::HashMap<String, i64>> {
+    fn held(&self, session_id: &str) -> Result<transcripts::Held> {
         self.transcript_held(session_id)
     }
 
@@ -539,8 +544,15 @@ impl transcripts::Store for Client {
 }
 
 impl backfill::Service for Client {
-    fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[serde_json::Value]) -> Result<usize> {
-        Client::post_usage(self, session_id, host, repo, events)
+    fn post_usage(
+        &self,
+        session_id: &str,
+        host: &str,
+        repo: &str,
+        files: &[String],
+        events: &[serde_json::Value],
+    ) -> Result<usize> {
+        Client::post_usage(self, session_id, host, repo, files, events)
     }
 
     fn sync(&self, session_id: &str, body: &api::SessionBody) -> Result<()> {

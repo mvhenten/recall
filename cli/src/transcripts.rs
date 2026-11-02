@@ -82,9 +82,19 @@ pub fn sources(transcript: &Path) -> Result<Vec<Source>> {
     Ok(found)
 }
 
+/// What the service says about one session's transcript files: how far into each one it has been
+/// written, and which of them have had their tokens counted. The two move apart — a running
+/// session's lines are archived on a beat of their own, with no counting pass behind them — so
+/// neither ever stands in for the other.
+#[derive(Debug, Default)]
+pub struct Held {
+    pub bytes: HashMap<String, i64>,
+    pub counted: HashSet<String>,
+}
+
 /// What the service answers about one session's files, and what it takes.
 pub trait Store {
-    fn held(&self, session_id: &str) -> Result<HashMap<String, i64>>;
+    fn held(&self, session_id: &str) -> Result<Held>;
     fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended>;
 }
 
@@ -179,7 +189,7 @@ impl Archive {
         {
             return Ok(0);
         }
-        let held = store.held(session_id)?;
+        let held = store.held(session_id)?.bytes;
         let mut sent = 0;
         let mut ends = HashMap::new();
         for source in &sources {
@@ -189,6 +199,12 @@ impl Archive {
         }
         self.seen.insert(session_id.to_string(), ends);
         Ok(sent)
+    }
+
+    /// Takes an answer the caller already has, so a pass that asked the service for something
+    /// else does not ask again for this.
+    pub fn remember(&mut self, session_id: &str, bytes: &HashMap<String, i64>) {
+        self.seen.insert(session_id.to_string(), bytes.clone());
     }
 
     /// Forgets the sessions this host no longer holds, so a daemon that runs for weeks does not
@@ -252,14 +268,17 @@ mod tests {
     }
 
     impl Store for Fake {
-        fn held(&self, _session_id: &str) -> Result<HashMap<String, i64>> {
+        fn held(&self, _session_id: &str) -> Result<Held> {
             *self.asked.borrow_mut() += 1;
-            Ok(self
-                .files
-                .borrow()
-                .iter()
-                .map(|(file, body)| (file.clone(), body.len() as i64))
-                .collect())
+            Ok(Held {
+                bytes: self
+                    .files
+                    .borrow()
+                    .iter()
+                    .map(|(file, body)| (file.clone(), body.len() as i64))
+                    .collect(),
+                counted: HashSet::new(),
+            })
         }
 
         fn append(&self, _session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended> {

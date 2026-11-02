@@ -238,7 +238,8 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
             let id = &session.session_id;
             if let Some(pending) = session.usage_pending.as_ref() {
                 let started = Instant::now();
-                let outcome = match client.post_usage(id, &session.host, &session.repo, &pending.events) {
+                let files: Vec<String> = pending.files.keys().cloned().collect();
+                let outcome = match client.post_usage(id, &session.host, &session.repo, &files, &pending.events) {
                     Ok(sent) => format!("sessions:usage:{id}:{sent}"),
                     Err(error) => format!("sessions:usage-failed:{id}:{error:#}"),
                 };

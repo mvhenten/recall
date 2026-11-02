@@ -1,7 +1,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 use ureq::http::Response;
@@ -298,6 +298,9 @@ pub struct SessionBody<'a> {
 struct UsageBody<'a> {
     host: &'a str,
     repo: &'a str,
+    /// The transcript files this delta read. It is what says their tokens are counted, which a
+    /// run reading the same files back long after has nothing else to ask.
+    files: &'a [String],
     #[serde(flatten)]
     event: &'a serde_json::Value,
 }
@@ -325,6 +328,8 @@ struct HeldFile {
 #[derive(Deserialize)]
 struct HeldFiles {
     files: Vec<HeldFile>,
+    #[serde(default)]
+    counted: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -580,22 +585,35 @@ impl Client {
 
     /// Sends every event of one stretch. The events are the hooks' own: nothing here reads inside
     /// one, so a counter the hooks learn to read needs no change in this binary.
-    pub fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[serde_json::Value]) -> Result<usize> {
+    pub fn post_usage(
+        &self,
+        session_id: &str,
+        host: &str,
+        repo: &str,
+        files: &[String],
+        events: &[serde_json::Value],
+    ) -> Result<usize> {
         for event in events {
             let response = self
                 .authed(
                     self.agent
                         .post(self.url(&format!("{}/usage", Self::session_path(session_id)))),
                 )
-                .send_json(UsageBody { host, repo, event })?;
+                .send_json(UsageBody {
+                    host,
+                    repo,
+                    files,
+                    event,
+                })?;
             check(response, &format!("sending usage for session {session_id}"))?;
         }
         Ok(events.len())
     }
 
-    /// How far into each of a session's transcript files the service has been written. A file it
-    /// holds nothing of is simply absent.
-    pub fn transcript_held(&self, session_id: &str) -> Result<HashMap<String, i64>> {
+    /// What the service holds of one session: how far into each transcript file it has been
+    /// written, and which files have had their tokens counted. It answers only for a session the
+    /// account already has on record.
+    pub fn transcript_held(&self, session_id: &str) -> Result<crate::transcripts::Held> {
         let response = self
             .authed(
                 self.agent
@@ -605,7 +623,10 @@ impl Client {
         let held: HeldFiles = check(response, &format!("reading the archive of session {session_id}"))?
             .body_mut()
             .read_json()?;
-        Ok(held.files.into_iter().map(|file| (file.file, file.bytes)).collect())
+        Ok(crate::transcripts::Held {
+            bytes: held.files.into_iter().map(|file| (file.file, file.bytes)).collect(),
+            counted: held.counted.into_iter().collect(),
+        })
     }
 
     /// Appends one stretch to one of a session's transcript files. The store takes a stretch only

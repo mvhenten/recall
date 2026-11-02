@@ -85,6 +85,10 @@ pub struct Past {
     pub permission_mode: String,
     /// The session's own transcript, which is what names the set its files are found from.
     pub main: PathBuf,
+    /// Whether the service already holds the session. Its own transcript was counted by whatever
+    /// put it there and is never read again; its delegated turns are another matter, since no run
+    /// before this one ever counted one at all.
+    pub on_record: bool,
     pub parts: Vec<Part>,
 }
 
@@ -316,6 +320,7 @@ fn synthesize(
     scope: &adopt::Scope,
     session_id: &str,
     path: &Path,
+    on_record: bool,
     tags: &mut HashMap<PathBuf, String>,
 ) -> Result<Option<Past>> {
     let tagged = |cwd: &str, tags: &mut HashMap<PathBuf, String>| {
@@ -352,27 +357,31 @@ fn synthesize(
         focus: reading.focus,
         permission_mode: reading.permission_mode,
         main: path.to_path_buf(),
+        on_record,
         parts: parts(path)?,
     }))
 }
 
-/// Every past session this host holds a transcript for that the service does not already have,
-/// oldest first. A session the registry still names is live and adoption's to take on, not this
-/// pass's.
-///
-/// A session the service has on record is left alone whole. Its tokens were counted by whatever
-/// put it there — the hooks as it ran, or an earlier run of this — and a transcript cannot say
-/// which, so reading it again could only count what is already counted.
+/// Every past session this host holds a transcript for, oldest first, whether or not the service
+/// already has it: a session on record still owes it every delegated turn, which no run before
+/// this one ever counted. A session the registry still names is live and adoption's to take on,
+/// not this pass's.
 pub fn past(scope: &adopt::Scope, on_record: &HashSet<String>) -> Result<Vec<Past>> {
     let found = transcripts(&scope.projects)?;
     let live = adopt::registry(&scope.sessions).sessions;
     let mut tags: HashMap<PathBuf, String> = HashMap::new();
     let mut sessions = Vec::new();
     for (session_id, path) in &found {
-        if on_record.contains(session_id) || live.contains(session_id) {
+        if live.contains(session_id) {
             continue;
         }
-        sessions.extend(synthesize(scope, session_id, path, &mut tags)?);
+        sessions.extend(synthesize(
+            scope,
+            session_id,
+            path,
+            on_record.contains(session_id),
+            &mut tags,
+        )?);
     }
     sessions.sort_by(|left, right| {
         left.started_at
@@ -384,7 +393,8 @@ pub fn past(scope: &adopt::Scope, on_record: &HashSet<String>) -> Result<Vec<Pas
 
 /// What a run asks of the service for one past session.
 pub trait Service: transcripts::Store {
-    fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[Value]) -> Result<usize>;
+    fn post_usage(&self, session_id: &str, host: &str, repo: &str, files: &[String], events: &[Value])
+    -> Result<usize>;
     fn sync(&self, session_id: &str, body: &SessionBody) -> Result<()>;
     fn end(&self, session_id: &str) -> Result<()>;
 }
@@ -396,15 +406,39 @@ pub struct Sent {
     pub bytes: i64,
 }
 
-/// Sends each past session: every file's tokens, then the record that writes the history row,
-/// then the end, then the files themselves. Nothing here asks the service what it already holds,
-/// because nothing needs to — the chunk numbers are derived from the transcripts, the service
-/// keeps the rows they land on, and a reading that arrives twice is a row it already has.
+/// Which of one session's files this run still owes tokens for.
+///
+/// A session the service has never seen owes all of them, and is not asked about: the route that
+/// would answer only knows a session already on record, and nothing it could say would change the
+/// answer. A session it has owes only the delegated turns it has not counted. Its own transcript
+/// is never read again, whatever the service says — the hooks counted that one as the session
+/// ran, or a run before this did, and a transcript cannot say which.
+fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<(Vec<&'a Part>, transcripts::Held)> {
+    if !session.on_record {
+        return Ok((session.parts.iter().collect(), transcripts::Held::default()));
+    }
+    let held = service.held(&session.session_id)?;
+    let owed = session
+        .parts
+        .iter()
+        .filter(|part| part.source.file != MAIN && !held.counted.contains(&part.source.file))
+        .collect();
+    Ok((owed, held))
+}
+
+/// Sends each past session: the tokens it still owes, then for a session the service has never
+/// seen the record that writes the history row and the end that leaves it standing, then the
+/// files themselves.
+///
+/// A reading that arrives twice costs nothing either way. The chunk numbers come from the
+/// transcript, so the same file read again yields the same ones, and the rows a run writes are
+/// kept rather than swept at two weeks — so the rollup counts each of them exactly once, however
+/// long after the first a second reading lands.
 ///
 /// The order is what makes an interrupted run safe to repeat. The history row is what the next
 /// run reads as already sent, so it may not land ahead of the tokens it stands for; the archive
 /// goes last because the route that takes it answers only for a session on record, and the end
-/// is what puts this one there.
+/// is what puts a new one there.
 pub fn send(
     service: &impl Service,
     archive: &mut transcripts::Archive,
@@ -414,14 +448,20 @@ pub fn send(
 ) -> Result<()> {
     for session in past {
         let id = &session.session_id;
+        let (owed, held) = owed(service, session)?;
         let mut done = Sent::default();
-        for part in &session.parts {
+        for part in owed {
             let prompts = if part.source.file == MAIN { session.prompts } else { 0 };
             let events = part.events(account, prompts)?;
-            done.events += service.post_usage(id, &session.host, &session.repo, &events)?;
+            let files = [part.source.file.clone()];
+            done.events += service.post_usage(id, &session.host, &session.repo, &files, &events)?;
         }
-        service.sync(id, &session.body())?;
-        service.end(id)?;
+        if !session.on_record {
+            service.sync(id, &session.body())?;
+            service.end(id)?;
+        } else {
+            archive.remember(id, &held.bytes);
+        }
         done.bytes = archive.send(service, id, &session.main)?;
         sent(id, done);
     }
@@ -515,6 +555,7 @@ mod tests {
     struct Fake {
         events: RefCell<HashMap<(String, i64), Value>>,
         daily: RefCell<HashMap<(i64, String), i64>>,
+        counted: RefCell<HashSet<(String, String)>>,
         archive: RefCell<HashMap<(String, String), Vec<u8>>>,
         history: RefCell<HashSet<String>>,
         ended: RefCell<Vec<String>>,
@@ -528,6 +569,7 @@ mod tests {
             Fake {
                 events: dying.events.clone(),
                 daily: dying.daily.clone(),
+                counted: dying.counted.clone(),
                 archive: dying.archive.clone(),
                 ..Fake::default()
             }
@@ -554,14 +596,23 @@ mod tests {
     }
 
     impl transcripts::Store for Fake {
-        fn held(&self, session_id: &str) -> Result<HashMap<String, i64>> {
-            Ok(self
-                .archive
-                .borrow()
-                .iter()
-                .filter(|((held, _), _)| held == session_id)
-                .map(|((_, file), body)| (file.clone(), body.len() as i64))
-                .collect())
+        fn held(&self, session_id: &str) -> Result<transcripts::Held> {
+            Ok(transcripts::Held {
+                bytes: self
+                    .archive
+                    .borrow()
+                    .iter()
+                    .filter(|((held, _), _)| held == session_id)
+                    .map(|((_, file), body)| (file.clone(), body.len() as i64))
+                    .collect(),
+                counted: self
+                    .counted
+                    .borrow()
+                    .iter()
+                    .filter(|(held, _)| held == session_id)
+                    .map(|(_, file)| file.clone())
+                    .collect(),
+            })
         }
 
         fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<transcripts::Appended> {
@@ -576,8 +627,18 @@ mod tests {
     }
 
     impl Service for Fake {
-        fn post_usage(&self, session_id: &str, host: &str, _repo: &str, events: &[Value]) -> Result<usize> {
+        fn post_usage(
+            &self,
+            session_id: &str,
+            host: &str,
+            _repo: &str,
+            files: &[String],
+            events: &[Value],
+        ) -> Result<usize> {
             assert_eq!(host, "laptop", "a delta carries the host that spent the tokens");
+            for file in files {
+                self.counted.borrow_mut().insert((session_id.to_string(), file.clone()));
+            }
             for event in events {
                 let seq = event["seq"].as_i64().expect("every event carries a chunk number");
                 let mut held = self.events.borrow_mut();
@@ -781,12 +842,100 @@ mod tests {
         .unwrap();
         let once = service.rollup();
 
+        let again = sandbox.found(&service.on_record());
+        send(
+            &service,
+            &mut transcripts::Archive::default(),
+            &again,
+            ACCOUNT,
+            |session_id, sent| assert_eq!(sent.events, 0, "{session_id} had tokens left to send"),
+        )
+        .unwrap();
+
+        assert_eq!(service.rollup(), once, "a second run adds nothing to the rollup");
         assert_eq!(
-            sandbox.found(&service.on_record()),
-            Vec::new(),
-            "a session the service already holds on record is passed over"
+            *service.ended.borrow(),
+            vec!["s-old".to_string()],
+            "and writes no history row a second time"
         );
-        assert_eq!(service.rollup(), once, "so a second run adds nothing to the rollup");
+    }
+
+    #[test]
+    fn a_session_on_record_owes_the_delegated_turns_nothing_ever_counted_and_nothing_else() {
+        let sandbox = Sandbox::new("recovered");
+        sandbox.transcript("-home-you-recall", "s-old", &session());
+        let service = Fake::default();
+        // The run a host made before a delegated turn was ever read: its own transcript counted,
+        // and the service left holding the session on record.
+        send(
+            &service,
+            &mut transcripts::Archive::default(),
+            &sandbox.found(&nothing()),
+            ACCOUNT,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(spent(&service, "claude-opus-4"), 150);
+        sandbox.subagent("-home-you-recall", "s-old", "agent-7f21", &delegated());
+
+        send(
+            &service,
+            &mut transcripts::Archive::default(),
+            &sandbox.found(&service.on_record()),
+            ACCOUNT,
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            spent(&service, "claude-opus-4"),
+            850,
+            "the delegated turn is counted and the session's own transcript is not counted again"
+        );
+        let recovered = service.rollup();
+        send(
+            &service,
+            &mut transcripts::Archive::default(),
+            &sandbox.found(&service.on_record()),
+            ACCOUNT,
+            |session_id, sent| assert_eq!(sent.events, 0, "{session_id} had tokens left to send"),
+        )
+        .unwrap();
+        assert_eq!(service.rollup(), recovered, "and the run after it owes nothing at all");
+    }
+
+    #[test]
+    fn a_delegated_turn_the_hooks_counted_as_it_ran_is_never_counted_again() {
+        let sandbox = Sandbox::new("livecounted");
+        sandbox.transcript("-home-you-recall", "s-old", &session());
+        sandbox.subagent("-home-you-recall", "s-old", "agent-7f21", &delegated());
+        let service = Fake::default();
+        // A session that ran under hooks that read every file: the service holds the session and
+        // both of its files counted, at chunk numbers of the hooks' own.
+        service.history.borrow_mut().insert("s-old".to_string());
+        for file in ["main", "agent-7f21"] {
+            service
+                .counted
+                .borrow_mut()
+                .insert(("s-old".to_string(), file.to_string()));
+        }
+        *self_spent(&service) += 850;
+        let counted = service.rollup();
+
+        send(
+            &service,
+            &mut transcripts::Archive::default(),
+            &sandbox.found(&service.on_record()),
+            ACCOUNT,
+            |session_id, sent| assert_eq!(sent.events, 0, "{session_id} had tokens left to send"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            service.rollup(),
+            counted,
+            "a file the hooks counted is one this run owes nothing for, whatever numbers they used"
+        );
     }
 
     #[test]
@@ -1021,6 +1170,15 @@ mod tests {
     /// and show only in the total.
     fn delegated() -> Vec<String> {
         vec![answer("2026-10-01T10:05:00.000Z", "msg-a1", "claude-opus-4", 700, 70)]
+    }
+
+    /// The rollup cell `session()` and its delegated turn both land in.
+    fn self_spent(service: &Fake) -> std::cell::RefMut<'_, i64> {
+        std::cell::RefMut::map(service.daily.borrow_mut(), |daily| {
+            daily
+                .entry((day(1_790_850_605_000), "claude-opus-4".to_string()))
+                .or_default()
+        })
     }
 
     fn spent(service: &Fake, model: &str) -> i64 {

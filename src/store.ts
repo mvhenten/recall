@@ -877,7 +877,24 @@ export const recordUsage = async (
     db
       .prepare("DELETE FROM usage_events WHERE user_id = ? AND recorded_at < ? AND durable = 0")
       .bind(userId, now - USAGE_RETENTION_MS),
+    ...input.files.map((file) =>
+      db
+        .prepare("INSERT OR IGNORE INTO counted_files (user_id, session_id, file) VALUES (?, ?, ?)")
+        .bind(userId, sessionId, file),
+    ),
   ]);
+};
+
+// The transcript files of one session whose tokens have been counted, whoever counted them: the
+// hooks as the session ran, or a run reading the file back long after. It is the only thing a
+// later reading can ask, since the raw events are swept at two weeks and never said which file
+// they read.
+export const countedFiles = async (db: D1Database, userId: string, sessionId: string): Promise<string[]> => {
+  const { results } = await db
+    .prepare("SELECT file FROM counted_files WHERE user_id = ? AND session_id = ? ORDER BY file")
+    .bind(userId, sessionId)
+    .all<{ file: string }>();
+  return results.map((row) => row.file);
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {

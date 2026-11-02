@@ -77,6 +77,7 @@ import {
 import { artifactPage, CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
 import {
+  countedFiles,
   decodeCursor,
   deleteMemory,
   describeMemories,
@@ -304,7 +305,11 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "GET" && request.method !== "PUT") return error(405, "method not allowed");
     if (!(await sessionOnRecord(env.DB, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
     if (request.method === "GET") {
-      return json({ files: await transcriptFiles(env.DB, caller.userId, sessionId) });
+      const [files, counted] = await Promise.all([
+        transcriptFiles(env.DB, caller.userId, sessionId),
+        countedFiles(env.DB, caller.userId, sessionId),
+      ]);
+      return json({ files, counted });
     }
     const file = parseTranscriptFile(url.searchParams.get("file"));
     if (!file.ok) return error(400, file.error);
