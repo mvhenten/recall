@@ -264,8 +264,8 @@ fn transcripts(projects: &Path, cwd: &Path) -> Vec<Transcript> {
 /// alone, parsed or not — the hooks write one with a single write and no rename, so a record read
 /// mid-write does not parse, and overwriting that session would throw away the inbox it carries.
 #[derive(Debug, Default)]
-struct Registry {
-    sessions: HashSet<String>,
+pub struct Registry {
+    pub sessions: HashSet<String>,
     pids: HashSet<i32>,
     adopted: Vec<(String, Value)>,
 }
@@ -274,7 +274,7 @@ fn parsed(path: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-fn registry(dir: &Path) -> Registry {
+pub fn registry(dir: &Path) -> Registry {
     let mut registry = Registry::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return registry;

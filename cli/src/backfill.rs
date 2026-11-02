@@ -1,34 +1,14 @@
-//! The sessions that ran before the hooks did. A host keeps every past session's transcript under
-//! `~/.claude/projects/`, while the dashboard's history and stats start the day its hooks shipped.
-//! This pass reads those transcripts back and sends each one as the session it was: the record goes
-//! out as a sync, which writes the history row, the row survives the end that follows it, and the
-//! tokens the session spent go out as usage deltas of their own.
-//!
-//! The record comes from the same reader `recall sessions --adopt` uses, so a session read back
-//! long after it ended says what one read mid-flight says. What a running session takes from its
-//! own process — the pid, whether it was interactive, the commit its directory sat on — a past
-//! session cannot have, and the API's own empty readings carry that.
-//!
-//! The tokens are read as hooks/usage.mjs reads them: one JSON document a line, an answer counted
-//! once by its message id, summed by model, and one event per model. The whole transcript is one
-//! stretch, so the chunk numbers are the ones a single hook pass over it from byte zero would have
-//! spent, and the service keeps the first event it saw for a chunk number. A second run over the
-//! same transcript therefore regenerates the same events and changes nothing.
-//!
-//! What has already been sent is the service's own answer, never a mark this host keeps: the
-//! sessions it holds on record are read back before the pass starts, and every one of them is
-//! passed over. A ledger on disk would read as a host with nothing left to send after a reinstall
-//! wiped it, and the tokens of every session it had already sent would be counted a second time.
-//!
-//! Attribution is the one thing a transcript cannot give back: it names no subscription, so every
-//! event carries the account this host is signed in as now.
+//! The sessions that ran before the hooks did, read back out of the transcripts
+//! `~/.claude/projects/` keeps and sent as the sessions they were. The record comes from the reader
+//! `recall sessions --adopt` uses and the tokens are read as hooks/usage.mjs reads them, so a
+//! session read back long after it ended says what one read mid-flight says. README's "Live
+//! sessions" carries the rest.
 
 use crate::adopt::{self, Reading};
 use crate::api::SessionBody;
 use crate::config;
-use crate::listen;
 use crate::repo;
-use crate::sessions::{Focus, UsagePending};
+use crate::sessions::Focus;
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -39,31 +19,7 @@ use std::path::{Path, PathBuf};
 /// Mirrors PROVIDER in hooks/usage.mjs.
 const PROVIDER: &str = "claude";
 
-/// Where one pass looks: the directory Claude Code writes transcripts under, the registry the hooks
-/// write, and the file naming the subscription the tokens are counted against.
-#[derive(Debug, Clone)]
-pub struct Scope {
-    pub projects: PathBuf,
-    pub sessions: PathBuf,
-    pub claude_json: PathBuf,
-    pub host: String,
-}
-
-impl Scope {
-    pub fn here() -> Result<Scope> {
-        let claude =
-            config::claude_dir().context("neither CLAUDE_CONFIG_DIR nor HOME is set, so there are no transcripts")?;
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("HOME is not set, so this host names no account to count the tokens against")?;
-        Ok(Scope {
-            projects: claude.join("projects"),
-            sessions: listen::sessions_dir(),
-            claude_json: home.join(".claude.json"),
-            host: crate::host_name(),
-        })
-    }
-}
+const DAY_MS: i64 = 86_400_000;
 
 /// One past session, as its transcript gives it back. `mode` and the commit subject are left to the
 /// API's empty readings: a transcript says neither whether the session was interactive nor which
@@ -81,7 +37,7 @@ pub struct Past {
     pub prompts: i64,
     pub focus: Focus,
     pub permission_mode: String,
-    pub usage: UsagePending,
+    pub events: Vec<Value>,
 }
 
 impl Past {
@@ -106,7 +62,7 @@ impl Past {
 /// The subscription the tokens are spent on; mirrors account() in hooks/usage.mjs. A host whose
 /// account was swapped out has no `oauthAccount` left, so the user id the harness always writes is
 /// the identity to fall back on.
-fn account(claude_json: &Path) -> String {
+pub fn account(claude_json: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(claude_json) else {
         return String::new();
     };
@@ -120,52 +76,51 @@ fn account(claude_json: &Path) -> String {
         .to_string()
 }
 
-/// Every session this pass leaves alone: the ones the service already holds on record, and the ones
-/// the registry names, which are this host's live sessions and adoption's to take on.
-fn skipped(scope: &Scope, on_record: &HashSet<String>) -> HashSet<String> {
-    let mut held = on_record.clone();
-    let Ok(entries) = std::fs::read_dir(&scope.sessions) else {
-        return held;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension() != Some(OsStr::new("json")) {
-            continue;
-        }
-        if let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) {
-            held.insert(session_id.to_string());
-        }
+/// The subscription this host is signed in as. A host that names none cannot have its tokens
+/// counted against anything, and the run says so rather than sending events the service refuses.
+pub fn account_here() -> Result<String> {
+    let claude_json = config::claude_dir()
+        .context("neither CLAUDE_CONFIG_DIR nor HOME is set, so this host names no account")?
+        .parent()
+        .context("the Claude Code directory has no parent, so there is no .claude.json beside it")?
+        .join(".claude.json");
+    let named = account(&claude_json);
+    if named.is_empty() {
+        bail!(
+            "{} names no account, so the tokens these sessions spent have nothing to be counted against",
+            claude_json.display()
+        );
     }
-    held
+    Ok(named)
 }
 
 /// Every transcript this host holds. A session's transcript sits directly under a project
-/// directory; a subagent's sits a level down and is no session of its own.
-fn transcripts(projects: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(projects) = std::fs::read_dir(projects) else {
-        return Vec::new();
-    };
-    let mut found: Vec<(String, PathBuf)> = projects
-        .flatten()
-        .filter_map(|project| std::fs::read_dir(project.path()).ok())
-        .flat_map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let path = entry.path();
-                    if path.extension() != Some(OsStr::new(adopt::TRANSCRIPT)) {
-                        return None;
-                    }
-                    Some((path.file_stem()?.to_str()?.to_string(), path))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+/// directory; a subagent's sits a level down and is no session of its own. A directory that cannot
+/// be read fails the pass: a host that could not look must not report a host with nothing to send.
+fn transcripts(projects: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut found = Vec::new();
+    for project in std::fs::read_dir(projects).with_context(|| format!("reading {}", projects.display()))? {
+        let project = project.with_context(|| format!("reading {}", projects.display()))?;
+        if !project.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let dir = project.path();
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
+            if path.extension() != Some(OsStr::new(adopt::TRANSCRIPT)) {
+                continue;
+            }
+            let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()).map(str::to_string) else {
+                continue;
+            };
+            found.push((session_id, path));
+        }
+    }
     found.sort();
-    found
+    Ok(found)
 }
 
-/// What one model spent over a transcript, and when it last answered.
+/// What one model spent on one day, and when within it it last answered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Counted {
     at: i64,
@@ -185,13 +140,22 @@ fn counter(usage: &Value, field: &str) -> i64 {
     usage[field].as_i64().filter(|count| *count > 0).unwrap_or_default()
 }
 
-/// What the models answering one transcript spent, in the order they first answered; mirrors
-/// aggregate() in hooks/usage.mjs. One API response is written as several transcript entries, one
-/// per content block, each carrying the same usage, so a message counts once by its id.
-fn aggregate(text: &str) -> (Vec<(String, Counted)>, String) {
-    let mut models: Vec<(String, Counted)> = Vec::new();
+/// The UTC day an event falls in, as usageDay() in src/model.ts reads it off the same `at`.
+fn day(at: i64) -> i64 {
+    at.div_euclid(DAY_MS)
+}
+
+/// What the models answering one transcript spent, by model and by the day they spent it, in the
+/// order each pair first answered; mirrors aggregate() in hooks/usage.mjs. One API response is
+/// written as several transcript entries, one per content block, each carrying the same usage, so a
+/// message counts once by its id.
+///
+/// The day is part of the key because a hook pass covers minutes while this one covers a whole
+/// transcript: a session that ran past midnight, or was resumed over weeks, would otherwise land
+/// every token it ever spent on the day of its last answer, and its months would read as one spike.
+fn aggregate(text: &str, now: i64) -> Vec<(String, Counted)> {
+    let mut spans: Vec<((String, i64), Counted)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut message_id = String::new();
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -200,22 +164,22 @@ fn aggregate(text: &str) -> (Vec<(String, Counted)>, String) {
             continue;
         }
         let message = &entry["message"];
-        if let Some(id) = message["id"].as_str().filter(|id| !id.is_empty()) {
-            if !seen.insert(id.to_string()) {
-                continue;
-            }
-            message_id = id.to_string();
+        if let Some(id) = message["id"].as_str().filter(|id| !id.is_empty())
+            && !seen.insert(id.to_string())
+        {
+            continue;
         }
         let Some(model) = message["model"].as_str().filter(|model| !model.is_empty()) else {
             continue;
         };
         let usage = &message["usage"];
+        let at = entry["timestamp"]
+            .as_str()
+            .and_then(|at| at.parse::<Timestamp>().ok())
+            .map(|at| at.as_millisecond())
+            .unwrap_or(now);
         let spent = Counted {
-            at: entry["timestamp"]
-                .as_str()
-                .and_then(|at| at.parse::<Timestamp>().ok())
-                .map(|at| at.as_millisecond())
-                .unwrap_or_default(),
+            at,
             input_tokens: counter(usage, "input_tokens"),
             output_tokens: counter(usage, "output_tokens"),
             cache_write_tokens: counter(usage, "cache_creation_input_tokens"),
@@ -224,11 +188,12 @@ fn aggregate(text: &str) -> (Vec<(String, Counted)>, String) {
         if spent.spent() == 0 {
             continue;
         }
-        let found = match models.iter_mut().find(|(named, _)| named == model) {
+        let key = (model.to_string(), day(at));
+        let found = match spans.iter_mut().find(|(named, _)| *named == key) {
             Some((_, found)) => found,
             None => {
-                models.push((model.to_string(), Counted::default()));
-                &mut models.last_mut().expect("the model just pushed").1
+                spans.push((key, Counted::default()));
+                &mut spans.last_mut().expect("the span just pushed").1
             }
         };
         found.at = found.at.max(spent.at);
@@ -237,14 +202,14 @@ fn aggregate(text: &str) -> (Vec<(String, Counted)>, String) {
         found.cache_write_tokens += spent.cache_write_tokens;
         found.cache_read_tokens += spent.cache_read_tokens;
     }
-    (models, message_id)
+    spans.into_iter().map(|((model, _), spent)| (model, spent)).collect()
 }
 
-/// One event per model, each with a chunk number of its own; mirrors events() in hooks/usage.mjs.
-/// The whole transcript is one stretch, so the numbers start where a first hook pass over it would
-/// have started and the prompts it answers all ride on the first event.
-fn events(models: &[(String, Counted)], account: &str, prompts: i64, now: i64) -> Vec<Value> {
-    models
+/// One event per model and day, each with a chunk number of its own; mirrors events() in
+/// hooks/usage.mjs. The whole transcript is one stretch, so the numbers start where a first hook
+/// pass over it would have started and the prompts it answers all ride on the first event.
+fn events(spans: &[(String, Counted)], account: &str, prompts: i64) -> Vec<Value> {
+    spans
         .iter()
         .enumerate()
         .map(|(index, (model, spent))| {
@@ -254,7 +219,7 @@ fn events(models: &[(String, Counted)], account: &str, prompts: i64, now: i64) -
                 "account": account,
                 "model": model,
                 "prompts": if index == 0 { prompts } else { 0 },
-                "at": if spent.at == 0 { now } else { spent.at },
+                "at": spent.at,
                 "inputTokens": spent.input_tokens,
                 "outputTokens": spent.output_tokens,
                 "cacheWriteTokens": spent.cache_write_tokens,
@@ -264,20 +229,42 @@ fn events(models: &[(String, Counted)], account: &str, prompts: i64, now: i64) -
         .collect()
 }
 
-/// One past session read out of its transcript. The two readers take the whole file, which is read
-/// once for both: the record's reader counts what the user typed and the usage reader what the
-/// models answered, and the two never read the same entries. A transcript whose entries carry no
-/// time of their own leaves the file's own birth and last write to say when the session ran.
-fn synthesize(scope: &Scope, session_id: &str, path: &Path, account: &str, tags: &mut Repos, now: i64) -> Result<Past> {
+/// One past session read out of its transcript, or nothing for a transcript that holds neither a
+/// prompt nor an answer. A `claude -p` that failed to start and a session closed before its first
+/// prompt both leave one of those behind, and sending it would put a row on the history with
+/// nothing in it that no later pass ever revisits.
+///
+/// The whole file is read once, for both readers: the record's reader counts what the user typed
+/// and the usage reader what the models answered, and the two never read the same entries. A
+/// transcript whose entries carry no time of their own leaves the file's own birth and last write
+/// to say when the session ran.
+fn synthesize(
+    scope: &adopt::Scope,
+    session_id: &str,
+    path: &Path,
+    account: &str,
+    tags: &mut HashMap<PathBuf, String>,
+    now: i64,
+) -> Result<Option<Past>> {
     let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let reading = adopt::read_text(&text, Reading::default());
-    let (models, message_id) = aggregate(&text);
+    let spans = aggregate(&text, now);
+    if reading.prompts == 0 && spans.is_empty() {
+        return Ok(None);
+    }
     let cwd = PathBuf::from(&reading.cwd);
-    Ok(Past {
+    let repo = match cwd.as_os_str().is_empty() {
+        true => String::new(),
+        false => tags
+            .entry(cwd.clone())
+            .or_insert_with(|| repo::repo_tag(&cwd).unwrap_or_default())
+            .clone(),
+    };
+    Ok(Some(Past {
         session_id: session_id.to_string(),
         host: scope.host.clone(),
-        repo: tags.of(&cwd),
+        repo,
         cwd: reading.cwd,
         branch: reading.git_branch,
         started_at: match reading.started_at {
@@ -291,57 +278,23 @@ fn synthesize(scope: &Scope, session_id: &str, path: &Path, account: &str, tags:
         prompts: reading.prompts,
         focus: reading.focus,
         permission_mode: reading.permission_mode,
-        usage: UsagePending {
-            seq: 0,
-            end: metadata.len() as i64,
-            high_water: metadata.len() as i64,
-            prompts: reading.prompts,
-            message_id,
-            events: events(&models, account, reading.prompts, now),
-        },
-    })
-}
-
-/// The repo tag of each directory a transcript names, asked for once. A past session's directory is
-/// often gone, and one that is still there answers for every session that ran in it.
-#[derive(Debug, Default)]
-struct Repos(HashMap<PathBuf, String>);
-
-impl Repos {
-    fn of(&mut self, cwd: &Path) -> String {
-        if cwd.as_os_str().is_empty() {
-            return String::new();
-        }
-        self.0
-            .entry(cwd.to_path_buf())
-            .or_insert_with(|| repo::repo_tag(cwd).unwrap_or_default())
-            .clone()
-    }
+        events: events(&spans, account, reading.prompts),
+    }))
 }
 
 /// Every past session this host holds a transcript for that the service does not already have,
 /// oldest first. A session the registry still names is live and adoption's to take on, not this
 /// pass's.
-pub fn past(scope: &Scope, on_record: &HashSet<String>, now: i64) -> Result<Vec<Past>> {
-    let held = skipped(scope, on_record);
-    let found: Vec<(String, PathBuf)> = transcripts(&scope.projects)
-        .into_iter()
-        .filter(|(session_id, _)| !held.contains(session_id))
-        .collect();
-    if found.is_empty() {
-        return Ok(Vec::new());
-    }
-    let account = account(&scope.claude_json);
-    if account.is_empty() {
-        bail!(
-            "{} names no account, so the tokens these sessions spent have nothing to be counted against",
-            scope.claude_json.display()
-        );
-    }
-    let mut tags = Repos::default();
+pub fn past(scope: &adopt::Scope, account: &str, on_record: &HashSet<String>, now: i64) -> Result<Vec<Past>> {
+    let found = transcripts(&scope.projects)?;
+    let live = adopt::registry(&scope.sessions).sessions;
+    let mut tags: HashMap<PathBuf, String> = HashMap::new();
     let mut sessions = Vec::new();
     for (session_id, path) in &found {
-        sessions.push(synthesize(scope, session_id, path, &account, &mut tags, now)?);
+        if on_record.contains(session_id) || live.contains(session_id) {
+            continue;
+        }
+        sessions.extend(synthesize(scope, session_id, path, account, &mut tags, now)?);
     }
     sessions.sort_by(|left, right| {
         left.started_at
@@ -351,11 +304,36 @@ pub fn past(scope: &Scope, on_record: &HashSet<String>, now: i64) -> Result<Vec<
     Ok(sessions)
 }
 
+/// What a run asks of the service for one past session.
+pub trait Service {
+    fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[Value]) -> Result<usize>;
+    fn sync(&self, session_id: &str, body: &SessionBody) -> Result<()>;
+    fn end(&self, session_id: &str) -> Result<()>;
+}
+
+/// Sends each past session: the tokens first, then the record that writes the history row, then the
+/// end. The order is what makes an interrupted run safe to repeat. The row is what the next run
+/// reads as already sent, so it may not land ahead of the tokens it stands for — a run that dies
+/// between the two leaves the session off the record and the next one sends it again, where every
+/// event already posted is a chunk number the service holds and ignores.
+pub fn send(service: &impl Service, past: &[Past], mut sent: impl FnMut(&str, usize)) -> Result<()> {
+    for session in past {
+        let id = &session.session_id;
+        let events = service.post_usage(id, &session.host, &session.repo, &session.events)?;
+        service.sync(id, &session.body())?;
+        service.end(id)?;
+        sent(id, events);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     const NOW: i64 = 1_793_700_000_000;
+    const ACCOUNT: &str = "you@example.com";
 
     /// A service holding no session on record, which is every host's first run.
     fn nothing() -> HashSet<String> {
@@ -366,30 +344,31 @@ mod tests {
         session_ids.iter().map(|id| id.to_string()).collect()
     }
 
+    fn ids(past: &[Past]) -> Vec<String> {
+        past.iter().map(|session| session.session_id.clone()).collect()
+    }
+
     struct Sandbox {
         dir: PathBuf,
-        scope: Scope,
+        scope: adopt::Scope,
     }
 
     impl Sandbox {
         fn new(name: &str) -> Sandbox {
             let dir = std::env::temp_dir().join(format!("recall-backfill-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            for part in ["projects", "sessions"] {
+            for part in ["proc", "projects", "sessions"] {
                 std::fs::create_dir_all(dir.join(part)).unwrap();
             }
-            let scope = Scope {
-                projects: dir.join("projects"),
-                sessions: dir.join("sessions"),
-                claude_json: dir.join(".claude.json"),
-                host: "laptop".to_string(),
-            };
-            std::fs::write(
-                &scope.claude_json,
-                json!({ "oauthAccount": { "emailAddress": "you@example.com" }, "userID": "u-1" }).to_string(),
-            )
-            .unwrap();
-            Sandbox { dir, scope }
+            Sandbox {
+                scope: adopt::Scope {
+                    procfs: dir.join("proc"),
+                    projects: dir.join("projects"),
+                    sessions: dir.join("sessions"),
+                    host: "laptop".to_string(),
+                },
+                dir,
+            }
         }
 
         fn transcript(&self, project: &str, session_id: &str, lines: &[String]) -> PathBuf {
@@ -412,11 +391,66 @@ mod tests {
             )
             .unwrap();
         }
+
+        fn found(&self, on_record: &HashSet<String>) -> Vec<Past> {
+            past(&self.scope, ACCOUNT, on_record, NOW).unwrap()
+        }
     }
 
     impl Drop for Sandbox {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The service as a run can see it: events kept by the first write for a chunk number, the
+    /// history rows a sync wrote, and the sessions ended. `fail_sync` is the session whose sync
+    /// fails, which is where an interrupted run stops.
+    #[derive(Debug, Default)]
+    struct Fake {
+        events: RefCell<HashMap<(String, i64), Value>>,
+        history: RefCell<HashSet<String>>,
+        ended: RefCell<Vec<String>>,
+        fail_sync: String,
+    }
+
+    impl Fake {
+        fn holding(events: HashMap<(String, i64), Value>) -> Fake {
+            Fake {
+                events: RefCell::new(events),
+                ..Fake::default()
+            }
+        }
+
+        fn on_record(&self) -> HashSet<String> {
+            self.history.borrow().clone()
+        }
+    }
+
+    impl Service for Fake {
+        fn post_usage(&self, session_id: &str, host: &str, _repo: &str, events: &[Value]) -> Result<usize> {
+            assert_eq!(host, "laptop", "a delta carries the host that spent the tokens");
+            for event in events {
+                let seq = event["seq"].as_i64().expect("every event carries a chunk number");
+                self.events
+                    .borrow_mut()
+                    .entry((session_id.to_string(), seq))
+                    .or_insert_with(|| event.clone());
+            }
+            Ok(events.len())
+        }
+
+        fn sync(&self, session_id: &str, _body: &SessionBody) -> Result<()> {
+            if self.fail_sync == session_id {
+                bail!("the recall service had an error");
+            }
+            self.history.borrow_mut().insert(session_id.to_string());
+            Ok(())
+        }
+
+        fn end(&self, session_id: &str) -> Result<()> {
+            self.ended.borrow_mut().push(session_id.to_string());
+            Ok(())
         }
     }
 
@@ -468,9 +502,9 @@ mod tests {
     #[test]
     fn a_past_session_is_sent_as_its_transcript_gives_it_back() {
         let sandbox = Sandbox::new("one");
-        let path = sandbox.transcript("-home-you-recall", "s-old", &session());
+        sandbox.transcript("-home-you-recall", "s-old", &session());
 
-        let found = past(&sandbox.scope, &nothing(), NOW).unwrap();
+        let found = sandbox.found(&nothing());
 
         assert_eq!(found.len(), 1, "{found:?}");
         let session = &found[0];
@@ -497,12 +531,12 @@ mod tests {
         assert_eq!(body.mode, "", "and cannot tell interactive from headless");
         assert_eq!(body.pid, 0);
         assert_eq!(
-            session.usage.events,
+            session.events,
             vec![
                 json!({
                     "seq": 0,
                     "provider": "claude",
-                    "account": "you@example.com",
+                    "account": ACCOUNT,
                     "model": "claude-opus-4",
                     "prompts": 2,
                     "at": 1_790_850_605_000_i64,
@@ -514,7 +548,7 @@ mod tests {
                 json!({
                     "seq": 1,
                     "provider": "claude",
-                    "account": "you@example.com",
+                    "account": ACCOUNT,
                     "model": "claude-haiku-4",
                     "prompts": 0,
                     "at": 1_790_848_812_000_i64,
@@ -526,8 +560,46 @@ mod tests {
             ],
             "one answer written twice counts once, and every model takes a chunk number of its own"
         );
-        assert_eq!(session.usage.end, std::fs::metadata(&path).unwrap().len() as i64);
-        assert_eq!(session.usage.message_id, "msg-3");
+    }
+
+    #[test]
+    fn the_tokens_of_a_session_land_on_the_days_it_spent_them() {
+        let sandbox = Sandbox::new("midnight");
+        sandbox.transcript(
+            "-home-you-recall",
+            "s-long",
+            &[
+                human("2026-10-01T23:30:00.000Z", "start before midnight"),
+                answer("2026-10-01T23:45:00.000Z", "msg-1", "claude-opus-4", 100, 10),
+                answer("2026-10-02T00:15:00.000Z", "msg-2", "claude-opus-4", 200, 20),
+                answer("2026-10-21T09:00:00.000Z", "msg-3", "claude-opus-4", 400, 40),
+            ],
+        );
+
+        let events = sandbox.found(&nothing()).remove(0).events;
+
+        let landed: Vec<(i64, &str, i64, i64)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event["seq"].as_i64().unwrap(),
+                    event["model"].as_str().unwrap(),
+                    event["at"].as_i64().unwrap(),
+                    event["inputTokens"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            landed,
+            vec![
+                (0, "claude-opus-4", 1_790_898_300_000, 100),
+                (1, "claude-opus-4", 1_790_900_100_000, 200),
+                (2, "claude-opus-4", 1_792_573_200_000, 400),
+            ],
+            "one event per day the session answered on, each dated inside its own day"
+        );
+        assert_eq!(events[0]["prompts"], 1, "the prompts ride on the first event alone");
+        assert_eq!(events[1]["prompts"], 0);
     }
 
     #[test]
@@ -535,17 +607,73 @@ mod tests {
         let sandbox = Sandbox::new("again");
         sandbox.transcript("-home-you-recall", "s-old", &session());
 
-        let first = past(&sandbox.scope, &nothing(), NOW).unwrap();
+        let first = sandbox.found(&nothing());
         assert_eq!(
-            past(&sandbox.scope, &nothing(), NOW + 60_000).unwrap(),
+            past(&sandbox.scope, ACCOUNT, &nothing(), NOW + 60_000).unwrap(),
             first,
             "the same transcript regenerates the same chunk numbers, whenever it is read"
         );
 
         assert_eq!(
-            past(&sandbox.scope, &on_record(&["s-old"]), NOW).unwrap(),
+            sandbox.found(&on_record(&["s-old"])),
             Vec::new(),
             "a session the service already holds on record is passed over"
+        );
+    }
+
+    #[test]
+    fn a_run_that_dies_before_the_history_row_lands_repeats_it_without_counting_twice() {
+        let sandbox = Sandbox::new("interrupted");
+        sandbox.transcript("-home-you-recall", "s-old", &session());
+        let dying = Fake {
+            fail_sync: "s-old".to_string(),
+            ..Fake::default()
+        };
+
+        let first = sandbox.found(&dying.on_record());
+        assert!(
+            send(&dying, &first, |_, _| {}).is_err(),
+            "a sync the service refuses fails the run"
+        );
+        let posted = dying.events.borrow().clone();
+        assert_eq!(posted.len(), 2, "the tokens went out ahead of the row");
+        assert_eq!(dying.on_record(), nothing(), "and the row that stands for them did not");
+        assert!(dying.ended.borrow().is_empty());
+
+        let resumed = Fake::holding(posted.clone());
+        let again = sandbox.found(&resumed.on_record());
+        assert_eq!(again, first, "nothing is on record, so the same session is sent again");
+        send(&resumed, &again, |_, _| {}).unwrap();
+
+        assert_eq!(
+            *resumed.events.borrow(),
+            posted,
+            "every event it posted again is a chunk number the service already held"
+        );
+        assert_eq!(resumed.on_record(), on_record(&["s-old"]));
+        assert_eq!(*resumed.ended.borrow(), vec!["s-old".to_string()]);
+        assert_eq!(
+            sandbox.found(&resumed.on_record()),
+            Vec::new(),
+            "and the run after it has nothing left to send"
+        );
+    }
+
+    #[test]
+    fn a_transcript_with_neither_a_prompt_nor_an_answer_is_not_a_session() {
+        let sandbox = Sandbox::new("blank");
+        sandbox.transcript("-home-you-recall", "s-old", &session());
+        sandbox.transcript(
+            "-home-you-recall",
+            "s-misfire",
+            &[json!({ "type": "mode", "sessionId": "s-misfire" }).to_string()],
+        );
+        sandbox.transcript("-home-you-recall", "s-empty", &[]);
+
+        assert_eq!(
+            ids(&sandbox.found(&nothing())),
+            vec!["s-old".to_string()],
+            "a run that never started must leave no blank row behind"
         );
     }
 
@@ -555,13 +683,7 @@ mod tests {
         sandbox.transcript("-home-you-recall", "s-old", &session());
         sandbox.subagent("-home-you-recall", "s-subagent", &session());
 
-        let ids: Vec<String> = past(&sandbox.scope, &nothing(), NOW)
-            .unwrap()
-            .into_iter()
-            .map(|session| session.session_id)
-            .collect();
-
-        assert_eq!(ids, vec!["s-old".to_string()]);
+        assert_eq!(ids(&sandbox.found(&nothing())), vec!["s-old".to_string()]);
     }
 
     #[test]
@@ -571,35 +693,44 @@ mod tests {
         sandbox.transcript("-home-you--dotfiles", "s-old", &session());
         sandbox.registered("s-live");
 
-        let ids: Vec<String> = past(&sandbox.scope, &nothing(), NOW)
-            .unwrap()
-            .into_iter()
-            .map(|session| session.session_id)
-            .collect();
-
-        assert_eq!(ids, vec!["s-old".to_string()]);
+        assert_eq!(ids(&sandbox.found(&nothing())), vec!["s-old".to_string()]);
     }
 
     #[test]
-    fn a_host_that_names_no_account_sends_nothing() {
-        let sandbox = Sandbox::new("accountless");
-        sandbox.transcript("-home-you-recall", "s-old", &session());
-        std::fs::write(&sandbox.scope.claude_json, "{}").unwrap();
+    fn a_host_whose_transcripts_cannot_be_read_fails_the_pass() {
+        let sandbox = Sandbox::new("unreadable");
+        std::fs::remove_dir_all(&sandbox.scope.projects).unwrap();
+        std::fs::write(&sandbox.scope.projects, "not a directory").unwrap();
 
-        let error = past(&sandbox.scope, &nothing(), NOW).unwrap_err().to_string();
-        assert!(error.contains("names no account"), "{error}");
-
-        std::fs::write(&sandbox.scope.claude_json, json!({ "userID": "u-1" }).to_string()).unwrap();
-        assert_eq!(
-            past(&sandbox.scope, &nothing(), NOW).unwrap()[0].usage.events[0]["account"],
-            "u-1"
+        assert!(
+            past(&sandbox.scope, ACCOUNT, &nothing(), NOW).is_err(),
+            "a host that could not look must not report a host with nothing to send"
         );
     }
 
     #[test]
-    fn a_host_with_no_transcripts_has_nothing_to_send() {
-        let sandbox = Sandbox::new("empty");
-        std::fs::remove_file(&sandbox.scope.claude_json).unwrap();
-        assert_eq!(past(&sandbox.scope, &nothing(), NOW).unwrap(), Vec::new());
+    fn the_account_is_the_one_this_host_is_signed_in_as() {
+        let dir = std::env::temp_dir().join(format!("recall-backfill-account-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".claude.json");
+
+        std::fs::write(
+            &path,
+            json!({ "oauthAccount": { "emailAddress": ACCOUNT }, "userID": "u-1" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(account(&path), ACCOUNT);
+
+        std::fs::write(&path, json!({ "userID": "u-1" }).to_string()).unwrap();
+        assert_eq!(
+            account(&path),
+            "u-1",
+            "a host whose account was swapped out has only its user id"
+        );
+
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(account(&path), "");
+        assert_eq!(account(&dir.join("missing.json")), "");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

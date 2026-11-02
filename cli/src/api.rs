@@ -90,9 +90,6 @@ pub struct Client {
     config: Config,
 }
 
-/// The widest page the session listings take.
-const HISTORY_PAGE: u32 = 100;
-
 fn encode(value: &str) -> String {
     value
         .bytes()
@@ -462,7 +459,7 @@ impl Client {
         let mut held = HashSet::new();
         let mut cursor = String::new();
         loop {
-            let mut query = format!("/v1/sessions?scope=history&limit={HISTORY_PAGE}");
+            let mut query = "/v1/sessions?scope=history".to_string();
             if !cursor.is_empty() {
                 query.push_str(&format!("&cursor={}", encode(&cursor)));
             }
@@ -510,14 +507,8 @@ impl Client {
 
     /// Sends every event of one stretch. The events are the hooks' own: nothing here reads inside
     /// one, so a counter the hooks learn to read needs no change in this binary.
-    pub fn post_usage(
-        &self,
-        session_id: &str,
-        host: &str,
-        repo: &str,
-        pending: &crate::sessions::UsagePending,
-    ) -> Result<usize> {
-        for event in &pending.events {
+    pub fn post_usage(&self, session_id: &str, host: &str, repo: &str, events: &[serde_json::Value]) -> Result<usize> {
+        for event in events {
             let response = self
                 .authed(
                     self.agent
@@ -526,7 +517,7 @@ impl Client {
                 .send_json(UsageBody { host, repo, event })?;
             check(response, &format!("sending usage for session {session_id}"))?;
         }
-        Ok(pending.events.len())
+        Ok(events.len())
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {

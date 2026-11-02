@@ -194,7 +194,7 @@ describe("session history", () => {
     ]);
   });
 
-  it("lists the ids it holds, newest activity first, paged, and only the caller's", async () => {
+  it("lists the ids it holds, in id order, and only the caller's", async () => {
     const h = await harness();
     const { laptop, tower } = await account(h);
     const stranger = await h.user("stranger");
@@ -205,29 +205,37 @@ describe("session history", () => {
     expect((await laptop.request("DELETE", "/v1/sessions/s-newest")).status).toBe(204);
     await stranger.sync("s-stranger", { lastActivityAt: h.now() });
 
-    const first = await ids(laptop, "scope=history&limit=2");
-    expect(first.sessionIds).toEqual(["s-newest", "s-middle"]);
-    expect(first.nextCursor).not.toBe("");
-
-    const second = await ids(laptop, `scope=history&limit=2&cursor=${encodeURIComponent(first.nextCursor)}`);
-    expect(second).toEqual({ sessionIds: ["s-oldest"], nextCursor: "" });
+    expect(await ids(laptop, "scope=history")).toEqual({
+      sessionIds: ["s-middle", "s-newest", "s-oldest"],
+      nextCursor: "",
+    });
     expect(await ids(stranger, "scope=history")).toEqual({ sessionIds: ["s-stranger"], nextCursor: "" });
   });
 
-  it("refuses a scope it does not know, a limit out of range and a malformed cursor", async () => {
+  it("pages from the last id it gave, so a session syncing under the page is still listed", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+
+    await laptop.sync("s-middle", { lastActivityAt: h.now() });
+    await laptop.sync("s-newest", { lastActivityAt: h.now() });
+    await laptop.sync("s-oldest", { lastActivityAt: h.now() });
+
+    await laptop.sync("s-newest", { lastActivityAt: h.tick(3_600_000) });
+
+    expect(await ids(laptop, "scope=history&cursor=s-middle")).toEqual({
+      sessionIds: ["s-newest", "s-oldest"],
+      nextCursor: "",
+    });
+  });
+
+  it("refuses a scope it does not know", async () => {
     const h = await harness();
     const { laptop } = await account(h);
     await laptop.sync("s-held");
 
-    for (const query of [
-      "scope=past",
-      "scope=history&limit=0",
-      "scope=history&limit=101",
-      "scope=history&cursor=%7B",
-    ]) {
-      const response = await laptop.request("GET", `/v1/sessions?${query}`);
-      expect(response.status, query).toBe(400);
-    }
+    const refused = await laptop.request("GET", "/v1/sessions?scope=past");
+    expect(refused.status).toBe(400);
+
     const live = await laptop.request("GET", "/v1/sessions?scope=live");
     expect(live.status).toBe(200);
     expect(await live.json()).toMatchObject({ sessions: [expect.objectContaining({ sessionId: "s-held" })] });

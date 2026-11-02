@@ -49,7 +49,6 @@ import {
   parseSave,
   parseSearch,
   parseSession,
-  parseSessionHistoryPage,
   parseSessionId,
   parseSessionScope,
   parseUsage,
@@ -250,13 +249,8 @@ export const createApp = (deps: Deps): App => {
     return new Response(null, { status: 204 });
   };
 
-  const sessionHistoryIds = async (url: URL, db: D1Database, caller: Caller): Promise<Response> => {
-    const input = parseSessionHistoryPage(url.searchParams);
-    if (!input.ok) return error(400, input.error);
-    const cursor = decodeCursor(input.value.cursor);
-    if (!cursor) return error(400, "cursor is malformed; page from the one the last answer gave");
-    return json(await listSessionHistoryIds(db, caller.userId, cursor, input.value.limit));
-  };
+  const sessionHistoryIds = async (url: URL, db: D1Database, caller: Caller): Promise<Response> =>
+    json(await listSessionHistoryIds(db, caller.userId, url.searchParams.get("cursor") ?? ""));
 
   const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
     if (request.method !== "POST") return error(405, "method not allowed");
