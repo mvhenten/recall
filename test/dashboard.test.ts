@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { harness } from "./harness";
+import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -84,5 +84,97 @@ describe("the dashboard", () => {
     });
     expect(response.status).toBe(405);
     expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+  });
+});
+
+const hosts = async (h: Harness): Promise<{ assertion: string; laptop: Client; tower: Client }> => {
+  const address = await h.invite(email("owner"));
+  return {
+    assertion: await h.assertionFor(address),
+    laptop: h.clientWithToken(await h.login(address, "laptop")),
+    tower: h.clientWithToken(await h.login(address, "tower")),
+  };
+};
+
+const sessionsTab = async (h: Harness, assertion: string | null): Promise<string> => {
+  const response = await open(h, "/dashboard", assertion);
+  return response.text();
+};
+
+describe("the sessions tab", () => {
+  it("lists every host's session, busy first, with its handle, host, scope and focus", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const stranger = h.clientWithToken(await h.login(await h.invite(email("stranger")), "nomad"));
+    const now = h.now();
+    await owner.laptop.sync("9f8a1b2c", {
+      host: "laptop",
+      repo: "repo:github.com/mvhenten/recall",
+      branch: "feat/dashboard-sessions",
+      prompts: 3,
+      focus: { first: "list the sessions", latest: "why is the worker test red" },
+      startedAt: now - 720_000,
+      lastActivityAt: now - 60_000,
+    });
+    await owner.tower.sync("c4e21a99", {
+      host: "tower",
+      repo: "",
+      branch: "",
+      prompts: 1,
+      focus: { first: "draft the release notes", latest: "" },
+      startedAt: now - 10_800_000,
+      lastActivityAt: now - 840_000,
+    });
+    await stranger.sync("aa11bb22", { host: "nomad", startedAt: now, lastActivityAt: now });
+
+    const html = await sessionsTab(h, owner.assertion);
+    expect(html).toContain("laptop-9f8a");
+    expect(html).toContain(">busy</p>");
+    expect(html).toContain("list the sessions");
+    expect(html).toContain("why is the worker test red");
+    expect(html).toContain("repo:github.com/mvhenten/recall@feat/dashboard-sessions · 12m · 3 prompts");
+    expect(html).toContain("tower-c4e2");
+    expect(html).toContain(">idle 14m</p>");
+    expect(html).toContain("draft the release notes");
+    expect(html).toContain("global · 3h · 1 prompt");
+    expect(html.indexOf("laptop-9f8a")).toBeLessThan(html.indexOf("tower-c4e2"));
+    expect(html).not.toContain("nomad");
+  });
+
+  it("reads busy for five minutes after the last prompt, idle from then on", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.laptop.sync("aaa10000", { startedAt: now - 600_000, lastActivityAt: now - 299_999 });
+    await owner.laptop.sync("bbb20000", { startedAt: now - 600_000, lastActivityAt: now - 300_000 });
+
+    const html = await sessionsTab(h, owner.assertion);
+    expect(html).toContain(">busy</p>");
+    expect(html).toContain(">idle 5m</p>");
+    expect(html.indexOf("laptop-aaa1")).toBeLessThan(html.indexOf("laptop-bbb2"));
+  });
+
+  it("shortens the prompt that opened the session and keeps the latest one whole", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.laptop.sync("cafe0001", {
+      startedAt: now,
+      lastActivityAt: now,
+      focus: { first: "o".repeat(90), latest: "l".repeat(90) },
+    });
+
+    const html = await sessionsTab(h, owner.assertion);
+    expect(html).toContain(`${"o".repeat(80)}…`);
+    expect(html).toContain("l".repeat(90));
+    expect(html).not.toContain("o".repeat(81));
+  });
+
+  it("says so when no host is running a session", async () => {
+    const h = await harness();
+    const owner = await signedIn(h);
+    const html = await sessionsTab(h, owner.assertion);
+    expect(html).toContain("No session is running on any of your hosts.");
+    expect(html).not.toContain('class="feed"');
   });
 });

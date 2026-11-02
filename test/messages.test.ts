@@ -31,22 +31,6 @@ const queued = (userId: string, toDeviceId: string, now: number): Promise<Messag
 const send = (client: Client, toDeviceId: string, body: string, toSessionId = ""): Promise<Response> =>
   client.request("POST", "/v1/messages", { toDeviceId, toSessionId, body });
 
-const sync = (client: Client, sessionId: string): Promise<Response> =>
-  client.request("PUT", `/v1/sessions/${sessionId}`, {
-    host: "desktop",
-    cwd: "/home/you/src/recall",
-    repo: "repo:github.com/mvhenten/recall",
-    branch: "work",
-    commit: "feat(messaging): address one session",
-    startedAt: 1_700_000_000_000,
-    lastActivityAt: 1_700_000_060_000,
-    prompts: 3,
-    focus: { first: "address one session", latest: "why is the worker test red" },
-    mode: "interactive",
-    permissionMode: "default",
-    pid: 4242,
-  });
-
 const sentMessage = async (response: Response): Promise<Message> => {
   expect(response.status).toBe(201);
   const body: { message: Message } = await response.json();
@@ -80,7 +64,7 @@ describe("messages", () => {
     const { laptop, desktop } = await account(h, userId);
     const laptopId = await deviceId(laptop, "laptop");
     const desktopId = await deviceId(laptop, "desktop");
-    expect((await sync(desktop, "9f8a1b2c")).status).toBe(204);
+    expect((await desktop.sync("9f8a1b2c")).status).toBe(204);
 
     const message = await sentMessage(await send(laptop, desktopId, "only you", "9f8a1b2c"));
     expect(message).toMatchObject({ toDeviceId: desktopId, toSessionId: "9f8a1b2c" });
