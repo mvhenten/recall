@@ -101,6 +101,11 @@ export interface Session extends SessionInput {
   deviceId: string;
 }
 
+export interface Live {
+  sessions: number;
+  busy: number;
+}
+
 // Raw events are detail and the daily rollup is the long window, so events past two weeks are
 // dropped and every window wider than that reads only usage_daily.
 export const USAGE_RETENTION_MS = 1_209_600_000;
@@ -208,6 +213,8 @@ export const parseTypes = (values: string[]): Parsed<MemoryType[]> => {
   }
   return { ok: true, value: [...types] };
 };
+
+export const LIST_PARAMS = ["tag", "type", "since", "limit"] as const;
 
 export const parseList = (params: URLSearchParams): Parsed<ListInput> => {
   const given = (name: string): string[] => params.getAll(name).filter((value) => value !== "");

@@ -33,6 +33,9 @@ describe("the root path", () => {
   });
 });
 
+const navLink = (path: string, label: string, current: boolean): RegExp =>
+  new RegExp(`<a href="${path}"${current ? ' aria-current="page"' : ""}><svg[^>]*>.*?</svg>${label}</a>`);
+
 describe("the dashboard", () => {
   it("renders a tab of the shell and links to the others", async () => {
     const h = await harness();
@@ -42,16 +45,27 @@ describe("the dashboard", () => {
     expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
     const html = await response.text();
     expect(html).toContain(owner.email);
-    expect(html).toContain('<a href="/dashboard/stats" aria-current="page">');
+    expect(html).toMatch(navLink("/dashboard/stats", "Stats", true));
     for (const [path, label] of [
       ["/dashboard", "Sessions"],
       ["/dashboard/history", "History"],
       ["/dashboard/memory", "Memory"],
       ["/dashboard/insights", "Insights"],
-    ]) {
-      expect(html).toContain(`<a href="${path}">`);
-      expect(plain(html)).toContain(label);
+    ] as const) {
+      expect(html).toMatch(navLink(path, label, false));
     }
+  });
+
+  it("carries the live session summary onto a tab that does not list sessions", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.laptop.sync("beef0001", { startedAt: now - 600_000, lastActivityAt: now });
+    await owner.tower.sync("beef0002", { startedAt: now - 600_000, lastActivityAt: now - 600_000 });
+
+    const response = await open(h, "/dashboard/memory", owner.assertion);
+    expect(response.status).toBe(200);
+    expect(plain(await response.text())).toContain("1 busy · 2 live");
   });
 
   it("has no page at an unknown dashboard address", async () => {
@@ -134,15 +148,11 @@ describe("the sessions tab", () => {
     expect(html).toContain(">busy</p>");
     expect(html).toContain("list the sessions");
     expect(html).toContain("why is the worker test red");
-    expect(html).toContain(">repo:github.com/mvhenten/recall@feat/dashboard-sessions<");
-    expect(html).toContain(">12m<");
-    expect(html).toContain('3<span class="unit"> prompts</span>');
+    expect(plain(html)).toContain("repo:github.com/mvhenten/recall@feat/dashboard-sessions 12m 3 prompts");
     expect(html).toContain("tower-c4e2");
     expect(html).toContain(">idle 14m</p>");
     expect(html).toContain("draft the release notes");
-    expect(html).toContain(">global<");
-    expect(html).toContain(">3h<");
-    expect(html).toContain('1<span class="unit"> prompt</span>');
+    expect(plain(html)).toContain("global 3h 1 prompt");
     expect(html.indexOf("laptop-9f8a")).toBeLessThan(html.indexOf("tower-c4e2"));
     expect(html).not.toContain("nomad");
   });

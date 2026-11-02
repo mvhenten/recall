@@ -1,8 +1,6 @@
 import {
   dashboardNotice,
   dashboardPage,
-  type Live,
-  liveSummary,
   MEMORY_TAB,
   memoriesPage,
   memoryBodyPage,
@@ -36,6 +34,7 @@ import {
   DEFAULT_MIN_SCORE,
   type Embedder,
   FRESH_WINDOW_MS,
+  type Live,
   type MemoryHit,
   type MemoryType,
   parseList,
@@ -64,6 +63,7 @@ import {
   recordUsage,
   saveMemory,
   sessionOnDevice,
+  sessionTally,
   textCandidates,
   vectorCandidates,
 } from "./store";
@@ -288,10 +288,7 @@ export const createApp = (deps: Deps): App => {
     }
     const tab = tabForPath(url.pathname);
     const now = deps.now();
-    const sessions = await listSessions(db, userId, now);
-    if (tab?.path === SESSIONS_TAB.path) return sessionsPage(email, sessions, now);
-    // Every page carries the sidebar's live summary, so the session list is read whatever the tab.
-    const live = liveSummary(sessions, now);
+    const live = await sessionTally(db, userId, now);
     if (tab === null) {
       const prefix = `${MEMORY_TAB.path}/`;
       if (!url.pathname.startsWith(prefix)) {
@@ -300,6 +297,7 @@ export const createApp = (deps: Deps): App => {
       return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
     }
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
+    if (tab.path === SESSIONS_TAB.path) return sessionsPage(email, live, await listSessions(db, userId, now), now);
     return dashboardPage(email, tab, live);
   };
 

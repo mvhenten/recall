@@ -2,7 +2,9 @@ import {
   type Focus,
   FRESH_WINDOW_DAYS,
   IDLE_AFTER_MS,
+  LIST_PARAMS,
   type ListInput,
+  type Live,
   type Memory,
   type MemoryCounts,
   type MemoryHit,
@@ -15,11 +17,6 @@ export interface Tab {
   path: string;
   label: string;
   icon: string;
-}
-
-export interface Live {
-  live: number;
-  busy: number;
 }
 
 const DISC = '<circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="2.6" style="fill:currentColor;stroke:none"/>';
@@ -39,42 +36,26 @@ export const TABS: Tab[] = [
   { path: "/dashboard/insights", label: "Insights", icon: SPARK },
 ];
 
-const PLACEHOLDER = "Nothing to show here yet.";
-const PLACEHOLDER_HINT = "This page is still being built.";
-const NO_SESSIONS = "No session is running on any of your hosts.";
-const NO_SESSIONS_HINT = "A session appears here within a minute of its first prompt.";
-const NO_MEMORIES = "No memory is saved yet.";
-const NO_MEMORIES_HINT = "Save one with recall save.";
-const NO_MATCHES = "No memory matches this search.";
-const NO_MATCHES_HINT = "Try fewer words, or drop the type filter.";
 const FOCUS_FIRST_CHARS = 80;
 
 export const tabForPath = (pathname: string): Tab | null =>
   TABS.find((tab) => tab.path === pathname.replace(/\/$/, "")) ?? null;
 
-// The token sheet of the dashboard design: light is the base declaration because daylight is the
-// canonical read, and dark re-steps the same roles in the media query rather than inverting them.
 const TOKENS = `:root{color-scheme:light dark;
 --bg:#f5f6f8;--surface:#fff;--surface2:#edeff4;
---ink:#171a20;--dim:#5a6373;--faint:#8b94a3;
+--ink:#171a20;--dim:#5a6373;--faint:#636c7c;
 --line:#e2e5eb;--line2:#d2d7e0;
 --accent:#3451b2;--on-accent:#fff;
---live:#157a42;--good:#157a42;--warn:#96670a;--bad:#b3362c;
---s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;
---bar:#8595ac;--grid:#e7eaef;--axis:#c6ccd6;
---h0:#eef1f6;--h1:#dbe9fa;--h2:#9ec5f4;--h3:#5598e7;--h4:#256abf;--h5:#0d366b;
+--live:#157a42;--warn:#96670a;
 --t-user:#3451b2;--t-project:#157a62;--t-reference:#7a56c9;--t-feedback:#b4541f;
 --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
 --sans:system-ui,-apple-system,"Segoe UI",sans-serif}
 @media (prefers-color-scheme:dark){:root{
 --bg:#111318;--surface:#1a1d24;--surface2:#232733;
---ink:#e7eaf0;--dim:#9aa3b2;--faint:#6f7888;
+--ink:#e7eaf0;--dim:#9aa3b2;--faint:#868f9e;
 --line:#2a2f3a;--line2:#394050;
 --accent:#93aaff;--on-accent:#121419;
---live:#56c988;--good:#56c988;--warn:#d9a441;--bad:#e4766c;
---s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;
---bar:#5c6c85;--grid:#232833;--axis:#394050;
---h0:#20242e;--h1:#182c49;--h2:#1f4572;--h3:#2a62a4;--h4:#3987e5;--h5:#9ec5f4;
+--live:#56c988;--warn:#d9a441;
 --t-user:#93aaff;--t-project:#45c0a0;--t-reference:#a98ff0;--t-feedback:#e08a4e}}`;
 
 const STYLE = `${TOKENS}
@@ -94,7 +75,7 @@ a{color:var(--accent)}
 .snav a:focus-visible,.find :focus-visible,.chips a:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 main{padding:1rem;display:grid;gap:.7rem;align-content:start}
 .pagehead{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}
-.pagehead h2{margin:0;font-size:1.05rem;letter-spacing:-.01em;overflow-wrap:anywhere}
+.pagehead h1{margin:0;font-size:1.05rem;letter-spacing:-.01em;overflow-wrap:anywhere}
 .pagehead span{font:400 .76rem/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
 .empty{display:grid;gap:.3rem;padding:1.4rem .2rem}
 .empty b{font-size:.92rem;font-weight:600}
@@ -148,7 +129,7 @@ main{padding:1rem;display:grid;gap:.7rem;align-content:start}
 .body{margin:0;padding:1rem 1.1rem;background:var(--surface);border:1px solid var(--line);border-radius:8px;font:400 .82rem/1.65 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
 .noticewrap{max-width:34rem;margin:0 auto;padding:3rem 1.25rem;display:grid;gap:1.1rem}
 .notice{display:grid;gap:.45rem;padding:1rem 1.1rem;background:var(--surface);border:1px solid var(--line2);border-left:3px solid var(--warn);border-radius:8px}
-.notice b{font-size:.92rem}
+.notice h1{margin:0;font-size:.92rem}
 .notice p{margin:0;font-size:.85rem;color:var(--dim)}
 .notice a{font-size:.85rem;font-weight:600}
 .notice a::after{content:" \\2192"}
@@ -169,7 +150,7 @@ main{padding:1rem;display:grid;gap:.7rem;align-content:start}
 .livedot{display:inline-block;width:.45rem;height:.45rem;border-radius:50%;background:var(--live);margin-right:.35rem}
 .swho{padding:0 .55rem}
 main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
-.pagehead h2{font-size:1.2rem}
+.pagehead h1{font-size:1.2rem}
 .withrail{display:grid;grid-template-columns:minmax(0,1fr) 19rem;gap:1rem;align-items:start}
 .rail{display:grid;gap:1rem;align-content:start}
 .rk{display:grid;gap:.55rem;padding:.9rem 1rem;background:var(--surface);border:1px solid var(--line);border-radius:8px}
@@ -233,17 +214,12 @@ const focusHtml = (focus: Focus): string => {
 
 const isBusy = (session: Session, now: number): boolean => now - session.lastActivityAt < IDLE_AFTER_MS;
 
-export const liveSummary = (sessions: Session[], now: number): Live => ({
-  live: sessions.length,
-  busy: sessions.filter((session) => isBusy(session, now)).length,
-});
-
 const emptyState = (headline: string, hint: string): string =>
   `<div class="empty"><b>${escapeHtml(headline)}</b><p>${escapeHtml(hint)}</p></div>`;
 
 const summary = (live: Live): string => {
   const dot = live.busy === 0 ? "" : '<span class="livedot"></span>';
-  return `<div class="ssum"><b>Now</b><p>${dot}<strong>${live.busy} busy</strong> · ${live.live} live</p></div>`;
+  return `<div class="ssum"><b>Now</b><p>${dot}<strong>${live.busy} busy</strong> · ${live.sessions} live</p></div>`;
 };
 
 const shell = (email: string, tab: Tab, live: Live, heading: string, meta: string, main: string): Response =>
@@ -255,11 +231,11 @@ const shell = (email: string, tab: Tab, live: Live, heading: string, meta: strin
 ${navigation(tab)}
 ${summary(live)}
 <p class="swho">${escapeHtml(email)}</p></header>
-<main><div class="pagehead"><h2>${escapeHtml(heading)}</h2><span>${escapeHtml(meta)}</span></div>${main}</main></div>`,
+<main><div class="pagehead"><h1>${escapeHtml(heading)}</h1><span>${escapeHtml(meta)}</span></div>${main}</main></div>`,
   );
 
 export const dashboardPage = (email: string, tab: Tab, live: Live): Response =>
-  shell(email, tab, live, tab.label, "", emptyState(PLACEHOLDER, PLACEHOLDER_HINT));
+  shell(email, tab, live, tab.label, "", emptyState("Nothing to show here yet.", "This page is still being built."));
 
 const sessionRow = (session: Session, now: number): string => {
   const busy = isBusy(session, now);
@@ -301,18 +277,20 @@ const oldestIdleCard = (sessions: Session[], now: number): string => {
   return `<div class="rk"><b>Oldest idle</b><p><strong>${escapeHtml(oldest.name)}</strong> · idle ${age(oldest.lastActivityAt, now)} on ${escapeHtml(repoAtBranch(oldest.repo, oldest.branch))}</p><p>Started ${age(oldest.startedAt, now)} ago · ${oldest.prompts} ${oldest.prompts === 1 ? "prompt" : "prompts"}.</p></div>`;
 };
 
-export const sessionsPage = (email: string, sessions: Session[], now: number): Response => {
-  const live = liveSummary(sessions, now);
+export const sessionsPage = (email: string, live: Live, sessions: Session[], now: number): Response => {
   const main =
     sessions.length === 0
-      ? emptyState(NO_SESSIONS, NO_SESSIONS_HINT)
+      ? emptyState(
+          "No session is running on any of your hosts.",
+          "A session appears here within a minute of its first prompt.",
+        )
       : `<div class="withrail">${ledger(sessions, now)}<div class="rail">${hostsCard(sessions, now)}${oldestIdleCard(sessions, now)}</div></div>`;
-  return shell(email, SESSIONS_TAB, live, SESSIONS_TAB.label, `${live.live} live · ${live.busy} busy`, main);
+  return shell(email, SESSIONS_TAB, live, SESSIONS_TAB.label, `${live.sessions} live · ${live.busy} busy`, main);
 };
 
 const memoryLink = (url: URL, changes: Record<string, string>): string => {
   const next = new URLSearchParams();
-  for (const name of ["q", "tag", "type", "limit"]) {
+  for (const name of ["q", ...LIST_PARAMS]) {
     const value = url.searchParams.get(name) ?? "";
     if (value !== "") next.set(name, value);
   }
@@ -396,8 +374,8 @@ export const memoriesPage = (
       : `<p class="more"><a href="${memoryLink(url, { cursor: nextCursor })}">Older memories</a></p>`;
   const grid = memoryGrid(
     memories.map((memory) => memoryCard(memory, now, "")),
-    NO_MEMORIES,
-    NO_MEMORIES_HINT,
+    "No memory is saved yet.",
+    "Save one with recall save.",
   );
   return shell(
     email,
@@ -420,8 +398,8 @@ export const memorySearchPage = (
 ): Response => {
   const grid = memoryGrid(
     hits.map((hit) => memoryCard(hit.memory, now, hit.score.toFixed(3))),
-    NO_MATCHES,
-    NO_MATCHES_HINT,
+    "No memory matches this search.",
+    "Try fewer words, or drop the type filter.",
   );
   return shell(
     email,
@@ -453,6 +431,6 @@ export const dashboardNotice = (status: number, title: string, text: string, act
     status,
     `recall ${title.toLowerCase()}`,
     STYLE,
-    `<div class="noticewrap"><p class="brand"><i></i>recall</p>
-<div class="notice"><b>${escapeHtml(title)}</b><p>${escapeHtml(text)}</p><a href="/dashboard">${escapeHtml(action)}</a></div></div>`,
+    `<main class="noticewrap"><p class="brand"><i></i>recall</p>
+<div class="notice"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(text)}</p><a href="/dashboard">${escapeHtml(action)}</a></div></main>`,
   );

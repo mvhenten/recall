@@ -1,6 +1,8 @@
 import type { Caller } from "./device";
 import {
+  IDLE_AFTER_MS,
   type ListInput,
+  type Live,
   type Memory,
   type MemoryCounts,
   type MemoryType,
@@ -356,6 +358,17 @@ export const listSessions = async (db: D1Database, userId: string, now: number):
       .bind(userId),
   ]);
   return (listed?.results ?? []).map(toSession);
+};
+
+export const sessionTally = async (db: D1Database, userId: string, now: number): Promise<Live> => {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS sessions, COALESCE(SUM(last_activity_at > ?2), 0) AS busy
+       FROM sessions WHERE user_id = ?1 AND last_activity_at > ?3`,
+    )
+    .bind(userId, now - IDLE_AFTER_MS, now - SESSION_TTL_MS)
+    .first<Live>();
+  return row ?? { sessions: 0, busy: 0 };
 };
 
 export const sessionOnDevice = async (
