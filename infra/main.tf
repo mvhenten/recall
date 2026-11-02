@@ -48,30 +48,22 @@ resource "cloudflare_zero_trust_access_application" "recall" {
 
 resource "cloudflare_zero_trust_access_application" "device" {
   account_id                = var.account_id
-  name                      = "recall device approval"
+  name                      = "recall browser pages"
   type                      = "self_hosted"
-  domain                    = "${var.hostname}/device"
   session_duration          = "24h"
   app_launcher_visible      = false
   allowed_idps              = [var.otp_idp_id]
   auto_redirect_to_identity = true
-  policies = [
+  destinations = [
     {
-      id         = cloudflare_zero_trust_access_policy.approvers.id
-      precedence = 1
+      type = "public"
+      uri  = "${var.hostname}/device"
+    },
+    {
+      type = "public"
+      uri  = "${var.hostname}/dashboard"
     }
   ]
-}
-
-resource "cloudflare_zero_trust_access_application" "dashboard" {
-  account_id                = var.account_id
-  name                      = "recall dashboard"
-  type                      = "self_hosted"
-  domain                    = "${var.hostname}/dashboard"
-  session_duration          = "24h"
-  app_launcher_visible      = false
-  allowed_idps              = [var.otp_idp_id]
-  auto_redirect_to_identity = true
   policies = [
     {
       id         = cloudflare_zero_trust_access_policy.approvers.id

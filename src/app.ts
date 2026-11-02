@@ -1,4 +1,4 @@
-import { dashboardPage, tabForPath } from "./dashboard";
+import { dashboardNotice, dashboardPage, tabForPath } from "./dashboard";
 import {
   type Caller,
   DEVICE_CODE_TTL_MS,
@@ -66,6 +66,8 @@ export interface App {
   fetch(request: Request, env: AppEnv): Promise<Response>;
 }
 
+type Refusal = (status: number, title: string, text: string) => Response;
+
 const json = (body: unknown, status = 200): Response => Response.json(body, { status });
 const error = (status: number, message: string): Response => json({ error: message }, status);
 
@@ -91,16 +93,6 @@ interface Rankings {
   inScope: Ranking;
   elsewhere: Ranking;
 }
-
-// A browser names text/html outright; curl and the CLI send */* or
-// application/json, so they keep today's JSON answers.
-const acceptsHtml = (accept: string | null): boolean =>
-  (accept ?? "").split(",").some((entry) => {
-    const [type, ...parameters] = entry.split(";").map((part) => part.trim().toLowerCase());
-    if (type !== "text/html") return false;
-    const quality = parameters.find((parameter) => parameter.startsWith("q="));
-    return quality === undefined || Number(quality.slice(2)) > 0;
-  });
 
 const decodeSegment = (segment: string): string | null => {
   try {
@@ -240,24 +232,27 @@ export const createApp = (deps: Deps): App => {
     return mailboxFor(env, caller.userId).fetch(upgrade);
   };
 
-  const approver = async (request: Request): Promise<string | Response> => {
+  const approver = async (request: Request, refuse: Refusal = messagePage): Promise<string | Response> => {
     const assertion = request.headers.get("cf-access-jwt-assertion");
-    if (!assertion) return messagePage(401, "Sign in first", "This page needs a Cloudflare Access sign-in.");
+    if (!assertion) return refuse(401, "Sign in first", "This page needs a Cloudflare Access sign-in.");
     const verified = await deps.verify(assertion);
-    if (!verified.ok)
-      return messagePage(401, "Sign in again", `Cloudflare Access sign-in rejected: ${verified.reason}.`);
+    if (!verified.ok) return refuse(401, "Sign in again", `Cloudflare Access sign-in rejected: ${verified.reason}.`);
     return verified.email;
   };
 
   const dashboard = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
-    if (request.method !== "GET") return error(405, "method not allowed");
-    const email = await approver(request);
+    const lost = (status: number, title: string, text: string): Response =>
+      dashboardNotice(status, title, text, "Back to the dashboard");
+    const signIn = (status: number, title: string, text: string): Response =>
+      dashboardNotice(status, title, text, "Sign in again");
+    if (request.method !== "GET") return lost(405, "Not allowed", "The dashboard only answers a GET.");
+    const email = await approver(request, signIn);
     if (email instanceof Response) return email;
     if ((await userForEmail(db, email)) === null) {
-      return messagePage(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
+      return signIn(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
     }
     const tab = tabForPath(url.pathname);
-    if (!tab) return messagePage(404, "No such page", "The dashboard has no page at this address.");
+    if (!tab) return lost(404, "No such page", "The dashboard has no page at this address.");
     return dashboardPage(email, tab);
   };
 
@@ -400,8 +395,14 @@ export const createApp = (deps: Deps): App => {
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
       return dashboard(request, url, env.DB);
     }
-    if (url.pathname === "/" && acceptsHtml(request.headers.get("accept"))) {
-      return new Response(null, { status: 303, headers: { location: "/dashboard" } });
+    if (url.pathname === "/") {
+      if ((request.headers.get("accept") ?? "").includes("text/html")) {
+        return new Response(null, { status: 303, headers: { location: "/dashboard", vary: "accept" } });
+      }
+      return Response.json(
+        { error: "not found" },
+        { status: 404, headers: { vary: "accept", "cache-control": "no-store" } },
+      );
     }
     const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
     if (version !== "v1" || rest.length > 0) return error(404, "not found");

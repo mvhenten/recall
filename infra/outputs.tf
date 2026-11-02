@@ -7,10 +7,7 @@ output "hostname" {
 }
 
 output "access_aud" {
-  value = join(",", [
-    cloudflare_zero_trust_access_application.device.aud,
-    cloudflare_zero_trust_access_application.dashboard.aud,
-  ])
+  value = cloudflare_zero_trust_access_application.device.aud
 }
 
 output "access_team_domain" {

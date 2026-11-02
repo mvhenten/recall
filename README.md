@@ -54,7 +54,7 @@ npm run setup -- --hostname recall.example.com --user alice --email alice@exampl
 recall login --endpoint https://recall.example.com
 ```
 
-The setup creates the D1 database and three Cloudflare Access applications. One covers the hostname and lets every request through, since the Worker checks device tokens itself. The other two cover `/device`, the approval page, and `/dashboard`, the browser view; both admit the listed emails through the one-time PIN login method, which the setup switches on. The setup then migrates the database, maps the emails to the user id, deploys the Worker to the hostname and prints the `recall login` command. Run it again at any time: it finds what exists and creates the rest. Run it with a new `--user` and `--email` to add a person; their memories stay apart. `--email` repeats for more addresses, `--dry-run` prints what it would do and `--account <id>` picks an account when the token sees several.
+The setup creates the D1 database and two Cloudflare Access applications. One covers the hostname and lets every request through, since the Worker checks device tokens itself. The other covers the two browser pages, `/device` and `/dashboard`: it admits the listed emails through the one-time PIN login method, which the setup switches on. The setup then migrates the database, maps the emails to the user id, deploys the Worker to the hostname and prints the `recall login` command. Run it again at any time: it finds what exists and creates the rest. Run it with a new `--user` and `--email` to add a person; their memories stay apart. `--email` repeats for more addresses, `--dry-run` prints what it would do and `--account <id>` picks an account when the token sees several.
 
 Create the API token under My Profile → API Tokens → Create Custom Token, with:
 
@@ -207,7 +207,7 @@ The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and
 
 The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` and the dashboard at `/dashboard` are the paths behind an Access login; the approve and deny form checks the Access JWT, the origin and a CSRF token.
 
-Opening the hostname in a browser answers `303 /dashboard`; a client that does not ask for `text/html` still gets the 404 JSON. The dashboard is server-rendered, reads the Access JWT the same way `/device` does and refuses an email that is not invited. Its tabs are `/dashboard`, `/dashboard/memory`, `/dashboard/stats` and `/dashboard/insights`.
+Opening the hostname in a browser answers `303 /dashboard`; a client that does not ask for `text/html` still gets the 404 JSON. Both answers carry `Vary: Accept`. The dashboard is server-rendered, reads the same Access JWT as `/device` through the one application that covers both paths, and refuses an email that is not invited. Its tabs are `/dashboard`, `/dashboard/memory`, `/dashboard/stats` and `/dashboard/insights`.
 
 ## Deploying from CI
 

@@ -15,14 +15,6 @@ export interface Env {
   ACCESS_AUD: string;
 }
 
-// One aud per Access application: the device approval page and the dashboard
-// each have their own, so ACCESS_AUD holds them comma separated.
-const audiences = (value: string): string[] =>
-  value
-    .split(",")
-    .map((aud) => aud.trim())
-    .filter((aud) => aud !== "");
-
 const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
 
 const workersAiEmbedder = (ai: Ai): Embedder => ({
@@ -41,7 +33,7 @@ const appFor = (env: Env): ReturnType<typeof createApp> => {
   if (app) return app;
   const issuer = `https://${env.ACCESS_TEAM_DOMAIN}`;
   app = createApp({
-    verify: accessVerifier(cachedAccessKeys(`${issuer}/cdn-cgi/access/certs`), issuer, audiences(env.ACCESS_AUD)),
+    verify: accessVerifier(cachedAccessKeys(`${issuer}/cdn-cgi/access/certs`), issuer, env.ACCESS_AUD),
     deviceCodeLimits: DEVICE_CODE_LIMITS,
     embedder: workersAiEmbedder(env.AI),
     now: Date.now,
