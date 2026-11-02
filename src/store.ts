@@ -6,6 +6,10 @@ import {
   type HistoryInput,
   IDLE_AFTER_MS,
   type Insights,
+  type Label,
+  type LabelKind,
+  type Labels,
+  type LabelTargets,
   type ListInput,
   type Live,
   type Memory,
@@ -464,6 +468,58 @@ export const sessionHistoryFilters = async (db: D1Database, userId: string): Pro
     .all<{ field: string; value: string }>();
   const values = (field: string): string[] => results.filter((row) => row.field === field).map((row) => row.value);
   return { hosts: values("host"), repos: values("repo") };
+};
+
+type LabelRow = { kind: LabelKind; value: string; label: string };
+
+export const readLabels = async (db: D1Database, userId: string): Promise<Labels> => {
+  const { results } = await db
+    .prepare("SELECT kind, value, label FROM labels WHERE user_id = ? ORDER BY kind, value")
+    .bind(userId)
+    .all<LabelRow>();
+  const of = (kind: LabelKind): Map<string, string> =>
+    new Map(results.filter((row) => row.kind === kind).map((row) => [row.value, row.label]));
+  return { hosts: of("host"), accounts: of("account") };
+};
+
+// Every host and account the user has on record, live or past, plus the ones already labelled, so a
+// label survives on the page that set it even once its value stops appearing in the data.
+export const labelTargets = async (db: D1Database, userId: string): Promise<LabelTargets> => {
+  const { results } = await db
+    .prepare(
+      `SELECT DISTINCT 'host' AS kind, host AS value FROM sessions WHERE user_id = ?1 AND host <> ''
+       UNION
+       SELECT DISTINCT 'host', host FROM session_history WHERE user_id = ?1 AND host <> ''
+       UNION
+       SELECT DISTINCT 'host', host FROM usage_daily WHERE user_id = ?1 AND host <> ''
+       UNION
+       SELECT DISTINCT 'account', account FROM usage_daily WHERE user_id = ?1 AND account <> ''
+       UNION
+       SELECT DISTINCT kind, value FROM labels WHERE user_id = ?1
+       ORDER BY kind, value`,
+    )
+    .bind(userId)
+    .all<{ kind: string; value: string }>();
+  const values = (kind: string): string[] => results.filter((row) => row.kind === kind).map((row) => row.value);
+  return { hosts: values("host"), accounts: values("account") };
+};
+
+export const writeLabels = async (db: D1Database, userId: string, labels: Label[]): Promise<void> => {
+  if (labels.length === 0) return;
+  await db.batch(
+    labels.map((entry) =>
+      entry.label === ""
+        ? db
+            .prepare("DELETE FROM labels WHERE user_id = ?1 AND kind = ?2 AND value = ?3")
+            .bind(userId, entry.kind, entry.value)
+        : db
+            .prepare(
+              `INSERT INTO labels (user_id, kind, value, label) VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT (user_id, kind, value) DO UPDATE SET label = excluded.label`,
+            )
+            .bind(userId, entry.kind, entry.value, entry.label),
+    ),
+  );
 };
 
 type CountRow = {

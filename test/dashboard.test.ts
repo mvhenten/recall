@@ -53,6 +53,7 @@ describe("the dashboard", () => {
       ["/dashboard/history", "History"],
       ["/dashboard/memory", "Memory"],
       ["/dashboard/insights", "Insights"],
+      ["/dashboard/labels", "Labels"],
     ] as const) {
       expect(html).toMatch(navLink(path, label, false));
     }
@@ -984,5 +985,138 @@ describe("the long horizon on the insights tab", () => {
 
     const html = await insightsTab(h, owner);
     expect(html).toContain("2026-11 is the only month with input to grade, at 75.0%.");
+  });
+});
+
+const ORIGIN = "https://recall.test";
+
+const labelsForm = async (h: Harness, assertion: string): Promise<{ html: string; csrf: string; cookie: string }> => {
+  const response = await open(h, "/dashboard/labels", assertion);
+  expect(response.status).toBe(200);
+  const html = await response.text();
+  const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
+  if (!csrf) throw new Error("the labels page shows no form");
+  return { html, csrf, cookie: (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "" };
+};
+
+const saveLabels = async (h: Harness, assertion: string, fields: Record<string, string>): Promise<Response> => {
+  const form = await labelsForm(h, assertion);
+  return h.send("/dashboard/labels", {
+    method: "POST",
+    headers: {
+      "cf-access-jwt-assertion": assertion,
+      origin: ORIGIN,
+      cookie: form.cookie,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ ...fields, csrf: form.csrf }),
+  });
+};
+
+const statsHtml = async (h: Harness, assertion: string): Promise<string> => {
+  const response = await open(h, "/dashboard/stats", assertion);
+  expect(response.status).toBe(200);
+  return plain(await response.text());
+};
+
+describe("the labels tab", () => {
+  it("offers every host and account on record, prefilled with the label it already carries", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.laptop.sync("1111aaaa", { host: "laptop", startedAt: now, lastActivityAt: now });
+    await owner.tower.sync("2222bbbb", { host: "tower", startedAt: now, lastActivityAt: now });
+    expect((await owner.laptop.usage("1111aaaa", { host: "laptop", account: "work", at: now })).status).toBe(204);
+
+    expect((await saveLabels(h, owner.assertion, { "host:laptop": "Studio" })).status).toBe(303);
+    const { html } = await labelsForm(h, owner.assertion);
+    expect(html).toContain('name="host:laptop" value="Studio"');
+    expect(html).toContain('name="host:tower" value=""');
+    expect(html).toContain('name="account:work" value=""');
+  });
+
+  it("names the host and the account wherever the dashboard prints one", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.tower.sync("3333cccc", { host: "tower", startedAt: now, lastActivityAt: now });
+    expect(
+      (await owner.tower.usage("3333cccc", { host: "tower", account: "work", at: now, inputTokens: 1_000_000 })).status,
+    ).toBe(204);
+    const saved = await saveLabels(h, owner.assertion, { "host:tower": "Attic", "account:work": "Day job" });
+    expect(saved.status).toBe(303);
+    expect(saved.headers.get("location")).toBe("/dashboard/labels");
+
+    expect(plain(await sessionsTab(h, owner.assertion))).toContain("Attic");
+    expect(await historyTab(h, owner.assertion)).toContain("All hosts Attic");
+    const stats = await statsHtml(h, owner.assertion);
+    expect(stats).toContain("Day job 1.0M");
+    expect(stats).toContain("Attic 1.0M");
+    expect(stats).not.toContain("work 1.0M");
+  });
+
+  it("keeps filtering and grouping on the raw value under the label", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.laptop.sync("5555eeee", {
+      host: "laptop",
+      focus: { first: "the laptop session", latest: "" },
+      startedAt: now - 600_000,
+      lastActivityAt: now,
+    });
+    await owner.tower.sync("6666ffff", {
+      host: "tower",
+      focus: { first: "the tower session", latest: "" },
+      startedAt: now - 600_000,
+      lastActivityAt: now - 60_000,
+    });
+    expect((await saveLabels(h, owner.assertion, { "host:tower": "Attic" })).status).toBe(303);
+
+    const byHost = await historyTab(h, owner.assertion, "?host=tower");
+    expect(byHost).toContain("the tower session");
+    expect(byHost).toContain("Attic");
+    expect(byHost).not.toContain("the laptop session");
+    expect(await historyTab(h, owner.assertion, "?host=Attic")).toContain("No session matches this filter.");
+  });
+
+  it("clears a label submitted empty and refuses one past the text limit", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.tower.sync("7777aaaa", { host: "tower", startedAt: now, lastActivityAt: now });
+    expect((await saveLabels(h, owner.assertion, { "host:tower": "Attic" })).status).toBe(303);
+    expect((await labelsForm(h, owner.assertion)).html).toContain('name="host:tower" value="Attic"');
+
+    expect((await saveLabels(h, owner.assertion, { "host:tower": "   " })).status).toBe(303);
+    expect((await labelsForm(h, owner.assertion)).html).toContain('name="host:tower" value=""');
+    expect(plain(await sessionsTab(h, owner.assertion))).not.toContain("Attic");
+
+    const long = await saveLabels(h, owner.assertion, { "host:tower": "n".repeat(501) });
+    expect(long.status).toBe(400);
+    expect(await long.text()).toContain("at most 500 characters");
+  });
+
+  it("refuses a save that did not come from the page, and stays behind Access", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.tower.sync("8888bbbb", { host: "tower", startedAt: now, lastActivityAt: now });
+    const form = await labelsForm(h, owner.assertion);
+    const send = (origin: string, cookie: string, csrf: string): Promise<Response> =>
+      h.send("/dashboard/labels", {
+        method: "POST",
+        headers: {
+          "cf-access-jwt-assertion": owner.assertion,
+          origin,
+          cookie: `__Host-recall_csrf=${cookie}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({ "host:tower": "Attic", csrf }),
+      });
+    expect((await send("https://evil.example", form.csrf, form.csrf)).status).toBe(403);
+    expect((await send(ORIGIN, form.csrf, "forged")).status).toBe(403);
+    expect((await labelsForm(h, owner.assertion)).html).toContain('name="host:tower" value=""');
+    expect((await open(h, "/dashboard/labels", null)).status).toBe(401);
   });
 });
