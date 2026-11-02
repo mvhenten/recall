@@ -214,17 +214,27 @@ async fn reconnect_loop(url: &str, token: &str, sessions_dir: &Path, seen: &mut 
 
 /// A session whose Claude process died never ran its SessionEnd hook, so its row would sit on the
 /// service reading idle until it expired a day later, indistinguishable from a session that is
-/// merely quiet. The tick that unlinks the record tells the service too, on a blocking thread so
-/// the call cannot stall message delivery.
-fn report_ended(client: &Arc<Client>, ended: Vec<String>) {
+/// merely quiet, and the delta its record still carried would go with the record. The tick that
+/// unlinks it sends both, on a blocking thread so the calls cannot stall message delivery; a delta
+/// the service refuses is reported and dropped, since the record it came from is already gone.
+fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
     let client = Arc::clone(client);
     tokio::task::spawn_blocking(move || {
-        for session_id in ended {
+        for session in ended {
+            let id = &session.session_id;
+            if let Some(pending) = session.usage_pending.as_ref() {
+                let started = Instant::now();
+                let outcome = match client.post_usage(id, &session.host, &session.repo, pending) {
+                    Ok(sent) => format!("sessions:usage:{id}:{sent}"),
+                    Err(error) => format!("sessions:usage-failed:{id}:{error:#}"),
+                };
+                log(&outcome, started.elapsed());
+            }
             let started = Instant::now();
-            let outcome = match client.end_session(&session_id) {
-                Ok(true) => format!("sessions:ended:{session_id}"),
-                Ok(false) => format!("sessions:already-gone:{session_id}"),
-                Err(error) => format!("sessions:end-failed:{session_id}:{error:#}"),
+            let outcome = match client.end_session(id) {
+                Ok(true) => format!("sessions:ended:{id}"),
+                Ok(false) => format!("sessions:already-gone:{id}"),
+                Err(error) => format!("sessions:end-failed:{id}:{error:#}"),
             };
             log(&outcome, started.elapsed());
         }
@@ -423,6 +433,7 @@ mod tests {
                 focus: sessions::Focus::default(),
                 mode: "interactive".to_string(),
                 permission_mode: "default".to_string(),
+                usage_pending: None,
                 state,
             },
         }

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -52,14 +52,31 @@ pub struct Focus {
     pub latest: String,
 }
 
+/// The stretch of transcript the hooks read and have not seen land. Each event is one model's
+/// share of the delta, and it is sent as the hooks wrote it: the reading is theirs, and nothing
+/// here parses or recomputes it. `end`, `high_water`, `prompts` and `message_id` are where the
+/// next stretch starts, and they move only once every event has been taken.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePending {
+    pub seq: i64,
+    pub end: i64,
+    pub high_water: i64,
+    pub prompts: i64,
+    pub message_id: String,
+    pub events: Vec<serde_json::Value>,
+}
+
 /// How `hooks/session-start.mjs` left one Claude Code session. It writes
 /// `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json` at mode 600 for every session, registered
 /// or not, `hooks/recall-memories.mjs` rewrites the moving fields on every prompt, and
-/// `hooks/session-end.mjs` removes it; the daemon only ever reads the directory.
+/// `recall sessions --end` removes it; the daemon only ever reads the directory.
 ///
 /// `pid` is the Claude process that owns the session, whatever the state, so a record outliving a
-/// session that never reached session end is removed on the next pass. `syncStartedAt`, which the hooks
-/// use to throttle their own syncing, is theirs alone and is not read back here.
+/// session that never reached session end is removed on the next pass. `syncStartedAt`, which the
+/// hooks use to throttle their own syncing, is theirs alone and is not read back here, and so are
+/// `transcriptPath`, `usageOffset`, `usageHighWater`, `usagePrompts` and `usageMessageId`, which
+/// say how far into the session's transcript the usage this host sent has reached.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
@@ -76,6 +93,8 @@ pub struct Record {
     pub focus: Focus,
     pub mode: String,
     pub permission_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_pending: Option<UsagePending>,
     #[serde(flatten)]
     pub state: State,
 }
@@ -115,13 +134,23 @@ fn read(path: &Path) -> Option<Status> {
     Some(Status { session_id, record })
 }
 
+/// A session the registry outlived, carrying whatever its record still held: the delta it never
+/// got to send goes out with the notice that the session is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ended {
+    pub session_id: String,
+    pub host: String,
+    pub repo: String,
+    pub usage_pending: Option<UsagePending>,
+}
+
 /// What one pass over the registry found: the sessions still running, newest first, and the ones
 /// it unlinked because their Claude process is gone. A session that ends without its SessionEnd
 /// hook leaves a record here and a row on the service, and `ended` is the only notice either gets.
 #[derive(Debug, Default)]
 pub struct Scan {
     pub live: Vec<(PathBuf, Status)>,
-    pub ended: Vec<String>,
+    pub ended: Vec<Ended>,
 }
 
 /// A record whose Claude process is gone, or whose socket has been removed, is unlinked on the way
@@ -148,7 +177,12 @@ pub fn scan(dir: &Path) -> Scan {
         };
         if !alive(status.record.pid) {
             let _ = std::fs::remove_file(&path);
-            ended.push(status.session_id);
+            ended.push(Ended {
+                session_id: status.session_id,
+                host: status.record.host,
+                repo: status.record.repo,
+                usage_pending: status.record.usage_pending,
+            });
             continue;
         }
         if socketless {
@@ -167,7 +201,7 @@ pub fn scan(dir: &Path) -> Scan {
             .cmp(&left.0)
             .then_with(|| left.2.session_id.cmp(&right.2.session_id))
     });
-    ended.sort();
+    ended.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     Scan {
         live: live.into_iter().map(|(_, path, status)| (path, status)).collect(),
         ended,
@@ -181,7 +215,40 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
 
 /// The record this host wrote for one session, whatever state the hook left it in.
 pub fn record(dir: &Path, session_id: &str) -> Option<Record> {
-    read(&dir.join(format!("{session_id}.json"))).map(|status| status.record)
+    read(&record_path(dir, session_id)).map(|status| status.record)
+}
+
+fn record_path(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.json"))
+}
+
+/// Takes a session's record out of the registry. The record carries the session's last usage
+/// delta, so the command that ends a session reads it before removing it.
+pub fn forget(dir: &Path, session_id: &str) {
+    let _ = std::fs::remove_file(record_path(dir, session_id));
+}
+
+/// Moves the stretch that landed on and leaves every other field alone: the record is rewritten
+/// from its own JSON rather than from `Record`, which models only what this binary reads, so the
+/// fields the hooks own survive. A record that is gone is a session that ended under the send, and
+/// nothing about it is worth keeping.
+pub fn commit_usage(dir: &Path, session_id: &str, pending: &UsagePending) -> Result<()> {
+    let path = record_path(dir, session_id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let mut document: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("reading the record of session {session_id}"))?;
+    let Some(fields) = document.as_object_mut() else {
+        bail!("the record of session {session_id} is not a JSON object");
+    };
+    fields.insert("usageOffset".to_string(), pending.end.into());
+    fields.insert("usageHighWater".to_string(), pending.high_water.into());
+    fields.insert("usagePrompts".to_string(), pending.prompts.into());
+    fields.insert("usageMessageId".to_string(), pending.message_id.clone().into());
+    fields.remove("usagePending");
+    std::fs::write(&path, format!("{}\n", serde_json::to_string(&document)?))
+        .with_context(|| format!("writing the record of session {session_id}"))
 }
 
 pub const IDLE_AFTER: Duration = Duration::from_secs(300);
@@ -328,7 +395,7 @@ pub async fn to_session(dir: &Path, session_id: &str, body: &str) -> Fanout {
 /// let go of the lock. A SessionStart hook brings it straight back with `recall listen --ensure`.
 /// Each pass hands `ended` the sessions it unlinked, since the same tick that notices a Claude
 /// process is gone is the only thing that can tell the service.
-pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut ended: impl FnMut(Vec<String>)) {
+pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut ended: impl FnMut(Vec<Ended>)) {
     let mut tick = tokio::time::interval(check);
     let mut empty_since: Option<Instant> = None;
     loop {
@@ -392,6 +459,7 @@ mod tests {
                 },
                 mode: "interactive".to_string(),
                 permission_mode: "default".to_string(),
+                usage_pending: None,
                 state,
             };
             std::fs::write(
@@ -769,10 +837,151 @@ mod tests {
         .await;
 
         assert_eq!(
-            reported,
-            vec!["s-dead".to_string(), "s-skipped".to_string()],
+            reported
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s-dead", "s-skipped"],
             "only a session whose process is gone has ended; a socket can go while Claude stays"
         );
         assert!(!sandbox.sessions().join("s-socketless.json").exists());
+    }
+
+    const HOOK_RECORD: &str = r#"{
+      "state": "off",
+      "pid": 42,
+      "cwd": "/src/recall",
+      "sessionId": "s-usage",
+      "host": "laptop",
+      "repo": "repo:github.com/mvhenten/recall",
+      "branch": "work",
+      "commit": "feat(usage): count what a session spends",
+      "startedAt": 1762000000000,
+      "lastActivityAt": 1762000060000,
+      "syncStartedAt": 1762000060000,
+      "prompts": 2,
+      "focus": { "first": "count the tokens", "latest": "count the tokens" },
+      "mode": "interactive",
+      "permissionMode": "default",
+      "transcriptPath": "/home/you/.claude/projects/recall/s-usage.jsonl",
+      "usageOffset": 1200,
+      "usageHighWater": 1200,
+      "usagePrompts": 1,
+      "usageMessageId": "msg-1",
+      "usagePending": {
+        "seq": 1200,
+        "end": 4800,
+        "highWater": 4800,
+        "prompts": 2,
+        "messageId": "msg-3",
+        "events": [
+          {
+            "seq": 1200,
+            "provider": "claude",
+            "account": "you@example.com",
+            "model": "claude-opus-4",
+            "prompts": 2,
+            "at": 1762000050000,
+            "inputTokens": 11,
+            "outputTokens": 22,
+            "cacheWriteTokens": 33,
+            "cacheReadTokens": 44
+          },
+          {
+            "seq": 1201,
+            "provider": "claude",
+            "account": "you@example.com",
+            "model": "claude-haiku-4",
+            "prompts": 0,
+            "at": 1762000055000,
+            "inputTokens": 1,
+            "outputTokens": 2,
+            "cacheWriteTokens": 3,
+            "cacheReadTokens": 4
+          }
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn the_record_carries_the_delta_the_hooks_fixed() {
+        let sandbox = Sandbox::new("usage-read");
+        std::fs::write(sandbox.sessions().join("s-usage.json"), HOOK_RECORD).unwrap();
+
+        let record = record(&sandbox.sessions(), "s-usage").expect("the record parses");
+        let pending = record.usage_pending.expect("the pending delta parses");
+        assert_eq!(
+            (pending.seq, pending.end, pending.high_water, pending.prompts),
+            (1200, 4800, 4800, 2)
+        );
+        assert_eq!(pending.message_id, "msg-3");
+        assert_eq!(
+            pending.events.iter().map(|event| &event["model"]).collect::<Vec<_>>(),
+            vec!["claude-opus-4", "claude-haiku-4"],
+            "an event is passed on as the hooks wrote it"
+        );
+        assert_eq!(pending.events[0]["cacheReadTokens"], 44);
+    }
+
+    #[test]
+    fn committing_a_delta_moves_the_marks_on_and_leaves_the_hooks_fields_alone() {
+        let sandbox = Sandbox::new("usage-commit");
+        let path = sandbox.sessions().join("s-usage.json");
+        std::fs::write(&path, HOOK_RECORD).unwrap();
+        let pending = record(&sandbox.sessions(), "s-usage").unwrap().usage_pending.unwrap();
+
+        commit_usage(&sandbox.sessions(), "s-usage", &pending).unwrap();
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["usageOffset"], 4800);
+        assert_eq!(written["usageHighWater"], 4800);
+        assert_eq!(
+            written["usagePrompts"], 2,
+            "the prompts this delta carried are marked spent"
+        );
+        assert_eq!(written["usageMessageId"], "msg-3");
+        assert!(
+            written.get("usagePending").is_none(),
+            "a delta that landed is not sent again"
+        );
+        assert_eq!(written["syncStartedAt"], 1_762_000_060_000_i64);
+        assert_eq!(
+            written["transcriptPath"],
+            "/home/you/.claude/projects/recall/s-usage.jsonl"
+        );
+        assert_eq!(written["prompts"], 2);
+    }
+
+    #[test]
+    fn the_delta_of_a_session_whose_process_is_gone_leaves_with_it() {
+        let sandbox = Sandbox::new("usage-scan");
+        let dead = HOOK_RECORD.replace("\"pid\": 42", &format!("\"pid\": {}", i32::MAX));
+        std::fs::write(sandbox.sessions().join("s-usage.json"), dead).unwrap();
+
+        let scanned = scan(&sandbox.sessions());
+
+        let ended = scanned
+            .ended
+            .first()
+            .expect("a session whose process is gone is reported");
+        assert_eq!((ended.session_id.as_str(), ended.host.as_str()), ("s-usage", "laptop"));
+        assert_eq!(
+            ended.usage_pending.as_ref().map(|pending| pending.events.len()),
+            Some(2),
+            "the delta the record still held goes out with the notice that the session is over"
+        );
+        assert!(!sandbox.sessions().join("s-usage.json").exists());
+    }
+
+    #[test]
+    fn committing_a_delta_for_a_session_that_ended_writes_nothing_back() {
+        let sandbox = Sandbox::new("usage-gone");
+        std::fs::write(sandbox.sessions().join("s-usage.json"), HOOK_RECORD).unwrap();
+        let pending = record(&sandbox.sessions(), "s-usage").unwrap().usage_pending.unwrap();
+
+        forget(&sandbox.sessions(), "s-usage");
+
+        commit_usage(&sandbox.sessions(), "s-usage", &pending).unwrap();
+        assert!(!sandbox.sessions().join("s-usage.json").exists());
     }
 }

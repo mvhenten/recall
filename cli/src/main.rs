@@ -389,11 +389,15 @@ fn message_body(words: &[String]) -> Result<String> {
     Ok(text)
 }
 
+/// One sync carries both halves of what a host knows about a session: the document, and the usage
+/// delta the hooks fixed since the last one. Nothing here reads the transcript.
 fn sync_session(session_id: &str) -> Result<()> {
-    let Some(record) = sessions::record(&listen::sessions_dir(), session_id) else {
+    let dir = listen::sessions_dir();
+    let Some(record) = sessions::record(&dir, session_id) else {
         bail!("no session {session_id} is registered on this host");
     };
-    Client::new(config::load()?).sync_session(
+    let client = Client::new(config::load()?);
+    client.sync_session(
         session_id,
         &api::SessionBody {
             host: &record.host,
@@ -411,6 +415,31 @@ fn sync_session(session_id: &str) -> Result<()> {
         },
     )?;
     println!("synced {session_id}");
+    let Some(pending) = record.usage_pending.as_ref() else {
+        return Ok(());
+    };
+    let sent = client.post_usage(session_id, &record.host, &record.repo, pending)?;
+    sessions::commit_usage(&dir, session_id, pending)?;
+    println!("sent {sent} usage deltas for {session_id}");
+    Ok(())
+}
+
+/// The record is what carries a session's closing usage delta, so the delta goes out before the
+/// record does: a service that refuses the end keeps the record, and the daemon's own sweep sends
+/// the delta again rather than losing it with a session nothing is left to describe.
+fn end_session(session_id: &str) -> Result<()> {
+    let dir = listen::sessions_dir();
+    let record = sessions::record(&dir, session_id);
+    let client = Client::new(config::load()?);
+    if let Some(record) = record.as_ref()
+        && let Some(pending) = record.usage_pending.as_ref()
+    {
+        let sent = client.post_usage(session_id, &record.host, &record.repo, pending)?;
+        println!("sent {sent} usage deltas for {session_id}");
+    }
+    let ended = client.end_session(session_id)?;
+    sessions::forget(&dir, session_id);
+    println!("{} {session_id}", if ended { "ended" } else { "already gone" });
     Ok(())
 }
 
@@ -521,11 +550,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(logged("synced", "sync-failed", &id, || sync_session(&id)));
             }
             if let Some(id) = end {
-                return Ok(logged("ended", "end-failed", &id, || {
-                    let ended = client()?.end_session(&id)?;
-                    println!("{} {id}", if ended { "ended" } else { "already gone" });
-                    Ok(())
-                }));
+                return Ok(logged("ended", "end-failed", &id, || end_session(&id)));
             }
             let client = client()?;
             let listed = client.sessions()?;

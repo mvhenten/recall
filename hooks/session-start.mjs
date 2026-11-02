@@ -49,15 +49,20 @@ function modeOf(result) {
 
 function registerSession(input, repoTag) {
   if (!input.session_id) return "no-session";
-  const permissionMode = input.permission_mode;
+  const session = {
+    cwd: input.cwd,
+    repo: repoTag,
+    permissionMode: input.permission_mode,
+    transcriptPath: input.transcript_path,
+  };
   try {
-    if (messagingEnabled()) return register(input.session_id, input.cwd, repoTag, permissionMode);
-    record(input.session_id, { state: "off" }, input.cwd, repoTag, permissionMode);
+    if (messagingEnabled()) return register(input.session_id, session);
+    record(input.session_id, { state: "off" }, session);
     return "off";
   } catch (error) {
     const state = { state: "failed", error: firstLine(error.message) };
     try {
-      record(input.session_id, state, input.cwd, repoTag, permissionMode);
+      record(input.session_id, state, session);
     } catch {
       // The registry is unwritable, so the hooks log is the only place left to say so.
     }

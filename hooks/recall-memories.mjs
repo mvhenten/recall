@@ -2,6 +2,7 @@ import { emit, firstLine, logRun, readInput, recall, recallDetached } from "./li
 import { touch } from "./messaging.mjs";
 import { MIN_SCORE, searchQuery, unseen } from "./query.mjs";
 import { readShown, recordShown } from "./shown.mjs";
+import { countUsage } from "./usage.mjs";
 
 const TIMEOUT_MS = 4000;
 const MIN_WORDS = 3;
@@ -27,9 +28,10 @@ async function repoTagOf(cwd) {
   return result.ok ? result.stdout.trim() : undefined;
 }
 
-// Every prompt moves the focus line on, including the ones too short to search on. The record is
-// a local write; the sync behind it is started and left to run, at most once every
-// SYNC_INTERVAL_MS, because this hook's budget belongs to the prompt and not to the dashboard.
+// Every prompt moves the focus line on, including the ones too short to search on. The record and
+// the usage delta the transcript has grown since the last sync are local writes; the sync that
+// carries both is started and left to run, at most once every SYNC_INTERVAL_MS, because this
+// hook's budget belongs to the prompt and not to the dashboard.
 function refresh(input, prompt) {
   if (!input.session_id || !prompt) return "skipped";
   let touched;
@@ -40,7 +42,9 @@ function refresh(input, prompt) {
   }
   if (!touched) return "unregistered";
   if (!touched.due) return "throttled";
-  return recallDetached(["sessions", "--sync", input.session_id], input.cwd) ? "syncing" : "not-installed";
+  const usage = countUsage(input.session_id, input.transcript_path);
+  const synced = recallDetached(["sessions", "--sync", input.session_id], input.cwd) ? "syncing" : "not-installed";
+  return `${synced} usage:${usage}`;
 }
 
 async function memories(input, prompt) {

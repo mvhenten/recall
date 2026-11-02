@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -123,20 +123,59 @@ function read(file) {
   }
 }
 
+export function readRecord(sessionId, env = process.env, uid = process.getuid()) {
+  return read(registryPath(sessionId, env, uid));
+}
+
+export function writeRecord(sessionId, document, env = process.env, uid = process.getuid()) {
+  const file = registryPath(sessionId, env, uid);
+  writeFileSync(file, `${JSON.stringify(document)}\n`);
+  chmodSync(file, 0o600);
+}
+
+function size(file) {
+  try {
+    return statSync(file).size;
+  } catch {
+    return 0;
+  }
+}
+
+// Where the usage reader picks the transcript up. A session carried on in the same file — a resume,
+// a restart, a clear — keeps the offset this host already counted from. Anything else starts at
+// the file's end: what came before was counted by the run that wrote it. The chunk numbers already
+// spent come along whatever the transcript, since they are the session's and may never be reused,
+// and the prompt mark starts at nothing because the prompt count does.
+function transcript(stored, transcriptPath) {
+  const spent = { usageHighWater: stored?.usageHighWater ?? 0, usagePrompts: 0 };
+  if (!transcriptPath) return { ...spent, transcriptPath: "", usageOffset: 0, usageMessageId: "" };
+  if (stored?.transcriptPath === transcriptPath && Number.isInteger(stored.usageOffset)) {
+    return {
+      ...spent,
+      transcriptPath,
+      usageOffset: stored.usageOffset,
+      usageMessageId: stored.usageMessageId ?? "",
+      usagePending: stored.usagePending,
+    };
+  }
+  return { ...spent, transcriptPath, usageOffset: size(transcriptPath), usageMessageId: "" };
+}
+
 // The registry is the one record of what became of a session, so a session the hook passed over
 // gets a file too, carrying the state and no inbox. `recall listen --status` reads them all, the
 // daemon delivers only to the ones carrying a socket, and `recall sessions --sync` sends the rest
 // of the document to the service, whatever the state, so every host's sessions are listed.
-export function record(sessionId, state, cwd, repo, permissionMode, env = process.env, uid = process.getuid()) {
+export function record(sessionId, state, session, env = process.env, uid = process.getuid()) {
+  const { cwd, repo, permissionMode, transcriptPath } = session;
   const dir = sessionsDir(env, uid);
   mkdirSync(dir, { recursive: true });
   chmodSync(dir, 0o700);
-  const file = registryPath(sessionId, env, uid);
+  const stored = readRecord(sessionId, env, uid);
   const pid = sessionPid(env);
   const now = Date.now();
-  writeFileSync(
-    file,
-    `${JSON.stringify({
+  writeRecord(
+    sessionId,
+    {
       ...state,
       pid,
       cwd,
@@ -151,15 +190,17 @@ export function record(sessionId, state, cwd, repo, permissionMode, env = proces
       focus: { first: "", latest: "" },
       mode: invocation(pid),
       permissionMode: permissionMode ?? "",
-    })}\n`,
+      ...transcript(stored, transcriptPath),
+    },
+    env,
+    uid,
   );
-  chmodSync(file, 0o600);
 }
 
-export function register(sessionId, cwd, repo, permissionMode, env = process.env, uid = process.getuid()) {
+export function register(sessionId, session, env = process.env, uid = process.getuid()) {
   const found = inbox(env);
   const state = found ? { state: "registered", ...found.inbox } : { state: "no-inbox" };
-  record(sessionId, state, cwd, repo, permissionMode, env, uid);
+  record(sessionId, state, session, env, uid);
   return state.state;
 }
 
@@ -168,15 +209,14 @@ export function register(sessionId, cwd, repo, permissionMode, env = process.env
 // whether the caller should fire a sync: at most one every SYNC_INTERVAL_MS, and the stamp goes in
 // before the spawn, because the hook never learns whether the sync it started arrived.
 export function touch(sessionId, prompt, permissionMode, env = process.env, uid = process.getuid()) {
-  const file = registryPath(sessionId, env, uid);
-  const stored = read(file);
+  const stored = readRecord(sessionId, env, uid);
   if (!stored) return undefined;
   const now = Date.now();
   const due = now - (stored.syncStartedAt ?? 0) >= SYNC_INTERVAL_MS;
   const latest = truncate(prompt);
-  writeFileSync(
-    file,
-    `${JSON.stringify({
+  writeRecord(
+    sessionId,
+    {
       ...stored,
       ...head(stored.cwd),
       lastActivityAt: now,
@@ -184,9 +224,10 @@ export function touch(sessionId, prompt, permissionMode, env = process.env, uid 
       prompts: (stored.prompts ?? 0) + 1,
       focus: { first: stored.focus?.first || latest, latest },
       permissionMode: permissionMode ?? "",
-    })}\n`,
+    },
+    env,
+    uid,
   );
-  chmodSync(file, 0o600);
   return { due };
 }
 
