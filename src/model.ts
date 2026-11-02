@@ -158,6 +158,22 @@ export const usageDay = (at: number): string => new Date(at).toISOString().slice
 
 export const usageDayStart = (at: number): number => at - (at % DAY_MS);
 
+export const usageMonth = (at: number): string => new Date(at).toISOString().slice(0, 7);
+
+// Every month from the first to the last, so a quiet month in between reads as a gap in the trend
+// rather than closing it up.
+export const monthsBetween = (first: string, last: string): string[] => {
+  if (first === "") return [];
+  const year = Number(first.slice(0, 4));
+  const index = Number(first.slice(5, 7)) - 1;
+  const span: string[] = [];
+  for (let step = 0; ; step += 1) {
+    const month = usageMonth(Date.UTC(year, index + step, 1));
+    if (month > last) return span;
+    span.push(month);
+  }
+};
+
 // The three windows the stats page answers over. Today is the UTC day the rollup keys on; the
 // wider two are inclusive of today, so seven days means today and the six before it.
 export const USAGE_WEEK_DAYS = 7;
@@ -204,6 +220,10 @@ export interface ModelTotals extends TokenCounts {
 
 export interface ModelDay extends ModelTotals {
   day: string;
+}
+
+export interface ModelMonth extends ModelTotals {
+  month: string;
 }
 
 export type UsageSplitField = "host" | "repo" | "account";
@@ -270,9 +290,11 @@ export interface Stats {
 export interface Insights {
   fortnight: DayWindow;
   usage: ModelDay[];
+  monthly: ModelMonth[];
   working: WorkingSet;
   stale: GoingStale;
   repos: RepoHours[];
+  allTime: RepoHours[];
   rhythm: RhythmCell[];
 }
 

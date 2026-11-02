@@ -30,6 +30,25 @@ const dayLabel = (day: string, withMonth: boolean): string => {
   return withMonth ? `${month} ${date}` : String(date);
 };
 
+const monthLabel = (month: string, withYear: boolean): string => {
+  const name = MONTHS[Number(month.slice(5, 7)) - 1] ?? "";
+  return withYear ? `${name} ${month.slice(2, 4)}` : name;
+};
+
+// One entry per column of a bar chart, empty where the axis skips a tick. The caller picks the
+// bucket, so a chart over days and a chart over months share the one builder and still read right.
+export const dayTicks = (days: string[]): string[] =>
+  days.map((day, index) => (index % 3 === 0 ? dayLabel(day, index === 0 || day.endsWith("-01")) : ""));
+
+const MONTH_TICK_LIMIT = 12;
+
+export const monthTicks = (months: string[]): string[] => {
+  const every = months.length > MONTH_TICK_LIMIT ? 2 : 1;
+  return months.map((month, index) =>
+    index % every === 0 ? monthLabel(month, index === 0 || month.endsWith("-01")) : "",
+  );
+};
+
 const n = (value: number): string => String(Math.round(value * 10) / 10);
 
 const svg = (viewBox: string, label: string, body: string): string =>
@@ -73,7 +92,7 @@ const capped = (x: number, width: number, top: number, bottom: number, radius: n
 const STACK_GAP = 2;
 
 export const stackedBars = (
-  days: string[],
+  ticks: string[],
   series: Series[],
   label: string,
   money: (value: number) => string,
@@ -82,12 +101,12 @@ export const stackedBars = (
   const right = 394;
   const base = 212;
   const top = 18;
-  const totals = days.map((_, index) => series.reduce((sum, band) => sum + (band.values[index] ?? 0), 0));
+  const totals = ticks.map((_, index) => series.reduce((sum, band) => sum + (band.values[index] ?? 0), 0));
   const high = niceTop(Math.max(...totals, 0));
-  const step = (right - left) / Math.max(days.length, 1);
+  const step = (right - left) / Math.max(ticks.length, 1);
   const width = step * 0.618;
-  const bars = days
-    .map((day, index) => {
+  const bars = ticks
+    .map((caption, index) => {
       const x = left + (step - width) / 2 + index * step;
       const present = series.filter((band) => (band.values[index] ?? 0) > 0);
       let bottom = base;
@@ -105,11 +124,11 @@ export const stackedBars = (
       });
       const center = x + width / 2;
       const tick =
-        index % 3 === 0
-          ? `<text x="${n(center)}" y="${base + 13}" text-anchor="middle" class="cl-ax">${escapeHtml(dayLabel(day, index === 0 || day.endsWith("-01")))}</text>`
-          : "";
+        caption === ""
+          ? ""
+          : `<text x="${n(center)}" y="${base + 13}" text-anchor="middle" class="cl-ax">${escapeHtml(caption)}</text>`;
       const value =
-        index === days.length - 1 && totals[index] !== undefined && (totals[index] ?? 0) > 0
+        index === ticks.length - 1 && totals[index] !== undefined && (totals[index] ?? 0) > 0
           ? `<text x="${n(center)}" y="${n(highest - 6)}" text-anchor="middle" class="cl-val">${escapeHtml(money(totals[index] ?? 0))}</text>`
           : "";
       return `${drawn.join("")}${tick}${value}`;

@@ -445,6 +445,7 @@ type CountRow = {
 
 type ModelRow = CountRow & { provider: string; model: string };
 type ModelDayRow = ModelRow & { day: string };
+type ModelMonthRow = ModelRow & { month: string };
 type SplitRow = ModelRow & { field: UsageSplitField; value: string };
 type SessionsRow = { day: string; sessions: number };
 type LiveRow = { sessions: number; busy: number; sessions_today: number };
@@ -499,6 +500,17 @@ const usageDaysStatement = (db: D1Database, userId: string, fromDay: string): D1
     )
     .bind(userId, fromDay);
 
+// The month a delta falls in is the month of the UTC day the rollup already keyed it under, so the
+// long horizon reads the same column the windows do and the two can never disagree.
+const usageMonthsStatement = (db: D1Database, userId: string): D1PreparedStatement =>
+  db
+    .prepare(
+      `SELECT substr(day, 1, 7) AS month, provider, model, ${COUNT_SUMS} FROM usage_daily
+       WHERE user_id = ?1
+       GROUP BY month, provider, model ORDER BY month, provider, model`,
+    )
+    .bind(userId);
+
 const usageSplitsStatement = (db: D1Database, userId: string, fromDay: string): D1PreparedStatement =>
   db
     .prepare(
@@ -525,8 +537,15 @@ const sessionsPerDayStatement = (db: D1Database, userId: string, since: number):
 // A session that opened before the window or runs past its end only lends the stretch that falls
 // inside it, so a months-old session touching a repo yesterday cannot donate its whole life to the
 // fortnight. Overlapping sessions still each count their own stretch: this is session time, not
-// wall-clock time, and the page says so.
-const repoHoursStatement = (db: D1Database, userId: string, window: DayWindow, limit: number): D1PreparedStatement =>
+// wall-clock time, and the page says so. The all-time ranking passes since 0, which leaves the clip
+// at now and nothing else.
+const repoHoursStatement = (
+  db: D1Database,
+  userId: string,
+  since: number,
+  until: number,
+  limit: number,
+): D1PreparedStatement =>
   db
     .prepare(
       `SELECT repo, SUM(MAX(MIN(last_activity_at, ?3) - MAX(started_at, ?2), 0)) AS ms, COUNT(*) AS sessions
@@ -534,7 +553,7 @@ const repoHoursStatement = (db: D1Database, userId: string, window: DayWindow, l
        WHERE user_id = ?1 AND last_activity_at >= ?2 AND started_at <= ?3
        GROUP BY repo ORDER BY ms DESC, repo LIMIT ?4`,
     )
-    .bind(userId, window.since, window.until, limit);
+    .bind(userId, since, until, limit);
 
 const rhythmStatement = (db: D1Database, userId: string, since: number): D1PreparedStatement =>
   db
@@ -631,8 +650,9 @@ export const readInsights = async (
   fortnight: DayWindow,
   now: number,
 ): Promise<Insights> => {
-  const [usage, recalled, stale, memories, repos, rhythm] = await db.batch<Record<string, unknown>>([
+  const [usage, monthly, recalled, stale, memories, repos, allTime, rhythm] = await db.batch<Record<string, unknown>>([
     usageDaysStatement(db, userId, fortnight.from),
+    usageMonthsStatement(db, userId),
     workingSetStatement(db, userId, usageDayStart(now) - (USAGE_MONTH_DAYS - 1) * DAY_MS, WORKING_SET_SIZE),
     staleStatement(
       db,
@@ -642,7 +662,8 @@ export const readInsights = async (
       STALE_LIST_SIZE,
     ),
     db.prepare("SELECT COUNT(*) AS memories FROM memories WHERE user_id = ?").bind(userId),
-    repoHoursStatement(db, userId, fortnight, REPO_BAR_COUNT),
+    repoHoursStatement(db, userId, fortnight.since, fortnight.until, REPO_BAR_COUNT),
+    repoHoursStatement(db, userId, 0, now, REPO_BAR_COUNT),
     rhythmStatement(db, userId, fortnight.since),
   ]);
   const recalls = resultRows<RecallRow>(recalled);
@@ -650,6 +671,7 @@ export const readInsights = async (
   return {
     fortnight,
     usage: resultRows<ModelDayRow>(usage).map((row) => ({ day: row.day, ...toModelTotals(row) })),
+    monthly: resultRows<ModelMonthRow>(monthly).map((row) => ({ month: row.month, ...toModelTotals(row) })),
     working: {
       entries: recalls.map((row) => ({ name: row.name, recalls: row.recall_count })),
       recalls: recalls[0]?.total_recalls ?? 0,
@@ -665,6 +687,7 @@ export const readInsights = async (
       total: resultRows<MemoryTotalRow>(memories)[0]?.memories ?? 0,
     },
     repos: resultRows<RepoRow>(repos).map((row) => ({ repo: row.repo, ms: row.ms, sessions: row.sessions })),
+    allTime: resultRows<RepoRow>(allTime).map((row) => ({ repo: row.repo, ms: row.ms, sessions: row.sessions })),
     rhythm: resultRows<RhythmRow>(rhythm).map((row) => ({
       weekday: row.weekday,
       hour: row.hour,

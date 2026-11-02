@@ -858,6 +858,9 @@ describe("the insights tab", () => {
     expect(html).toContain("No cache read is recorded yet.");
     expect(html).toContain("No session has been recorded yet.");
     expect(html).toContain("No session ran in this window.");
+    expect(html).toContain("No month of usage is on record yet.");
+    expect(html).toContain("No month has any input to grade.");
+    expect(html).toContain("No session has ever synced.");
     expect(html).not.toContain("stranger-note");
   });
 
@@ -865,5 +868,101 @@ describe("the insights tab", () => {
     const h = await harness();
     expect((await open(h, "/dashboard/insights", null)).status).toBe(401);
     expect((await open(h, "/dashboard/insights", await h.assertionFor(email("stranger")))).status).toBe(403);
+  });
+});
+
+const AUGUST = Date.UTC(2026, 7, 15, 12, 0, 0);
+const SEPTEMBER = Date.UTC(2026, 8, 15, 12, 0, 0);
+const OCTOBER_LAST = Date.UTC(2026, 9, 31, 12, 0, 0);
+const NOVEMBER_FIRST = Date.UTC(2026, 10, 1, 12, 0, 0);
+
+describe("the long horizon on the insights tab", () => {
+  it("buckets a delta by the month of the day it was counted under, and keeps a quiet month on the axis", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    const spend = spender(owner);
+    await spend({ at: AUGUST, inputTokens: 4_000_000 });
+    await spend({ at: OCTOBER_LAST, inputTokens: 1_000_000 });
+    await spend({ at: NOVEMBER_FIRST, inputTokens: 2_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("$35.00 and 7.0M tokens over 4 months, peaking in 2026-08 at $20.00.");
+    expect(html).toContain("Aug 26");
+  });
+
+  it("marks a month total that mixes a priced model with an unpriced one as the floor it is", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    const spend = spender(owner);
+    await spend({ at: OCTOBER_LAST, model: "mystery-1", inputTokens: 2_000_000 });
+    await spend({ at: NOON, inputTokens: 1_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("≈ $5.00 and 3.0M tokens over 2 months, peaking in 2026-11 at $5.00.");
+  });
+
+  it("prices no month at all when no model on record carries a price", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await spender(owner)({ at: NOON, model: "mystery-1", inputTokens: 1_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("No model on record carries a price.");
+    expect(html).toContain("mystery-1 has no entry in the price table");
+    expect(html).not.toContain("peaking in");
+  });
+
+  it("ranks every repo by session time ever recorded, where the fortnight only lends its own stretch", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await owner.client.sync("old00001", {
+      repo: "repo:github.com/acme/old",
+      startedAt: AUGUST,
+      lastActivityAt: AUGUST + 7 * 3_600_000,
+    });
+    await owner.client.sync("edge0001", {
+      repo: "repo:github.com/acme/app",
+      startedAt: Date.UTC(2026, 9, 31, 22, 0, 0),
+      lastActivityAt: Date.UTC(2026, 10, 1, 2, 0, 0),
+    });
+    await owner.client.sync("now00001", {
+      repo: "repo:github.com/acme/app",
+      startedAt: NOON - 2 * 3_600_000,
+      lastActivityAt: NOON,
+    });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("acme/old took 7h of the 13h these 2 repos hold, over 3 sessions.");
+    expect(html).toContain("acme/app took 6h of the fortnight's 6h of session time.");
+  });
+
+  it("grades the cache hit rate by month, leaving out a month with no input to grade", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    const spend = spender(owner);
+    await spend({ at: SEPTEMBER, inputTokens: 1_000_000, cacheReadTokens: 1_000_000 });
+    await spend({ at: OCTOBER_LAST, outputTokens: 1_000_000 });
+    await spend({ at: NOON, inputTokens: 1_000_000, cacheReadTokens: 9_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("2026-09 50.0%");
+    expect(html).toContain("2026-11 90.0%");
+    expect(html).toContain("The hit rate went from 50.0% in 2026-09 to 90.0% in 2026-11.");
+    expect(html).not.toContain("2026-10 0.0%");
+  });
+
+  it("names the one month on record rather than a drift between two", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await spender(owner)({ at: NOON, inputTokens: 1_000_000, cacheReadTokens: 3_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("2026-11 is the only month with input to grade, at 75.0%.");
   });
 });
