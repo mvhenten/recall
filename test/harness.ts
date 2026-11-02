@@ -8,6 +8,7 @@ import { DIMENSIONS, normalize } from "../src/rank";
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const AUDIENCE = "recall-test-aud";
+export const DASHBOARD_AUDIENCE = "recall-test-dashboard-aud";
 const ORIGIN = "https://recall.test";
 
 export interface DeviceStart {
@@ -58,11 +59,10 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
   };
   let clock = 1_700_000_000_000;
   const app = createApp({
-    verify: accessVerifier(
-      keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable,
-      ISSUER,
+    verify: accessVerifier(keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable, ISSUER, [
       AUDIENCE,
-    ),
+      DASHBOARD_AUDIENCE,
+    ]),
     embedder: wordEmbedder,
     deviceCodeLimits,
     now: () => clock,

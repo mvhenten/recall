@@ -62,3 +62,20 @@ resource "cloudflare_zero_trust_access_application" "device" {
     }
   ]
 }
+
+resource "cloudflare_zero_trust_access_application" "dashboard" {
+  account_id                = var.account_id
+  name                      = "recall dashboard"
+  type                      = "self_hosted"
+  domain                    = "${var.hostname}/dashboard"
+  session_duration          = "24h"
+  app_launcher_visible      = false
+  allowed_idps              = [var.otp_idp_id]
+  auto_redirect_to_identity = true
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.approvers.id
+      precedence = 1
+    }
+  ]
+}

@@ -189,6 +189,17 @@ const deviceApp = await upsertApp(deviceDomain, {
   auto_redirect_to_identity: true,
   policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
 });
+const dashboardDomain = `${hostname}/dashboard`;
+const dashboardApp = await upsertApp(dashboardDomain, {
+  name: `${name} dashboard`,
+  domain: dashboardDomain,
+  type: "self_hosted",
+  session_duration: "24h",
+  app_launcher_visible: false,
+  allowed_idps: otp ? [otp.id] : [],
+  auto_redirect_to_identity: true,
+  policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
+});
 
 if (dryRun) {
   say(`would deploy the Worker ${name} to ${hostname}`);
@@ -219,7 +230,7 @@ const config = {
     migrations_dir: join(ROOT, db.migrations_dir),
   })),
   routes: [{ pattern: hostname, custom_domain: true, zone_id: zone.id }],
-  vars: { ACCESS_TEAM_DOMAIN: teamDomain, ACCESS_AUD: deviceApp.aud },
+  vars: { ACCESS_TEAM_DOMAIN: teamDomain, ACCESS_AUD: [deviceApp.aud, dashboardApp.aud].join(",") },
 };
 mkdirSync(WORK, { recursive: true });
 const configPath = join(WORK, "wrangler.json");

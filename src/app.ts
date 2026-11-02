@@ -1,3 +1,4 @@
+import { dashboardPage, tabForPath } from "./dashboard";
 import {
   type Caller,
   DEVICE_CODE_TTL_MS,
@@ -90,6 +91,16 @@ interface Rankings {
   inScope: Ranking;
   elsewhere: Ranking;
 }
+
+// A browser names text/html outright; curl and the CLI send */* or
+// application/json, so they keep today's JSON answers.
+const acceptsHtml = (accept: string | null): boolean =>
+  (accept ?? "").split(",").some((entry) => {
+    const [type, ...parameters] = entry.split(";").map((part) => part.trim().toLowerCase());
+    if (type !== "text/html") return false;
+    const quality = parameters.find((parameter) => parameter.startsWith("q="));
+    return quality === undefined || Number(quality.slice(2)) > 0;
+  });
 
 const decodeSegment = (segment: string): string | null => {
   try {
@@ -238,6 +249,18 @@ export const createApp = (deps: Deps): App => {
     return verified.email;
   };
 
+  const dashboard = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    const email = await approver(request);
+    if (email instanceof Response) return email;
+    if ((await userForEmail(db, email)) === null) {
+      return messagePage(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
+    }
+    const tab = tabForPath(url.pathname);
+    if (!tab) return messagePage(404, "No such page", "The dashboard has no page at this address.");
+    return dashboardPage(email, tab);
+  };
+
   const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
     if (request.method !== "GET" && request.method !== "POST") return error(405, "method not allowed");
     const email = await approver(request);
@@ -374,6 +397,12 @@ export const createApp = (deps: Deps): App => {
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
     const url = new URL(request.url);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
+    if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
+      return dashboard(request, url, env.DB);
+    }
+    if (url.pathname === "/" && acceptsHtml(request.headers.get("accept"))) {
+      return new Response(null, { status: 303, headers: { location: "/dashboard" } });
+    }
     const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
     if (version !== "v1" || rest.length > 0) return error(404, "not found");
     if (collection === "device") {

@@ -118,13 +118,13 @@ const decodeJson = (segment: string): Record<string, unknown> | null => {
   }
 };
 
-const audienceMatches = (claim: unknown, audience: string): boolean =>
-  claim === audience || (Array.isArray(claim) && claim.includes(audience));
+const audienceMatches = (claim: unknown, audiences: string[]): boolean =>
+  (Array.isArray(claim) ? claim : [claim]).some((value) => typeof value === "string" && audiences.includes(value));
 
 const reject = (reason: string): Verification => ({ ok: false, reason });
 
 export const accessVerifier =
-  (source: KeySource, issuer: string, audience: string): Verify =>
+  (source: KeySource, issuer: string, audiences: string[]): Verify =>
   async (assertion: string): Promise<Verification> => {
     const [headerSegment, payloadSegment, signatureSegment, ...extra] = assertion.split(".");
     if (headerSegment === undefined || payloadSegment === undefined || signatureSegment === undefined || extra.length) {
@@ -144,7 +144,7 @@ export const accessVerifier =
 
     const nowS = Date.now() / 1000;
     if (payload.iss !== issuer) return reject("the JWT was issued by another Access team");
-    if (!audienceMatches(payload.aud, audience)) return reject("the JWT is meant for another Access application");
+    if (!audienceMatches(payload.aud, audiences)) return reject("the JWT is meant for another Access application");
     if (typeof payload.exp !== "number" || payload.exp + CLOCK_LEEWAY_S <= nowS) return reject("the JWT has expired");
     if (typeof payload.nbf === "number" && payload.nbf - CLOCK_LEEWAY_S > nowS)
       return reject("the JWT is not valid yet");
