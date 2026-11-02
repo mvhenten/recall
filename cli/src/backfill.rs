@@ -292,12 +292,14 @@ fn events(models: &[(String, Counted)], account: &str, prompts: i64, now: i64) -
         .collect()
 }
 
-/// One past session read out of its transcript. A transcript whose entries carry no time of their
-/// own leaves the file's own birth and last write to say when the session ran.
+/// One past session read out of its transcript. The two readers take the whole file, which is read
+/// once for both: the record's reader counts what the user typed and the usage reader what the
+/// models answered, and the two never read the same entries. A transcript whose entries carry no
+/// time of their own leaves the file's own birth and last write to say when the session ran.
 fn synthesize(scope: &Scope, session_id: &str, path: &Path, account: &str, tags: &mut Repos, now: i64) -> Result<Past> {
     let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let reading = adopt::read_on(path, Reading::default());
+    let reading = adopt::read_text(&text, Reading::default());
     let (models, message_id) = aggregate(&text);
     let cwd = PathBuf::from(&reading.cwd);
     Ok(Past {

@@ -451,7 +451,14 @@ pub fn read_on(path: &Path, carried: Reading) -> Reading {
         return reading;
     };
     reading.offset = from + cut as u64 + 1;
-    for line in String::from_utf8_lossy(&bytes[..cut]).lines() {
+    read_text(&String::from_utf8_lossy(&bytes[..cut]), reading)
+}
+
+/// What a stretch of transcript says, for a caller that already holds it. A line that does not
+/// parse is skipped, which is also what an entry still being written leaves behind.
+pub fn read_text(stretch: &str, carried: Reading) -> Reading {
+    let mut reading = carried;
+    for line in stretch.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
