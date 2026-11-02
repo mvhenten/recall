@@ -1,6 +1,7 @@
 use crate::config::Config;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use ureq::http::Response;
 use ureq::{Agent, RequestBuilder};
@@ -88,6 +89,9 @@ pub struct Client {
     agent: Agent,
     config: Config,
 }
+
+/// The widest page the session listings take.
+const HISTORY_PAGE: u32 = 100;
 
 fn encode(value: &str) -> String {
     value
@@ -249,6 +253,13 @@ struct UsageBody<'a> {
 #[derive(Deserialize)]
 struct Sessions {
     sessions: Vec<Session>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryIds {
+    session_ids: Vec<String>,
+    next_cursor: String,
 }
 
 /// The device a message is queued against, and the one session on it the message is for; an empty
@@ -442,6 +453,29 @@ impl Client {
         let response = self.authed(self.agent.get(self.url("/v1/sessions"))).call()?;
         let listed: Sessions = check(response, "listing sessions")?.body_mut().read_json()?;
         Ok(listed.sessions)
+    }
+
+    /// Every session this account has on record, read to the last page. A host sending its past
+    /// sessions back needs the whole set before it starts, since a transcript says nothing about
+    /// whether the service already holds the session it describes.
+    pub fn session_history_ids(&self) -> Result<HashSet<String>> {
+        let mut held = HashSet::new();
+        let mut cursor = String::new();
+        loop {
+            let mut query = format!("/v1/sessions?scope=history&limit={HISTORY_PAGE}");
+            if !cursor.is_empty() {
+                query.push_str(&format!("&cursor={}", encode(&cursor)));
+            }
+            let response = self.authed(self.agent.get(self.url(&query))).call()?;
+            let page: HistoryIds = check(response, "listing the sessions on record")?
+                .body_mut()
+                .read_json()?;
+            held.extend(page.session_ids);
+            if page.next_cursor.is_empty() {
+                return Ok(held);
+            }
+            cursor = page.next_cursor;
+        }
     }
 
     pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<()> {

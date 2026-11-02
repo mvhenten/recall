@@ -421,6 +421,32 @@ export const listSessionHistory = async (
   return { sessions, nextCursor };
 };
 
+// Which sessions the account has on record, and nothing else about them. A host reading its own
+// past sessions back out of its transcripts needs only to know which ones are already here, and
+// the ids alone page far cheaper than the rows the history tab draws.
+export const listSessionHistoryIds = async (
+  db: D1Database,
+  userId: string,
+  [cursorLastActivityAt, cursorSessionId]: [number, string],
+  limit: number,
+): Promise<{ sessionIds: string[]; nextCursor: string }> => {
+  const { results } = await db
+    .prepare(
+      `SELECT session_id, last_activity_at FROM session_history
+       WHERE user_id = ?1 AND (last_activity_at < ?2 OR (last_activity_at = ?2 AND session_id < ?3))
+       ORDER BY last_activity_at DESC, session_id DESC
+       LIMIT ?4`,
+    )
+    .bind(userId, cursorLastActivityAt, cursorSessionId, limit + 1)
+    .all<{ session_id: string; last_activity_at: number }>();
+  const page = results.slice(0, limit);
+  const last = page.at(-1);
+  return {
+    sessionIds: page.map((row) => row.session_id),
+    nextCursor: results.length > limit && last ? encodeCursor(last.last_activity_at, last.session_id) : "",
+  };
+};
+
 export const sessionHistoryFilters = async (db: D1Database, userId: string): Promise<HistoryFilters> => {
   const { results } = await db
     .prepare(

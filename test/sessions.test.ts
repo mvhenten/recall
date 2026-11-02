@@ -16,6 +16,12 @@ const listed = async (client: Client): Promise<ListedSession[]> => {
   return body.sessions;
 };
 
+const ids = async (client: Client, query: string): Promise<{ sessionIds: string[]; nextCursor: string }> => {
+  const response = await client.request("GET", `/v1/sessions?${query}`);
+  expect(response.status).toBe(200);
+  return await response.json();
+};
+
 const account = async (h: Harness): Promise<{ laptop: Client; tower: Client }> => {
   const email = await h.invite(`sessions-${crypto.randomUUID()}@example.com`);
   return {
@@ -186,5 +192,44 @@ describe("session history", () => {
       { branch: "feat/session-history", prompts: 9, focus_latest: "ship it" },
       expect.objectContaining({ branch: "feat/stranger-session" }),
     ]);
+  });
+
+  it("lists the ids it holds, newest activity first, paged, and only the caller's", async () => {
+    const h = await harness();
+    const { laptop, tower } = await account(h);
+    const stranger = await h.user("stranger");
+
+    await laptop.sync("s-oldest", { lastActivityAt: h.now() });
+    await tower.sync("s-middle", { host: "tower", lastActivityAt: h.tick(60_000) });
+    await laptop.sync("s-newest", { lastActivityAt: h.tick(60_000) });
+    expect((await laptop.request("DELETE", "/v1/sessions/s-newest")).status).toBe(204);
+    await stranger.sync("s-stranger", { lastActivityAt: h.now() });
+
+    const first = await ids(laptop, "scope=history&limit=2");
+    expect(first.sessionIds).toEqual(["s-newest", "s-middle"]);
+    expect(first.nextCursor).not.toBe("");
+
+    const second = await ids(laptop, `scope=history&limit=2&cursor=${encodeURIComponent(first.nextCursor)}`);
+    expect(second).toEqual({ sessionIds: ["s-oldest"], nextCursor: "" });
+    expect(await ids(stranger, "scope=history")).toEqual({ sessionIds: ["s-stranger"], nextCursor: "" });
+  });
+
+  it("refuses a scope it does not know, a limit out of range and a malformed cursor", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+    await laptop.sync("s-held");
+
+    for (const query of [
+      "scope=past",
+      "scope=history&limit=0",
+      "scope=history&limit=101",
+      "scope=history&cursor=%7B",
+    ]) {
+      const response = await laptop.request("GET", `/v1/sessions?${query}`);
+      expect(response.status, query).toBe(400);
+    }
+    const live = await laptop.request("GET", "/v1/sessions?scope=live");
+    expect(live.status).toBe(200);
+    expect(await live.json()).toMatchObject({ sessions: [expect.objectContaining({ sessionId: "s-held" })] });
   });
 });

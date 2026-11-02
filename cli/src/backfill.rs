@@ -15,6 +15,11 @@
 //! spent, and the service keeps the first event it saw for a chunk number. A second run over the
 //! same transcript therefore regenerates the same events and changes nothing.
 //!
+//! What has already been sent is the service's own answer, never a mark this host keeps: the
+//! sessions it holds on record are read back before the pass starts, and every one of them is
+//! passed over. A ledger on disk would read as a host with nothing left to send after a reinstall
+//! wiped it, and the tokens of every session it had already sent would be counted a second time.
+//!
 //! Attribution is the one thing a transcript cannot give back: it names no subscription, so every
 //! event carries the account this host is signed in as now.
 
@@ -29,21 +34,17 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// Mirrors PROVIDER in hooks/usage.mjs.
 const PROVIDER: &str = "claude";
 
 /// Where one pass looks: the directory Claude Code writes transcripts under, the registry the hooks
-/// write, the ledger of what this host has already sent, and the file naming the subscription the
-/// tokens are counted against.
+/// write, and the file naming the subscription the tokens are counted against.
 #[derive(Debug, Clone)]
 pub struct Scope {
     pub projects: PathBuf,
     pub sessions: PathBuf,
-    pub ledger: PathBuf,
     pub claude_json: PathBuf,
     pub host: String,
 }
@@ -58,7 +59,6 @@ impl Scope {
         Ok(Scope {
             projects: claude.join("projects"),
             sessions: listen::sessions_dir(),
-            ledger: listen::state_dir().join("backfilled"),
             claude_json: home.join(".claude.json"),
             host: crate::host_name(),
         })
@@ -120,38 +120,10 @@ fn account(claude_json: &Path) -> String {
         .to_string()
 }
 
-/// The ids this host has already backfilled. The file is appended to as each session lands, so an
-/// interrupted run resumes where it stopped rather than sending the whole span again.
-fn ledger(path: &Path) -> HashSet<String> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Records one session as sent, which only happens once its row, its tokens and its end have all
-/// landed. Recording ahead of that would drop a session from the next run with nothing on record.
-pub fn note(path: &Path, session_id: &str) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("writing {}", path.display()))?;
-    file.write_all(format!("{session_id}\n").as_bytes())
-        .with_context(|| format!("writing {}", path.display()))
-}
-
-/// Every session this pass leaves alone: the ones the registry names, which are this host's live
-/// sessions and adoption's to take on, and the ones already sent.
-fn skipped(scope: &Scope) -> HashSet<String> {
-    let mut held = ledger(&scope.ledger);
+/// Every session this pass leaves alone: the ones the service already holds on record, and the ones
+/// the registry names, which are this host's live sessions and adoption's to take on.
+fn skipped(scope: &Scope, on_record: &HashSet<String>) -> HashSet<String> {
+    let mut held = on_record.clone();
     let Ok(entries) = std::fs::read_dir(&scope.sessions) else {
         return held;
     };
@@ -347,10 +319,11 @@ impl Repos {
     }
 }
 
-/// Every past session this host holds a transcript for and has not sent, oldest first. A session
-/// the registry still names is live and adoption's to take on, not this pass's.
-pub fn past(scope: &Scope, now: i64) -> Result<Vec<Past>> {
-    let held = skipped(scope);
+/// Every past session this host holds a transcript for that the service does not already have,
+/// oldest first. A session the registry still names is live and adoption's to take on, not this
+/// pass's.
+pub fn past(scope: &Scope, on_record: &HashSet<String>, now: i64) -> Result<Vec<Past>> {
+    let held = skipped(scope, on_record);
     let found: Vec<(String, PathBuf)> = transcripts(&scope.projects)
         .into_iter()
         .filter(|(session_id, _)| !held.contains(session_id))
@@ -384,6 +357,15 @@ mod tests {
 
     const NOW: i64 = 1_793_700_000_000;
 
+    /// A service holding no session on record, which is every host's first run.
+    fn nothing() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn on_record(session_ids: &[&str]) -> HashSet<String> {
+        session_ids.iter().map(|id| id.to_string()).collect()
+    }
+
     struct Sandbox {
         dir: PathBuf,
         scope: Scope,
@@ -393,13 +375,12 @@ mod tests {
         fn new(name: &str) -> Sandbox {
             let dir = std::env::temp_dir().join(format!("recall-backfill-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            for part in ["projects", "sessions", "state"] {
+            for part in ["projects", "sessions"] {
                 std::fs::create_dir_all(dir.join(part)).unwrap();
             }
             let scope = Scope {
                 projects: dir.join("projects"),
                 sessions: dir.join("sessions"),
-                ledger: dir.join("state").join("backfilled"),
                 claude_json: dir.join(".claude.json"),
                 host: "laptop".to_string(),
             };
@@ -489,7 +470,7 @@ mod tests {
         let sandbox = Sandbox::new("one");
         let path = sandbox.transcript("-home-you-recall", "s-old", &session());
 
-        let found = past(&sandbox.scope, NOW).unwrap();
+        let found = past(&sandbox.scope, &nothing(), NOW).unwrap();
 
         assert_eq!(found.len(), 1, "{found:?}");
         let session = &found[0];
@@ -554,19 +535,17 @@ mod tests {
         let sandbox = Sandbox::new("again");
         sandbox.transcript("-home-you-recall", "s-old", &session());
 
-        let first = past(&sandbox.scope, NOW).unwrap();
+        let first = past(&sandbox.scope, &nothing(), NOW).unwrap();
         assert_eq!(
-            past(&sandbox.scope, NOW + 60_000).unwrap(),
+            past(&sandbox.scope, &nothing(), NOW + 60_000).unwrap(),
             first,
             "the same transcript regenerates the same chunk numbers, whenever it is read"
         );
 
-        note(&sandbox.scope.ledger, "s-old").unwrap();
-
         assert_eq!(
-            past(&sandbox.scope, NOW).unwrap(),
+            past(&sandbox.scope, &on_record(&["s-old"]), NOW).unwrap(),
             Vec::new(),
-            "a session already sent is passed over"
+            "a session the service already holds on record is passed over"
         );
     }
 
@@ -576,7 +555,7 @@ mod tests {
         sandbox.transcript("-home-you-recall", "s-old", &session());
         sandbox.subagent("-home-you-recall", "s-subagent", &session());
 
-        let ids: Vec<String> = past(&sandbox.scope, NOW)
+        let ids: Vec<String> = past(&sandbox.scope, &nothing(), NOW)
             .unwrap()
             .into_iter()
             .map(|session| session.session_id)
@@ -592,7 +571,7 @@ mod tests {
         sandbox.transcript("-home-you--dotfiles", "s-old", &session());
         sandbox.registered("s-live");
 
-        let ids: Vec<String> = past(&sandbox.scope, NOW)
+        let ids: Vec<String> = past(&sandbox.scope, &nothing(), NOW)
             .unwrap()
             .into_iter()
             .map(|session| session.session_id)
@@ -607,17 +586,20 @@ mod tests {
         sandbox.transcript("-home-you-recall", "s-old", &session());
         std::fs::write(&sandbox.scope.claude_json, "{}").unwrap();
 
-        let error = past(&sandbox.scope, NOW).unwrap_err().to_string();
+        let error = past(&sandbox.scope, &nothing(), NOW).unwrap_err().to_string();
         assert!(error.contains("names no account"), "{error}");
 
         std::fs::write(&sandbox.scope.claude_json, json!({ "userID": "u-1" }).to_string()).unwrap();
-        assert_eq!(past(&sandbox.scope, NOW).unwrap()[0].usage.events[0]["account"], "u-1");
+        assert_eq!(
+            past(&sandbox.scope, &nothing(), NOW).unwrap()[0].usage.events[0]["account"],
+            "u-1"
+        );
     }
 
     #[test]
     fn a_host_with_no_transcripts_has_nothing_to_send() {
         let sandbox = Sandbox::new("empty");
         std::fs::remove_file(&sandbox.scope.claude_json).unwrap();
-        assert_eq!(past(&sandbox.scope, NOW).unwrap(), Vec::new());
+        assert_eq!(past(&sandbox.scope, &nothing(), NOW).unwrap(), Vec::new());
     }
 }

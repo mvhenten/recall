@@ -511,22 +511,23 @@ fn adopt_sessions() -> Result<ExitCode> {
 /// the history row, the row survives the end that follows it, and the tokens go out between the
 /// two, since a delta carries its own host and repo and the usage route takes an ended session.
 ///
-/// One session that cannot be sent fails the run, and the ledger carries what landed, so the next
-/// run picks the span up where this one stopped instead of sending it again.
+/// The sessions the service already holds are read back first and passed over, so one session that
+/// cannot be sent fails the run and the next run picks the span up where this one stopped: what
+/// landed is on record, and nothing on record is sent again.
 fn backfill_sessions() -> Result<ExitCode> {
     let scope = backfill::Scope::here()?;
-    let past = backfill::past(&scope, Timestamp::now().as_millisecond())?;
+    let client = Client::new(config::load()?);
+    let on_record = client.session_history_ids()?;
+    let past = backfill::past(&scope, &on_record, Timestamp::now().as_millisecond())?;
     if past.is_empty() {
         println!("no past session needs backfilling");
         return Ok(ExitCode::SUCCESS);
     }
-    let client = Client::new(config::load()?);
     for session in &past {
         let id = &session.session_id;
         client.sync_session(id, &session.body())?;
         let sent = client.post_usage(id, &session.host, &session.repo, &session.usage)?;
         client.end_session(id)?;
-        backfill::note(&scope.ledger, id)?;
         println!("backfilled {id} with {sent} usage deltas");
     }
     println!("backfilled {} past sessions", past.len());

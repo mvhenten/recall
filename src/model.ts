@@ -417,6 +417,31 @@ export const parseHistory = (params: URLSearchParams): Parsed<HistoryInput> => {
   return { ok: true, value: { host, repo, cursor: params.get("cursor") ?? "", limit } };
 };
 
+export const SESSIONS_PARAMS = ["scope", "cursor", "limit"] as const;
+
+export const sessionScopes = ["live", "history"] as const;
+export type SessionScope = (typeof sessionScopes)[number];
+
+export interface SessionHistoryPage {
+  cursor: string;
+  limit: number;
+}
+
+export const parseSessionHistoryPage = (params: URLSearchParams): Parsed<SessionHistoryPage> => {
+  const limit = Number(params.get("limit") ?? 100);
+  if (!isInteger(limit, 1, 100)) return fail("limit must be a whole number from 1 to 100");
+  return { ok: true, value: { cursor: params.get("cursor") ?? "", limit } };
+};
+
+// Which sessions a listing covers: the ones running now, or every one the account has on record. A
+// scope this service does not know is refused rather than read as the default, so a client asking
+// for a listing it cannot give never takes the live sessions for the whole span.
+export const parseSessionScope = (value: string | null): Parsed<SessionScope> => {
+  if (value === null || value === "") return { ok: true, value: "live" };
+  if (!isOneOf(sessionScopes, value)) return fail(`scope must be one of ${sessionScopes.join(", ")}`);
+  return { ok: true, value };
+};
+
 const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/;
 
 const isText = (value: unknown, max: number): value is string => typeof value === "string" && value.length <= max;
