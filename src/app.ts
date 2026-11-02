@@ -26,18 +26,22 @@ import {
   parseName,
   parseSave,
   parseSearch,
+  parseSession,
+  parseSessionId,
   type SearchInput,
   type Verify,
 } from "./model";
 import { CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
-import { endSession, listSessions, parseSession, parseSessionId, putSession } from "./sessions";
 import {
   decodeCursor,
   deleteMemory,
   describeMemories,
+  endSession,
   getMemory,
   listMemories,
+  listSessions,
+  putSession,
   recall,
   saveMemory,
   textCandidates,
@@ -186,13 +190,11 @@ export const createApp = (deps: Deps): App => {
     if (request.method === "PUT") {
       const input = parseSession(await readJson(request));
       if (!input.ok) return error(400, input.error);
-      return json({ session: await putSession(db, caller, sessionId.value, input.value, deps.now()) });
+      await putSession(db, caller, sessionId.value, input.value, deps.now());
+      return new Response(null, { status: 204 });
     }
     if (request.method !== "DELETE") return error(405, "method not allowed");
-    const endedAt = new Date(deps.now()).toISOString();
-    if (!(await endSession(db, caller.userId, sessionId.value, endedAt))) {
-      return error(404, `no live session ${sessionId.value}`);
-    }
+    if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
     return new Response(null, { status: 204 });
   };
 

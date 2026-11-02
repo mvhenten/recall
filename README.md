@@ -87,7 +87,7 @@ The plugin starts `recall mcp` as an MCP server and adds four hooks. The hooks n
 - Before a `Write` to an auto-memory file, it saves the content to recall under the file name, with the same tag rules as below, and blocks the write so the local memory folder stops growing; Claude is told the memory is in recall and how to read or change it. When the save fails or takes over 5 seconds, the write goes ahead locally as a fallback and a message shows the first error line. An `Edit` or `MultiEdit` to a memory file is blocked with a pointer to `recall edit <name>`, and any write to `MEMORY.md` is blocked because recall finds memories by search, not by index.
 - After a `Write` or `Edit` to an auto-memory file (under `autoMemoryDirectory`, or `~/.claude/projects/*/memory/` when that is unset; `MEMORY.md` excluded), it runs `recall save`. `user` and `feedback` memories are saved as global; `project` and `reference` memories get the repo tag of the session's directory, or `global` outside a repo. When the save fails, a message says the memory was saved locally but not synced.
 - On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. Up to three matches from other scopes follow under "In other scopes:", each with its tags. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
-- On every prompt, including the ones too short to search on, it rewrites the moving half of the session's record — focus, prompt count, last activity, branch, last commit and permission mode — and syncs it, so `recall sessions` shows from any host what this session is working on.
+- On every prompt, including the ones too short to search on, it rewrites the moving half of the session's record — focus, prompt count, last activity, branch, last commit and permission mode — and starts a sync it does not wait for, at most one every thirty seconds, so `recall sessions` shows from any host what this session is working on.
 - At session start, it adds a short block saying recall is the durable store, listing the CLI commands and the session directory's repo tag (or "global only"). In `tools` mode it first adds memory instructions: what to save, what not to, to update rather than duplicate, and to delete what turns out wrong. When `recall` is missing, it adds an install hint instead.
 - Every hook run appends one line to `${XDG_STATE_HOME:-~/.local/state}/recall/hooks.log`: time, session id, outcome (`hits=<n>`, `no-hits`, `skipped:<reason>`, each followed by `focus:<state>`, plus `crib:<mode>:repo:messaging:<state>`, `crib:<mode>:global:messaging:<state>`, `messaging:<state>`, `not-installed`, `timeout`, `saved:<name>`, `redirect:saved:<name>`, `redirect:fallback:<error>`, `redirect:index`, `redirect:edit`, `error:<message>`) and duration. Prompts, focus lines and memory bodies are never logged.
 
@@ -147,13 +147,16 @@ recall config set messaging.enabled true
 recall devices                                        # the host names you can address
 recall send desktop "pull main and rerun the migration"
 echo "the build is green" | recall send desktop
+recall listen --status                                # who can receive here, and who cannot
 ```
 
 `<host>` is a device name as `recall devices` prints it, or a device id; a name two devices share is an error. The message arrives in every live Claude Code session on that host as a user turn. Claude reaches the same hosts through the `recall_send` MCP tool, registered only while messaging is on.
 
-The plugin runs the listener. At session start the hook writes the session's record to `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json`, then runs `recall listen --ensure`. That starts a background daemon unless one already holds an exclusive `flock` on `$XDG_RUNTIME_DIR/recall/listen.lock`. The daemon holds one WebSocket to the Worker, reconnects with a backoff that doubles from a second to a minute, and writes each message it receives into every registered socket. Session end removes the registry file, and the daemon exits once the registry has stood empty for five minutes; the next session start brings it back. It writes its own `listen:…` and `message:…` lines to the hooks log.
+The plugin runs the listener. At session start the hook writes `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json`, carrying the session's `state`, the pid of its Claude process and, when it registered, the inbox socket and token, then runs `recall listen --ensure`. That starts a background daemon unless one already holds an exclusive `flock` on `$XDG_RUNTIME_DIR/recall/listen.lock`. The daemon holds one WebSocket to the Worker, reconnects with a backoff that doubles from a second to a minute, and writes each message it receives into every registered socket. Session end removes the registry file, and the daemon exits once the registry has stood empty for five minutes; the next session start brings it back. It writes its own `listen:…` and `message:…` lines to the hooks log.
 
-Delivery rides on Claude Code's cross-session inbox, which sits behind the server-side gate `agents_cross_session_inbox`. With the gate off, Claude sets no `CLAUDE_CODE_MESSAGING_SOCKET` and the hooks log one line and stop. No command reports an error, and a message sent to such a host sits in the queue until it expires.
+Delivery rides on Claude Code's cross-session inbox, which sits behind the server-side gate `agents_cross_session_inbox`. With the gate off, Claude sets no `CLAUDE_CODE_MESSAGING_SOCKET` and the hooks log one line and stop. A message sent to such a host sits in the queue until it expires.
+
+`recall listen --status` says why. It prints whether messaging is on and whether a listener holds the lock, then one line per running session: the session id, its directory, and what the hook recorded — `registered` with the pid that receives, `off` for messaging being off, `no-inbox` for a session Claude gave no inbox, or the error a failed registry write raised. A session leaves the list at session end, or on the next read once its Claude process is gone, so a crash leaves nothing behind. Add `--json` for the same report as a document; it carries no socket and no token.
 
 The mailbox is a SQLite-backed Durable Object, one per account. A message carries at most 32 KiB, an account queues at most 1000 messages, and a message expires after 72 hours. A revoked device loses its socket and its queued messages.
 
@@ -165,7 +168,7 @@ Durable Objects with SQLite storage run on the Workers Free plan, which allows 1
 
 ```bash
 recall sessions
-recall --json sessions   # the whole record of each
+recall --json sessions   # the whole document of each
 ```
 
 ```
@@ -173,31 +176,11 @@ laptop  laptop  repo:github.com/mvhenten/recall@feat/sessions-list  12m  busy  l
 tower   tower   global                                              3h   idle  draft the release notes
 ```
 
-Each session is one JSON document, written by the hooks and synced to the service on every prompt. Nothing in it costs a model call or a second network call: the focus line is the session's first prompt and its latest, each cut to 72 characters; the branch and the last commit subject come from one `git log` in the session's directory; the prompt count, the permission mode Claude reports on the hook's stdin, and whether the session is interactive or headless come free.
+The session's registry record is the document. Beside the state the hook left it in, it carries the host, the repo tag, the branch and the last commit subject, the start and last-activity times in epoch milliseconds, a prompt count, the focus, the permission mode Claude reports on the hook's stdin, and whether the session is interactive or headless. Nothing in it costs a model call: the focus line is the session's first prompt and its latest, each cut to 72 characters, and the branch and subject come from one `git log` in the session's directory.
 
-```json
-{
-  "sessionId": "0b9c…",
-  "name": "laptop",
-  "host": "laptop",
-  "cwd": "/home/you/src/recall",
-  "repo": "repo:github.com/mvhenten/recall",
-  "branch": "feat/sessions-list",
-  "commit": "feat(sessions): list every host's sessions",
-  "startedAt": "2026-11-02T10:00:00+01:00",
-  "lastActivityAt": "2026-11-02T10:12:00+01:00",
-  "endedAt": "",
-  "prompts": 7,
-  "focus": { "first": "list every host's sessions", "latest": "why is the worker test red" },
-  "mode": "interactive",
-  "permissionMode": "default",
-  "pid": 4242
-}
-```
+Every host syncs its own sessions, whether or not messaging is on, so the list covers them all. Session start sends the record and session end deletes it. In between, each prompt rewrites the record and starts a sync it does not wait for, at most one every thirty seconds, because the prompt hook's budget belongs to the prompt.
 
-State is read, never stored. A session prompted within the last five minutes is `busy` and one quiet since is `idle`. Session end leaves a tombstone, which reads as `gone` and is swept a quarter of an hour later; a session whose host died before it could tombstone it reads as `gone` on that host, which says so once on behalf of the others, and expires a day after its last prompt either way. `name` is the device name, which is what `recall send` resolves, so the listing doubles as the address book for messaging.
-
-Sessions ride on the same registry as messaging, so they are listed only while `messaging.enabled` is on and Claude's cross-session inbox is open.
+State is read, never stored. A session prompted within the last five minutes is `busy` and one quiet since is `idle`. A session that is gone is one its own host deleted: nothing else ends a session on another host's behalf, and a host that died without deleting its own leaves a record that expires a day after its last prompt. `name` is the device name, which is what `recall send` resolves, so the listing doubles as the address book for messaging.
 
 ## API
 
@@ -216,7 +199,7 @@ The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and
 | `GET`    | `/v1/messages/listen`                     | WebSocket only; pushes the caller's queue and takes ack frames     |
 | `PUT`    | `/v1/sessions/:sessionId`                 | create or replace one session document                             |
 | `GET`    | `/v1/sessions`                            | the account's sessions, newest activity first                      |
-| `DELETE` | `/v1/sessions/:sessionId`                 | tombstone the session, so the listing reads it as gone             |
+| `DELETE` | `/v1/sessions/:sessionId`                 | the session is over; every host stops listing it                   |
 
 The device login follows RFC 8628. `POST /v1/device/code` with `{device_name}` answers a device code, a user code, the verification URL, `expires_in` (600) and `interval` (5). `POST /v1/device/token` with `{grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code}` answers `{access_token, token_type}` once approved, or a 400 with `authorization_pending`, `slow_down`, `access_denied`, `expired_token` or `invalid_grant`. A poll inside the interval gets `slow_down` and widens the interval by five seconds. At most 5 codes per client address and 200 overall wait for approval at once; past that the start answers 429. The approval page at `/device` is the only path behind an Access login; its approve and deny form checks the Access JWT, the origin and a CSRF token.
 

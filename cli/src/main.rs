@@ -14,7 +14,6 @@ use api::{Client, Memory, SaveBody};
 use clap::{Args, Parser, Subcommand};
 use jiff::Timestamp;
 use settings::{Mode, Settings};
-use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -158,9 +157,15 @@ enum Command {
     Listen {
         #[arg(
             long,
+            conflicts_with = "status",
             help = "Start the listener in the background unless one already holds the lock, then exit"
         )]
         ensure: bool,
+        #[arg(
+            long,
+            help = "Print which sessions are registered for messages and why the hook passed the rest over, then exit"
+        )]
+        status: bool,
     },
     #[command(about = "Update recall to the latest release")]
     Update,
@@ -381,39 +386,6 @@ fn message_body(words: &[String]) -> Result<String> {
     Ok(text)
 }
 
-fn session_id(value: &str) -> Result<&str> {
-    if value.is_empty()
-        || value.len() > 100
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        bail!("a session id holds 1 to 100 letters, digits, - and _");
-    }
-    Ok(value)
-}
-
-/// Sessions this host registered and then lost: Claude died before its SessionEnd hook could
-/// tombstone them, so only this host can tell they are over. It says so once, and reads them as
-/// gone meanwhile.
-fn gone_here(client: &Client, listed: &[api::Session]) -> Result<HashSet<String>> {
-    let live: HashSet<String> = sessions::registered(&listen::sessions_dir())
-        .into_iter()
-        .map(|registered| registered.session_id)
-        .collect();
-    let mut gone = HashSet::new();
-    for session in listed {
-        if !session.current || live.contains(&session.session_id) {
-            continue;
-        }
-        if session.ended_at.is_empty() {
-            client.end_session(&session.session_id)?;
-        }
-        gone.insert(session.session_id.clone());
-    }
-    Ok(gone)
-}
-
 fn require_messaging(settings: &Settings) -> Result<()> {
     if settings.messaging_enabled() {
         return Ok(());
@@ -484,24 +456,37 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Update => return update(),
         Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
         Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
-        Command::Listen { ensure } => listen::run(&settings::load(&cli.settings)?, ensure)?,
+        Command::Listen { ensure, status } => {
+            let settings = settings::load(&cli.settings)?;
+            if status {
+                let report = listen::status(&settings)?;
+                if cli.json {
+                    print_json(&report)?;
+                } else {
+                    for line in report.lines() {
+                        println!("{line}");
+                    }
+                }
+            } else {
+                listen::run(&settings, ensure)?;
+            }
+        }
         Command::Sessions { sync, end } => {
             let client = client()?;
             if let Some(id) = sync {
-                let id = session_id(&id)?;
-                let Some(record) = sessions::record(&listen::sessions_dir(), id) else {
+                let Some(record) = sessions::record(&listen::sessions_dir(), &id) else {
                     bail!("no session {id} is registered on this host");
                 };
-                let session = client.sync_session(
-                    id,
+                client.sync_session(
+                    &id,
                     &api::SessionBody {
                         host: &record.host,
                         cwd: &record.cwd.to_string_lossy(),
                         repo: &record.repo,
                         branch: &record.branch,
                         commit: &record.commit,
-                        started_at: &record.started_at,
-                        last_activity_at: &record.last_activity_at,
+                        started_at: record.started_at,
+                        last_activity_at: record.last_activity_at,
                         prompts: record.prompts,
                         focus: &record.focus,
                         mode: &record.mode,
@@ -509,21 +494,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         pid: i64::from(record.pid),
                     },
                 )?;
-                if cli.json {
-                    print_json(&session)?;
-                } else {
-                    println!("synced {id}");
-                }
+                println!("synced {id}");
                 return Ok(ExitCode::SUCCESS);
             }
             if let Some(id) = end {
-                let id = session_id(&id)?;
-                let ended = client.end_session(id)?;
+                let ended = client.end_session(&id)?;
                 println!("{} {id}", if ended { "ended" } else { "already gone" });
                 return Ok(ExitCode::SUCCESS);
             }
             let listed = client.sessions()?;
-            let gone = gone_here(&client, &listed)?;
             if cli.json {
                 print_json(&listed)?;
             } else if listed.is_empty() {
@@ -531,7 +510,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 print!(
                     "{}",
-                    markdown::render_sessions(&listed, &gone, Timestamp::now().as_millisecond())
+                    markdown::render_sessions(&listed, Timestamp::now().as_millisecond())
                 );
             }
         }

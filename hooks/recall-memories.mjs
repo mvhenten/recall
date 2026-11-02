@@ -1,5 +1,5 @@
-import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
-import { messagingEnabled, touch } from "./messaging.mjs";
+import { emit, firstLine, logRun, readInput, recall, recallDetached } from "./lib.mjs";
+import { touch } from "./messaging.mjs";
 import { MIN_SCORE, searchQuery, unseen } from "./query.mjs";
 import { readShown, recordShown } from "./shown.mjs";
 
@@ -27,18 +27,20 @@ async function repoTagOf(cwd) {
   return result.ok ? result.stdout.trim() : undefined;
 }
 
-// Every prompt moves the focus line on, including the ones too short to search on, and the record
-// goes to the service so the other hosts see what this session is working on.
-async function refresh(input, prompt) {
-  if (!messagingEnabled()) return "off";
+// Every prompt moves the focus line on, including the ones too short to search on. The record is
+// a local write; the sync behind it is started and left to run, at most once every
+// SYNC_INTERVAL_MS, because this hook's budget belongs to the prompt and not to the dashboard.
+function refresh(input, prompt) {
   if (!input.session_id || !prompt) return "skipped";
+  let touched;
   try {
-    if (!touch(input.session_id, prompt, input.permission_mode)) return "unregistered";
+    touched = touch(input.session_id, prompt, input.permission_mode);
   } catch (error) {
     return `failed:${firstLine(error.message)}`;
   }
-  const synced = await recall(["sessions", "--sync", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS });
-  return synced.ok ? "synced" : `unsynced:${firstLine(synced.error)}`;
+  if (!touched) return "unregistered";
+  if (!touched.due) return "throttled";
+  return recallDetached(["sessions", "--sync", input.session_id], input.cwd) ? "syncing" : "not-installed";
 }
 
 async function memories(input, prompt) {
@@ -77,9 +79,8 @@ async function memories(input, prompt) {
 
 async function run(input) {
   const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
-  const refreshing = refresh(input, prompt);
-  const outcome = await memories(input, prompt);
-  return `${outcome} focus:${await refreshing}`;
+  const focus = refresh(input, prompt);
+  return `${await memories(input, prompt)} focus:${focus}`;
 }
 
 const started = Date.now();

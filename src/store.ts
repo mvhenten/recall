@@ -1,4 +1,14 @@
-import type { ListInput, Memory, MemoryType, SaveInput } from "./model";
+import type { Caller } from "./device";
+import {
+  type ListInput,
+  type Memory,
+  type MemoryType,
+  type SaveInput,
+  SESSION_TTL_MS,
+  type Session,
+  type SessionInput,
+  type SessionMode,
+} from "./model";
 
 interface MemoryRow {
   memory_id: string;
@@ -176,6 +186,112 @@ export const describeMemories = async (db: D1Database, userId: string, memoryIds
     .bind(userId, JSON.stringify(memoryIds))
     .all<MemoryRow>();
   return results.map(toMemory);
+};
+
+interface SessionRow {
+  session_id: string;
+  name: string;
+  device_id: string;
+  host: string;
+  cwd: string;
+  repo: string;
+  branch: string;
+  commit_subject: string;
+  started_at: number;
+  last_activity_at: number;
+  prompts: number;
+  focus_first: string;
+  focus_latest: string;
+  mode: SessionMode;
+  permission_mode: string;
+  pid: number;
+}
+
+const toSession = (row: SessionRow, caller: Caller): Session => ({
+  sessionId: row.session_id,
+  name: row.name,
+  deviceId: row.device_id,
+  host: row.host,
+  cwd: row.cwd,
+  repo: row.repo,
+  branch: row.branch,
+  commit: row.commit_subject,
+  startedAt: row.started_at,
+  lastActivityAt: row.last_activity_at,
+  prompts: row.prompts,
+  focus: { first: row.focus_first, latest: row.focus_latest },
+  mode: row.mode,
+  permissionMode: row.permission_mode,
+  pid: row.pid,
+  current: row.device_id === caller.deviceId,
+});
+
+const SESSION_COLUMNS = `s.session_id, COALESCE(d.name, '') AS name, s.device_id, s.host, s.cwd, s.repo, s.branch,
+  s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest, s.mode,
+  s.permission_mode, s.pid
+  FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id`;
+
+const expireSessions = (db: D1Database, now: number): D1PreparedStatement =>
+  db.prepare("DELETE FROM sessions WHERE last_activity_at <= ?").bind(now - SESSION_TTL_MS);
+
+export const putSession = async (
+  db: D1Database,
+  caller: Caller,
+  sessionId: string,
+  input: SessionInput,
+  now: number,
+): Promise<void> => {
+  await db.batch([
+    expireSessions(db, now),
+    db
+      .prepare(
+        `INSERT INTO sessions (user_id, session_id, device_id, host, cwd, repo, branch, commit_subject,
+           started_at, last_activity_at, prompts, focus_first, focus_latest, mode, permission_mode, pid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+         ON CONFLICT (user_id, session_id) DO UPDATE SET
+           device_id = excluded.device_id, host = excluded.host, cwd = excluded.cwd, repo = excluded.repo,
+           branch = excluded.branch, commit_subject = excluded.commit_subject, started_at = excluded.started_at,
+           last_activity_at = excluded.last_activity_at, prompts = excluded.prompts,
+           focus_first = excluded.focus_first, focus_latest = excluded.focus_latest, mode = excluded.mode,
+           permission_mode = excluded.permission_mode, pid = excluded.pid`,
+      )
+      .bind(
+        caller.userId,
+        sessionId,
+        caller.deviceId,
+        input.host,
+        input.cwd,
+        input.repo,
+        input.branch,
+        input.commit,
+        input.startedAt,
+        input.lastActivityAt,
+        input.prompts,
+        input.focus.first,
+        input.focus.latest,
+        input.mode,
+        input.permissionMode,
+        input.pid,
+      ),
+  ]);
+};
+
+export const endSession = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+  const result = await db
+    .prepare("DELETE FROM sessions WHERE user_id = ? AND session_id = ?")
+    .bind(userId, sessionId)
+    .run();
+  return result.meta.changes === 1;
+};
+
+export const listSessions = async (db: D1Database, caller: Caller, now: number): Promise<Session[]> => {
+  const [, listed] = await db.batch<SessionRow>([
+    expireSessions(db, now),
+    db
+      .prepare(`SELECT ${SESSION_COLUMNS} WHERE s.user_id = ? ORDER BY s.last_activity_at DESC, s.session_id`)
+      .bind(caller.userId),
+  ]);
+  return (listed?.results ?? []).map((row) => toSession(row, caller));
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {

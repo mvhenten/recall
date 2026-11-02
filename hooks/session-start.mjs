@@ -1,5 +1,5 @@
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
-import { messagingEnabled, register } from "./messaging.mjs";
+import { messagingEnabled, record, register } from "./messaging.mjs";
 
 const TIMEOUT_MS = 3000;
 const INSTALL_HINT = "recall CLI not found; install it from https://github.com/mvhenten/recall#install";
@@ -48,27 +48,38 @@ function modeOf(result) {
 }
 
 function registerSession(input, repoTag) {
-  if (!messagingEnabled()) return "off";
   if (!input.session_id) return "no-session";
+  const permissionMode = input.permission_mode;
   try {
-    return register(input.session_id, input.cwd, repoTag, input.permission_mode) ? "registered" : "no-inbox";
+    if (messagingEnabled()) return register(input.session_id, input.cwd, repoTag, permissionMode);
+    record(input.session_id, { state: "off" }, input.cwd, repoTag, permissionMode);
+    return "off";
   } catch (error) {
-    return `failed:${firstLine(error.message)}`;
+    const state = { state: "failed", error: firstLine(error.message) };
+    try {
+      record(input.session_id, state, input.cwd, repoTag, permissionMode);
+    } catch {
+      // The registry is unwritable, so the hooks log is the only place left to say so.
+    }
+    return `failed:${state.error}`;
   }
 }
 
+// The repo tag is part of the record, so it is read before the session is written rather than
+// beside it. Every session syncs, registered or not: a host with messaging off still belongs in
+// the list `recall sessions` prints.
 async function run(input) {
   const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
   const repoTag = repo.ok ? repo.stdout.trim() : "";
   const messaging = registerSession(input, repoTag);
   const work = [recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS })];
   if (messaging === "registered") {
-    work.push(
-      recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
-      recall(["sessions", "--sync", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS }),
-    );
+    work.push(recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }));
   }
-  const [config, , synced] = await Promise.all(work);
+  if (input.session_id) {
+    work.push(recall(["sessions", "--sync", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS }));
+  }
+  const [config] = await Promise.all(work);
   if (!config.ok && config.error.includes("recall CLI not found")) {
     sessionContext(INSTALL_HINT);
     return "not-installed";
@@ -79,8 +90,7 @@ async function run(input) {
     return `error:${firstLine(error)}`;
   }
   sessionContext(context(mode, repoTag));
-  const state = synced && !synced.ok ? `registered:unsynced:${firstLine(synced.error)}` : messaging;
-  return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${state}`;
+  return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${messaging}`;
 }
 
 const started = Date.now();

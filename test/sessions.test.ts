@@ -1,10 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session, TOMBSTONE_TTL_MS } from "../src/sessions";
+import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session } from "../src/model";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
-
-const iso = (ms: number): string => new Date(ms).toISOString();
 
 const document = (fields: Record<string, unknown> = {}): Record<string, unknown> => ({
   host: "laptop",
@@ -12,8 +10,8 @@ const document = (fields: Record<string, unknown> = {}): Record<string, unknown>
   repo: "repo:github.com/mvhenten/recall",
   branch: "feat/sessions-list",
   commit: "feat(sessions): list every host's sessions",
-  startedAt: "2026-11-02T10:00:00+01:00",
-  lastActivityAt: "2026-11-02T10:02:00+01:00",
+  startedAt: 1_700_000_000_000,
+  lastActivityAt: 1_700_000_060_000,
   prompts: 3,
   focus: { first: "list every host's sessions", latest: "why is the worker test red" },
   mode: "interactive",
@@ -46,10 +44,10 @@ describe("sessions", () => {
     const { laptop, tower } = await account(h);
     const stranger = await h.user("stranger");
 
-    expect((await sync(laptop, "s-laptop", { lastActivityAt: iso(h.now() - 60_000) })).status).toBe(200);
+    expect((await sync(laptop, "s-laptop", { lastActivityAt: h.now() - 60_000 })).status).toBe(204);
     expect(
-      (await sync(tower, "s-tower", { host: "tower", repo: "", branch: "", lastActivityAt: iso(h.now()) })).status,
-    ).toBe(200);
+      (await sync(tower, "s-tower", { host: "tower", repo: "", branch: "", lastActivityAt: h.now() })).status,
+    ).toBe(204);
     await sync(stranger, "s-stranger");
 
     const sessions = await listed(laptop);
@@ -62,12 +60,12 @@ describe("sessions", () => {
       cwd: "/home/you/src/recall",
       branch: "feat/sessions-list",
       commit: "feat(sessions): list every host's sessions",
+      startedAt: 1_700_000_000_000,
       prompts: 3,
       focus: { first: "list every host's sessions", latest: "why is the worker test red" },
       mode: "interactive",
       permissionMode: "default",
       pid: 4242,
-      endedAt: "",
     });
     expect(await listed(stranger)).toHaveLength(1);
   });
@@ -80,7 +78,7 @@ describe("sessions", () => {
     await sync(laptop, "s-1", {
       prompts: 4,
       focus: { first: "list every host's sessions", latest: "ship it" },
-      lastActivityAt: iso(h.now()),
+      lastActivityAt: h.now(),
     });
 
     const sessions = await listed(laptop);
@@ -89,23 +87,20 @@ describe("sessions", () => {
     expect(sessions[0]?.prompts).toBe(4);
   });
 
-  it("tombstones a session on SessionEnd and sweeps the tombstone soon after", async () => {
+  it("drops a session on SessionEnd, so every host stops listing it", async () => {
     const h = await harness();
-    const { laptop } = await account(h);
-    await sync(laptop, "s-1", { lastActivityAt: iso(h.now()) });
+    const { laptop, tower } = await account(h);
+    await sync(laptop, "s-1", { lastActivityAt: h.now() });
 
     expect((await laptop.request("DELETE", "/v1/sessions/s-1")).status).toBe(204);
     expect((await laptop.request("DELETE", "/v1/sessions/s-1")).status).toBe(404);
-    expect((await listed(laptop))[0]?.endedAt).toBe(iso(h.now()));
-
-    h.tick(TOMBSTONE_TTL_MS + 1000);
-    expect(await listed(laptop)).toEqual([]);
+    expect(await listed(tower)).toEqual([]);
   });
 
   it("forgets a session whose host died before it could end it", async () => {
     const h = await harness();
     const { laptop } = await account(h);
-    await sync(laptop, "s-crashed", { lastActivityAt: iso(h.now()) });
+    await sync(laptop, "s-crashed", { lastActivityAt: h.now() });
 
     h.tick(SESSION_TTL_MS + 1000);
 
@@ -121,8 +116,8 @@ describe("sessions", () => {
     );
     expect((await sync(laptop, "s-1", { focus: "just a line" })).status).toBe(400);
     expect((await sync(laptop, "s-1", { host: "" })).status).toBe(400);
-    expect((await sync(laptop, "s-1", { startedAt: 1_762_000_000_000 })).status).toBe(400);
-    expect((await sync(laptop, "s-1", { lastActivityAt: "2026-11-02 10:00:00" })).status).toBe(400);
+    expect((await sync(laptop, "s-1", { startedAt: "2026-11-02T10:00:00+01:00" })).status).toBe(400);
+    expect((await sync(laptop, "s-1", { lastActivityAt: -1 })).status).toBe(400);
     expect((await sync(laptop, "s-1", { mode: "tmux" })).status).toBe(400);
     expect((await sync(laptop, "s-1", { prompts: -1 })).status).toBe(400);
     expect((await sync(laptop, "s 1")).status).toBe(400);

@@ -3,7 +3,6 @@ use crate::sessions;
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
-use std::collections::HashSet;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Document {
@@ -160,28 +159,32 @@ pub fn repo_at_branch(repo: &str, branch: &str) -> String {
 }
 
 /// One line per session: host, the name `recall send` takes, repo@branch, age, state and what the
-/// session is working on. Columns are padded to the widest value so the focus lines start together.
-pub fn render_sessions(sessions: &[Session], gone: &HashSet<String>, now: i64) -> String {
-    let rows: Vec<[String; 6]> = sessions
+/// session is working on. Every column but the last is padded to its widest value, so the focus
+/// lines start together.
+pub fn render_sessions(sessions: &[Session], now: i64) -> String {
+    let rows: Vec<Vec<String>> = sessions
         .iter()
         .map(|session| {
-            [
+            vec![
                 session.host.clone(),
                 session.name.clone(),
                 repo_at_branch(&session.repo, &session.branch),
-                sessions::age(&session.started_at, now),
-                sessions::state(
-                    &session.last_activity_at,
-                    !session.ended_at.is_empty() || gone.contains(&session.session_id),
-                    now,
-                )
-                .to_string(),
-                sessions::focus_line(&session.focus.first, &session.focus.latest),
+                sessions::age(session.started_at, now),
+                sessions::state(session.last_activity_at, now).to_string(),
+                sessions::focus_line(&session.focus),
             ]
         })
         .collect();
-    let width = |column: usize| rows.iter().map(|row| row[column].chars().count()).max().unwrap_or(0);
-    let widths: Vec<usize> = (0..5).map(width).collect();
+    let columns = rows.first().map_or(0, Vec::len);
+    let widths: Vec<usize> = (0..columns.saturating_sub(1))
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
     rows.iter()
         .map(|row| {
             let mut line: String = widths
@@ -190,9 +193,10 @@ pub fn render_sessions(sessions: &[Session], gone: &HashSet<String>, now: i64) -
                 .map(|(column, size)| format!("{:width$}", row[column], width = size))
                 .collect::<Vec<String>>()
                 .join("  ");
-            if !row[5].is_empty() {
+            let focus = row.last().map_or("", String::as_str);
+            if !focus.is_empty() {
                 line.push_str("  ");
-                line.push_str(&row[5]);
+                line.push_str(focus);
             }
             format!("{line}\n")
         })
@@ -241,8 +245,8 @@ mod tests {
 
     #[test]
     fn one_line_per_session_lines_the_focus_up() {
-        let now = sessions::millis("2026-11-02T12:00:00Z").unwrap();
-        let session = |host: &str, repo: &str, branch: &str, started: &str, active: &str, focus: [&str; 2]| Session {
+        let now = 1_762_000_000_000;
+        let session = |host: &str, repo: &str, branch: &str, started: i64, active: i64, focus: [&str; 2]| Session {
             session_id: format!("s-{host}"),
             name: format!("{host}-2"),
             device_id: format!("d-{host}"),
@@ -251,9 +255,8 @@ mod tests {
             repo: repo.to_string(),
             branch: branch.to_string(),
             commit: "feat(sessions): list every host's sessions".to_string(),
-            started_at: started.to_string(),
-            last_activity_at: active.to_string(),
-            ended_at: String::new(),
+            started_at: started,
+            last_activity_at: active,
             prompts: 3,
             focus: sessions::Focus {
                 first: focus[0].to_string(),
@@ -269,30 +272,30 @@ mod tests {
                 "laptop",
                 "repo:github.com/mvhenten/recall",
                 "feat/sessions-list",
-                "2026-11-02T11:48:00Z",
-                "2026-11-02T11:59:00Z",
+                now - 720_000,
+                now - 60_000,
                 ["list the sessions", "why is the worker test red"],
             ),
             session(
                 "tower",
                 "",
                 "",
-                "2026-11-02T09:00:00Z",
-                "2026-11-02T11:00:00Z",
+                now - 10_800_000,
+                now - 3_600_000,
                 ["draft the release notes", ""],
             ),
         ];
 
         assert_eq!(
-            render_sessions(&listed, &HashSet::new(), now),
+            render_sessions(&listed, now),
             "laptop  laptop-2  repo:github.com/mvhenten/recall@feat/sessions-list  12m  busy  list the sessions → why is the worker test red\n\
              tower   tower-2   global                                              3h   idle  draft the release notes\n"
         );
         assert_eq!(
-            render_sessions(&listed[1..], &HashSet::from(["s-tower".to_string()]), now),
-            "tower  tower-2  global  3h  gone  draft the release notes\n"
+            render_sessions(&listed[1..], now),
+            "tower  tower-2  global  3h  idle  draft the release notes\n"
         );
-        assert_eq!(render_sessions(&[], &HashSet::new(), now), "");
+        assert_eq!(render_sessions(&[], now), "");
     }
 
     #[test]

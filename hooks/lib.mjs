@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -25,14 +25,6 @@ export function firstLine(text) {
   return String(text).trim().split("\n").find(Boolean) ?? "";
 }
 
-// ISO 8601 with the host's own offset, so a session record says when its host saw the prompt.
-export function isoNow(date = new Date()) {
-  const offset = -date.getTimezoneOffset();
-  const pad = (value) => String(Math.abs(Math.trunc(value))).padStart(2, "0");
-  const local = new Date(date.getTime() + offset * 60_000).toISOString().slice(0, 19);
-  return `${local}${offset < 0 ? "-" : "+"}${pad(offset / 60)}:${pad(offset % 60)}`;
-}
-
 export function stateDir() {
   const stateHome = process.env.XDG_STATE_HOME || path.join(homedir(), ".local", "state");
   return path.join(stateHome, "recall");
@@ -47,6 +39,22 @@ export function logRun(sessionId, outcome, started) {
   } catch {
     // A failing log must never change how the hook behaves.
   }
+}
+
+// Starts recall and walks away. The prompt hook has a five second budget that belongs to the
+// prompt, so work the prompt does not wait on must not sit in it; a detached child outlives this
+// process and reports nothing back.
+export function recallDetached(args, cwd) {
+  const binary = recallBinary();
+  if (!binary) return false;
+  const child = spawn(binary, args, {
+    cwd: cwd && existsSync(cwd) ? cwd : homedir(),
+    detached: true,
+    stdio: "ignore",
+  });
+  child.on("error", () => {});
+  child.unref();
+  return true;
 }
 
 export function recall(args, { cwd, timeout, input }) {

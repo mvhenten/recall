@@ -203,9 +203,8 @@ pub struct Session {
     pub repo: String,
     pub branch: String,
     pub commit: String,
-    pub started_at: String,
-    pub last_activity_at: String,
-    pub ended_at: String,
+    pub started_at: i64,
+    pub last_activity_at: i64,
     pub prompts: i64,
     pub focus: crate::sessions::Focus,
     pub mode: String,
@@ -222,8 +221,8 @@ pub struct SessionBody<'a> {
     pub repo: &'a str,
     pub branch: &'a str,
     pub commit: &'a str,
-    pub started_at: &'a str,
-    pub last_activity_at: &'a str,
+    pub started_at: i64,
+    pub last_activity_at: i64,
     pub prompts: i64,
     pub focus: &'a crate::sessions::Focus,
     pub mode: &'a str,
@@ -234,11 +233,6 @@ pub struct SessionBody<'a> {
 #[derive(Deserialize)]
 struct Sessions {
     sessions: Vec<Session>,
-}
-
-#[derive(Deserialize)]
-struct Synced {
-    session: Session,
 }
 
 pub fn resolve_host(devices: &[Device], host: &str) -> Result<String> {
@@ -405,14 +399,12 @@ impl Client {
         Ok(listed.sessions)
     }
 
-    pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<Session> {
+    pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<()> {
         let response = self
             .authed(self.agent.put(self.url(&Self::session_path(session_id))))
             .send_json(body)?;
-        let synced: Synced = check(response, &format!("syncing session {session_id}"))?
-            .body_mut()
-            .read_json()?;
-        Ok(synced.session)
+        check(response, &format!("syncing session {session_id}"))?;
+        Ok(())
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {
