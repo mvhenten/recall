@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -6,16 +7,38 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
-/// One live Claude Code session. `hooks/session-start.mjs` writes
-/// `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json` at mode 600 and `hooks/session-end.mjs`
-/// removes it; the daemon only ever reads the directory.
+/// The two prompts a focus line is built from: the one that opened the session and the latest.
+/// The hooks truncate both; nothing here calls a model.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Focus {
+    #[serde(default)]
+    pub first: String,
+    #[serde(default)]
+    pub latest: String,
+}
+
+/// One live Claude Code session, as one JSON document. `hooks/session-start.mjs` writes
+/// `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json` at mode 600, `hooks/recall-memories.mjs`
+/// rewrites the moving fields on every prompt and `hooks/session-end.mjs` removes it; the daemon
+/// only ever reads the directory.
 ///
 /// ```json
 /// {
 ///   "socket": "/run/user/1000/cc-socks/4242.sock",
 ///   "token": "<CLAUDE_CODE_MESSAGING_TOKEN>",
 ///   "pid": 4242,
-///   "cwd": "/home/you/src/recall"
+///   "sessionId": "0b9c…",
+///   "host": "laptop",
+///   "cwd": "/home/you/src/recall",
+///   "repo": "repo:github.com/mvhenten/recall",
+///   "branch": "feat/sessions-list",
+///   "commit": "feat(sessions): list every host's sessions",
+///   "startedAt": "2026-11-02T10:00:00+01:00",
+///   "lastActivityAt": "2026-11-02T10:02:00+01:00",
+///   "prompts": 3,
+///   "focus": { "first": "list every host's sessions", "latest": "why is the worker test red" },
+///   "mode": "interactive",
+///   "permissionMode": "default"
 /// }
 /// ```
 ///
@@ -23,13 +46,37 @@ use tokio::net::UnixStream;
 /// the hook inherited them, `pid` is the Claude process the socket belongs to, and the file name
 /// is the session id Claude reports on the hook's stdin. The file name is what a delivered frame
 /// carries as `session_id`, so a registration that outlived its session is dropped by Claude
-/// instead of landing in whatever session now owns the socket.
+/// instead of landing in whatever session now owns the socket. No state is stored: busy, idle and
+/// gone are read off the timestamps, the tombstone and the pid.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Session {
     pub socket: PathBuf,
     pub token: String,
     pub pid: i32,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub host: String,
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub last_activity_at: String,
+    #[serde(default)]
+    pub prompts: i64,
+    #[serde(default)]
+    pub focus: Focus,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub permission_mode: String,
 }
 
 /// Holds the inbox token back, so no log line or error can carry the credential that writes into
@@ -41,7 +88,18 @@ impl std::fmt::Debug for Session {
             .field("socket", &self.socket)
             .field("token", &"<redacted>")
             .field("pid", &self.pid)
+            .field("session_id", &self.session_id)
+            .field("host", &self.host)
             .field("cwd", &self.cwd)
+            .field("repo", &self.repo)
+            .field("branch", &self.branch)
+            .field("commit", &self.commit)
+            .field("started_at", &self.started_at)
+            .field("last_activity_at", &self.last_activity_at)
+            .field("prompts", &self.prompts)
+            .field("focus", &self.focus)
+            .field("mode", &self.mode)
+            .field("permission_mode", &self.permission_mode)
             .finish()
     }
 }
@@ -112,6 +170,59 @@ pub fn registered(dir: &Path) -> Vec<Registered> {
             .then_with(|| left.1.session_id.cmp(&right.1.session_id))
     });
     live.into_iter().map(|(_, registered)| registered).collect()
+}
+
+/// The record this host wrote for one session, whether or not its process is still alive.
+pub fn record(dir: &Path, session_id: &str) -> Option<Session> {
+    read(&dir.join(format!("{session_id}.json"))).map(|registered| registered.session)
+}
+
+pub const IDLE_AFTER: Duration = Duration::from_secs(300);
+pub const FOCUS_SEPARATOR: &str = " → ";
+
+pub fn millis(timestamp: &str) -> Option<i64> {
+    timestamp
+        .parse::<Timestamp>()
+        .ok()
+        .map(|parsed| parsed.as_millisecond())
+}
+
+/// State is read, never stored: a session prompted within `IDLE_AFTER` is busy, one that has sat
+/// quiet since is idle, and one that ended, or whose process is gone on its own host, is gone.
+pub fn state(last_activity_at: &str, ended: bool, now: i64) -> &'static str {
+    if ended {
+        return "gone";
+    }
+    match millis(last_activity_at) {
+        Some(at) if now.saturating_sub(at) < IDLE_AFTER.as_millis() as i64 => "busy",
+        _ => "idle",
+    }
+}
+
+/// How long ago, in the largest unit that still reads as a duration: 45s, 12m, 3h, 2d.
+pub fn age(since: &str, now: i64) -> String {
+    let Some(since) = millis(since) else {
+        return "-".to_string();
+    };
+    let seconds = now.saturating_sub(since).max(0) / 1000;
+    for (unit, size) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if seconds >= size {
+            return format!("{}{unit}", seconds / size);
+        }
+    }
+    format!("{seconds}s")
+}
+
+/// The focus line: the prompt that opened the session, then the latest one.
+pub fn focus_line(first: &str, latest: &str) -> String {
+    if first.is_empty() || latest.is_empty() || first == latest {
+        return if first.is_empty() {
+            latest.to_string()
+        } else {
+            first.to_string()
+        };
+    }
+    format!("{first}{FOCUS_SEPARATOR}{latest}")
 }
 
 fn frames(registered: &Registered, body: &str) -> String {
@@ -221,7 +332,21 @@ mod tests {
                 socket: socket.to_path_buf(),
                 token: "t-inbox".to_string(),
                 pid,
+                session_id: session_id.to_string(),
+                host: "laptop".to_string(),
                 cwd: self.dir.clone(),
+                repo: "repo:github.com/mvhenten/recall".to_string(),
+                branch: "work".to_string(),
+                commit: "feat(sessions): list every host's sessions".to_string(),
+                started_at: "2026-11-02T10:00:00+01:00".to_string(),
+                last_activity_at: "2026-11-02T10:01:00+01:00".to_string(),
+                prompts: 2,
+                focus: Focus {
+                    first: "list the sessions".to_string(),
+                    latest: "why is the worker test red".to_string(),
+                },
+                mode: "interactive".to_string(),
+                permission_mode: "default".to_string(),
             };
             std::fs::write(
                 self.sessions().join(format!("{session_id}.json")),
@@ -299,6 +424,55 @@ mod tests {
         );
         assert!(!sandbox.sessions().join("s-dead.json").exists());
         assert!(!sandbox.sessions().join("s-socketless.json").exists());
+    }
+
+    #[test]
+    fn state_is_read_off_the_timestamps_and_the_tombstone() {
+        let now = millis("2026-11-02T10:05:00+01:00").unwrap();
+        assert_eq!(state("2026-11-02T10:05:00+01:00", false, now), "busy");
+        assert_eq!(state("2026-11-02T09:00:01+00:00", false, now), "busy");
+        assert_eq!(state("2026-11-02T10:00:00+01:00", false, now), "idle");
+        assert_eq!(state("", false, now), "idle");
+        assert_eq!(state("2026-11-02T10:05:00+01:00", true, now), "gone");
+    }
+
+    #[test]
+    fn an_age_reads_in_the_largest_unit_that_still_fits() {
+        let now = millis("2026-11-02T12:00:00Z").unwrap();
+        assert_eq!(age("2026-11-02T11:59:15Z", now), "45s");
+        assert_eq!(age("2026-11-02T11:48:00Z", now), "12m");
+        assert_eq!(age("2026-11-02T10:00:00+01:00", now), "3h");
+        assert_eq!(age("2026-10-31T12:00:00Z", now), "2d");
+        assert_eq!(age("2026-11-02T12:00:05Z", now), "0s");
+        assert_eq!(age("", now), "-");
+    }
+
+    #[test]
+    fn a_focus_line_is_the_first_prompt_and_the_latest() {
+        assert_eq!(focus_line("ship it", "why is CI red"), "ship it → why is CI red");
+        assert_eq!(focus_line("ship it", "ship it"), "ship it");
+        assert_eq!(focus_line("ship it", ""), "ship it");
+        assert_eq!(focus_line("", "ship it"), "ship it");
+        assert_eq!(focus_line("", ""), "");
+    }
+
+    #[test]
+    fn a_record_written_before_the_session_document_still_reads() {
+        let sandbox = Sandbox::new("legacy");
+        std::fs::write(
+            sandbox.sessions().join("s-old.json"),
+            r#"{"socket":"/run/cc.sock","token":"t-inbox","pid":42,"cwd":"/home/you/src/recall"}"#,
+        )
+        .unwrap();
+
+        let session = record(&sandbox.sessions(), "s-old").expect("an older record must still parse");
+
+        assert_eq!(session.pid, 42);
+        assert_eq!(session.focus.first, "");
+        assert_eq!(session.prompts, 0);
+        assert_eq!(session.started_at, "");
+        assert_eq!(state(&session.last_activity_at, false, 1_762_000_000_000), "idle");
+        assert!(record(&sandbox.sessions(), "s-missing").is_none());
     }
 
     #[tokio::test]

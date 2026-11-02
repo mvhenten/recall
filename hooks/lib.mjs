@@ -25,6 +25,14 @@ export function firstLine(text) {
   return String(text).trim().split("\n").find(Boolean) ?? "";
 }
 
+// ISO 8601 with the host's own offset, so a session record says when its host saw the prompt.
+export function isoNow(date = new Date()) {
+  const offset = -date.getTimezoneOffset();
+  const pad = (value) => String(Math.abs(Math.trunc(value))).padStart(2, "0");
+  const local = new Date(date.getTime() + offset * 60_000).toISOString().slice(0, 19);
+  return `${local}${offset < 0 ? "-" : "+"}${pad(offset / 60)}:${pad(offset % 60)}`;
+}
+
 export function stateDir() {
   const stateHome = process.env.XDG_STATE_HOME || path.join(homedir(), ".local", "state");
   return path.join(stateHome, "recall");

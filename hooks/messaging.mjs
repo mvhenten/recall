@@ -1,6 +1,11 @@
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
+import { truncate } from "./focus.mjs";
+import { isoNow } from "./lib.mjs";
+
+const GIT_TIMEOUT_MS = 2000;
 
 export function configFile(env = process.env) {
   if (env.RECALL_CONFIG_FILE) return env.RECALL_CONFIG_FILE;
@@ -43,15 +48,86 @@ function inbox(env = process.env) {
   return { socket, token, pid };
 }
 
-export function register(sessionId, cwd, env = process.env, uid = process.getuid()) {
+// One git call for both the branch and the last subject. %D decorates the tip with "HEAD -> " and
+// the branch it points at; a detached head, a repo with no commits and no repo at all give "".
+export function head(cwd) {
+  try {
+    const shown = execFileSync("git", ["-C", cwd, "log", "-1", "--no-color", "--format=%D%n%s"], {
+      encoding: "utf8",
+      timeout: GIT_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).split("\n");
+    const refs = shown[0] ?? "";
+    const pointer = refs.split(", ").find((ref) => ref.startsWith("HEAD -> "));
+    return { branch: pointer ? pointer.slice("HEAD -> ".length) : "", commit: (shown[1] ?? "").trim() };
+  } catch {
+    return { branch: "", commit: "" };
+  }
+}
+
+// `claude -p` runs headless. The Claude process is the one the inbox socket is named for, not the
+// hook's own parent, which is the shell Claude ran the hook command with.
+export function invocation(pid) {
+  try {
+    const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    return argv.includes("-p") || argv.includes("--print") ? "headless" : "interactive";
+  } catch {
+    return "";
+  }
+}
+
+function read(file) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function write(file, record) {
+  writeFileSync(file, `${JSON.stringify(record)}\n`);
+  chmodSync(file, 0o600);
+}
+
+export function register(sessionId, cwd, repo, permissionMode, env = process.env, uid = process.getuid()) {
   const session = inbox(env);
   if (!session) return false;
   const dir = sessionsDir(env, uid);
   mkdirSync(dir, { recursive: true });
   chmodSync(dir, 0o700);
+  const now = isoNow();
+  write(registryPath(sessionId, env, uid), {
+    ...session,
+    sessionId,
+    host: hostname(),
+    cwd,
+    repo: repo ?? "",
+    ...head(cwd),
+    startedAt: now,
+    lastActivityAt: now,
+    prompts: 0,
+    focus: { first: "", latest: "" },
+    mode: invocation(session.pid),
+    permissionMode: permissionMode ?? "",
+  });
+  return true;
+}
+
+// Each prompt counts, moves the focus on and marks the session active. The branch, the commit and
+// the permission mode all change under a running session, so they are read again here.
+export function touch(sessionId, prompt, permissionMode, env = process.env, uid = process.getuid()) {
   const file = registryPath(sessionId, env, uid);
-  writeFileSync(file, `${JSON.stringify({ ...session, cwd })}\n`);
-  chmodSync(file, 0o600);
+  const record = read(file);
+  if (!record) return false;
+  const latest = truncate(prompt);
+  write(file, {
+    ...record,
+    ...head(record.cwd),
+    lastActivityAt: isoNow(),
+    prompts: (record.prompts ?? 0) + 1,
+    focus: { first: record.focus?.first || latest, latest },
+    permissionMode: permissionMode ?? "",
+  });
   return true;
 }
 

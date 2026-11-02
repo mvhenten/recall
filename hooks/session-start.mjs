@@ -47,26 +47,28 @@ function modeOf(result) {
   return { error: result.error };
 }
 
-function registerSession(input) {
+function registerSession(input, repoTag) {
   if (!messagingEnabled()) return "off";
   if (!input.session_id) return "no-session";
   try {
-    return register(input.session_id, input.cwd) ? "registered" : "no-inbox";
+    return register(input.session_id, input.cwd, repoTag, input.permission_mode) ? "registered" : "no-inbox";
   } catch (error) {
     return `failed:${firstLine(error.message)}`;
   }
 }
 
 async function run(input) {
-  const messaging = registerSession(input);
-  const work = [
-    recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
-    recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
-  ];
+  const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
+  const repoTag = repo.ok ? repo.stdout.trim() : "";
+  const messaging = registerSession(input, repoTag);
+  const work = [recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS })];
   if (messaging === "registered") {
-    work.push(recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }));
+    work.push(
+      recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
+      recall(["sessions", "--sync", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS }),
+    );
   }
-  const [repo, config] = await Promise.all(work);
+  const [config, , synced] = await Promise.all(work);
   if (!config.ok && config.error.includes("recall CLI not found")) {
     sessionContext(INSTALL_HINT);
     return "not-installed";
@@ -76,9 +78,9 @@ async function run(input) {
     sessionContext(`recall is misconfigured: ${error}`);
     return `error:${firstLine(error)}`;
   }
-  const repoTag = repo.ok ? repo.stdout.trim() : "";
   sessionContext(context(mode, repoTag));
-  return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${messaging}`;
+  const state = synced && !synced.ok ? `registered:unsynced:${firstLine(synced.error)}` : messaging;
+  return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${state}`;
 }
 
 const started = Date.now();

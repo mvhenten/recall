@@ -1,4 +1,5 @@
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
+import { messagingEnabled, touch } from "./messaging.mjs";
 import { MIN_SCORE, searchQuery, unseen } from "./query.mjs";
 import { readShown, recordShown } from "./shown.mjs";
 
@@ -26,8 +27,21 @@ async function repoTagOf(cwd) {
   return result.ok ? result.stdout.trim() : undefined;
 }
 
-async function run(input) {
-  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+// Every prompt moves the focus line on, including the ones too short to search on, and the record
+// goes to the service so the other hosts see what this session is working on.
+async function refresh(input, prompt) {
+  if (!messagingEnabled()) return "off";
+  if (!input.session_id || !prompt) return "skipped";
+  try {
+    if (!touch(input.session_id, prompt, input.permission_mode)) return "unregistered";
+  } catch (error) {
+    return `failed:${firstLine(error.message)}`;
+  }
+  const synced = await recall(["sessions", "--sync", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS });
+  return synced.ok ? "synced" : `unsynced:${firstLine(synced.error)}`;
+}
+
+async function memories(input, prompt) {
   if (prompt.startsWith("/")) return "skipped:slash-command";
   if (prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) return "skipped:short-prompt";
 
@@ -59,6 +73,13 @@ async function run(input) {
     ...found.elsewhere.map(({ name }) => name),
   ]);
   return `hits=${found.hits.length} elsewhere=${found.elsewhere.length}`;
+}
+
+async function run(input) {
+  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+  const refreshing = refresh(input, prompt);
+  const outcome = await memories(input, prompt);
+  return `${outcome} focus:${await refreshing}`;
 }
 
 const started = Date.now();
