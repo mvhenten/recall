@@ -1,5 +1,6 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session } from "../src/model";
+import { MAX_FOCUS_CHARS, SESSION_HISTORY_TTL_MS, SESSION_TTL_MS, type Session } from "../src/model";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -123,5 +124,82 @@ describe("sessions", () => {
     expect((await laptop.sync("s-1", { prompts: -1 })).status).toBe(400);
     expect((await laptop.sync("s 1")).status).toBe(400);
     expect((await laptop.request("POST", "/v1/sessions")).status).toBe(405);
+  });
+});
+
+describe("session history", () => {
+  it("keeps the row of a session that ended and of one that expired", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+
+    await laptop.sync("ended-session", { lastActivityAt: h.now() });
+    const lastActivityAt = h.tick(60_000);
+    await laptop.sync("crashed-session", { lastActivityAt });
+    expect((await laptop.request("DELETE", "/v1/sessions/ended-session")).status).toBe(204);
+    h.tick(SESSION_TTL_MS + 1000);
+    expect(await listed(laptop)).toEqual([]);
+
+    const { results } = await env.DB.prepare(
+      `SELECT session_id, device_name, host, cwd, repo, branch, commit_subject, started_at, last_activity_at,
+         prompts, focus_first, focus_latest, mode
+       FROM session_history WHERE session_id IN ('ended-session', 'crashed-session')
+       ORDER BY last_activity_at DESC`,
+    ).all();
+    expect(results).toEqual([
+      {
+        session_id: "crashed-session",
+        device_name: "laptop",
+        host: "laptop",
+        cwd: "/home/you/src/recall",
+        repo: "repo:github.com/mvhenten/recall",
+        branch: "feat/sessions-list",
+        commit_subject: "feat(sessions): list every host's sessions",
+        started_at: 1_700_000_000_000,
+        last_activity_at: lastActivityAt,
+        prompts: 3,
+        focus_first: "list every host's sessions",
+        focus_latest: "why is the worker test red",
+        mode: "interactive",
+      },
+      expect.objectContaining({ session_id: "ended-session" }),
+    ]);
+  });
+
+  it("holds one row per session, so the latest sync wins", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+
+    await laptop.sync("resynced-session");
+    await laptop.sync("resynced-session", {
+      branch: "feat/session-history",
+      prompts: 9,
+      focus: { first: "list every host's sessions", latest: "ship it" },
+      lastActivityAt: h.now(),
+    });
+
+    const { results } = await env.DB.prepare(
+      "SELECT branch, prompts, focus_latest FROM session_history WHERE session_id = 'resynced-session'",
+    ).all();
+    expect(results).toEqual([{ branch: "feat/session-history", prompts: 9, focus_latest: "ship it" }]);
+  });
+
+  it("drops a row past the retention window on the next sync, and only the caller's", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+    const stranger = await h.user("stranger");
+
+    await laptop.sync("ancient-mine", { lastActivityAt: h.now() });
+    await stranger.sync("ancient-theirs", { lastActivityAt: h.now() });
+    h.tick(SESSION_HISTORY_TTL_MS / 2);
+    await laptop.sync("midway-mine", { lastActivityAt: h.now() });
+    h.tick(SESSION_HISTORY_TTL_MS / 2 + 1000);
+    await laptop.sync("fresh-mine", { lastActivityAt: h.now() });
+
+    const { results } = await env.DB.prepare(
+      `SELECT session_id FROM session_history
+       WHERE session_id IN ('ancient-mine', 'ancient-theirs', 'midway-mine', 'fresh-mine')
+       ORDER BY last_activity_at DESC`,
+    ).all<{ session_id: string }>();
+    expect(results.map((row) => row.session_id)).toEqual(["fresh-mine", "midway-mine", "ancient-theirs"]);
   });
 });

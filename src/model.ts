@@ -67,6 +67,7 @@ export const sessionModes = ["interactive", "headless", ""] as const;
 export type SessionMode = (typeof sessionModes)[number];
 
 export const SESSION_TTL_MS = 86_400_000;
+export const SESSION_HISTORY_TTL_MS = 180 * 86_400_000;
 // The five minutes of IDLE_AFTER in cli/src/sessions.rs, which is the original: both sides derive
 // busy and idle on read and must agree on where the line falls.
 export const IDLE_AFTER_MS = 300_000;

@@ -5,6 +5,7 @@ import {
   type MemoryCounts,
   type MemoryType,
   type SaveInput,
+  SESSION_HISTORY_TTL_MS,
   SESSION_TTL_MS,
   type Session,
   type SessionInput,
@@ -271,6 +272,11 @@ const toSession = (row: SessionRow): Session => ({
 const expireSessions = (db: D1Database, userId: string, now: number): D1PreparedStatement =>
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND last_activity_at <= ?").bind(userId, now - SESSION_TTL_MS);
 
+const forgetOldHistory = (db: D1Database, userId: string, now: number): D1PreparedStatement =>
+  db
+    .prepare("DELETE FROM session_history WHERE user_id = ? AND last_activity_at <= ?")
+    .bind(userId, now - SESSION_HISTORY_TTL_MS);
+
 export const putSession = async (
   db: D1Database,
   caller: Caller,
@@ -310,6 +316,18 @@ export const putSession = async (
         input.permissionMode,
         input.pid,
       ),
+    forgetOldHistory(db, caller.userId, now),
+    db
+      .prepare(
+        `INSERT OR REPLACE INTO session_history (user_id, session_id, device_id, device_name, host, cwd, repo,
+           branch, commit_subject, started_at, last_activity_at, prompts, focus_first, focus_latest, mode)
+         SELECT s.user_id, s.session_id, s.device_id, COALESCE(d.name, ''), s.host, s.cwd, s.repo,
+           s.branch, s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest,
+           s.mode
+         FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
+         WHERE s.user_id = ?1 AND s.session_id = ?2`,
+      )
+      .bind(caller.userId, sessionId),
   ]);
 };
 
