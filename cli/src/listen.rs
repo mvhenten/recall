@@ -8,8 +8,10 @@ use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::Serialize;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -459,15 +461,32 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
 }
 
 pub const HANDOVER: Duration = Duration::from_secs(5);
+const PROCFS: &str = "/proc";
 
-/// Ends the daemon named beside the lock and waits for it to let the lock go. A pid file a daemon
-/// that is gone left behind names nothing, and the signal says so.
-fn stop(limit: Duration) -> bool {
-    let named = std::fs::read_to_string(pid_path())
+/// Whether the pid file names this host's own daemon, and not whatever process now owns a pid a
+/// daemon that was killed left behind: the runtime directory can outlive a reboot, so a stale pid
+/// file is ordinary. A pid is only signalled when a daemon really does hold the lock and that pid
+/// really is a recall process.
+fn daemon(lock: &Path, pid_file: &Path, procfs: &Path) -> Option<i32> {
+    let pid = std::fs::read_to_string(pid_file)
+        .ok()?
+        .trim()
+        .parse::<i32>()
         .ok()
-        .and_then(|text| text.trim().parse::<i32>().ok())
-        .filter(|pid| *pid > 1);
-    let Some(pid) = named else {
+        .filter(|pid| *pid > 1)?;
+    if !matches!(Lock::acquire(lock), Ok(None)) {
+        return None;
+    }
+    let argv = std::fs::read(procfs.join(pid.to_string()).join("cmdline")).ok()?;
+    let first = argv.split(|byte| *byte == 0).next()?;
+    let command = Path::new(OsStr::from_bytes(first)).file_name()?.to_str()?.to_string();
+    (command == "recall").then_some(pid)
+}
+
+/// Ends this host's daemon and waits for it to let the lock go. A pid file that names no daemon
+/// leaves everything alone, and the caller's own `ensure` is then what brings a listener up.
+fn stop(lock: &Path, pid_file: &Path, procfs: &Path, limit: Duration) -> bool {
+    let Some(pid) = daemon(lock, pid_file, procfs) else {
         return false;
     };
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
@@ -475,7 +494,7 @@ fn stop(limit: Duration) -> bool {
     }
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
-        if matches!(Lock::acquire(&lock_path()), Ok(Some(_))) {
+        if matches!(Lock::acquire(lock), Ok(Some(_))) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -489,7 +508,7 @@ fn stop(limit: Duration) -> bool {
 /// here may fail the update, so the hooks log is where it reports.
 pub fn restart(settings: &Settings) {
     let started = Instant::now();
-    let stopped = stop(HANDOVER);
+    let stopped = stop(&lock_path(), &pid_path(), Path::new(PROCFS), HANDOVER);
     if !settings.messaging_enabled() {
         log(&format!("listen:stopped-for-update:{stopped}"), started.elapsed());
         return;
@@ -647,6 +666,50 @@ mod tests {
                 "no session is running on this host".to_string(),
             ]
         );
+    }
+
+    /// The pid file names this test's own process twice over, so a signal sent where none is due
+    /// would take the test runner down with it: surviving the first two passes is the assertion.
+    #[test]
+    fn only_a_recall_daemon_that_holds_the_lock_is_ever_signalled() {
+        let dir = sandbox("stop");
+        let lock = dir.join("listen.lock");
+        let pid_file = dir.join("listen.pid");
+        let procfs = dir.join("proc");
+        let named = |pid: u32, argv: &str| {
+            let entry = procfs.join(pid.to_string());
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join("cmdline"), argv.replace(' ', "\0")).unwrap();
+            std::fs::write(&pid_file, format!("{pid}\n")).unwrap();
+        };
+        let limit = Duration::from_millis(100);
+
+        named(std::process::id(), "node --test");
+        assert!(
+            !stop(&lock, &pid_file, &procfs, limit),
+            "a pid now owned by something else is left alone"
+        );
+
+        named(std::process::id(), "/home/you/.cargo/bin/recall listen");
+        assert!(
+            !stop(&lock, &pid_file, &procfs, limit),
+            "a pid file no daemon stands behind is a stale one, whatever it names"
+        );
+
+        let mut standing_in = Command::new("sleep").arg("60").spawn().unwrap();
+        named(standing_in.id(), "recall listen");
+        let held = Lock::acquire(&lock).unwrap().unwrap();
+        assert!(
+            !stop(&lock, &pid_file, &procfs, limit),
+            "the lock stays held here, so the handover never completes"
+        );
+        assert!(
+            !standing_in.wait().unwrap().success(),
+            "the daemon holding the lock is the one that gets the signal"
+        );
+
+        held.release().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

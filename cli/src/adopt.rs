@@ -38,6 +38,11 @@ const TRANSCRIPT: &str = "jsonl";
 const HEAD: usize = 8192;
 const ADOPTED: &str = "adopted";
 
+/// How long after a session starts its transcript may be opened. Claude Code opens one seconds in,
+/// so a wide allowance still holds, and it keeps a process whose own transcript is missing from
+/// reaching forward to one a session that started much later opened.
+const OPENED_WITHIN: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The tagged envelopes Claude Code writes as a user turn. A transcript old enough to carry no
 /// origin on its entries is read off these instead; a prompt that merely opens with a tag of its
 /// own, a question about `<div>` for one, still counts.
@@ -216,17 +221,17 @@ fn opened(path: &Path) -> Option<i64> {
         .find_map(|entry| timestamp(&entry))
 }
 
-/// When the transcript was opened. The filesystem's own creation time is the reading to trust; a
-/// filesystem that keeps none leaves the time of the first entry, and a transcript whose first
-/// line says nothing leaves its last write.
-fn birth(path: &Path, metadata: &std::fs::Metadata) -> SystemTime {
+/// When the transcript was opened. The filesystem's own creation time is the reading to trust, and
+/// a filesystem that keeps none leaves the time of the first entry. Nothing else will do: a last
+/// write says when a session was busy and not when it began, and matching on that is what hands a
+/// live session the id of one that ended. A transcript that can say neither is one no running
+/// session is matched to at all.
+fn birth(path: &Path, metadata: &std::fs::Metadata) -> Option<SystemTime> {
     if let Ok(created) = metadata.created() {
-        return created;
+        return Some(created);
     }
-    if let Some(at) = opened(path).filter(|at| *at > 0) {
-        return UNIX_EPOCH + std::time::Duration::from_millis(at as u64);
-    }
-    metadata.modified().unwrap_or(UNIX_EPOCH)
+    let at = opened(path).filter(|at| *at > 0)?;
+    Some(UNIX_EPOCH + std::time::Duration::from_millis(at as u64))
 }
 
 /// The transcripts of one directory. A session's transcript sits directly under the project
@@ -245,7 +250,7 @@ fn transcripts(projects: &Path, cwd: &Path) -> Vec<Transcript> {
             let metadata = entry.metadata().ok()?;
             Some(Transcript {
                 session_id: path.file_stem()?.to_str()?.to_string(),
-                born: birth(&path, &metadata),
+                born: birth(&path, &metadata)?,
                 modified: metadata.modified().ok()?,
                 size: metadata.len(),
                 path,
@@ -326,7 +331,12 @@ fn claims(scope: &Scope, registry: &Registry) -> Vec<Claim> {
             let found = available
                 .iter()
                 .enumerate()
-                .filter(|(_, transcript)| transcript.born >= process.started)
+                .filter(|(_, transcript)| {
+                    transcript
+                        .born
+                        .duration_since(process.started)
+                        .is_ok_and(|after| after <= OPENED_WITHIN)
+                })
                 .min_by_key(|(_, transcript)| transcript.born)
                 .map(|(index, _)| index);
             let Some(index) = found else {
@@ -649,7 +659,7 @@ mod tests {
         }
 
         fn born(&self, path: &Path) -> SystemTime {
-            birth(path, &std::fs::metadata(path).unwrap())
+            birth(path, &std::fs::metadata(path).unwrap()).unwrap()
         }
 
         fn record(&self, session_id: &str) -> Option<Value> {
@@ -722,7 +732,7 @@ mod tests {
         let path = sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
         let wrote = ago(30);
         stamp(&path, wrote);
-        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        sandbox.claude(4242, &cwd, &["claude"], ago(60));
 
         let adopted = adopt(&sandbox.scope).unwrap();
 
@@ -777,7 +787,7 @@ mod tests {
         let sandbox = Sandbox::new("registered");
         let cwd = sandbox.work("recall");
         sandbox.transcript(&cwd, "s-hooked", &session("2026-11-02T10:00:00.000Z"));
-        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        sandbox.claude(4242, &cwd, &["claude"], ago(60));
         let path = sandbox.scope.sessions.join("s-hooked.json");
         let written = r#"{"state":"registered","socket":"/run/inbox.sock","token":"t","pid":4242,"cwd":"/elsewhere","sessionId":"s-hooked","prompts":9}"#;
         std::fs::write(&path, written).unwrap();
@@ -795,7 +805,7 @@ mod tests {
         let sandbox = Sandbox::new("torn");
         let cwd = sandbox.work("recall");
         sandbox.transcript(&cwd, "s-hooked", &session("2026-11-02T10:00:00.000Z"));
-        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        sandbox.claude(4242, &cwd, &["claude"], ago(60));
         let path = sandbox.scope.sessions.join("s-hooked.json");
         let torn = r#"{"state":"registered","socket":"/run/inbox.sock","to"#;
         std::fs::write(&path, torn).unwrap();
@@ -817,7 +827,7 @@ mod tests {
         assert_eq!(adopt(&sandbox.scope).unwrap(), Vec::new());
         assert!(sandbox.record("s-ended").is_none());
 
-        sandbox.claude(4242, &sandbox.work("other"), &["claude", "-p", "ship it"], ago(3600));
+        sandbox.claude(4242, &sandbox.work("other"), &["claude", "-p", "ship it"], ago(60));
         assert_eq!(
             adopt(&sandbox.scope).unwrap(),
             Vec::new(),
@@ -831,7 +841,7 @@ mod tests {
         let cwd = sandbox.work("recall");
         let path = sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
         stamp(&path, ago(300));
-        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        sandbox.claude(4242, &cwd, &["claude"], ago(60));
 
         adopt(&sandbox.scope).unwrap();
         let first = sandbox.record("s-live").unwrap();
@@ -893,7 +903,7 @@ mod tests {
         let cwd = sandbox.work("recall");
         let path = sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
         stamp(&path, ago(300));
-        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        sandbox.claude(4242, &cwd, &["claude"], ago(60));
         adopt(&sandbox.scope).unwrap();
 
         std::fs::write(&path, format!("{}\n", human("2026-11-02T11:00:00.000Z", "start over"))).unwrap();
@@ -948,7 +958,7 @@ mod tests {
             human("2026-11-02T10:20:00.000Z", &"word ".repeat(30)),
         ];
         sandbox.transcript(&cwd, "s-live", &lines);
-        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        sandbox.claude(4242, &cwd, &["claude"], ago(60));
 
         adopt(&sandbox.scope).unwrap();
 
@@ -1036,7 +1046,7 @@ mod tests {
         let sandbox = Sandbox::new("unwritable");
         let cwd = sandbox.work("recall");
         sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
-        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        sandbox.claude(4242, &cwd, &["claude"], ago(60));
         std::fs::remove_dir_all(&sandbox.scope.sessions).unwrap();
         std::fs::write(&sandbox.scope.sessions, "not a directory").unwrap();
 
