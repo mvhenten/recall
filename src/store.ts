@@ -2,6 +2,7 @@ import type { Caller } from "./device";
 import {
   type ListInput,
   type Memory,
+  type MemoryCounts,
   type MemoryType,
   type SaveInput,
   SESSION_TTL_MS,
@@ -120,16 +121,46 @@ export const listMemories = async (
     .prepare(
       `SELECT ${MEMORY_COLUMNS} FROM memories m
        WHERE m.user_id = ?1 AND ${TAG_FILTER} AND m.created_at >= ?3
+         AND (json_array_length(?7) = 0 OR m.type IN (SELECT value FROM json_each(?7)))
          AND (m.created_at < ?4 OR (m.created_at = ?4 AND m.memory_id < ?5))
        ORDER BY m.created_at DESC, m.memory_id DESC
        LIMIT ?6`,
     )
-    .bind(userId, JSON.stringify(input.tags), input.since, cursorCreatedAt, cursorId, input.limit + 1)
+    .bind(
+      userId,
+      JSON.stringify(input.tags),
+      input.since,
+      cursorCreatedAt,
+      cursorId,
+      input.limit + 1,
+      JSON.stringify(input.types),
+    )
     .all<MemoryRow>();
   const memories = results.slice(0, input.limit).map(toMemory);
   const last = memories.at(-1);
   const nextCursor = results.length > input.limit && last ? encodeCursor(last) : "";
   return { memories, nextCursor };
+};
+
+export const memoryCounts = async (db: D1Database, userId: string, since: number): Promise<MemoryCounts> => {
+  const { results } = await db
+    .prepare(
+      `SELECT m.type AS type, COUNT(*) AS total,
+         SUM(CASE WHEN m.recall_count > 0 THEN 1 ELSE 0 END) AS recalled,
+         SUM(CASE WHEN m.created_at >= ?2 THEN 1 ELSE 0 END) AS fresh
+       FROM memories m WHERE m.user_id = ?1
+       GROUP BY m.type ORDER BY total DESC, m.type`,
+    )
+    .bind(userId, since)
+    .all<{ type: MemoryType; total: number; recalled: number; fresh: number }>();
+  const sum = (pick: (row: { total: number; recalled: number; fresh: number }) => number): number =>
+    results.reduce((running, row) => running + pick(row), 0);
+  return {
+    total: sum((row) => row.total),
+    recalled: sum((row) => row.recalled),
+    fresh: sum((row) => row.fresh),
+    byType: results.map((row) => ({ type: row.type, count: row.total })),
+  };
 };
 
 const toBytes = (value: unknown): Uint8Array => {

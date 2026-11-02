@@ -178,3 +178,200 @@ describe("the sessions tab", () => {
     expect(html).not.toContain('class="feed"');
   });
 });
+
+interface Owner {
+  email: string;
+  assertion: string;
+  client: Client;
+}
+
+const withMemories = async (h: Harness, label = "owner"): Promise<Owner> => {
+  const address = await h.invite(email(label));
+  return {
+    email: address,
+    assertion: await h.assertionFor(address),
+    client: h.clientWithToken(await h.login(address, "laptop")),
+  };
+};
+
+// The tab is read as a reader reads it: tags out, whitespace collapsed, so an assertion names the
+// sentence on the page instead of the markup that carries it.
+const plain = (html: string): string => html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+
+const memoryTab = async (h: Harness, owner: Owner, search = ""): Promise<string> => {
+  const response = await open(h, `/dashboard/memory${search}`, owner.assertion);
+  expect(response.status).toBe(200);
+  return plain(await response.text());
+};
+
+const older = (html: string): string => {
+  const href = /href="(\/dashboard\/memory\?[^"]+)">Older memories/.exec(html);
+  if (!href?.[1]) throw new Error("the listing shows no link to the older page");
+  return href[1].replaceAll("&amp;", "&");
+};
+
+describe("the memory tab", () => {
+  it("lists the signed-in user's memories newest created first and no stranger's", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    const stranger = await withMemories(h, "stranger");
+    await owner.client.save("oldest-note", { description: "the first thing learned" });
+    h.tick(1_000);
+    await owner.client.save("newest-note", { description: "the latest thing learned", type: "user" });
+    await stranger.client.save("stranger-note", { description: "none of the owner's business" });
+
+    const html = await memoryTab(h, owner);
+    expect(html).toContain("newest-note");
+    expect(html).toContain("the latest thing learned");
+    expect(html).toContain("oldest-note");
+    expect(html.indexOf("newest-note")).toBeLessThan(html.indexOf("oldest-note"));
+    expect(html).not.toContain("stranger-note");
+    expect(html).not.toContain("none of the owner's business");
+  });
+
+  it("counts the memories, the recalled, the never recalled and the fresh ones per type", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    await owner.client.save("read-often", { type: "user" });
+    await owner.client.save("read-never", { type: "project" });
+    await owner.client.save("read-never-either", { type: "project" });
+    expect((await owner.client.request("GET", "/v1/memories/read-often?recall=true")).status).toBe(200);
+
+    const html = await memoryTab(h, owner);
+    expect(html).toContain("3 memories");
+    expect(html).toContain("1 recalled");
+    expect(html).toContain("2 never recalled");
+    expect(html).toContain("3 new in 30 days");
+    expect(html).toContain("project 2");
+    expect(html).toContain("user 1");
+  });
+
+  it("narrows the listing by tag and by type, and refuses a type it does not know", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    await owner.client.save("repo-note", { type: "project", tags: ["repo:github.com/acme/app"] });
+    await owner.client.save("global-note", { type: "reference", tags: ["global"] });
+
+    const byTag = await memoryTab(h, owner, "?tag=global");
+    expect(byTag).toContain("global-note");
+    expect(byTag).not.toContain("repo-note");
+
+    const byType = await memoryTab(h, owner, "?type=project");
+    expect(byType).toContain("repo-note");
+    expect(byType).not.toContain("global-note");
+
+    const refused = await open(h, "/dashboard/memory?type=notatype", owner.assertion);
+    expect(refused.status).toBe(400);
+    expect(plain(await refused.text())).toContain("type must be one of user, feedback, project, reference");
+  });
+
+  it("follows the cursor to the older page, keeping the filter", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    for (const name of ["first-note", "second-note", "third-note"]) {
+      await owner.client.save(name, { tags: ["global"] });
+      h.tick(1_000);
+    }
+
+    const response = await open(h, "/dashboard/memory?tag=global&limit=2", owner.assertion);
+    const markup = await response.text();
+    const first = plain(markup);
+    expect(first).toContain("third-note");
+    expect(first).toContain("second-note");
+    expect(first).not.toContain("first-note");
+
+    const page = await open(h, older(markup), owner.assertion);
+    expect(page.status).toBe(200);
+    const second = plain(await page.text());
+    expect(second).toContain("first-note");
+    expect(second).not.toContain("third-note");
+    expect(second).not.toContain("Older memories");
+  });
+
+  it("narrows to the memories a search matches, with a score, and says so when none do", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    await owner.client.save("coffee-order", { body: "he takes his espresso ristretto" });
+    await owner.client.save("deploy-steps", { body: "run the migration before the worker" });
+
+    const found = await memoryTab(h, owner, "?q=espresso");
+    expect(found).toContain("coffee-order");
+    expect(found).not.toContain("deploy-steps");
+    expect(found).toMatch(/score 0\.\d{3}/);
+
+    const nothing = await memoryTab(h, owner, "?q=kombucha");
+    expect(nothing).toContain("No memory matches this search.");
+    expect(nothing).not.toContain("coffee-order");
+  });
+
+  it("says so when nothing is saved yet", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    expect(await memoryTab(h, owner)).toContain("No memory is saved yet.");
+  });
+
+  it("stays behind Access, for the listing and for one memory", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    await owner.client.save("private-note", {});
+    const stranger = email("stranger");
+
+    for (const path of ["/dashboard/memory", "/dashboard/memory/private-note"]) {
+      expect((await open(h, path, null)).status).toBe(401);
+      expect((await open(h, path, await h.assertionFor(stranger))).status).toBe(403);
+    }
+  });
+});
+
+describe("one memory's page", () => {
+  it("renders the body and never lets its markdown become markup", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    await owner.client.save("risky-note", {
+      description: "holds markup a browser must not run",
+      type: "reference",
+      tags: ["global"],
+      body: "# heading\n\n<script>alert('pwned')</script>\n\n- a & b < c",
+    });
+
+    const response = await open(h, "/dashboard/memory/risky-note", owner.assertion);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("&lt;script&gt;");
+    const text = plain(html);
+    expect(text).toContain("risky-note");
+    expect(text).toContain("holds markup a browser must not run");
+    expect(text).toContain("# heading");
+    expect(text).toContain("reference");
+    expect(text).toContain("global");
+  });
+
+  it("leaves the recall count and the last recall alone", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    await owner.client.save("quiet-note", {});
+    expect((await owner.client.request("GET", "/v1/memories/quiet-note?recall=true")).status).toBe(200);
+    const before = await owner.client.get("quiet-note");
+    h.tick(60_000);
+
+    expect((await open(h, "/dashboard/memory/quiet-note", owner.assertion)).status).toBe(200);
+    expect(await memoryTab(h, owner, "?q=quiet")).toContain("quiet-note");
+    const after = await owner.client.get("quiet-note");
+    expect(after.recallCount).toBe(before.recallCount);
+    expect(after.lastRecalledAt).toBe(before.lastRecalledAt);
+  });
+
+  it("has no page for a memory this user does not have", async () => {
+    const h = await harness();
+    const owner = await withMemories(h);
+    const stranger = await withMemories(h, "stranger");
+    await stranger.client.save("stranger-note", {});
+
+    for (const path of ["/dashboard/memory/stranger-note", "/dashboard/memory/never-saved", "/dashboard/memory/Nope"]) {
+      const response = await open(h, path, owner.assertion);
+      expect(response.status).toBe(404);
+      expect(plain(await response.text())).toContain("This recall holds no memory at this address.");
+    }
+  });
+});

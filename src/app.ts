@@ -1,4 +1,15 @@
-import { dashboardNotice, dashboardPage, SESSIONS_TAB, sessionsPage, tabForPath } from "./dashboard";
+import {
+  dashboardNotice,
+  dashboardPage,
+  MEMORY_TAB,
+  type MemoryFilters,
+  memoriesPage,
+  memoryBodyPage,
+  memorySearchPage,
+  SESSIONS_TAB,
+  sessionsPage,
+  tabForPath,
+} from "./dashboard";
 import {
   type Caller,
   DEVICE_CODE_TTL_MS,
@@ -22,7 +33,11 @@ import {
 import { DEVICE_HEADER, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, NOW_HEADER, parseSend } from "./mailbox";
 import {
   type Embedder,
+  FRESH_WINDOW_MS,
+  type ListInput,
+  MAX_QUERY_CHARS,
   type Memory,
+  type MemoryHit,
   parseList,
   parseName,
   parseSave,
@@ -42,6 +57,7 @@ import {
   getMemory,
   listMemories,
   listSessions,
+  memoryCounts,
   putSession,
   recall,
   saveMemory,
@@ -86,6 +102,10 @@ const GRANT_ERRORS = {
 } as const;
 
 const ELSEWHERE_LIMIT = 3;
+
+// The --min-score default of recall search, so the dashboard keeps or drops a vector match the way
+// the CLI does.
+const BROWSE_MIN_SCORE = 0.55;
 
 type Ranking = Array<[string, number]>;
 
@@ -256,10 +276,92 @@ export const createApp = (deps: Deps): App => {
       return signIn(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
     }
     const tab = tabForPath(url.pathname);
-    if (!tab) return lost(404, "No such page", "The dashboard has no page at this address.");
+    if (tab === null) {
+      const prefix = `${MEMORY_TAB.path}/`;
+      if (!url.pathname.startsWith(prefix)) {
+        return lost(404, "No such page", "The dashboard has no page at this address.");
+      }
+      return memoryBody(url.pathname.slice(prefix.length), db, userId, email, lost);
+    }
+    if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, lost);
     if (tab.path !== SESSIONS_TAB.path) return dashboardPage(email, tab);
     const now = deps.now();
     return sessionsPage(email, await listSessions(db, userId, now), now);
+  };
+
+  const memoryBody = async (
+    rawName: string,
+    db: D1Database,
+    userId: string,
+    email: string,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const name = parseName(decodeSegment(rawName) ?? "");
+    const memory = name.ok ? await getMemory(db, userId, name.value) : null;
+    if (!memory) return lost(404, "No such memory", "This recall holds no memory at this address.");
+    return memoryBodyPage(email, memory, deps.now());
+  };
+
+  // The tab reads with getMemory and describeMemories, never recall, so browsing never counts as a
+  // recall: the distinction the CLI and the tools draw holds in the browser too.
+  const memoryTab = async (
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const params = new URLSearchParams();
+    for (const [key, value] of url.searchParams) if (value !== "") params.append(key, value);
+    const filters: MemoryFilters = {
+      query: params.get("q") ?? "",
+      tag: params.get("tag") ?? "",
+      type: params.get("type") ?? "",
+    };
+    if (filters.query.length > MAX_QUERY_CHARS) {
+      return lost(400, "Search too long", `A search holds at most ${MAX_QUERY_CHARS} characters.`);
+    }
+    const input = parseList(params);
+    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
+    const now = deps.now();
+    const counts = await memoryCounts(db, userId, now - FRESH_WINDOW_MS);
+    if (filters.query === "") {
+      const cursor = decodeCursor(input.value.cursor);
+      if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the Memory tab.");
+      const page = await listMemories(db, userId, input.value, cursor);
+      return memoriesPage(email, filters, counts, page.memories, page.nextCursor, now);
+    }
+    const hits = await searchMemories(db, userId, filters.query, input.value);
+    return memorySearchPage(email, filters, counts, hits, now);
+  };
+
+  const searchMemories = async (
+    db: D1Database,
+    userId: string,
+    query: string,
+    filter: ListInput,
+  ): Promise<MemoryHit[]> => {
+    const rankings = await rank(db, userId, {
+      query,
+      tags: filter.tags,
+      limit: filter.limit,
+      minScore: BROWSE_MIN_SCORE,
+      mode: "hybrid",
+    });
+    const top = rankings.inScope.slice(0, filter.limit);
+    if (top.length === 0) return [];
+    const described = await describeMemories(
+      db,
+      userId,
+      top.map(([id]) => id),
+    );
+    const byId = new Map(described.map((memory) => [memory.memoryId, memory]));
+    return top.flatMap(([id, score]) => {
+      const memory = byId.get(id);
+      if (!memory) return [];
+      if (filter.types.length > 0 && !filter.types.includes(memory.type)) return [];
+      return [{ memory, score }];
+    });
   };
 
   const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
