@@ -55,10 +55,10 @@ pub fn repo_tag(dir: &Path) -> Option<String> {
 }
 
 /// What a session's record says about the work: the subject of the last commit and the branch the
-/// tip points at. Mirrors head() in hooks/messaging.mjs, down to the one git call — %D decorates
-/// the tip with "HEAD -> " and the branch it points at, and the subject comes first so an empty
-/// decoration cannot be mistaken for one. A detached head, a repo with no commits and no repo at
-/// all each give nothing.
+/// tip points at, from the one git call hooks/messaging.mjs makes for the same two fields. %D
+/// decorates the tip with "HEAD -> " and the branch it points at; the subject is asked for first
+/// here, because this reader trims the output and an empty decoration ahead of it would be read as
+/// the subject. A detached head, a repo with no commits and no repo at all each give nothing.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Head {
     pub branch: String,

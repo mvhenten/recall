@@ -2,19 +2,20 @@
 //! leaves every session that was already running without a record: it never syncs, and the
 //! dashboard shows nothing of it until it restarts. What its hooks would have written is read back
 //! out of /proc and the session's own transcript instead — the Claude processes running now, the
-//! transcript each is writing, and the prompts in it.
+//! transcript each one opened, and the prompts in it.
 //!
-//! A session that already has a record is left alone, whatever state it is in: the hooks own what
-//! they wrote, and adoption only fills an absence. The record it writes carries `state: adopted`,
-//! which is both what `recall listen --status` reports and the mark that says this pass may move
-//! the record on; the hooks' own next write takes it over.
+//! A session the registry already names is left alone, whatever its record says and whether or not
+//! that record even parses: the hooks own what they wrote, and adoption only fills an absence. The
+//! record it writes carries `state: adopted`, which is both what `recall listen --status` reports
+//! and the mark that says a later pass may move this record on. The first prompt a current hook
+//! sees takes the record back, and adoption leaves it alone from then on.
 //!
-//! The transcript is read line by line, as hooks/usage.mjs reads it: one JSON document a line, a
-//! line that does not parse skipped, and `message.content` either a string or a list of blocks.
-//! The usage reader counts what the models answered; this one reads what the user typed, and the
-//! two never read the same entries. It lives here rather than in the hooks because the daemon tick
-//! that keeps an adopted session fresh is this binary's, and the hooks are installed as a plugin
-//! this binary cannot find.
+//! The transcript is read line by line and past a mark, as hooks/usage.mjs reads one: one JSON
+//! document a line, a line that does not parse skipped, a stretch cut back to its last complete
+//! line, and `message.content` either a string or a list of blocks. That reader counts what the
+//! models answered; this one reads what the user typed, and the two never read the same entries.
+//! It lives here rather than in the hooks because the daemon tick that keeps an adopted session
+//! fresh is this binary's, and the hooks are installed as a plugin this binary cannot find.
 
 use crate::config;
 use crate::listen;
@@ -22,19 +23,33 @@ use crate::repo;
 use crate::sessions::Focus;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use serde::Serialize;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Mirrors FOCUS_PART_CHARS in hooks/messaging.mjs.
 const FOCUS_PART_CHARS: usize = 72;
 const CLAUDE: &str = "claude";
 const TRANSCRIPT: &str = "jsonl";
+const HEAD: usize = 8192;
+const ADOPTED: &str = "adopted";
+
+/// The tagged envelopes Claude Code writes as a user turn. A transcript old enough to carry no
+/// origin on its entries is read off these instead; a prompt that merely opens with a tag of its
+/// own, a question about `<div>` for one, still counts.
+const ENVELOPES: [&str; 7] = [
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<system-reminder>",
+    "<task-notification>",
+];
 
 /// Where one pass looks: the procfs that names the running processes, the directory Claude Code
 /// writes transcripts under, the registry the hooks write, and the host name a record carries.
@@ -48,8 +63,8 @@ pub struct Scope {
 
 impl Scope {
     pub fn here() -> Result<Scope> {
-        let claude = config::claude_dir()
-            .context("neither CLAUDE_CONFIG_DIR nor HOME is set, so there are no transcripts to read")?;
+        let claude =
+            config::claude_dir().context("neither CLAUDE_CONFIG_DIR nor HOME is set, so there are no transcripts")?;
         Ok(Scope {
             procfs: PathBuf::from("/proc"),
             projects: claude.join("projects"),
@@ -59,15 +74,14 @@ impl Scope {
     }
 }
 
-/// One running Claude process. `named` is the session an open file descriptor gives away, which is
-/// the only reading that settles two sessions sharing a directory outright, and `started` is when
-/// the process began, which bounds how old its transcript can be.
+/// One running Claude process. `started` is when it began, and that is what says which transcript
+/// is its own: Claude Code opens the session's transcript seconds after the process starts, so the
+/// transcript born soonest after that is the one this session is writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Process {
     pid: i32,
     cwd: PathBuf,
     mode: String,
-    named: Option<String>,
     started: SystemTime,
 }
 
@@ -75,7 +89,9 @@ struct Process {
 struct Transcript {
     session_id: String,
     path: PathBuf,
+    born: SystemTime,
     modified: SystemTime,
+    size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +101,7 @@ struct Claim {
 }
 
 /// A record this pass wrote: `adopted` for a session that had none, `refreshed` for one whose
-/// transcript has moved since the last pass. Either way the service has not been told yet.
+/// transcript has been written to since the last pass. Either way the service has not been told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Adoption {
     pub session_id: String,
@@ -96,6 +112,14 @@ fn millis(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|since| since.as_millis() as i64)
         .unwrap_or_default()
+}
+
+fn number(document: &Value, field: &str) -> i64 {
+    document[field].as_i64().unwrap_or_default()
+}
+
+fn text(document: &Value, field: &str) -> String {
+    document[field].as_str().unwrap_or_default().to_string()
 }
 
 fn argv(procfs: &Path, pid: i32) -> Vec<String> {
@@ -128,33 +152,6 @@ fn is_claude(procfs: &Path, pid: i32, argv: &[String]) -> bool {
         .unwrap_or(false)
 }
 
-/// The session id an open descriptor names. Claude Code holds a transcript open only while it is
-/// writing one, so this is usually nothing: the session's own transcript is
-/// `<slug>/<session-id>.jsonl` and a subagent's sits under `<slug>/<session-id>/`.
-fn named(procfs: &Path, pid: i32, projects: &Path) -> Option<String> {
-    let entries = std::fs::read_dir(procfs.join(pid.to_string()).join("fd")).ok()?;
-    for entry in entries.flatten() {
-        let Ok(target) = std::fs::read_link(entry.path()) else {
-            continue;
-        };
-        let Ok(rest) = target.strip_prefix(projects) else {
-            continue;
-        };
-        let mut parts = rest.components().filter_map(|part| match part {
-            Component::Normal(name) => name.to_str(),
-            _ => None,
-        });
-        let (Some(_slug), Some(second)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let session = second.strip_suffix(".jsonl").unwrap_or(second);
-        if !session.is_empty() {
-            return Some(session.to_string());
-        }
-    }
-    None
-}
-
 /// When the process began: procfs stamps the pid's own directory with it.
 fn started(procfs: &Path, pid: i32) -> SystemTime {
     std::fs::metadata(procfs.join(pid.to_string()))
@@ -162,12 +159,12 @@ fn started(procfs: &Path, pid: i32) -> SystemTime {
         .unwrap_or(UNIX_EPOCH)
 }
 
-/// Every Claude process this host is running, oldest pid first.
+/// Every Claude process this host is running.
 fn running(scope: &Scope) -> Vec<Process> {
     let Ok(entries) = std::fs::read_dir(&scope.procfs) else {
         return Vec::new();
     };
-    let mut found: Vec<Process> = entries
+    entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
         .filter_map(|pid| {
@@ -175,18 +172,14 @@ fn running(scope: &Scope) -> Vec<Process> {
             if !is_claude(&scope.procfs, pid, &argv) {
                 return None;
             }
-            let cwd = std::fs::read_link(scope.procfs.join(pid.to_string()).join("cwd")).ok()?;
             Some(Process {
                 pid,
-                cwd,
+                cwd: std::fs::read_link(scope.procfs.join(pid.to_string()).join("cwd")).ok()?,
                 mode: mode(&argv),
-                named: named(&scope.procfs, pid, &scope.projects),
                 started: started(&scope.procfs, pid),
             })
         })
-        .collect();
-    found.sort_by_key(|process| process.pid);
-    found
+        .collect()
 }
 
 /// Mirrors how Claude Code names a project directory: every character outside [A-Za-z0-9] becomes
@@ -204,79 +197,157 @@ fn slug(cwd: &Path) -> String {
         .collect()
 }
 
-/// The transcripts of one directory, newest write first. A session's transcript sits directly
-/// under the project directory; a subagent's sits a level down and belongs to no session of its
-/// own.
+fn timestamp(entry: &Value) -> Option<i64> {
+    entry["timestamp"]
+        .as_str()?
+        .parse::<Timestamp>()
+        .ok()
+        .map(|time| time.as_millisecond())
+}
+
+/// The time the first entry of a transcript carries, read out of its opening bytes.
+fn opened(path: &Path) -> Option<i64> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    file.take(HEAD as u64).read_to_end(&mut head).ok()?;
+    String::from_utf8_lossy(&head)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|entry| timestamp(&entry))
+}
+
+/// When the transcript was opened. The filesystem's own creation time is the reading to trust; a
+/// filesystem that keeps none leaves the time of the first entry, and a transcript whose first
+/// line says nothing leaves its last write.
+fn birth(path: &Path, metadata: &std::fs::Metadata) -> SystemTime {
+    if let Ok(created) = metadata.created() {
+        return created;
+    }
+    if let Some(at) = opened(path).filter(|at| *at > 0) {
+        return UNIX_EPOCH + std::time::Duration::from_millis(at as u64);
+    }
+    metadata.modified().unwrap_or(UNIX_EPOCH)
+}
+
+/// The transcripts of one directory. A session's transcript sits directly under the project
+/// directory; a subagent's sits a level down and is no session of its own.
 fn transcripts(projects: &Path, cwd: &Path) -> Vec<Transcript> {
     let Ok(entries) = std::fs::read_dir(projects.join(slug(cwd))) else {
         return Vec::new();
     };
-    let mut found: Vec<Transcript> = entries
+    entries
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
             if path.extension() != Some(OsStr::new(TRANSCRIPT)) {
                 return None;
             }
+            let metadata = entry.metadata().ok()?;
             Some(Transcript {
                 session_id: path.file_stem()?.to_str()?.to_string(),
-                modified: entry.metadata().ok()?.modified().ok()?,
+                born: birth(&path, &metadata),
+                modified: metadata.modified().ok()?,
+                size: metadata.len(),
                 path,
             })
         })
-        .collect();
-    found.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| left.session_id.cmp(&right.session_id))
-    });
-    found
+        .collect()
 }
 
-fn take_named(available: &mut Vec<Transcript>, session_id: &str) -> Option<Transcript> {
-    let found = available.iter().position(|entry| entry.session_id == session_id)?;
-    Some(available.remove(found))
+/// What the registry already holds: every session it names, the Claude processes those records
+/// name, and the adopted records a pass may move on. A record counts as present from its file
+/// alone, parsed or not — the hooks write one with a single write and no rename, so a record read
+/// mid-write does not parse, and overwriting that session would throw away the inbox it carries.
+#[derive(Debug, Default)]
+struct Registry {
+    sessions: HashSet<String>,
+    pids: HashSet<i32>,
+    adopted: Vec<(String, Value)>,
 }
 
-/// Which transcript each running session is writing. A descriptor Claude still holds open settles
-/// it outright. The rest of a directory's transcripts are handed out newest first, one per
-/// process, oldest process to oldest transcript: a directory running two sessions must not adopt
-/// one transcript twice, and the transcripts of sessions that have ended are left where they are.
-/// A transcript last written before its process began is one of those: a session that has just
-/// started, or one resumed and not yet prompted, takes nothing until it writes something of its
-/// own.
-fn claims(scope: &Scope) -> Vec<Claim> {
+fn parsed(path: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn registry(dir: &Path) -> Registry {
+    let mut registry = Registry::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return registry;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()).map(str::to_string) else {
+            continue;
+        };
+        registry.sessions.insert(session_id.clone());
+        let Some(document) = parsed(&path) else {
+            continue;
+        };
+        if let Some(pid) = document["pid"].as_i64() {
+            registry.pids.insert(pid as i32);
+        }
+        if document["state"] == ADOPTED {
+            registry.adopted.push((session_id, document));
+        }
+    }
+    registry.adopted.sort_by(|left, right| left.0.cmp(&right.0));
+    registry
+}
+
+/// Which transcript each running session opened. A process the registry already names is passed
+/// over, and so is a transcript it already names, so only what nothing describes is matched at
+/// all. Of what is left, a process takes the transcript born soonest after it started: a session
+/// that ended minutes ago leaves the directory's most recently written transcript behind, and
+/// matching on that would hand a live session a dead one's id.
+///
+/// A session resumed into a transcript opened before it was is passed over rather than guessed at.
+/// Nothing in a transcript says which process is writing it, and taking one that merely looks
+/// recent is exactly how a live session ends up under a dead one's id; that session is listed
+/// again when it next starts.
+fn claims(scope: &Scope, registry: &Registry) -> Vec<Claim> {
     let mut by_directory: BTreeMap<PathBuf, Vec<Process>> = BTreeMap::new();
     for process in running(scope) {
+        if registry.pids.contains(&process.pid) {
+            continue;
+        }
         by_directory.entry(process.cwd.clone()).or_default().push(process);
     }
     let mut claimed = Vec::new();
-    for (cwd, processes) in by_directory {
-        let mut available = transcripts(&scope.projects, &cwd);
-        let mut waiting = Vec::new();
+    for (cwd, mut processes) in by_directory {
+        let mut available: Vec<Transcript> = transcripts(&scope.projects, &cwd)
+            .into_iter()
+            .filter(|transcript| !registry.sessions.contains(&transcript.session_id))
+            .collect();
+        processes.sort_by_key(|process| process.started);
         for process in processes {
-            match process.named.as_deref().and_then(|id| take_named(&mut available, id)) {
-                Some(transcript) => claimed.push(Claim { process, transcript }),
-                None => waiting.push(process),
-            }
-        }
-        available.truncate(waiting.len());
-        available.reverse();
-        for (process, transcript) in waiting.into_iter().zip(available) {
-            if transcript.modified >= process.started {
-                claimed.push(Claim { process, transcript });
-            }
+            let found = available
+                .iter()
+                .enumerate()
+                .filter(|(_, transcript)| transcript.born >= process.started)
+                .min_by_key(|(_, transcript)| transcript.born)
+                .map(|(index, _)| index);
+            let Some(index) = found else {
+                continue;
+            };
+            claimed.push(Claim {
+                transcript: available.remove(index),
+                process,
+            });
         }
     }
     claimed.sort_by_key(|claim| claim.process.pid);
     claimed
 }
 
-/// What the transcript says about its session: when it opened, the prompts the user typed, and the
-/// permission mode the last of them carried.
+/// What a transcript says about its session, and how far into it this reading has reached. It goes
+/// into the next pass as it stands, so a stretch with no prompt in it leaves the count and the
+/// focus where they are.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Transcribed {
+struct Reading {
+    offset: u64,
     started_at: i64,
     prompts: i64,
     focus: Focus,
@@ -313,7 +384,7 @@ fn content(message: &Value) -> String {
 /// say which is which outright: `origin.kind` is `human` for a prompt the user submitted and names
 /// the machinery that wrote every other one. An older transcript carries no origin, and is read
 /// off the marks it does have: a tool result, an interrupted turn, a meta entry, a compaction
-/// summary and the tagged envelopes the harness writes are none of them prompts.
+/// summary and the envelopes above are none of them prompts.
 fn typed(entry: &Value) -> Option<String> {
     if entry["type"] != "user" {
         return None;
@@ -333,92 +404,61 @@ fn typed(entry: &Value) -> Option<String> {
     match entry["origin"]["kind"].as_str() {
         Some("human") => Some(text),
         Some(_) => None,
-        None if text.starts_with('<') => None,
+        None if ENVELOPES.iter().any(|envelope| text.starts_with(envelope)) => None,
         None => Some(text),
     }
 }
 
-fn timestamp(entry: &Value) -> Option<i64> {
-    entry["timestamp"]
-        .as_str()?
-        .parse::<Timestamp>()
-        .ok()
-        .map(|time| time.as_millisecond())
-}
-
-/// Reads the whole transcript: the prompt count is every prompt the file holds, which is what the
-/// file supports and not what a record counted from zero would say about a session resumed into
-/// it.
-fn transcribe(path: &Path, fallback: i64) -> Transcribed {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Transcribed {
-            started_at: fallback,
-            ..Transcribed::default()
-        };
+/// The stretch of transcript past the mark the last reading left, cut back to its last complete
+/// line: an entry still being written is never half-read, and the next pass takes it whole. A file
+/// shorter than the mark is a different transcript under the same name, and is read again from its
+/// start.
+fn read_on(path: &Path, carried: Reading) -> Reading {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return carried;
     };
-    let mut told = Transcribed::default();
-    for line in BufReader::new(file).lines().map_while(std::result::Result::ok) {
-        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or_default();
+    let restarted = size < carried.offset;
+    let from = if restarted { 0 } else { carried.offset };
+    let mut reading = if restarted { Reading::default() } else { carried.clone() };
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return carried;
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return carried;
+    }
+    let Some(cut) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        reading.offset = from;
+        return reading;
+    };
+    reading.offset = from + cut as u64 + 1;
+    for line in String::from_utf8_lossy(&bytes[..cut]).lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if told.started_at == 0 {
-            told.started_at = timestamp(&entry).unwrap_or_default();
+        if reading.started_at == 0 {
+            reading.started_at = timestamp(&entry).unwrap_or_default();
         }
         let Some(prompt) = typed(&entry) else {
             continue;
         };
         let latest = truncate(&prompt);
-        if told.focus.first.is_empty() {
-            told.focus.first = latest.clone();
+        if reading.focus.first.is_empty() {
+            reading.focus.first = latest.clone();
         }
-        told.focus.latest = latest;
-        told.prompts += 1;
-        told.permission_mode = entry["permissionMode"].as_str().unwrap_or_default().to_string();
+        reading.focus.latest = latest;
+        reading.prompts += 1;
+        reading.permission_mode = text(&entry, "permissionMode");
     }
-    if told.started_at == 0 {
-        told.started_at = fallback;
-    }
-    told
+    reading
 }
 
-/// The record shape hooks/messaging.mjs writes, so a session the hooks never saw reads back the
-/// same as one they did. The usage marks start at the end of the transcript: nothing has counted
-/// the tokens spent before this pass, and a hook that takes the record over must not count them
-/// twice.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Document<'a> {
-    state: &'static str,
-    pid: i32,
-    cwd: &'a Path,
-    session_id: &'a str,
-    host: &'a str,
-    repo: String,
-    branch: String,
-    commit: String,
-    started_at: i64,
-    last_activity_at: i64,
-    sync_started_at: i64,
-    prompts: i64,
-    focus: Focus,
-    mode: &'a str,
-    permission_mode: String,
-    transcript_path: &'a Path,
-    usage_offset: u64,
-    usage_high_water: i64,
-    usage_prompts: i64,
-    usage_message_id: String,
+fn record_path(scope: &Scope, session_id: &str) -> PathBuf {
+    scope.sessions.join(format!("{session_id}.json"))
 }
 
-fn stored(path: &Path) -> Option<Value> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
-}
-
-fn number(document: &Value, field: &str) -> i64 {
-    document[field].as_i64().unwrap_or_default()
-}
-
-fn write(path: &Path, document: &Document) -> Result<()> {
+fn write(path: &Path, document: &Value) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
@@ -430,109 +470,137 @@ fn write(path: &Path, document: &Document) -> Result<()> {
         .with_context(|| format!("locking down {}", path.display()))
 }
 
-/// Writes the record every running session is missing, and moves an adopted record on when its
-/// transcript has grown. Last activity is the transcript's own last write, so a session whose
-/// transcript has not moved since the last pass has nothing new to say and is passed over; the
-/// sessions that come back are the ones the caller syncs.
-pub fn adopt(scope: &Scope) -> Vec<Adoption> {
-    let mut adopted = Vec::new();
-    for claim in claims(scope) {
-        let session_id = &claim.transcript.session_id;
-        let path = scope.sessions.join(format!("{session_id}.json"));
-        let held = stored(&path);
-        if let Some(document) = held.as_ref()
-            && document["state"] != "adopted"
-        {
-            continue;
-        }
-        let last_activity_at = millis(claim.transcript.modified);
-        if held
-            .as_ref()
-            .is_some_and(|document| number(document, "lastActivityAt") == last_activity_at)
-        {
-            continue;
-        }
-        let birth = std::fs::metadata(&claim.transcript.path)
-            .and_then(|metadata| metadata.created())
-            .map(millis)
-            .unwrap_or(last_activity_at);
-        let told = transcribe(&claim.transcript.path, birth);
-        let head = repo::head(&claim.process.cwd);
-        let outcome = match held.as_ref() {
-            Some(_) => "refreshed",
-            None => "adopted",
-        };
-        let document = Document {
-            state: "adopted",
-            pid: claim.process.pid,
-            cwd: &claim.process.cwd,
-            session_id,
-            host: &scope.host,
-            repo: repo::repo_tag(&claim.process.cwd).unwrap_or_default(),
-            branch: head.branch,
-            commit: head.commit,
-            started_at: match held.as_ref() {
-                Some(document) => number(document, "startedAt"),
-                None => told.started_at,
-            },
-            last_activity_at,
-            sync_started_at: held
-                .as_ref()
-                .map(|document| number(document, "syncStartedAt"))
-                .unwrap_or(0),
-            prompts: told.prompts,
-            focus: told.focus,
-            mode: &claim.process.mode,
-            permission_mode: told.permission_mode,
-            transcript_path: &claim.transcript.path,
-            usage_offset: match held.as_ref() {
-                Some(document) => document["usageOffset"].as_u64().unwrap_or_default(),
-                None => std::fs::metadata(&claim.transcript.path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default(),
-            },
-            usage_high_water: held
-                .as_ref()
-                .map(|document| number(document, "usageHighWater"))
-                .unwrap_or(0),
-            usage_prompts: held
-                .as_ref()
-                .map(|document| number(document, "usagePrompts"))
-                .unwrap_or(0),
-            usage_message_id: held
-                .as_ref()
-                .and_then(|document| document["usageMessageId"].as_str().map(str::to_string))
-                .unwrap_or_default(),
-        };
-        if write(&path, &document).is_err() {
-            continue;
-        }
-        adopted.push(Adoption {
-            session_id: session_id.clone(),
-            outcome,
-        });
+/// The fields a transcript can move, written over the record the pass started from. The rest of
+/// that record is left as it stands, so everything the hooks own — the inbox, the sync stamp, the
+/// usage marks and a delta waiting to go out — survives a pass that only moves the focus on.
+fn moved(document: &mut Value, reading: &Reading, head: &repo::Head, last_activity_at: i64) {
+    let Some(fields) = document.as_object_mut() else {
+        return;
+    };
+    for (field, value) in [
+        ("lastActivityAt", Value::from(last_activity_at)),
+        ("prompts", Value::from(reading.prompts)),
+        ("focus", json!(reading.focus)),
+        ("permissionMode", Value::from(reading.permission_mode.clone())),
+        ("branch", Value::from(head.branch.clone())),
+        ("commit", Value::from(head.commit.clone())),
+        ("adoptedOffset", Value::from(reading.offset)),
+    ] {
+        fields.insert(field.to_string(), value);
     }
-    adopted
+}
+
+/// Moves an adopted record on when the transcript it names has been written to since the last
+/// pass. Only the stretch past the mark the last pass left is read, so a tick costs the bytes the
+/// session has written rather than the whole transcript.
+fn refresh(scope: &Scope, session_id: &str, stored: &Value) -> Result<Option<Adoption>> {
+    let path = PathBuf::from(text(stored, "transcriptPath"));
+    let Ok(modified) = std::fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
+        return Ok(None);
+    };
+    let last_activity_at = millis(modified);
+    if number(stored, "lastActivityAt") == last_activity_at {
+        return Ok(None);
+    }
+    let reading = read_on(
+        &path,
+        Reading {
+            offset: number(stored, "adoptedOffset").max(0) as u64,
+            started_at: number(stored, "startedAt"),
+            prompts: number(stored, "prompts"),
+            focus: Focus {
+                first: text(&stored["focus"], "first"),
+                latest: text(&stored["focus"], "latest"),
+            },
+            permission_mode: text(stored, "permissionMode"),
+        },
+    );
+    let mut document = stored.clone();
+    moved(
+        &mut document,
+        &reading,
+        &repo::head(Path::new(&text(stored, "cwd"))),
+        last_activity_at,
+    );
+    write(&record_path(scope, session_id), &document)?;
+    Ok(Some(Adoption {
+        session_id: session_id.to_string(),
+        outcome: "refreshed",
+    }))
+}
+
+/// Writes the record one running session is missing. The usage marks start at the end of the
+/// transcript: nothing has counted the tokens spent before this pass, and the hook that takes the
+/// record over must not count them twice.
+fn take_on(scope: &Scope, claim: &Claim) -> Result<Adoption> {
+    let session_id = &claim.transcript.session_id;
+    let reading = read_on(&claim.transcript.path, Reading::default());
+    let head = repo::head(&claim.process.cwd);
+    let document = json!({
+        "state": ADOPTED,
+        "pid": claim.process.pid,
+        "cwd": claim.process.cwd,
+        "sessionId": session_id,
+        "host": scope.host,
+        "repo": repo::repo_tag(&claim.process.cwd).unwrap_or_default(),
+        "branch": head.branch,
+        "commit": head.commit,
+        "startedAt": match reading.started_at {
+            0 => millis(claim.transcript.born),
+            at => at,
+        },
+        "lastActivityAt": millis(claim.transcript.modified),
+        "syncStartedAt": 0,
+        "prompts": reading.prompts,
+        "focus": reading.focus,
+        "mode": claim.process.mode,
+        "permissionMode": reading.permission_mode,
+        "transcriptPath": claim.transcript.path,
+        "adoptedOffset": reading.offset,
+        "usageOffset": claim.transcript.size,
+        "usageHighWater": 0,
+        "usagePrompts": 0,
+        "usageMessageId": "",
+    });
+    write(&record_path(scope, session_id), &document)?;
+    Ok(Adoption {
+        session_id: session_id.clone(),
+        outcome: "adopted",
+    })
+}
+
+/// One pass: every adopted record whose transcript has moved, then every running session no record
+/// describes. The sessions that come back are the ones the caller syncs. A registry that cannot be
+/// written fails the pass rather than reading as a host with nothing to adopt.
+pub fn adopt(scope: &Scope) -> Result<Vec<Adoption>> {
+    let registry = registry(&scope.sessions);
+    let mut adopted = Vec::new();
+    for (session_id, document) in &registry.adopted {
+        adopted.extend(refresh(scope, session_id, document)?);
+    }
+    for claim in claims(scope, &registry) {
+        adopted.push(take_on(scope, &claim)?);
+    }
+    Ok(adopted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::time::Duration;
 
-    /// When every process in a sandbox began, and when its transcripts were last written: procfs
-    /// stamps a pid directory with the one, and a transcript carries the other.
-    const STARTED: u64 = 1_761_000_000;
-    const WROTE: u64 = STARTED + 60;
-
-    fn stamp(path: &Path, seconds: u64) {
-        let when = UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+    fn stamp(path: &Path, when: SystemTime) {
         std::fs::File::options()
             .read(true)
             .open(path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(when))
             .unwrap();
+    }
+
+    fn ago(seconds: u64) -> SystemTime {
+        SystemTime::now() - Duration::from_secs(seconds)
     }
 
     struct Sandbox {
@@ -562,36 +630,30 @@ mod tests {
             cwd
         }
 
-        fn claude(&self, pid: i32, cwd: &Path, argv: &[&str]) {
+        /// A running Claude process, begun when procfs says its own directory was last written.
+        fn claude(&self, pid: i32, cwd: &Path, argv: &[&str], started: SystemTime) {
             let dir = self.scope.procfs.join(pid.to_string());
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("comm"), "claude\n").unwrap();
             std::fs::write(dir.join("cmdline"), argv.join("\0")).unwrap();
             symlink(cwd, dir.join("cwd")).unwrap();
-            stamp(&dir, STARTED);
-        }
-
-        fn holds(&self, pid: i32, transcript: &Path) {
-            let fd = self.scope.procfs.join(pid.to_string()).join("fd");
-            std::fs::create_dir_all(&fd).unwrap();
-            symlink(transcript, fd.join("12")).unwrap();
+            stamp(&dir, started);
         }
 
         fn transcript(&self, cwd: &Path, session_id: &str, lines: &[String]) -> PathBuf {
-            self.wrote(cwd, session_id, lines, WROTE)
-        }
-
-        fn wrote(&self, cwd: &Path, session_id: &str, lines: &[String], seconds: u64) -> PathBuf {
             let dir = self.scope.projects.join(slug(cwd));
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join(format!("{session_id}.jsonl"));
             std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
-            stamp(&path, seconds);
             path
         }
 
+        fn born(&self, path: &Path) -> SystemTime {
+            birth(path, &std::fs::metadata(path).unwrap())
+        }
+
         fn record(&self, session_id: &str) -> Option<Value> {
-            stored(&self.scope.sessions.join(format!("{session_id}.json")))
+            parsed(&self.scope.sessions.join(format!("{session_id}.json")))
         }
     }
 
@@ -602,7 +664,7 @@ mod tests {
     }
 
     fn human(at: &str, text: &str) -> String {
-        serde_json::json!({
+        json!({
             "type": "user",
             "timestamp": at,
             "promptSource": "typed",
@@ -614,7 +676,7 @@ mod tests {
     }
 
     fn notification(at: &str, text: &str) -> String {
-        serde_json::json!({
+        json!({
             "type": "user",
             "timestamp": at,
             "promptSource": "system",
@@ -625,7 +687,7 @@ mod tests {
     }
 
     fn tool_result(at: &str) -> String {
-        serde_json::json!({
+        json!({
             "type": "user",
             "timestamp": at,
             "toolUseResult": { "stdout": "ok" },
@@ -635,7 +697,7 @@ mod tests {
     }
 
     fn answer(at: &str) -> String {
-        serde_json::json!({
+        json!({
             "type": "assistant",
             "timestamp": at,
             "message": { "id": "msg-1", "model": "claude-opus-4", "usage": { "input_tokens": 11 } },
@@ -657,10 +719,12 @@ mod tests {
     fn a_running_session_the_hooks_never_registered_is_adopted_from_its_transcript() {
         let sandbox = Sandbox::new("adopt");
         let cwd = sandbox.work("recall");
-        sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
-        sandbox.claude(4242, &cwd, &["claude"]);
+        let path = sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
+        let wrote = ago(30);
+        stamp(&path, wrote);
+        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
 
-        let adopted = adopt(&sandbox.scope);
+        let adopted = adopt(&sandbox.scope).unwrap();
 
         assert_eq!(
             adopted,
@@ -670,7 +734,7 @@ mod tests {
             }]
         );
         let record = sandbox.record("s-live").expect("the record is written");
-        assert_eq!(record["state"], "adopted");
+        assert_eq!(record["state"], ADOPTED);
         assert_eq!(record["sessionId"], "s-live");
         assert_eq!(record["pid"], 4242);
         assert_eq!(record["cwd"], cwd.to_string_lossy().as_ref());
@@ -684,20 +748,20 @@ mod tests {
         );
         assert_eq!(
             record["focus"],
-            serde_json::json!({ "first": "list every host's sessions", "latest": "why is the worker test red" })
+            json!({ "first": "list every host's sessions", "latest": "why is the worker test red" })
         );
-        let transcript = sandbox.scope.projects.join(slug(&cwd)).join("s-live.jsonl");
-        assert_eq!(record["transcriptPath"], transcript.to_string_lossy().as_ref());
-        assert_eq!(
-            record["usageOffset"],
-            std::fs::metadata(&transcript).unwrap().len(),
-            "nothing counted the tokens spent before this pass, so none of them are counted now"
-        );
+        assert_eq!(record["transcriptPath"], path.to_string_lossy().as_ref());
         assert_eq!(
             record["lastActivityAt"],
-            (WROTE * 1000) as i64,
+            millis(wrote),
             "the transcript's own last write"
         );
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            record["usageOffset"], size,
+            "nothing counted the tokens spent before this pass, so none of them are counted now"
+        );
+        assert_eq!(record["adoptedOffset"], size, "the prompts read reach the file's end");
         assert_eq!(
             std::fs::metadata(sandbox.scope.sessions.join("s-live.json"))
                 .unwrap()
@@ -709,20 +773,38 @@ mod tests {
     }
 
     #[test]
-    fn a_session_the_hooks_registered_is_left_alone() {
+    fn a_session_the_registry_already_names_is_left_alone() {
         let sandbox = Sandbox::new("registered");
         let cwd = sandbox.work("recall");
         sandbox.transcript(&cwd, "s-hooked", &session("2026-11-02T10:00:00.000Z"));
-        sandbox.claude(4242, &cwd, &["claude"]);
+        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
         let path = sandbox.scope.sessions.join("s-hooked.json");
-        let written = r#"{"state":"no-inbox","pid":4242,"cwd":"/elsewhere","sessionId":"s-hooked","prompts":9}"#;
+        let written = r#"{"state":"registered","socket":"/run/inbox.sock","token":"t","pid":4242,"cwd":"/elsewhere","sessionId":"s-hooked","prompts":9}"#;
         std::fs::write(&path, written).unwrap();
 
-        assert_eq!(adopt(&sandbox.scope), Vec::new());
+        assert_eq!(adopt(&sandbox.scope).unwrap(), Vec::new());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             written,
             "the hooks own the record they wrote, whatever state it is in"
+        );
+    }
+
+    #[test]
+    fn a_record_caught_half_written_is_never_overwritten() {
+        let sandbox = Sandbox::new("torn");
+        let cwd = sandbox.work("recall");
+        sandbox.transcript(&cwd, "s-hooked", &session("2026-11-02T10:00:00.000Z"));
+        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        let path = sandbox.scope.sessions.join("s-hooked.json");
+        let torn = r#"{"state":"registered","socket":"/run/inbox.sock","to"#;
+        std::fs::write(&path, torn).unwrap();
+
+        assert_eq!(adopt(&sandbox.scope).unwrap(), Vec::new());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            torn,
+            "a record that does not parse is one caught mid-write, and the inbox in it must survive"
         );
     }
 
@@ -732,12 +814,12 @@ mod tests {
         let cwd = sandbox.work("recall");
         sandbox.transcript(&cwd, "s-ended", &session("2026-11-02T10:00:00.000Z"));
 
-        assert_eq!(adopt(&sandbox.scope), Vec::new());
+        assert_eq!(adopt(&sandbox.scope).unwrap(), Vec::new());
         assert!(sandbox.record("s-ended").is_none());
 
-        sandbox.claude(4242, &sandbox.work("other"), &["claude", "-p", "ship it"]);
+        sandbox.claude(4242, &sandbox.work("other"), &["claude", "-p", "ship it"], ago(3600));
         assert_eq!(
-            adopt(&sandbox.scope),
+            adopt(&sandbox.scope).unwrap(),
             Vec::new(),
             "a process in another directory adopts nothing of this one"
         );
@@ -748,13 +830,19 @@ mod tests {
         let sandbox = Sandbox::new("refresh");
         let cwd = sandbox.work("recall");
         let path = sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
-        sandbox.claude(4242, &cwd, &["claude"]);
+        stamp(&path, ago(300));
+        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
 
-        adopt(&sandbox.scope);
+        adopt(&sandbox.scope).unwrap();
         let first = sandbox.record("s-live").unwrap();
+        let held = sandbox.scope.sessions.join("s-live.json");
+        let mut owned = first.clone();
+        owned["usagePending"] = json!({ "seq": 1200, "events": [{ "model": "claude-opus-4" }] });
+        owned["syncStartedAt"] = json!(1_762_000_060_000_i64);
+        std::fs::write(&held, serde_json::to_string(&owned).unwrap()).unwrap();
 
         assert_eq!(
-            adopt(&sandbox.scope),
+            adopt(&sandbox.scope).unwrap(),
             Vec::new(),
             "a transcript that has not moved has nothing to send"
         );
@@ -762,10 +850,10 @@ mod tests {
         let mut grown = session("2026-11-02T10:00:00.000Z");
         grown.push(human("2026-11-02T10:30:00.000Z", "and now the dashboard"));
         std::fs::write(&path, format!("{}\n", grown.join("\n"))).unwrap();
-        stamp(&path, WROTE + 300);
+        stamp(&path, ago(10));
 
         assert_eq!(
-            adopt(&sandbox.scope),
+            adopt(&sandbox.scope).unwrap(),
             vec![Adoption {
                 session_id: "s-live".to_string(),
                 outcome: "refreshed",
@@ -777,8 +865,22 @@ mod tests {
             "the session still started when it did"
         );
         assert_eq!(second["usageOffset"], first["usageOffset"], "the usage marks stay put");
+        assert_eq!(
+            second["usagePending"], owned["usagePending"],
+            "a delta the hooks fixed is still waiting after the pass"
+        );
+        assert_eq!(second["syncStartedAt"], 1_762_000_060_000_i64);
         assert_eq!(second["prompts"], 3);
         assert_eq!(second["focus"]["latest"], "and now the dashboard");
+        assert_eq!(
+            second["focus"]["first"], first["focus"]["first"],
+            "the prompt that opened the session is read once"
+        );
+        assert_eq!(
+            second["adoptedOffset"],
+            std::fs::metadata(&path).unwrap().len(),
+            "only the stretch past the last mark is read, and the mark moves with it"
+        );
         assert!(
             second["lastActivityAt"].as_i64() > first["lastActivityAt"].as_i64(),
             "{second}"
@@ -786,11 +888,34 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_rewritten_shorter_is_read_again_from_its_start() {
+        let sandbox = Sandbox::new("rewritten");
+        let cwd = sandbox.work("recall");
+        let path = sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
+        stamp(&path, ago(300));
+        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        adopt(&sandbox.scope).unwrap();
+
+        std::fs::write(&path, format!("{}\n", human("2026-11-02T11:00:00.000Z", "start over"))).unwrap();
+        stamp(&path, ago(10));
+
+        adopt(&sandbox.scope).unwrap();
+
+        let record = sandbox.record("s-live").unwrap();
+        assert_eq!(record["prompts"], 1);
+        assert_eq!(
+            record["focus"],
+            json!({ "first": "start over", "latest": "start over" })
+        );
+        assert_eq!(record["adoptedOffset"], std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
     fn only_the_prompts_the_user_typed_are_counted() {
         let sandbox = Sandbox::new("prompts");
         let cwd = sandbox.work("recall");
         let old_style = |text: &str| {
-            serde_json::json!({
+            json!({
                 "type": "user",
                 "timestamp": "2026-11-02T10:10:00.000Z",
                 "message": { "role": "user", "content": text },
@@ -802,14 +927,14 @@ mod tests {
             human("2026-11-02T10:00:00.000Z", "   adopt  the   running sessions\n"),
             notification("2026-11-02T10:01:00.000Z", "<task-notification>done</task-notification>"),
             tool_result("2026-11-02T10:02:00.000Z"),
-            serde_json::json!({
+            json!({
                 "type": "user",
                 "timestamp": "2026-11-02T10:03:00.000Z",
                 "isMeta": true,
                 "message": { "role": "user", "content": "<local-command-caveat>…</local-command-caveat>" },
             })
             .to_string(),
-            serde_json::json!({
+            json!({
                 "type": "user",
                 "timestamp": "2026-11-02T10:04:00.000Z",
                 "interruptedMessageId": "msg-9",
@@ -818,16 +943,20 @@ mod tests {
             .to_string(),
             old_style("/compact"),
             old_style("<command-name>/exit</command-name>"),
+            old_style("<div> renders twice"),
             "{ not json at all".to_string(),
             human("2026-11-02T10:20:00.000Z", &"word ".repeat(30)),
         ];
         sandbox.transcript(&cwd, "s-live", &lines);
-        sandbox.claude(4242, &cwd, &["claude"]);
+        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
 
-        adopt(&sandbox.scope);
+        adopt(&sandbox.scope).unwrap();
 
         let record = sandbox.record("s-live").unwrap();
-        assert_eq!(record["prompts"], 3, "two typed prompts and one slash command");
+        assert_eq!(
+            record["prompts"], 4,
+            "two typed prompts, a slash command, and a prompt that opens with a tag of its own"
+        );
         assert_eq!(
             record["focus"]["first"], "adopt the running sessions",
             "a prompt is collapsed to one line"
@@ -838,69 +967,83 @@ mod tests {
     }
 
     #[test]
+    fn a_live_session_takes_the_transcript_born_when_it_started_and_not_the_newest() {
+        let sandbox = Sandbox::new("newest-is-dead");
+        let cwd = sandbox.work("recall");
+        let lines = session("2026-11-02T10:00:00.000Z");
+        let live = sandbox.transcript(&cwd, "s-live", &lines);
+        std::thread::sleep(Duration::from_millis(5));
+        let headless = sandbox.transcript(&cwd, "s-headless-run", &lines);
+        stamp(&live, ago(600));
+        stamp(&headless, ago(5));
+        sandbox.claude(4242, &cwd, &["claude"], sandbox.born(&live) - Duration::from_secs(7));
+
+        let adopted = adopt(&sandbox.scope).unwrap();
+
+        assert_eq!(
+            adopted,
+            vec![Adoption {
+                session_id: "s-live".to_string(),
+                outcome: "adopted",
+            }],
+            "a claude -p run that just finished leaves the newest transcript behind, and it is not this session's"
+        );
+        assert!(sandbox.record("s-headless-run").is_none());
+    }
+
+    #[test]
     fn two_sessions_in_one_directory_take_one_transcript_each() {
         let sandbox = Sandbox::new("shared-cwd");
         let cwd = sandbox.work("recall");
-        for (session_id, wrote) in [("s-oldest", WROTE), ("s-older", WROTE + 100), ("s-newest", WROTE + 200)] {
-            sandbox.wrote(&cwd, session_id, &session("2026-11-02T10:00:00.000Z"), wrote);
-        }
-        sandbox.claude(4242, &cwd, &["claude"]);
-        sandbox.claude(4300, &cwd, &["claude"]);
+        let lines = session("2026-11-02T10:00:00.000Z");
+        let first = sandbox.transcript(&cwd, "s-first", &lines);
+        std::thread::sleep(Duration::from_millis(5));
+        let second = sandbox.transcript(&cwd, "s-second", &lines);
+        let born_first = sandbox.born(&first);
+        assert!(born_first < sandbox.born(&second), "the fixtures must be born in order");
+        sandbox.claude(4242, &cwd, &["claude"], born_first - Duration::from_secs(7));
+        sandbox.claude(4300, &cwd, &["claude"], born_first + Duration::from_millis(1));
 
         let adopted: Vec<String> = adopt(&sandbox.scope)
+            .unwrap()
             .into_iter()
             .map(|adoption| adoption.session_id)
             .collect();
 
-        assert_eq!(
-            adopted,
-            vec!["s-older".to_string(), "s-newest".to_string()],
-            "the newest transcript per running session, and the one a session that ended left behind is skipped"
-        );
-        assert_eq!(sandbox.record("s-older").unwrap()["pid"], 4242);
-        assert_eq!(sandbox.record("s-newest").unwrap()["pid"], 4300);
-        assert!(sandbox.record("s-oldest").is_none());
+        assert_eq!(adopted, vec!["s-first".to_string(), "s-second".to_string()]);
+        assert_eq!(sandbox.record("s-first").unwrap()["pid"], 4242);
+        assert_eq!(sandbox.record("s-second").unwrap()["pid"], 4300);
     }
 
     #[test]
-    fn an_open_transcript_names_the_session_whatever_the_times_say() {
-        let sandbox = Sandbox::new("open-fd");
+    fn a_session_that_has_opened_no_transcript_yet_adopts_nothing() {
+        let sandbox = Sandbox::new("just-started");
         let cwd = sandbox.work("recall");
-        let lines = session("2026-11-02T10:00:00.000Z");
-        sandbox.wrote(&cwd, "s-older", &lines, STARTED - 300);
-        sandbox.transcript(&cwd, "s-newest", &lines);
-        sandbox.claude(4242, &cwd, &["claude"]);
-        sandbox.holds(
-            4242,
-            &sandbox
-                .scope
-                .projects
-                .join(slug(&cwd))
-                .join("s-older/subagents/a.jsonl"),
-        );
-
-        adopt(&sandbox.scope);
-
-        assert_eq!(sandbox.record("s-older").unwrap()["pid"], 4242);
-        assert!(
-            sandbox.record("s-newest").is_none(),
-            "the descriptor settles which transcript the session is writing"
-        );
-    }
-
-    #[test]
-    fn a_transcript_last_written_before_its_session_began_belongs_to_another() {
-        let sandbox = Sandbox::new("stale");
-        let cwd = sandbox.work("recall");
-        sandbox.wrote(&cwd, "s-ended", &session("2026-11-02T10:00:00.000Z"), STARTED - 3600);
-        sandbox.claude(4242, &cwd, &["claude"]);
+        let ended = sandbox.transcript(&cwd, "s-ended", &session("2026-11-02T10:00:00.000Z"));
+        stamp(&ended, ago(5));
+        sandbox.claude(4242, &cwd, &["claude"], SystemTime::now());
 
         assert_eq!(
-            adopt(&sandbox.scope),
+            adopt(&sandbox.scope).unwrap(),
             Vec::new(),
-            "a session that has just started must not take on the transcript of one that ended here"
+            "a session whose transcript is not written yet must not take on one that ended here"
         );
         assert!(sandbox.record("s-ended").is_none());
+    }
+
+    #[test]
+    fn a_registry_that_cannot_be_written_fails_the_pass() {
+        let sandbox = Sandbox::new("unwritable");
+        let cwd = sandbox.work("recall");
+        sandbox.transcript(&cwd, "s-live", &session("2026-11-02T10:00:00.000Z"));
+        sandbox.claude(4242, &cwd, &["claude"], ago(3600));
+        std::fs::remove_dir_all(&sandbox.scope.sessions).unwrap();
+        std::fs::write(&sandbox.scope.sessions, "not a directory").unwrap();
+
+        assert!(
+            adopt(&sandbox.scope).is_err(),
+            "a host that cannot keep a record must not read as a host with nothing to adopt"
+        );
     }
 
     #[test]

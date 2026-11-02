@@ -16,6 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const BASE_DELAY: Duration = Duration::from_secs(1);
@@ -51,6 +52,12 @@ pub fn runtime_dir() -> PathBuf {
 
 pub fn lock_path() -> PathBuf {
     runtime_dir().join("listen.lock")
+}
+
+/// The daemon holding the lock names itself here, so an update can end the one it replaced. The
+/// lock is still what says a daemon is running; this only says which process to signal.
+pub fn pid_path() -> PathBuf {
+    runtime_dir().join("listen.pid")
 }
 
 pub fn sessions_dir() -> PathBuf {
@@ -245,16 +252,37 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
     });
 }
 
+/// One adoption pass at a time, whatever the tick does: a pass reads transcripts and then waits on
+/// the service, so passes left to pile up behind each other would have two of them writing the
+/// same records.
+struct Pass(Arc<AtomicBool>);
+
+impl Drop for Pass {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The same adoption `recall sessions --adopt` runs, on the tick that already sweeps the registry:
 /// a session the hooks never registered keeps its last activity up with its own transcript until
 /// its process is gone, and the sweep above is what ends it then. The transcript is the only thing
 /// that moves, so a session whose transcript stood still sends nothing. It runs on a blocking
 /// thread, like the end reports, so neither the reading nor the calls can stall message delivery.
-fn adopt_running(client: &Arc<Client>, scope: &Arc<adopt::Scope>) {
+fn adopt_running(client: &Arc<Client>, scope: &Arc<adopt::Scope>, running: &Arc<AtomicBool>) {
+    if running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let pass = Pass(Arc::clone(running));
     let client = Arc::clone(client);
     let scope = Arc::clone(scope);
     tokio::task::spawn_blocking(move || {
-        for session in adopt::adopt(&scope) {
+        let _pass = pass;
+        let started = Instant::now();
+        let adopted = match adopt::adopt(&scope) {
+            Ok(adopted) => adopted,
+            Err(error) => return log(&format!("sessions:adopt-failed:{error:#}"), started.elapsed()),
+        };
+        for session in adopted {
             let id = &session.session_id;
             let Some(record) = sessions::record(&scope.sessions, id) else {
                 continue;
@@ -278,6 +306,7 @@ async fn serve() -> Result<()> {
     if let Err(error) = scope.as_ref() {
         log(&format!("sessions:adopt-failed:{error:#}"), Duration::ZERO);
     }
+    let adopting = Arc::new(AtomicBool::new(false));
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -289,7 +318,7 @@ async fn serve() -> Result<()> {
         _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
             report_ended(&client, ended);
             if let Ok(scope) = scope.as_ref() {
-                adopt_running(&client, scope);
+                adopt_running(&client, scope, &adopting);
             }
         }) => Ok(()),
         result = &mut work => result,
@@ -414,6 +443,7 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
         eprintln!("recall: a listener is already running on this host");
         return Ok(());
     };
+    let _ = std::fs::write(pid_path(), format!("{}\n", std::process::id()));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let outcome = runtime.block_on(serve());
     log(
@@ -423,8 +453,53 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
         },
         Duration::ZERO,
     );
+    let _ = std::fs::remove_file(pid_path());
     lock.release()?;
     outcome
+}
+
+pub const HANDOVER: Duration = Duration::from_secs(5);
+
+/// Ends the daemon named beside the lock and waits for it to let the lock go. A pid file a daemon
+/// that is gone left behind names nothing, and the signal says so.
+fn stop(limit: Duration) -> bool {
+    let named = std::fs::read_to_string(pid_path())
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 1);
+    let Some(pid) = named else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return false;
+    }
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if matches!(Lock::acquire(&lock_path()), Ok(Some(_))) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Hands the listener over to the binary now installed. An update replaces the binary under a
+/// daemon that goes on running the code it started with: it holds the lock, so nothing newer can
+/// take over, and its tick is what keeps every adopted session's last activity moving. Nothing
+/// here may fail the update, so the hooks log is where it reports.
+pub fn restart(settings: &Settings) {
+    let started = Instant::now();
+    let stopped = stop(HANDOVER);
+    if !settings.messaging_enabled() {
+        log(&format!("listen:stopped-for-update:{stopped}"), started.elapsed());
+        return;
+    }
+    let outcome = match ensure(&lock_path(), spawn_daemon) {
+        Ok(true) => "listen:restarted".to_string(),
+        Ok(false) => "listen:still-running".to_string(),
+        Err(error) => format!("listen:restart-failed:{error:#}"),
+    };
+    log(&outcome, started.elapsed());
 }
 
 #[cfg(test)]

@@ -275,7 +275,7 @@ fn login(endpoint: Option<String>, name: Option<String>) -> Result<()> {
     }
 }
 
-fn update() -> Result<ExitCode> {
+fn update(cli_settings: &Settings) -> Result<ExitCode> {
     let updater = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("recall-update")))
@@ -290,6 +290,10 @@ fn update() -> Result<ExitCode> {
     if !status.success() {
         return Ok(ExitCode::from(1));
     }
+    match settings::load(cli_settings) {
+        Ok(settings) => listen::restart(&settings),
+        Err(error) => listen::log(&format!("listen:restart-failed:{error:#}"), Duration::ZERO),
+    }
     adopt_after_update();
     Ok(ExitCode::SUCCESS)
 }
@@ -300,7 +304,7 @@ fn update() -> Result<ExitCode> {
 /// so the hooks log is where it reports.
 fn adopt_after_update() {
     let started = Instant::now();
-    let found = match adopt::Scope::here().map(|scope| adopt::adopt(&scope)) {
+    let found = match adopt::Scope::here().and_then(|scope| adopt::adopt(&scope)) {
         Ok(found) => found,
         Err(error) => return listen::log(&format!("sessions:adopt-failed:{error:#}"), started.elapsed()),
     };
@@ -479,7 +483,7 @@ fn logged(done: &str, failed: &str, session_id: &str, work: impl FnOnce() -> Res
 /// when a session starts, so the sessions that were already running when a plugin update landed
 /// never write a record of their own: without this they stay off the list until each one restarts.
 fn adopt_sessions() -> Result<ExitCode> {
-    let adopted = adopt::adopt(&adopt::Scope::here()?);
+    let adopted = adopt::adopt(&adopt::Scope::here()?)?;
     if adopted.is_empty() {
         println!("no running session needs adopting");
         return Ok(ExitCode::SUCCESS);
@@ -563,7 +567,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let client = || -> Result<Client> { Ok(Client::new(config::load()?)) };
     match cli.command {
         Command::Login { endpoint, name } => login(endpoint, name)?,
-        Command::Update => return update(),
+        Command::Update => return update(&cli.settings),
         Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
         Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
         Command::Listen { ensure, status } => {
