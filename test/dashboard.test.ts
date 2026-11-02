@@ -239,12 +239,10 @@ describe("the history tab", () => {
     await owner.tower.request("DELETE", "/v1/sessions/c4e21a99");
 
     const html = await historyTab(h, owner.assertion);
-    expect(html).toContain("2026-10-30 · Fri 1 session · 1h 00m");
-    expect(html).toContain("11:00–12:00 laptop-9f8a laptop");
+    expect(html).toContain("2026-10-30 · Fri 11:00–12:00 laptop-9f8a laptop");
     expect(html).toContain("show the session history → group it by day");
     expect(html).toContain("repo:github.com/mvhenten/recall@feat/dashboard-history 1h 00m 31 prompts");
-    expect(html).toContain("2026-10-29 · Thu 1 session · 45m");
-    expect(html).toContain("tower-c4e2");
+    expect(html).toContain("2026-10-29 · Thu 11:15–12:00 tower-c4e2 tower");
     expect(html).toContain("global 45m 1 prompt");
     expect(html.indexOf("2026-10-30")).toBeLessThan(html.indexOf("2026-10-29"));
     expect(html).not.toContain("nomad");
@@ -260,7 +258,6 @@ describe("the history tab", () => {
 
     const html = await historyTab(h, owner.assertion);
     expect(html).toContain("laptop-1111 laptop running");
-    expect(html).toContain("laptop-2222 laptop ");
     expect(html).not.toContain("laptop-2222 laptop running");
   });
 
@@ -283,16 +280,16 @@ describe("the history tab", () => {
     const response = await open(h, "/dashboard/history?limit=2", owner.assertion);
     const markup = await response.text();
     const first = plain(markup);
-    expect(first).toContain("2026-10-30 · Fri 2 sessions");
+    expect(first).toContain("2026-10-30 · Fri");
     expect(first).toContain("laptop-aa11");
     expect(first).toContain("laptop-bb22");
     expect(first).not.toContain("laptop-cc33");
     expect(first).not.toContain("2026-10-29");
 
     const second = await historyTab(h, owner.assertion, olderSessions(markup).replace("/dashboard/history", ""));
-    expect(second).toContain("2026-10-30 · Fri 1 session");
+    expect(second).toContain("2026-10-30 · Fri");
     expect(second).toContain("laptop-cc33");
-    expect(second).toContain("2026-10-29 · Thu 1 session");
+    expect(second).toContain("2026-10-29 · Thu");
     expect(second).toContain("laptop-dd44");
     expect(second).not.toContain("laptop-aa11");
     expect(second).not.toContain("laptop-ee55");

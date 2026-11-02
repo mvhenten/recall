@@ -2,6 +2,7 @@ import {
   type Focus,
   FRESH_WINDOW_DAYS,
   HISTORY_PARAMS,
+  type HistoryFilters,
   type HistoryInput,
   IDLE_AFTER_MS,
   LIST_PARAMS,
@@ -306,9 +307,6 @@ export const sessionsPage = (email: string, live: Live, sessions: Session[], now
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 
-// session_history keeps epoch milliseconds and usage_daily rolls up on the UTC day, so the history
-// reads the clock and the day in UTC too and the two pages never disagree about which day a session
-// belongs to.
 const clock = (at: number): string => new Date(at).toISOString().slice(11, 16);
 
 const span = (ms: number): string => {
@@ -333,27 +331,21 @@ const byDay = (sessions: PastSession[]): DayGroup[] => {
   return groups;
 };
 
-const dayHead = (group: DayGroup): string => {
-  const count = group.sessions.length;
-  const worked = group.sessions.reduce((total, session) => total + (session.lastActivityAt - session.startedAt), 0);
-  const weekday = WEEKDAYS[new Date(`${group.day}T00:00:00Z`).getUTCDay()] ?? "";
-  return `<p class="dayhead"><b>${escapeHtml(group.day)} · ${weekday}</b><span>${count} ${count === 1 ? "session" : "sessions"} · ${span(worked)}</span></p>`;
-};
+const dayHead = (group: DayGroup): string =>
+  `<p class="dayhead"><b>${escapeHtml(group.day)} · ${WEEKDAYS[new Date(`${group.day}T00:00:00Z`).getUTCDay()] ?? ""}</b></p>`;
 
-const historyRow = (session: PastSession, running: boolean): string =>
+const historyRow = (session: PastSession): string =>
   `<li class="srow hrow"><p class="tm">${clock(session.startedAt)}–${clock(session.lastActivityAt)}</p>
-<p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(session.host)}</span>${running ? ' <span class="run">running</span>' : ""}</p>
+<p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(session.host)}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
 <p class="fc">${focusHtml(session.focus)}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${span(session.lastActivityAt - session.startedAt)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
 
-const dayBlock = (group: DayGroup, running: Set<string>): string =>
-  `<section class="day">${dayHead(group)}<ol class="sessions" role="list">${group.sessions
-    .map((session) => historyRow(session, running.has(session.sessionId)))
-    .join("")}</ol></section>`;
+const dayBlock = (group: DayGroup): string =>
+  `<section class="day">${dayHead(group)}<ol class="sessions" role="list">${group.sessions.map(historyRow).join("")}</ol></section>`;
 
-const historyLink = (url: URL, changes: Record<string, string>): string => {
+const tabLink = (tab: Tab, keep: readonly string[], url: URL, changes: Record<string, string>): string => {
   const next = new URLSearchParams();
-  for (const name of HISTORY_PARAMS) {
+  for (const name of keep) {
     const value = url.searchParams.get(name) ?? "";
     if (value !== "") next.set(name, value);
   }
@@ -362,8 +354,11 @@ const historyLink = (url: URL, changes: Record<string, string>): string => {
     else next.set(name, value);
   }
   const query = next.toString();
-  return escapeHtml(query === "" ? HISTORY_TAB.path : `${HISTORY_TAB.path}?${query}`);
+  return escapeHtml(query === "" ? tab.path : `${tab.path}?${query}`);
 };
+
+const historyLink = (url: URL, changes: Record<string, string>): string =>
+  tabLink(HISTORY_TAB, HISTORY_PARAMS, url, changes);
 
 const historyChips = (url: URL, name: string, label: string, all: string, active: string, values: string[]): string => {
   const chip = (value: string, text: string): string =>
@@ -382,8 +377,8 @@ export const historyPage = (
   live: Live,
   url: URL,
   filter: HistoryInput,
+  known: HistoryFilters,
   sessions: PastSession[],
-  running: Set<string>,
   nextCursor: string,
 ): Response => {
   const filtered = filter.host !== "" || filter.repo !== "";
@@ -400,28 +395,8 @@ export const historyPage = (
             ? "Clear the filter to read every host and every repo."
             : `A session lands here as soon as it syncs, and stays for ${SESSION_HISTORY_DAYS} days.`,
         )
-      : `<div class="hist">${groups.map((group) => dayBlock(group, running)).join("")}</div>${older}`;
-  const filters = `<div class="toolrow">${historyChips(
-    url,
-    "host",
-    "Filter by host",
-    "All hosts",
-    filter.host,
-    offered(
-      sessions.map((session) => session.host),
-      filter.host,
-    ),
-  )}${historyChips(
-    url,
-    "repo",
-    "Filter by repo",
-    "All repos",
-    filter.repo,
-    offered(
-      sessions.map((session) => session.repo),
-      filter.repo,
-    ),
-  )}</div>`;
+      : `<div class="hist">${groups.map(dayBlock).join("")}</div>${older}`;
+  const filters = `<div class="toolrow">${historyChips(url, "host", "Filter by host", "All hosts", filter.host, offered(known.hosts, filter.host))}${historyChips(url, "repo", "Filter by repo", "All repos", filter.repo, offered(known.repos, filter.repo))}</div>`;
   return shell(
     email,
     HISTORY_TAB,
@@ -432,19 +407,8 @@ export const historyPage = (
   );
 };
 
-const memoryLink = (url: URL, changes: Record<string, string>): string => {
-  const next = new URLSearchParams();
-  for (const name of ["q", ...LIST_PARAMS]) {
-    const value = url.searchParams.get(name) ?? "";
-    if (value !== "") next.set(name, value);
-  }
-  for (const [name, value] of Object.entries(changes)) {
-    if (value === "") next.delete(name);
-    else next.set(name, value);
-  }
-  const query = next.toString();
-  return escapeHtml(query === "" ? MEMORY_TAB.path : `${MEMORY_TAB.path}?${query}`);
-};
+const memoryLink = (url: URL, changes: Record<string, string>): string =>
+  tabLink(MEMORY_TAB, ["q", ...LIST_PARAMS], url, changes);
 
 const findForm = (url: URL, filter: ListInput): string => {
   const type = filter.types[0] ?? "";

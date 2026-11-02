@@ -1,5 +1,6 @@
 import type { Caller } from "./device";
 import {
+  type HistoryFilters,
   type HistoryInput,
   IDLE_AFTER_MS,
   type ListInput,
@@ -373,6 +374,7 @@ interface PastSessionRow {
   prompts: number;
   focus_first: string;
   focus_latest: string;
+  running: number;
 }
 
 const toPastSession = (row: PastSessionRow): PastSession => ({
@@ -385,6 +387,7 @@ const toPastSession = (row: PastSessionRow): PastSession => ({
   lastActivityAt: row.last_activity_at,
   prompts: row.prompts,
   focus: { first: row.focus_first, latest: row.focus_latest },
+  running: row.running === 1,
 });
 
 export const listSessionHistory = async (
@@ -392,18 +395,20 @@ export const listSessionHistory = async (
   userId: string,
   input: HistoryInput,
   [cursorLastActivityAt, cursorSessionId]: [number, string],
+  now: number,
 ): Promise<{ sessions: PastSession[]; nextCursor: string }> => {
   const { results } = await db
     .prepare(
-      `SELECT session_id, device_name, host, repo, branch, started_at, last_activity_at, prompts,
-         focus_first, focus_latest
-       FROM session_history
-       WHERE user_id = ?1 AND (?2 = '' OR host = ?2) AND (?3 = '' OR repo = ?3)
-         AND (last_activity_at < ?4 OR (last_activity_at = ?4 AND session_id < ?5))
-       ORDER BY last_activity_at DESC, session_id DESC
+      `SELECT h.session_id, h.device_name, h.host, h.repo, h.branch, h.started_at, h.last_activity_at, h.prompts,
+         h.focus_first, h.focus_latest, s.session_id IS NOT NULL AS running
+       FROM session_history h
+       LEFT JOIN sessions s ON s.user_id = h.user_id AND s.session_id = h.session_id AND s.last_activity_at > ?7
+       WHERE h.user_id = ?1 AND (?2 = '' OR h.host = ?2) AND (?3 = '' OR h.repo = ?3)
+         AND (h.last_activity_at < ?4 OR (h.last_activity_at = ?4 AND h.session_id < ?5))
+       ORDER BY h.last_activity_at DESC, h.session_id DESC
        LIMIT ?6`,
     )
-    .bind(userId, input.host, input.repo, cursorLastActivityAt, cursorSessionId, input.limit + 1)
+    .bind(userId, input.host, input.repo, cursorLastActivityAt, cursorSessionId, input.limit + 1, now - SESSION_TTL_MS)
     .all<PastSessionRow>();
   const sessions = results.slice(0, input.limit).map(toPastSession);
   const last = sessions.at(-1);
@@ -411,12 +416,18 @@ export const listSessionHistory = async (
   return { sessions, nextCursor };
 };
 
-export const liveSessionIds = async (db: D1Database, userId: string, now: number): Promise<string[]> => {
+export const sessionHistoryFilters = async (db: D1Database, userId: string): Promise<HistoryFilters> => {
   const { results } = await db
-    .prepare("SELECT session_id FROM sessions WHERE user_id = ? AND last_activity_at > ?")
-    .bind(userId, now - SESSION_TTL_MS)
-    .all<{ session_id: string }>();
-  return results.map((row) => row.session_id);
+    .prepare(
+      `SELECT DISTINCT 'host' AS field, host AS value FROM session_history WHERE user_id = ?1 AND host <> ''
+       UNION
+       SELECT DISTINCT 'repo' AS field, repo AS value FROM session_history WHERE user_id = ?1 AND repo <> ''
+       ORDER BY field, value`,
+    )
+    .bind(userId)
+    .all<{ field: string; value: string }>();
+  const values = (field: string): string[] => results.filter((row) => row.field === field).map((row) => row.value);
+  return { hosts: values("host"), repos: values("repo") };
 };
 
 export const sessionTally = async (db: D1Database, userId: string, now: number): Promise<Live> => {

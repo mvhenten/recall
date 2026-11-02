@@ -107,8 +107,6 @@ export interface Live {
   busy: number;
 }
 
-// A session as session_history keeps it: the device name is snapshotted on the row, so reading the
-// past never joins devices or sessions.
 export interface PastSession {
   sessionId: string;
   name: string;
@@ -119,6 +117,12 @@ export interface PastSession {
   lastActivityAt: number;
   prompts: number;
   focus: Focus;
+  running: boolean;
+}
+
+export interface HistoryFilters {
+  hosts: string[];
+  repos: string[];
 }
 
 export interface HistoryInput {

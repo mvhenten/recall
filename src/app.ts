@@ -61,12 +61,12 @@ import {
   listMemories,
   listSessionHistory,
   listSessions,
-  liveSessionIds,
   memoryCounts,
   putSession,
   recall,
   recordUsage,
   saveMemory,
+  sessionHistoryFilters,
   sessionOnDevice,
   sessionTally,
   textCandidates,
@@ -319,9 +319,9 @@ export const createApp = (deps: Deps): App => {
     if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
     const cursor = decodeCursor(input.value.cursor);
     if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the History tab.");
-    const page = await listSessionHistory(db, userId, input.value, cursor);
-    const running = await liveSessionIds(db, userId, deps.now());
-    return historyPage(email, live, url, input.value, page.sessions, new Set(running), page.nextCursor);
+    const page = await listSessionHistory(db, userId, input.value, cursor, deps.now());
+    const known = await sessionHistoryFilters(db, userId);
+    return historyPage(email, live, url, input.value, known, page.sessions, page.nextCursor);
   };
 
   const memoryBody = async (
