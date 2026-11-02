@@ -1,5 +1,6 @@
 mod adopt;
 mod api;
+mod backfill;
 mod config;
 mod listen;
 mod markdown;
@@ -148,6 +149,12 @@ enum Command {
             help = "Write and sync a record for every running session this host's hooks never registered"
         )]
         adopt: bool,
+        #[arg(
+            long,
+            conflicts_with_all = ["sync", "end", "adopt"],
+            help = "Send the history and usage of every past session this host holds a transcript for"
+        )]
+        backfill: bool,
     },
     #[command(about = "Send a message to another host signed in as you, or to one session on it")]
     Send {
@@ -500,6 +507,32 @@ fn adopt_sessions() -> Result<ExitCode> {
     Ok(ExitCode::from(2))
 }
 
+/// Every past session this host holds a transcript for, sent as the session it was. The sync writes
+/// the history row, the row survives the end that follows it, and the tokens go out between the
+/// two, since a delta carries its own host and repo and the usage route takes an ended session.
+///
+/// One session that cannot be sent fails the run, and the ledger carries what landed, so the next
+/// run picks the span up where this one stopped instead of sending it again.
+fn backfill_sessions() -> Result<ExitCode> {
+    let scope = backfill::Scope::here()?;
+    let past = backfill::past(&scope, Timestamp::now().as_millisecond())?;
+    if past.is_empty() {
+        println!("no past session needs backfilling");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let client = Client::new(config::load()?);
+    for session in &past {
+        let id = &session.session_id;
+        client.sync_session(id, &session.body())?;
+        let sent = client.post_usage(id, &session.host, &session.repo, &session.usage)?;
+        client.end_session(id)?;
+        backfill::note(&scope.ledger, id)?;
+        println!("backfilled {id} with {sent} usage deltas");
+    }
+    println!("backfilled {} past sessions", past.len());
+    Ok(ExitCode::SUCCESS)
+}
+
 fn require_messaging(settings: &Settings) -> Result<()> {
     if settings.messaging_enabled() {
         return Ok(());
@@ -585,7 +618,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 listen::run(&settings, ensure)?;
             }
         }
-        Command::Sessions { sync, end, adopt } => {
+        Command::Sessions {
+            sync,
+            end,
+            adopt,
+            backfill,
+        } => {
             if let Some(id) = sync {
                 return Ok(logged("synced", "sync-failed", &id, || sync_session(&id)));
             }
@@ -594,6 +632,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if adopt {
                 return adopt_sessions();
+            }
+            if backfill {
+                return backfill_sessions();
             }
             let client = client()?;
             let listed = client.sessions()?;

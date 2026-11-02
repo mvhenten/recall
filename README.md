@@ -173,8 +173,9 @@ Durable Objects with SQLite storage run on the Workers Free plan, which allows 1
 
 ```bash
 recall sessions
-recall --json sessions   # the whole document of each
-recall sessions --adopt  # take on the running sessions this host's hooks never registered
+recall --json sessions      # the whole document of each
+recall sessions --adopt     # take on the running sessions this host's hooks never registered
+recall sessions --backfill  # send the history and usage of this host's past sessions
 ```
 
 ```
@@ -185,6 +186,10 @@ tower   tower-c4e2   global                                              3h   id
 The session's registry record is the document. Beside the state the hook left it in, it carries the host, the repo tag, the branch and the last commit subject, the start and last-activity times in epoch milliseconds, a prompt count, the focus, the permission mode Claude reports on the hook's stdin, and whether the session is interactive or headless. Nothing in it costs a model call: the focus line is the session's first prompt and its latest, each cut to 72 characters, and the branch and subject come from one `git log` in the session's directory.
 
 Hooks load when a session starts, so a plugin update leaves every session already running with the hooks it started with: it writes no record, never syncs, and the list stays short until each one restarts. `recall sessions --adopt` takes those sessions on. It reads the Claude processes from `/proc` and pairs each with the transcript it opened under `~/.claude/projects/<directory>/`: the one born soonest after that process started, since Claude Code opens the transcript seconds into the session, and a session that ended minutes ago can leave the directory's most recently written transcript behind. Then it writes the record the hooks would have written: the session id from the file name, the start from its first line, the last activity from its last write, the focus and the prompt count from the prompts in it, and the repo, branch and commit from one `git log`. A session the registry already names is left alone — including one whose record is caught mid-write and does not parse, since overwriting that would throw away the inbox in it.
+
+`recall sessions --backfill` goes further back. History and stats start the day the hooks shipped, while `~/.claude/projects/` holds every session that ran before them, so this pass reads those transcripts back and sends each one as the session it was: the sync writes the history row, the tokens go out as usage deltas, and the end that follows leaves the row standing. It reads the same transcripts adoption reads, and only the session's own: a subagent writes its own a level down and that is no session. The whole transcript is one stretch, so the chunk numbers are the ones a first hook pass over it would have spent and the service keeps the first event it saw for each; the ids that landed go into `${XDG_STATE_HOME:-~/.local/state}/recall/backfilled`, and a session the registry still names is live and adoption's. An interrupted run resumes, and a second run sends nothing. Nothing is dropped: session history has no retention sweep, so the whole span lands and stays.
+
+A past session carries less than a live one. A transcript names no subscription, so every event it yields is attributed to the account this host is signed in as now; it also says neither whether the session was interactive nor which commit its directory sat on, and the history row carries the API's empty readings for both. The directory and the branch are what the entries themselves name.
 
 The record says `state: adopted`, which is also what lets a later pass move it on. The listener's thirty second tick runs the same adoption, one pass at a time, reading only the stretch of transcript past the mark the last pass left, so an adopted session's last activity keeps up with its own transcript until its process is gone. The first prompt a current hook sees takes the record back: the state becomes that session's own, and adoption leaves it alone from there on. Until then the session takes no messages, because the inbox it would take them on was known only to the hooks it never ran. `recall update` ends the daemon it just replaced, starts one from the new binary and runs a pass of its own, so an update heals the host instead of waiting for restarts.
 
