@@ -118,7 +118,7 @@ enum Command {
         file: PathBuf,
         #[arg(
             long,
-            help = "Publish under this kebab-case name; defaults to the file's own name, and an existing name is replaced"
+            help = "Publish under this name, as a kebab-case slug; defaults to the file's own name, and an existing name is replaced"
         )]
         name: Option<String>,
     },
@@ -873,7 +873,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Publish { file, name } => {
-            let artifact = client()?.publish_file(&file, name)?;
+            let artifact = client()?.publish_file(&file, name.as_deref())?;
             if cli.json {
                 print_json(&artifact)?;
             } else {

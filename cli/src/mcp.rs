@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 const SEND_TOOL: &str = "recall_send";
 
-const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. It also publishes artifacts: write a self-contained HTML page to a file and recall_publish it to give the user a URL they can open. Publishing the same name again redraws that same page at the same URL.";
+const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. Where the deployment hosts pages, recall_publish puts a self-contained HTML file at a URL the user can open.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -130,10 +130,9 @@ pub struct SendParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublishParams {
-    /// Path to the HTML file to publish. Write the page to disk first; its bytes are read from
-    /// there, never from this call.
+    /// Path to the HTML file to publish.
     pub file_path: String,
-    /// Publish under this kebab-case name instead of the file's own name.
+    /// Publish under this name, as a kebab-case slug, instead of the file's own name.
     pub name: Option<String>,
 }
 
@@ -369,11 +368,12 @@ impl Recall {
 
     #[tool(
         name = "recall_publish",
-        description = "Publish an artifact: one self-contained HTML file, carrying its own style, script and data: assets and reaching no other host, served to the user at a stable URL behind their own sign-in. Use it for anything worth looking at rather than reading in a terminal: a chart, a report, a small tool. Write the page to a file and pass its path, so the HTML goes from disk to the service and never through this conversation. Publishing a name that already exists replaces that page and keeps its URL. Returns the URL to give the user."
+        description = "Publish a self-contained HTML page, carrying its own style, script and data: assets, and return the URL the user opens it on. Write the page to a file and pass its path, never its content. Publishing a name that already exists replaces that page at the same URL."
     )]
     async fn publish(&self, Parameters(params): Parameters<PublishParams>) -> Result<String, String> {
         blocking(move || {
-            let artifact = client()?.publish_file(std::path::Path::new(&params.file_path), params.name)?;
+            let path = std::path::Path::new(&params.file_path);
+            let artifact = client()?.publish_file(path, params.name.as_deref())?;
             to_json(&serde_json::json!({
                 "name": artifact.name,
                 "url": artifact.url,

@@ -58,7 +58,6 @@ struct Single {
     memory: Memory,
 }
 
-/// One published page: its slug, the URL it answers on, and what the service holds of it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Artifact {
@@ -116,11 +115,12 @@ fn encode(value: &str) -> String {
         .collect()
 }
 
-/// A page takes the name of the file it was written to: lower case, every run of anything else a
-/// single dash, which is the kebab-case slug the service accepts.
-pub fn artifact_name(path: &Path) -> Result<String> {
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let name = stem
+const MAX_NAME_LENGTH: usize = 100;
+
+/// The service names a page by a kebab-case slug of at most 100 characters: lower case, every run
+/// of anything else a single dash.
+fn slug(text: &str) -> String {
+    let mut name = text
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -134,8 +134,20 @@ pub fn artifact_name(path: &Path) -> Result<String> {
         .filter(|part| !part.is_empty())
         .collect::<Vec<&str>>()
         .join("-");
+    name.truncate(MAX_NAME_LENGTH);
+    name.trim_end_matches('-').to_string()
+}
+
+/// A page is published under the name the caller gave, or the name of the file it was written to.
+/// Both go through the same slug, so neither reaches the service in a shape it refuses.
+pub fn artifact_name(path: &Path, given: Option<&str>) -> Result<String> {
+    let source = match given {
+        Some(given) => given.to_string(),
+        None => path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+    };
+    let name = slug(&source);
     if name.is_empty() {
-        bail!("{} has no name to publish it under; pass --name", path.display());
+        bail!("{source:?} holds no letter or digit to name a page by");
     }
     Ok(name)
 }
@@ -159,6 +171,9 @@ fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq
     };
     bail!("{what} failed with {status}: {}{hint}", text.trim())
 }
+
+/// A page runs to 16 MB, which the twenty seconds every other call gets will not carry.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn agent() -> Agent {
     Agent::config_builder()
@@ -587,17 +602,22 @@ impl Client {
 
     /// Publishes the page on disk, so its HTML travels from the file to the service without
     /// passing through whatever asked for it. An existing name is replaced and keeps its URL.
-    pub fn publish_file(&self, path: &Path, name: Option<String>) -> Result<Artifact> {
-        let name = match name {
-            Some(name) => name,
-            None => artifact_name(path)?,
-        };
+    pub fn publish_file(&self, path: &Path, name: Option<&str>) -> Result<Artifact> {
+        let name = artifact_name(path, name)?;
         let html = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let response = self
-            .authed(self.agent.put(self.url(&format!("/v1/artifacts/{}", encode(&name)))))
-            .header("content-type", "text/html; charset=utf-8")
-            .send(&html[..])?;
-        let published: Published = check(response, &format!("publishing {name}"))?.body_mut().read_json()?;
+        let request = self
+            .agent
+            .put(self.url(&format!("/v1/artifacts/{}", encode(&name))))
+            .config()
+            .timeout_global(Some(PUBLISH_TIMEOUT))
+            .build();
+        let response = self.authed(request).send(&html[..])?;
+        let published: Published = check(response, &format!("publishing {name}"))?
+            .body_mut()
+            .read_json()
+            .with_context(|| {
+                format!("reading back where {name} is published; a service older than 0.8 names no url")
+            })?;
         Ok(published.artifact)
     }
 }
@@ -646,12 +666,21 @@ mod tests {
 
     #[test]
     fn a_file_name_becomes_the_page_name() {
-        let name = |path: &str| artifact_name(Path::new(path)).unwrap();
+        let name = |path: &str| artifact_name(Path::new(path), None).unwrap();
         assert_eq!(name("/home/you/Burn Up Chart.html"), "burn-up-chart");
         assert_eq!(name("burn_up.v2.html"), "burn-up-v2");
         assert_eq!(name("./reports/--Q3--.html"), "q3");
-        let error = artifact_name(Path::new("/home/you/....html")).unwrap_err().to_string();
-        assert!(error.contains("pass --name"), "{error}");
+        assert!(artifact_name(Path::new("/home/you/....html"), None).is_err());
+    }
+
+    #[test]
+    fn a_given_name_goes_through_the_same_slug() {
+        let name = |given: &str| artifact_name(Path::new("page.html"), Some(given)).unwrap();
+        assert_eq!(name("Q3 Report"), "q3-report");
+        assert_eq!(name("already-a-slug"), "already-a-slug");
+        assert_eq!(name(&"long".repeat(40)).len(), 100);
+        assert_eq!(name(&format!("{} tail", "a".repeat(99))), "a".repeat(99));
+        assert!(artifact_name(Path::new("page.html"), Some("!!")).is_err());
     }
 
     #[test]
