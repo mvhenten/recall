@@ -1,6 +1,8 @@
 import {
   type Focus,
   FRESH_WINDOW_DAYS,
+  HISTORY_PARAMS,
+  type HistoryInput,
   IDLE_AFTER_MS,
   LIST_PARAMS,
   type ListInput,
@@ -9,7 +11,10 @@ import {
   type MemoryCounts,
   type MemoryHit,
   memoryTypes,
+  type PastSession,
+  SESSION_HISTORY_DAYS,
   type Session,
+  usageDay,
 } from "./model";
 import { escapeHtml, htmlPage } from "./page";
 
@@ -26,11 +31,12 @@ const BARS = '<path d="M5.5 16V10.5M10 16V5.5M14.5 16V8.5M3.5 16h13"/>';
 const SPARK = '<path d="M10 3l1.7 5.1L17 10l-5.3 1.9L10 17l-1.7-5.1L3 10l5.3-1.9z"/>';
 
 export const SESSIONS_TAB: Tab = { path: "/dashboard", label: "Sessions", icon: DISC };
+export const HISTORY_TAB: Tab = { path: "/dashboard/history", label: "History", icon: CLOCK };
 export const MEMORY_TAB: Tab = { path: "/dashboard/memory", label: "Memory", icon: BOOKMARK };
 
 export const TABS: Tab[] = [
   SESSIONS_TAB,
-  { path: "/dashboard/history", label: "History", icon: CLOCK },
+  HISTORY_TAB,
   MEMORY_TAB,
   { path: "/dashboard/stats", label: "Stats", icon: BARS },
   { path: "/dashboard/insights", label: "Insights", icon: SPARK },
@@ -99,6 +105,13 @@ main{padding:1rem;display:grid;gap:.7rem;align-content:start}
 .then{color:var(--faint)}
 .smeta{display:flex;flex-wrap:wrap;gap:.35rem;font:400 .74rem/1.5 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .smeta>*+*::before{content:"· "}
+.hist{display:grid;gap:1.1rem;align-items:start}
+.day{display:grid;gap:.6rem;align-content:start}
+.dayhead{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;margin:0;padding:.5rem .15rem;border-bottom:2px solid var(--line2)}
+.dayhead b{font:600 .78rem/1 var(--mono);letter-spacing:.1em}
+.dayhead span{font:400 .74rem/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
+.tm{font:400 .74rem/1.4 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
+.run{font:600 .7rem/1 var(--mono);color:var(--live)}
 .mcard{display:grid;gap:.45rem;padding:.85rem .95rem;background:var(--surface);border:1px solid var(--line);border-radius:8px;align-content:start}
 .mcard p{margin:0}
 .mh{display:flex;align-items:center;justify-content:space-between;gap:.6rem}
@@ -174,6 +187,9 @@ main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
 .ag,.pr{font:400 .8rem/1 var(--mono);font-variant-numeric:tabular-nums;color:var(--dim);text-align:right}
 .lhead .r{text-align:right}
 .unit{display:none}
+.hist{grid-template-columns:1fr 1fr;gap:1.2rem 1rem}
+.hrow{grid-template-columns:8.5rem 9rem 14rem minmax(0,1fr) 4.5rem 5.5rem}
+.hrow .tm{grid-area:1/1}
 .memories{grid-template-columns:repeat(auto-fill,minmax(18rem,1fr));gap:1rem}
 .chips{flex-wrap:wrap;overflow-x:visible}
 }`;
@@ -286,6 +302,134 @@ export const sessionsPage = (email: string, live: Live, sessions: Session[], now
         )
       : `<div class="withrail">${ledger(sessions, now)}<div class="rail">${hostsCard(sessions, now)}${oldestIdleCard(sessions, now)}</div></div>`;
   return shell(email, SESSIONS_TAB, live, SESSIONS_TAB.label, `${live.sessions} live · ${live.busy} busy`, main);
+};
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+
+// session_history keeps epoch milliseconds and usage_daily rolls up on the UTC day, so the history
+// reads the clock and the day in UTC too and the two pages never disagree about which day a session
+// belongs to.
+const clock = (at: number): string => new Date(at).toISOString().slice(11, 16);
+
+const span = (ms: number): string => {
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  const hours = Math.floor(minutes / 60);
+  return hours === 0 ? `${minutes}m` : `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
+};
+
+interface DayGroup {
+  day: string;
+  sessions: PastSession[];
+}
+
+const byDay = (sessions: PastSession[]): DayGroup[] => {
+  const groups: DayGroup[] = [];
+  for (const session of sessions) {
+    const day = usageDay(session.lastActivityAt);
+    const open = groups.at(-1);
+    if (open?.day === day) open.sessions.push(session);
+    else groups.push({ day, sessions: [session] });
+  }
+  return groups;
+};
+
+const dayHead = (group: DayGroup): string => {
+  const count = group.sessions.length;
+  const worked = group.sessions.reduce((total, session) => total + (session.lastActivityAt - session.startedAt), 0);
+  const weekday = WEEKDAYS[new Date(`${group.day}T00:00:00Z`).getUTCDay()] ?? "";
+  return `<p class="dayhead"><b>${escapeHtml(group.day)} · ${weekday}</b><span>${count} ${count === 1 ? "session" : "sessions"} · ${span(worked)}</span></p>`;
+};
+
+const historyRow = (session: PastSession, running: boolean): string =>
+  `<li class="srow hrow"><p class="tm">${clock(session.startedAt)}–${clock(session.lastActivityAt)}</p>
+<p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(session.host)}</span>${running ? ' <span class="run">running</span>' : ""}</p>
+<p class="fc">${focusHtml(session.focus)}</p>
+<p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${span(session.lastActivityAt - session.startedAt)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
+
+const dayBlock = (group: DayGroup, running: Set<string>): string =>
+  `<section class="day">${dayHead(group)}<ol class="sessions" role="list">${group.sessions
+    .map((session) => historyRow(session, running.has(session.sessionId)))
+    .join("")}</ol></section>`;
+
+const historyLink = (url: URL, changes: Record<string, string>): string => {
+  const next = new URLSearchParams();
+  for (const name of HISTORY_PARAMS) {
+    const value = url.searchParams.get(name) ?? "";
+    if (value !== "") next.set(name, value);
+  }
+  for (const [name, value] of Object.entries(changes)) {
+    if (value === "") next.delete(name);
+    else next.set(name, value);
+  }
+  const query = next.toString();
+  return escapeHtml(query === "" ? HISTORY_TAB.path : `${HISTORY_TAB.path}?${query}`);
+};
+
+const historyChips = (url: URL, name: string, label: string, all: string, active: string, values: string[]): string => {
+  const chip = (value: string, text: string): string =>
+    `<a href="${historyLink(url, { [name]: value })}"${value === active ? ' aria-current="page"' : ""}>${escapeHtml(text)}</a>`;
+  return `<nav class="chips" aria-label="${escapeHtml(label)}">${chip("", all)}${values.map((value) => chip(value, value)).join("")}</nav>`;
+};
+
+const offered = (values: string[], active: string): string[] => {
+  const present = new Set(values.filter((value) => value !== ""));
+  if (active !== "") present.add(active);
+  return [...present].sort();
+};
+
+export const historyPage = (
+  email: string,
+  live: Live,
+  url: URL,
+  filter: HistoryInput,
+  sessions: PastSession[],
+  running: Set<string>,
+  nextCursor: string,
+): Response => {
+  const filtered = filter.host !== "" || filter.repo !== "";
+  const groups = byDay(sessions);
+  const older =
+    nextCursor === ""
+      ? ""
+      : `<p class="more"><a href="${historyLink(url, { cursor: nextCursor })}">Older sessions</a></p>`;
+  const listing =
+    groups.length === 0
+      ? emptyState(
+          filtered ? "No session matches this filter." : "No session is in your history yet.",
+          filtered
+            ? "Clear the filter to read every host and every repo."
+            : `A session lands here as soon as it syncs, and stays for ${SESSION_HISTORY_DAYS} days.`,
+        )
+      : `<div class="hist">${groups.map((group) => dayBlock(group, running)).join("")}</div>${older}`;
+  const filters = `<div class="toolrow">${historyChips(
+    url,
+    "host",
+    "Filter by host",
+    "All hosts",
+    filter.host,
+    offered(
+      sessions.map((session) => session.host),
+      filter.host,
+    ),
+  )}${historyChips(
+    url,
+    "repo",
+    "Filter by repo",
+    "All repos",
+    filter.repo,
+    offered(
+      sessions.map((session) => session.repo),
+      filter.repo,
+    ),
+  )}</div>`;
+  return shell(
+    email,
+    HISTORY_TAB,
+    live,
+    HISTORY_TAB.label,
+    `last ${SESSION_HISTORY_DAYS} days`,
+    `${filters}${listing}`,
+  );
 };
 
 const memoryLink = (url: URL, changes: Record<string, string>): string => {
