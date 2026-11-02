@@ -10,6 +10,9 @@ import {
   type SessionInput,
   type SessionMode,
   sessionHandle,
+  USAGE_RETENTION_MS,
+  type UsageInput,
+  usageDay,
 } from "./model";
 
 interface MemoryRow {
@@ -352,6 +355,65 @@ export const sessionOnDevice = async (
     .bind(userId, sessionId, deviceId, now - SESSION_TTL_MS)
     .first<{ session_id: string }>();
   return row !== null;
+};
+
+const USAGE_SUMS = ["prompts", "input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens"]
+  .map((column) => `${column} = usage_daily.${column} + excluded.${column}`)
+  .join(", ");
+
+// The rollup runs before the event insert and is skipped when that seq is already stored, so a
+// resent delta adds nothing. Rollup, event and retention sweep share one batch, which D1 runs as a
+// single transaction.
+export const recordUsage = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  input: UsageInput,
+  now: number,
+): Promise<boolean> => {
+  const session = await db
+    .prepare("SELECT host, repo FROM sessions WHERE user_id = ? AND session_id = ?")
+    .bind(userId, sessionId)
+    .first<{ host: string; repo: string }>();
+  if (!session) return false;
+  const counters = [
+    input.prompts,
+    input.inputTokens,
+    input.outputTokens,
+    input.cacheWriteTokens,
+    input.cacheReadTokens,
+  ];
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO usage_daily (user_id, day, host, repo, account, provider, model, prompts,
+           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         WHERE NOT EXISTS (SELECT 1 FROM usage_events WHERE user_id = ?1 AND session_id = ?13 AND seq = ?14)
+         ON CONFLICT (user_id, day, host, repo, account, provider, model) DO UPDATE SET ${USAGE_SUMS}`,
+      )
+      .bind(
+        userId,
+        usageDay(input.at),
+        session.host,
+        session.repo,
+        input.account,
+        input.provider,
+        input.model,
+        ...counters,
+        sessionId,
+        input.seq,
+      ),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO usage_events (user_id, session_id, seq, provider, account, model, prompts,
+           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+      )
+      .bind(userId, sessionId, input.seq, input.provider, input.account, input.model, ...counters, input.at),
+    db.prepare("DELETE FROM usage_events WHERE user_id = ? AND at < ?").bind(userId, now - USAGE_RETENTION_MS),
+  ]);
+  return true;
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {

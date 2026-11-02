@@ -42,6 +42,7 @@ import {
   parseSearch,
   parseSession,
   parseSessionId,
+  parseUsage,
   type SearchInput,
   type Verify,
 } from "./model";
@@ -58,6 +59,7 @@ import {
   memoryCounts,
   putSession,
   recall,
+  recordUsage,
   saveMemory,
   sessionOnDevice,
   textCandidates,
@@ -198,6 +200,7 @@ export const createApp = (deps: Deps): App => {
     db: D1Database,
     caller: Caller,
     rawSessionId: string | undefined,
+    subresource: string | undefined,
   ): Promise<Response> => {
     if (rawSessionId === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
@@ -208,6 +211,10 @@ export const createApp = (deps: Deps): App => {
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);
+    if (subresource !== undefined) {
+      if (subresource !== "usage") return error(404, "not found");
+      return usage(request, db, caller, sessionId.value);
+    }
     if (request.method === "PUT") {
       const input = parseSession(await readJson(request));
       if (!input.ok) return error(400, input.error);
@@ -216,6 +223,16 @@ export const createApp = (deps: Deps): App => {
     }
     if (request.method !== "DELETE") return error(405, "method not allowed");
     if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
+    return new Response(null, { status: 204 });
+  };
+
+  const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const input = parseUsage(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    if (!(await recordUsage(db, caller.userId, sessionId, input.value, deps.now()))) {
+      return error(404, `no session ${sessionId}`);
+    }
     return new Response(null, { status: 204 });
   };
 
@@ -480,8 +497,9 @@ export const createApp = (deps: Deps): App => {
         { status: 404, headers: { vary: "accept", "cache-control": "no-store" } },
       );
     }
-    const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
+    const [version, collection, rawName, subresource, ...rest] = url.pathname.split("/").filter((part) => part !== "");
     if (version !== "v1" || rest.length > 0) return error(404, "not found");
+    if (subresource !== undefined && collection !== "sessions") return error(404, "not found");
     if (collection === "device") {
       if (request.method !== "POST") return error(405, "method not allowed");
       if (rawName === "code") return startDevice(request, url, env.DB);
@@ -491,7 +509,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
-    if (collection === "sessions") return sessions(request, env.DB, caller, rawName);
+    if (collection === "sessions") return sessions(request, env.DB, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {
         if (request.method !== "GET") return error(405, "method not allowed");

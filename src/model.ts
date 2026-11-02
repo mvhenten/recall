@@ -100,6 +100,29 @@ export interface Session extends SessionInput {
   deviceId: string;
 }
 
+// Raw events are detail and the daily rollup is the long window, so events past two weeks are
+// dropped and every window wider than that reads only usage_daily.
+export const USAGE_RETENTION_MS = 1_209_600_000;
+export const MAX_USAGE_TOKENS = 1_000_000_000;
+const MAX_EPOCH_MS = 8_640_000_000_000_000;
+
+export interface UsageInput {
+  seq: number;
+  provider: string;
+  account: string;
+  model: string;
+  prompts: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  at: number;
+}
+
+// The UTC day a delta rolls into. A session that runs through midnight sends deltas on both sides
+// of it, and each one carries the `at` that decides which day it joins.
+export const usageDay = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
 // The handle that addresses one session: its device name and the head of its session id. It is a
 // function of the session alone, so it names the same session for as long as that session runs and
 // never moves to another one.
@@ -255,5 +278,33 @@ export const parseSession = (body: unknown): Parsed<SessionInput> => {
       permissionMode,
       pid,
     },
+  };
+};
+
+export const parseUsage = (body: unknown): Parsed<UsageInput> => {
+  if (!isRecord(body)) return fail("body must be a JSON object");
+  const { seq, provider, account, model, prompts, at } = body;
+  const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
+  if (!isInteger(seq, 0, Number.MAX_SAFE_INTEGER)) return fail("seq must be the whole number of a delta in a session");
+  if (!isText(provider, MAX_SESSION_TEXT_CHARS) || provider.length < 1) {
+    return fail(`provider must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
+  }
+  if (!isText(model, MAX_SESSION_TEXT_CHARS) || model.length < 1) {
+    return fail(`model must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
+  }
+  if (!isText(account, MAX_SESSION_TEXT_CHARS)) {
+    return fail(`account must be a string of at most ${MAX_SESSION_TEXT_CHARS} characters, empty when unknown`);
+  }
+  if (!isInteger(prompts, 0, MAX_PROMPTS)) return fail(`prompts must be a whole number from 0 to ${MAX_PROMPTS}`);
+  if (!isInteger(at, 0, MAX_EPOCH_MS)) return fail("at must be a whole number of epoch milliseconds");
+  const counter = (value: unknown): value is number => isInteger(value, 0, MAX_USAGE_TOKENS);
+  if (!counter(inputTokens) || !counter(outputTokens) || !counter(cacheWriteTokens) || !counter(cacheReadTokens)) {
+    return fail(
+      `inputTokens, outputTokens, cacheWriteTokens and cacheReadTokens must each be a whole number from 0 to ${MAX_USAGE_TOKENS}`,
+    );
+  }
+  return {
+    ok: true,
+    value: { seq, provider, account, model, prompts, at, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens },
   };
 };
