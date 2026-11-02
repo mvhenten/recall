@@ -453,7 +453,7 @@ fn sync_session(session_id: &str) -> Result<()> {
         sessions::commit_usage(&dir, session_id, pending)?;
         println!("sent {sent} usage deltas for {session_id}");
     }
-    let archived = transcripts::send_session(&client, session_id, &record.transcript_path)?;
+    let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path)?;
     if archived > 0 {
         println!("archived {archived} transcript bytes for {session_id}");
     }
@@ -472,7 +472,7 @@ fn end_session(session_id: &str) -> Result<()> {
             let sent = client.post_usage(session_id, &record.host, &record.repo, &pending.events)?;
             println!("sent {sent} usage deltas for {session_id}");
         }
-        let archived = transcripts::send_session(&client, session_id, &record.transcript_path)?;
+        let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path)?;
         if archived > 0 {
             println!("archived {archived} transcript bytes for {session_id}");
         }

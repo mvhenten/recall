@@ -9,6 +9,13 @@
   "additionalProperties": false,
   "description": "Settings read from ~/.config/recall/config.json, overridden by the environment and these flags.",
   "properties": {
+    "archive_interval_seconds": {
+      "description": "Seconds between the passes that carry a running session's newest transcript lines up.",
+      "format": "uint64",
+      "maximum": 3600,
+      "minimum": 2,
+      "type": ["integer", "null"]
+    },
     "messaging_enabled": {
       "description": "Opt in to messaging between Claude Code sessions on the hosts signed in as you.",
       "type": ["boolean", "null"]

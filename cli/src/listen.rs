@@ -244,7 +244,12 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
                 };
                 log(&outcome, started.elapsed());
             }
-            archive(&client, id, &session.transcript_path);
+            archive(
+                &mut transcripts::Archive::default(),
+                &client,
+                id,
+                &session.transcript_path,
+            );
             let started = Instant::now();
             let outcome = match client.end_session(id) {
                 Ok(true) => format!("sessions:ended:{id}"),
@@ -257,10 +262,10 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
 }
 
 /// One session's transcript files, caught up with the service. A failure is reported and the pass
-/// carries on: what is not sent now is sent by the next tick, or by `recall backfill` long after.
-fn archive(client: &Client, session_id: &str, transcript: &Path) {
+/// carries on: what is not sent now is sent by the next pass, or by `recall backfill` long after.
+fn archive(archive: &mut transcripts::Archive, client: &Client, session_id: &str, transcript: &Path) {
     let started = Instant::now();
-    match transcripts::send_session(client, session_id, transcript) {
+    match archive.send(client, session_id, transcript) {
         Ok(0) => {}
         Ok(bytes) => log(&format!("sessions:archived:{session_id}:{bytes}"), started.elapsed()),
         Err(error) => log(
@@ -270,28 +275,33 @@ fn archive(client: &Client, session_id: &str, transcript: &Path) {
     }
 }
 
-/// The transcripts of the sessions still running, on the tick that already sweeps the registry. A
-/// session works for minutes between prompts and writes the whole time, while the hook that would
-/// carry its lines up only fires on a prompt, so without this a long turn reaches the archive only
-/// once it is over.
-fn archive_running(client: &Arc<Client>, scan: &sessions::Scan, running: &Arc<AtomicBool>) {
-    if running.swap(true, Ordering::AcqRel) {
-        return;
+/// The transcripts of the sessions still running, on a beat of its own. A session works for
+/// minutes between prompts and writes the whole time, while the hook that would carry its lines up
+/// only fires on a prompt, so without this a long turn reaches the archive only once it is over.
+///
+/// The beat is `archive.interval.seconds` and not the registry sweep's: the sweep ends dead
+/// sessions and runs adoption, which a host wanting its newest lines sooner has no reason to
+/// hurry. The registry is read and never swept here, since a second sweeper would unlink the dead
+/// records before the tick that owes the service their notice had seen them. One pass runs at a
+/// time: the next beat waits on the one before it rather than piling up behind it.
+async fn archive_loop(client: Arc<Client>, sessions_dir: PathBuf, every: Duration) {
+    let mut beat = tokio::time::interval(every);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pass = transcripts::Archive::default();
+    loop {
+        beat.tick().await;
+        let live = sessions::transcript_paths(&sessions_dir);
+        let client = Arc::clone(&client);
+        pass = tokio::task::spawn_blocking(move || {
+            pass.retain(&live.iter().map(|(session_id, _)| session_id.as_str()).collect());
+            for (session_id, path) in &live {
+                archive(&mut pass, &client, session_id, path);
+            }
+            pass
+        })
+        .await
+        .unwrap_or_default();
     }
-    let pass = Pass(Arc::clone(running));
-    let client = Arc::clone(client);
-    let live: Vec<(String, PathBuf)> = scan
-        .live
-        .iter()
-        .map(|(_, status)| (status.session_id.clone(), status.record.transcript_path.clone()))
-        .filter(|(_, path)| !path.as_os_str().is_empty())
-        .collect();
-    tokio::task::spawn_blocking(move || {
-        let _pass = pass;
-        for (session_id, path) in live {
-            archive(&client, &session_id, &path);
-        }
-    });
 }
 
 /// One adoption pass at a time, whatever the tick does: a pass reads transcripts and then waits on
@@ -339,7 +349,7 @@ fn adopt_running(client: &Arc<Client>, scope: &Arc<adopt::Scope>, running: &Arc<
     });
 }
 
-async fn serve() -> Result<()> {
+async fn serve(archive_every: Duration) -> Result<()> {
     let config = config::load()?;
     let url = ws::listen_url(&config.endpoint)?;
     let sessions_dir = sessions_dir();
@@ -349,7 +359,6 @@ async fn serve() -> Result<()> {
         log(&format!("sessions:adopt-failed:{error:#}"), Duration::ZERO);
     }
     let adopting = Arc::new(AtomicBool::new(false));
-    let archiving = Arc::new(AtomicBool::new(false));
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -358,9 +367,9 @@ async fn serve() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
-        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |scan| {
-            archive_running(&client, scan, &archiving);
-            report_ended(&client, scan.ended.clone());
+        _ = archive_loop(Arc::clone(&client), sessions_dir.clone(), archive_every) => Ok(()),
+        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
+            report_ended(&client, ended);
             if let Ok(scope) = scope.as_ref() {
                 adopt_running(&client, scope, &adopting);
             }
@@ -489,7 +498,7 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
     };
     let _ = std::fs::write(pid_path(), format!("{}\n", std::process::id()));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let outcome = runtime.block_on(serve());
+    let outcome = runtime.block_on(serve(settings.archive_interval()));
     log(
         &match &outcome {
             Ok(()) => "listen:stopped".to_string(),

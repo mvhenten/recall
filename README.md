@@ -113,10 +113,13 @@ recall config set messaging.enabled true  # write it to the file
 recall config schema                      # the JSON Schema of the file
 ```
 
-| Setting             | Default | Environment                | Flag                         |
-| ------------------- | ------- | -------------------------- | ---------------------------- |
-| `mode`              | `hook`  | `RECALL_MODE`              | `--mode hook\|tools`         |
-| `messaging.enabled` | `false` | `RECALL_MESSAGING_ENABLED` | `--messaging-enabled <BOOL>` |
+| Setting                    | Default | Environment                       | Flag                                |
+| -------------------------- | ------- | --------------------------------- | ----------------------------------- |
+| `mode`                     | `hook`  | `RECALL_MODE`                     | `--mode hook\|tools`                |
+| `messaging.enabled`        | `false` | `RECALL_MESSAGING_ENABLED`        | `--messaging-enabled <BOOL>`        |
+| `archive.interval.seconds` | `10`    | `RECALL_ARCHIVE_INTERVAL_SECONDS` | `--archive-interval-seconds <SECS>` |
+
+`archive.interval.seconds` is how often the listener carries a running session's newest [transcript](#the-transcript-archive) lines up, from 2 seconds to an hour. A pass over a session that has not written since the one before costs no call, so only sessions actually writing generate traffic; the floor is there because below it the calls cost more than the lines are worth. It moves nothing else: the registry sweep that ends dead sessions and runs adoption keeps its own thirty second beat.
 
 A flag goes before the subcommand: `recall --mode tools mcp`. The dotted name is the display name; `messaging.enabled` on the command line is `messaging_enabled` in the file. An unknown key or a value of the wrong type is rejected and the message names the key. A `RECALL_MODE` left in `~/.config/recall/env` still sets the mode until `recall config set mode` writes one, which also takes it out of the env file.
 
@@ -210,7 +213,7 @@ The count covers every file the session writes. A delegated turn goes to a file 
 
 ### The transcript archive
 
-Every transcript lands in the service's object storage and stays there: nothing is deleted and nothing expires. A running session's new lines reach it on the beat the hooks already fire and on the listener's own thirty second tick, so a long turn that answers no prompt for twenty minutes is archived while it works rather than once it is over. `recall sessions --backfill` carries up everything a host still holds.
+Every transcript lands in the service's object storage and stays there: nothing is deleted and nothing expires. A running session's new lines reach it on the beat the hooks already fire and on the listener's own, every `archive.interval.seconds` (10 by default), so a long turn that answers no prompt for twenty minutes is archived while it works rather than once it is over. A pass over a session that has not written since the pass before it costs no call at all, so a short beat over a quiet host is free. `recall sessions --backfill` carries up everything a host still holds.
 
 Object storage has no append, so a file is kept as one object per appended stretch, under `<user id>/<session id>/<file>/<start offset>`. The offset is zero-padded, so listing a session's prefix gives its stretches in the order they were written and reading one file back is a concatenation. A stretch is keyed by where it starts and nothing else, and the store takes one only where the file already ends — so a tick that retries writes the same key again rather than a second copy of the same lines, and two writers racing leave no overlap for a reader to see twice. A call landing anywhere else is answered 409 carrying where the file does end, and the next pass reads on from there.
 

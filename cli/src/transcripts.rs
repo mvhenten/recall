@@ -11,7 +11,7 @@
 //! other.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -111,39 +111,75 @@ fn stretch(path: &Path, offset: i64) -> Result<Vec<u8>> {
     }
 }
 
-/// Sends what the service does not hold of one file, from where it says the file ends to where it
-/// ends here. A file the service is already level with costs nothing.
-pub fn send_file(store: &impl Store, session_id: &str, source: &Source, held: i64) -> Result<i64> {
-    let mut at = held;
-    let mut sent = 0;
-    while at < source.size {
-        let bytes = stretch(&source.path, at)?;
-        if bytes.is_empty() {
-            return Ok(sent);
-        }
-        match store.append(session_id, &source.file, at, &bytes)? {
-            Appended::Wrote(end) => {
-                sent += bytes.len() as i64;
-                at = end;
-            }
-            Appended::Behind(_) => return Ok(sent),
-        }
-    }
-    Ok(sent)
+/// Where one file now ends on the service, and how much of that this pass put there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reached {
+    pub end: i64,
+    pub bytes: i64,
 }
 
-/// Every file of one live session, caught up with the service. The session's own transcript is
-/// what names the set, so a session whose record carries none sends nothing.
-pub fn send_session(store: &impl Store, session_id: &str, transcript: &Path) -> Result<i64> {
-    if transcript.as_os_str().is_empty() {
-        return Ok(0);
+/// Sends what the service does not hold of one file, from where it says the file ends to where it
+/// ends here. A file the service is already level with costs nothing.
+pub fn send_file(store: &impl Store, session_id: &str, source: &Source, held: i64) -> Result<Reached> {
+    let mut at = held;
+    let mut bytes = 0;
+    while at < source.size {
+        let stretch = stretch(&source.path, at)?;
+        if stretch.is_empty() {
+            break;
+        }
+        match store.append(session_id, &source.file, at, &stretch)? {
+            Appended::Wrote(end) => {
+                bytes += stretch.len() as i64;
+                at = end;
+            }
+            Appended::Behind(end) => return Ok(Reached { end, bytes }),
+        }
     }
-    let held = store.held(session_id)?;
-    let mut sent = 0;
-    for source in sources(transcript) {
-        sent += send_file(store, session_id, &source, held.get(&source.file).copied().unwrap_or(0))?;
+    Ok(Reached { end: at, bytes })
+}
+
+/// A run of passes over the sessions on this host. It remembers where the service was last seen
+/// to hold each file, so a pass over a session that has not written since the one before costs no
+/// call at all — which is what lets the archive run on a short beat. The memory is only a floor:
+/// a pass with anything to send asks the service, and takes its answer over this.
+#[derive(Debug, Default)]
+pub struct Archive {
+    seen: HashMap<String, HashMap<String, i64>>,
+}
+
+impl Archive {
+    /// Every file of one session, caught up with the service. The session's own transcript is what
+    /// names the set, so a session whose record carries none sends nothing.
+    pub fn send(&mut self, store: &impl Store, session_id: &str, transcript: &Path) -> Result<i64> {
+        if transcript.as_os_str().is_empty() {
+            return Ok(0);
+        }
+        let sources = sources(transcript);
+        let known = self.seen.entry(session_id.to_string()).or_default();
+        if sources
+            .iter()
+            .all(|source| known.get(&source.file).is_some_and(|end| *end >= source.size))
+        {
+            return Ok(0);
+        }
+        let held = store.held(session_id)?;
+        let mut sent = 0;
+        let mut ends = HashMap::new();
+        for source in &sources {
+            let reached = send_file(store, session_id, source, held.get(&source.file).copied().unwrap_or(0))?;
+            ends.insert(source.file.clone(), reached.end);
+            sent += reached.bytes;
+        }
+        self.seen.insert(session_id.to_string(), ends);
+        Ok(sent)
     }
-    Ok(sent)
+
+    /// Forgets the sessions this host no longer holds, so a daemon that runs for weeks does not
+    /// carry every session it ever archived.
+    pub fn retain(&mut self, live: &HashSet<&str>) {
+        self.seen.retain(|session_id, _| live.contains(session_id.as_str()));
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +225,7 @@ mod tests {
     struct Fake {
         files: RefCell<HashMap<String, Vec<u8>>>,
         refused: RefCell<usize>,
+        asked: RefCell<usize>,
     }
 
     impl Fake {
@@ -199,6 +236,7 @@ mod tests {
 
     impl Store for Fake {
         fn held(&self, _session_id: &str) -> Result<HashMap<String, i64>> {
+            *self.asked.borrow_mut() += 1;
             Ok(self
                 .files
                 .borrow()
@@ -241,19 +279,51 @@ mod tests {
         let transcript = sandbox.transcript("s-1", "one\ntwo\n");
         sandbox.delegated("s-1", "agent-a", "ay\n");
         let service = Fake::default();
+        let mut archive = Archive::default();
 
-        assert_eq!(send_session(&service, "s-1", &transcript).unwrap(), 11);
+        assert_eq!(archive.send(&service, "s-1", &transcript).unwrap(), 11);
         std::fs::write(&transcript, "one\ntwo\nthree\n").unwrap();
-        assert_eq!(send_session(&service, "s-1", &transcript).unwrap(), 6);
+        assert_eq!(archive.send(&service, "s-1", &transcript).unwrap(), 6);
 
         assert_eq!(service.body("main"), "one\ntwo\nthree\n");
         assert_eq!(service.body("agent-a"), "ay\n");
         assert_eq!(
-            send_session(&service, "s-1", &transcript).unwrap(),
+            archive.send(&service, "s-1", &transcript).unwrap(),
             0,
             "a pass over a transcript that has not grown sends nothing"
         );
         assert_eq!(service.body("main"), "one\ntwo\nthree\n", "no line is written twice");
+    }
+
+    #[test]
+    fn a_pass_over_a_session_that_has_not_written_costs_no_call() {
+        let sandbox = Sandbox::new("quiet");
+        let transcript = sandbox.transcript("s-1", "one\n");
+        let service = Fake::default();
+        let mut archive = Archive::default();
+
+        archive.send(&service, "s-1", &transcript).unwrap();
+        let asked = *service.asked.borrow();
+        for _ in 0..20 {
+            assert_eq!(archive.send(&service, "s-1", &transcript).unwrap(), 0);
+        }
+
+        assert_eq!(
+            *service.asked.borrow(),
+            asked,
+            "a short beat over quiet sessions is free, so only a session writing costs anything"
+        );
+        std::fs::write(&transcript, "one\ntwo\n").unwrap();
+        assert_eq!(archive.send(&service, "s-1", &transcript).unwrap(), 4);
+        assert_eq!(*service.asked.borrow(), asked + 1, "and a session that wrote asks once");
+
+        archive.retain(&HashSet::new());
+        archive.send(&service, "s-1", &transcript).unwrap();
+        assert_eq!(
+            *service.asked.borrow(),
+            asked + 2,
+            "a session forgotten is asked about again"
+        );
     }
 
     #[test]
@@ -266,7 +336,8 @@ mod tests {
         // The pass reads from nothing, since that is what a host with no answer yet would do.
         assert_eq!(
             send_file(&service, "s-1", &sources(&transcript).remove(0), 0).unwrap(),
-            0
+            Reached { end: 4, bytes: 0 },
+            "nothing is written, and the end the service named is what the next pass reads from"
         );
 
         assert_eq!(*service.refused.borrow(), 1);
@@ -281,7 +352,7 @@ mod tests {
         let transcript = sandbox.transcript("s-1", &text);
         let service = Fake::default();
 
-        let sent = send_session(&service, "s-1", &transcript).unwrap();
+        let sent = Archive::default().send(&service, "s-1", &transcript).unwrap();
 
         assert_eq!(sent, text.len() as i64);
         assert_eq!(service.body("main"), text, "the stretches concatenate to the file");

@@ -232,6 +232,26 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
     scan(dir).live
 }
 
+/// The transcript each record in the registry names, read and nothing more. The sweep that
+/// unlinks the record of a session whose process is gone belongs to one pass; a second pass
+/// sweeping as well would take those records away before the notices they owe the service had
+/// gone out with them.
+pub fn transcript_paths(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .filter_map(|path| read(&path))
+        .map(|status| (status.session_id, status.record.transcript_path))
+        .filter(|(_, path)| !path.as_os_str().is_empty())
+        .collect();
+    found.sort();
+    found
+}
+
 /// The record this host wrote for one session, whatever state the hook left it in.
 pub fn record(dir: &Path, session_id: &str) -> Option<Record> {
     read(&record_path(dir, session_id)).map(|status| status.record)
@@ -414,13 +434,13 @@ pub async fn to_session(dir: &Path, session_id: &str, body: &str) -> Fanout {
 /// Every pass hands `tick` the sessions it unlinked, since the same tick that notices a Claude
 /// process is gone is the only thing that can tell the service; it is handed an empty list on a
 /// pass that unlinked nothing, because it is also the beat the daemon's other sweeps run on.
-pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut tick: impl FnMut(&Scan)) {
+pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut tick: impl FnMut(Vec<Ended>)) {
     let mut beat = tokio::time::interval(check);
     let mut empty_since: Option<Instant> = None;
     loop {
         beat.tick().await;
         let scan = scan(dir);
-        tick(&scan);
+        tick(scan.ended);
         if scan
             .live
             .iter()
@@ -848,8 +868,8 @@ mod tests {
         let mut reported = Vec::new();
         let _ = tokio::time::timeout(
             Duration::from_millis(200),
-            idle_exit(&sandbox.sessions(), check, Duration::from_millis(40), |scan| {
-                reported.extend(scan.ended.iter().cloned());
+            idle_exit(&sandbox.sessions(), check, Duration::from_millis(40), |ended| {
+                reported.extend(ended);
             }),
         )
         .await;

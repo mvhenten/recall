@@ -445,7 +445,7 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
                 let events = part.events(account, prompts)?;
                 done.events += service.post_usage(id, &session.host, &session.repo, &events)?;
             }
-            done.bytes += transcripts::send_file(service, id, &part.source, have)?;
+            done.bytes += transcripts::send_file(service, id, &part.source, have)?.bytes;
         }
         if !session.on_record {
             service.sync(id, &session.body())?;
