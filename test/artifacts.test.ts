@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { type Artifact, MAX_ARTIFACT_BYTES } from "../src/artifacts";
-import { ARTIFACT_AUDIENCE, type Client, harness } from "./harness";
+import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
 
 const PAGE = `<!doctype html><html lang="en"><head><title>burn-up</title><style>body{color:#0f0}</style></head>
 <body><h1>Burn-up</h1><img src="data:image/gif;base64,R0lGODlhAQABAAAAACw="><script>document.title="drawn"</script></body></html>`;
@@ -34,12 +34,14 @@ describe("publishing", () => {
   it("replaces a page under the same name and lists what it holds", async () => {
     const { h, alice, assertion } = await publisher();
     await alice.publish("burn-up", PAGE);
-    await alice.publish("burn-up", "<p>redrawn</p>");
+    const replaced: { artifact: Artifact } = await (await alice.publish("burn-up", "<p>redrawn</p>")).json();
+    expect(replaced.artifact.url).toBe(`https://${ARTIFACT_HOSTNAME}/burn-up`);
 
     const listed = await alice.request("GET", "/v1/artifacts");
     const page: { artifacts: Artifact[] } = await listed.json();
     expect(page.artifacts).toHaveLength(1);
     expect(page.artifacts[0]?.name).toBe("burn-up");
+    expect(page.artifacts[0]?.url).toBe(`https://${ARTIFACT_HOSTNAME}/burn-up`);
     expect(page.artifacts[0]?.bytes).toBe("<p>redrawn</p>".length);
     expect(await (await h.sendToArtifactHost("/burn-up", assertion)).text()).toBe("<p>redrawn</p>");
 

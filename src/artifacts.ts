@@ -1,5 +1,6 @@
 export interface Artifact {
   name: string;
+  url: string;
   bytes: number;
   updatedAt: number;
 }
@@ -10,22 +11,21 @@ export const ARTIFACT_CONTENT_TYPE = "text/html; charset=utf-8";
 
 const keyFor = (userId: string, name: string): string => `${userId}/${name}`;
 
-const toArtifact = (userId: string, object: R2Object): Artifact => ({
-  name: object.key.slice(userId.length + 1),
-  bytes: object.size,
-  updatedAt: object.uploaded.getTime(),
-});
+const toArtifact = (hostname: string, userId: string, object: R2Object): Artifact => {
+  const name = object.key.slice(userId.length + 1);
+  return { name, url: `https://${hostname}/${name}`, bytes: object.size, updatedAt: object.uploaded.getTime() };
+};
 
 export const readArtifact = (bucket: R2Bucket, userId: string, name: string): Promise<R2ObjectBody | null> =>
   bucket.get(keyFor(userId, name));
 
-export const listArtifacts = async (bucket: R2Bucket, userId: string): Promise<Artifact[]> => {
+export const listArtifacts = async (bucket: R2Bucket, hostname: string, userId: string): Promise<Artifact[]> => {
   const prefix = `${userId}/`;
   const artifacts: Artifact[] = [];
   let cursor: string | undefined;
   for (;;) {
     const page = await bucket.list({ prefix, cursor });
-    artifacts.push(...page.objects.map((object) => toArtifact(userId, object)));
+    artifacts.push(...page.objects.map((object) => toArtifact(hostname, userId, object)));
     if (!page.truncated) {
       return artifacts.sort((a, b) => b.updatedAt - a.updatedAt || a.name.localeCompare(b.name));
     }
@@ -35,13 +35,14 @@ export const listArtifacts = async (bucket: R2Bucket, userId: string): Promise<A
 
 export const putArtifact = async (
   bucket: R2Bucket,
+  hostname: string,
   userId: string,
   name: string,
   body: ArrayBuffer,
 ): Promise<Artifact> => {
   const object = await bucket.put(keyFor(userId, name), body);
   if (object === null) throw new Error(`R2 stored no page at ${keyFor(userId, name)}`);
-  return toArtifact(userId, object);
+  return toArtifact(hostname, userId, object);
 };
 
 export const deleteArtifact = (bucket: R2Bucket, userId: string, name: string): Promise<void> =>

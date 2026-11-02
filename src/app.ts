@@ -538,10 +538,10 @@ export const createApp = (deps: Deps): App => {
     if (deps.artifactHost === null) {
       return error(404, "this recall publishes no pages; its deployment names no artifact hostname");
     }
-    const { bucket } = deps.artifactHost;
+    const { bucket, hostname } = deps.artifactHost;
     if (rawName === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
-      return json({ artifacts: await listArtifacts(bucket, userId) });
+      return json({ artifacts: await listArtifacts(bucket, hostname, userId) });
     }
     const name = parseName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
@@ -552,7 +552,7 @@ export const createApp = (deps: Deps): App => {
       const body = await request.arrayBuffer();
       if (body.byteLength === 0) return error(400, "the request body must hold the page's HTML");
       if (body.byteLength > MAX_ARTIFACT_BYTES) return tooLarge();
-      return json({ artifact: await putArtifact(bucket, userId, name.value, body) });
+      return json({ artifact: await putArtifact(bucket, hostname, userId, name.value, body) });
     }
     if (request.method === "DELETE") {
       await deleteArtifact(bucket, userId, name.value);

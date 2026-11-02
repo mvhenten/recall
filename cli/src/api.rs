@@ -1,7 +1,8 @@
 use crate::config::Config;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
 use ureq::http::Response;
 use ureq::{Agent, RequestBuilder};
@@ -57,6 +58,21 @@ struct Single {
     memory: Memory,
 }
 
+/// One published page: its slug, the URL it answers on, and what the service holds of it.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artifact {
+    pub name: String,
+    pub url: String,
+    pub bytes: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Deserialize)]
+struct Published {
+    artifact: Artifact,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
@@ -98,6 +114,30 @@ fn encode(value: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
+}
+
+/// A page takes the name of the file it was written to: lower case, every run of anything else a
+/// single dash, which is the kebab-case slug the service accepts.
+pub fn artifact_name(path: &Path) -> Result<String> {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<&str>>()
+        .join("-");
+    if name.is_empty() {
+        bail!("{} has no name to publish it under; pass --name", path.display());
+    }
+    Ok(name)
 }
 
 fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq::Body>> {
@@ -544,6 +584,22 @@ impl Client {
             .read_json()?;
         Ok(sent.message)
     }
+
+    /// Publishes the page on disk, so its HTML travels from the file to the service without
+    /// passing through whatever asked for it. An existing name is replaced and keeps its URL.
+    pub fn publish_file(&self, path: &Path, name: Option<String>) -> Result<Artifact> {
+        let name = match name {
+            Some(name) => name,
+            None => artifact_name(path)?,
+        };
+        let html = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let response = self
+            .authed(self.agent.put(self.url(&format!("/v1/artifacts/{}", encode(&name)))))
+            .header("content-type", "text/html; charset=utf-8")
+            .send(&html[..])?;
+        let published: Published = check(response, &format!("publishing {name}"))?.body_mut().read_json()?;
+        Ok(published.artifact)
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +642,16 @@ mod tests {
             device_id: device_id.to_string(),
             session_id: String::new(),
         }
+    }
+
+    #[test]
+    fn a_file_name_becomes_the_page_name() {
+        let name = |path: &str| artifact_name(Path::new(path)).unwrap();
+        assert_eq!(name("/home/you/Burn Up Chart.html"), "burn-up-chart");
+        assert_eq!(name("burn_up.v2.html"), "burn-up-v2");
+        assert_eq!(name("./reports/--Q3--.html"), "q3");
+        let error = artifact_name(Path::new("/home/you/....html")).unwrap_err().to_string();
+        assert!(error.contains("pass --name"), "{error}");
     }
 
     #[test]
