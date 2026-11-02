@@ -137,6 +137,11 @@ export interface HistoryInput {
 export const USAGE_RETENTION_MS = 1_209_600_000;
 export const MAX_USAGE_TOKENS = 1_000_000_000;
 
+// The client dates its own deltas and the rollup is unbounded, so one delta dated 1970 would
+// stretch every month the insights page draws. recall did not exist before 2020, and a host's clock
+// may run a little fast but never a day fast. A backfill of real months still lands inside this.
+export const USAGE_EPOCH = Date.UTC(2020, 0, 1);
+
 export interface UsageInput {
   seq: number;
   host: string;
@@ -157,6 +162,22 @@ export const DAY_MS = 86_400_000;
 export const usageDay = (at: number): string => new Date(at).toISOString().slice(0, 10);
 
 export const usageDayStart = (at: number): number => at - (at % DAY_MS);
+
+export const usageMonth = (at: number): string => new Date(at).toISOString().slice(0, 7);
+
+// Every month from the first to the last, so a quiet month in between reads as a gap in the trend
+// rather than closing it up.
+export const monthsBetween = (first: string, last: string): string[] => {
+  if (first === "") return [];
+  const year = Number(first.slice(0, 4));
+  const index = Number(first.slice(5, 7)) - 1;
+  const span: string[] = [];
+  for (let step = 0; ; step += 1) {
+    const month = usageMonth(Date.UTC(year, index + step, 1));
+    if (month > last) return span;
+    span.push(month);
+  }
+};
 
 // The three windows the stats page answers over. Today is the UTC day the rollup keys on; the
 // wider two are inclusive of today, so seven days means today and the six before it.
@@ -202,8 +223,9 @@ export interface ModelTotals extends TokenCounts {
   model: string;
 }
 
-export interface ModelDay extends ModelTotals {
-  day: string;
+// One bucket of the rollup: a UTC day for the windows, a month for the long horizon.
+export interface ModelBucket extends ModelTotals {
+  bucket: string;
 }
 
 export type UsageSplitField = "host" | "repo" | "account";
@@ -262,17 +284,19 @@ export interface StatsWindows {
 
 export interface Stats {
   windows: StatsWindows;
-  usage: ModelDay[];
+  usage: ModelBucket[];
   splits: UsageSplit[];
   sessions: DaySessions[];
 }
 
 export interface Insights {
   fortnight: DayWindow;
-  usage: ModelDay[];
+  usage: ModelBucket[];
+  monthly: ModelBucket[];
   working: WorkingSet;
   stale: GoingStale;
   repos: RepoHours[];
+  allTime: RepoHours[];
   rhythm: RhythmCell[];
 }
 
@@ -449,7 +473,7 @@ export const parseSession = (body: unknown): Parsed<SessionInput> => {
   };
 };
 
-export const parseUsage = (body: unknown): Parsed<UsageInput> => {
+export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
   const { seq, host, repo, provider, account, model, prompts, at } = body;
   const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
@@ -470,7 +494,9 @@ export const parseUsage = (body: unknown): Parsed<UsageInput> => {
     return fail(`account must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
   }
   if (!isInteger(prompts, 0, MAX_PROMPTS)) return fail(`prompts must be a whole number from 0 to ${MAX_PROMPTS}`);
-  if (!isInteger(at, 0, Number.MAX_SAFE_INTEGER)) return fail("at must be a whole number of epoch milliseconds");
+  if (!isInteger(at, USAGE_EPOCH, now + DAY_MS)) {
+    return fail("at must be a whole number of epoch milliseconds, no earlier than 2020 and no more than a day ahead");
+  }
   const counter = (value: unknown): value is number => isInteger(value, 0, MAX_USAGE_TOKENS);
   if (!counter(inputTokens) || !counter(outputTokens) || !counter(cacheWriteTokens) || !counter(cacheReadTokens)) {
     return fail(
