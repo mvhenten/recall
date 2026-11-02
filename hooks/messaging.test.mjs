@@ -193,6 +193,39 @@ test("each prompt counts, moves the focus on and reads the head again", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("the first prompt takes an adopted record back from the daemon", () => {
+  const { dir, env } = sandbox();
+  const cwd = repository(path.join(dir, "work"), "chore: start");
+  const adopted = {
+    state: "adopted",
+    pid: 1,
+    cwd,
+    sessionId: "s-adopted",
+    prompts: 7,
+    focus: { first: "read the transcript", latest: "read the transcript" },
+    adoptedOffset: 4096,
+  };
+  const read = () => JSON.parse(readFileSync(registryPath("s-adopted", env), "utf8"));
+  mkdirSync(sessionsDir(env), { recursive: true });
+  writeRecord("s-adopted", adopted, env);
+
+  const on = { ...env, RECALL_MESSAGING_ENABLED: "true" };
+  assert.deepEqual(touch("s-adopted", "mine now", "plan", on), { due: true });
+  const stored = read();
+  assert.equal(stored.state, "registered", "the session's own inbox replaces the state adoption wrote");
+  assert.equal(stored.socket, INBOX.CLAUDE_CODE_MESSAGING_SOCKET);
+  assert.equal(stored.token, INBOX.CLAUDE_CODE_MESSAGING_TOKEN);
+  assert.equal(stored.pid, sessionPid(on), "the pid becomes the one the hook can see");
+  assert.equal(stored.prompts, 8, "the count carries on from what the transcript supported");
+  assert.equal(stored.focus.latest, "mine now");
+
+  writeRecord("s-adopted", adopted, env);
+  touch("s-adopted", "messaging is off here", "plan", { ...env, RECALL_MESSAGING_ENABLED: "false" });
+  assert.equal(read().state, "off", "a host with messaging off takes the record back without an inbox");
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("the record says where in the transcript this host's counting has reached", () => {
   const { dir, env } = sandbox();
   const transcriptPath = path.join(dir, "s-6.jsonl");

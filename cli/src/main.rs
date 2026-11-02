@@ -1,3 +1,4 @@
+mod adopt;
 mod api;
 mod config;
 mod listen;
@@ -141,6 +142,12 @@ enum Command {
             help = "Mark the session with this id gone"
         )]
         end: Option<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["sync", "end"],
+            help = "Write and sync a record for every running session this host's hooks never registered"
+        )]
+        adopt: bool,
     },
     #[command(about = "Send a message to another host signed in as you, or to one session on it")]
     Send {
@@ -198,7 +205,7 @@ enum ConfigAction {
     Schema,
 }
 
-fn host_name() -> String {
+pub fn host_name() -> String {
     let from_file = std::fs::read_to_string("/etc/hostname").ok();
     let from_command = || {
         std::process::Command::new("hostname")
@@ -268,7 +275,7 @@ fn login(endpoint: Option<String>, name: Option<String>) -> Result<()> {
     }
 }
 
-fn update() -> Result<ExitCode> {
+fn update(cli_settings: &Settings) -> Result<ExitCode> {
     let updater = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("recall-update")))
@@ -280,11 +287,32 @@ fn update() -> Result<ExitCode> {
             updater.display()
         )
     })?;
-    Ok(if status.success() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    })
+    if !status.success() {
+        return Ok(ExitCode::from(1));
+    }
+    match settings::load(cli_settings) {
+        Ok(settings) => listen::restart(&settings),
+        Err(error) => listen::log(&format!("listen:restart-failed:{error:#}"), Duration::ZERO),
+    }
+    adopt_after_update();
+    Ok(ExitCode::SUCCESS)
+}
+
+/// An update replaces the hooks under every session already running, and those sessions keep the
+/// hooks they loaded at their start. Taking them on here heals the host as the update lands,
+/// rather than leaving the list short until each one restarts. Nothing here may fail the update,
+/// so the hooks log is where it reports.
+fn adopt_after_update() {
+    let started = Instant::now();
+    let found = match adopt::Scope::here().and_then(|scope| adopt::adopt(&scope)) {
+        Ok(found) => found,
+        Err(error) => return listen::log(&format!("sessions:adopt-failed:{error:#}"), started.elapsed()),
+    };
+    for session in &found {
+        log_outcome(session.outcome, "adopt-failed", &session.session_id, || {
+            sync_session(&session.session_id)
+        });
+    }
 }
 
 fn print_mode_hint(mode: Mode) {
@@ -397,23 +425,7 @@ fn sync_session(session_id: &str) -> Result<()> {
         bail!("no session {session_id} is registered on this host");
     };
     let client = Client::new(config::load()?);
-    client.sync_session(
-        session_id,
-        &api::SessionBody {
-            host: &record.host,
-            cwd: &record.cwd.to_string_lossy(),
-            repo: &record.repo,
-            branch: &record.branch,
-            commit: &record.commit,
-            started_at: record.started_at,
-            last_activity_at: record.last_activity_at,
-            prompts: record.prompts,
-            focus: &record.focus,
-            mode: &record.mode,
-            permission_mode: &record.permission_mode,
-            pid: i64::from(record.pid),
-        },
-    )?;
+    client.sync_record(session_id, &record)?;
     println!("synced {session_id}");
     let Some(pending) = record.usage_pending.as_ref() else {
         return Ok(());
@@ -445,19 +457,47 @@ fn end_session(session_id: &str) -> Result<()> {
 
 /// The hooks start the session commands detached, with no terminal to read their stderr and no
 /// caller to notice their exit code, so the hooks log is the only record that one ran at all.
-fn logged(done: &str, failed: &str, session_id: &str, work: impl FnOnce() -> Result<()>) -> ExitCode {
+fn log_outcome(done: &str, failed: &str, session_id: &str, work: impl FnOnce() -> Result<()>) -> bool {
     let started = Instant::now();
     match work() {
         Ok(()) => {
             listen::log(&format!("sessions:{done}:{session_id}"), started.elapsed());
-            ExitCode::SUCCESS
+            true
         }
         Err(error) => {
             listen::log(&format!("sessions:{failed}:{session_id}:{error:#}"), started.elapsed());
             eprintln!("recall: {error:#}");
-            ExitCode::from(2)
+            false
         }
     }
+}
+
+fn logged(done: &str, failed: &str, session_id: &str, work: impl FnOnce() -> Result<()>) -> ExitCode {
+    if log_outcome(done, failed, session_id, work) {
+        return ExitCode::SUCCESS;
+    }
+    ExitCode::from(2)
+}
+
+/// Every session running on this host that no record describes, taken on and synced. Hooks load
+/// when a session starts, so the sessions that were already running when a plugin update landed
+/// never write a record of their own: without this they stay off the list until each one restarts.
+fn adopt_sessions() -> Result<ExitCode> {
+    let adopted = adopt::adopt(&adopt::Scope::here()?)?;
+    if adopted.is_empty() {
+        println!("no running session needs adopting");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut synced = true;
+    for session in &adopted {
+        synced &= log_outcome(session.outcome, "adopt-failed", &session.session_id, || {
+            sync_session(&session.session_id)
+        });
+    }
+    if synced {
+        return Ok(ExitCode::SUCCESS);
+    }
+    Ok(ExitCode::from(2))
 }
 
 fn require_messaging(settings: &Settings) -> Result<()> {
@@ -527,7 +567,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let client = || -> Result<Client> { Ok(Client::new(config::load()?)) };
     match cli.command {
         Command::Login { endpoint, name } => login(endpoint, name)?,
-        Command::Update => return update(),
+        Command::Update => return update(&cli.settings),
         Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
         Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
         Command::Listen { ensure, status } => {
@@ -545,12 +585,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 listen::run(&settings, ensure)?;
             }
         }
-        Command::Sessions { sync, end } => {
+        Command::Sessions { sync, end, adopt } => {
             if let Some(id) = sync {
                 return Ok(logged("synced", "sync-failed", &id, || sync_session(&id)));
             }
             if let Some(id) = end {
                 return Ok(logged("ended", "end-failed", &id, || end_session(&id)));
+            }
+            if adopt {
+                return adopt_sessions();
             }
             let client = client()?;
             let listed = client.sessions()?;

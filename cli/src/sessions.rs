@@ -7,12 +7,16 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 /// A record carrying an inbox is one the daemon can deliver to; the rest say why it cannot.
+/// `Adopted` is the one state no hook writes: a session that was already running when its hooks
+/// were replaced has `recall sessions --adopt` read its record out of its transcript instead, and
+/// that reading can carry no inbox.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum State {
     Registered(Inbox),
     Off,
     NoInbox,
+    Adopted,
     Failed { error: String },
 }
 
@@ -393,17 +397,16 @@ pub async fn to_session(dir: &Path, session_id: &str, body: &str) -> Fanout {
 
 /// Resolves once the registry has held no live session for `idle`, which is the daemon's cue to
 /// let go of the lock. A SessionStart hook brings it straight back with `recall listen --ensure`.
-/// Each pass hands `ended` the sessions it unlinked, since the same tick that notices a Claude
-/// process is gone is the only thing that can tell the service.
-pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut ended: impl FnMut(Vec<Ended>)) {
-    let mut tick = tokio::time::interval(check);
+/// Every pass hands `tick` the sessions it unlinked, since the same tick that notices a Claude
+/// process is gone is the only thing that can tell the service; it is handed an empty list on a
+/// pass that unlinked nothing, because it is also the beat the daemon's other sweeps run on.
+pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut tick: impl FnMut(Vec<Ended>)) {
+    let mut beat = tokio::time::interval(check);
     let mut empty_since: Option<Instant> = None;
     loop {
-        tick.tick().await;
+        beat.tick().await;
         let scan = scan(dir);
-        if !scan.ended.is_empty() {
-            ended(scan.ended);
-        }
+        tick(scan.ended);
         if scan
             .live
             .iter()

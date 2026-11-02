@@ -197,11 +197,25 @@ export function record(sessionId, state, session, env = process.env, uid = proce
   );
 }
 
-export function register(sessionId, session, env = process.env, uid = process.getuid()) {
+function inboxState(env) {
   const found = inbox(env);
-  const state = found ? { state: "registered", ...found.inbox } : { state: "no-inbox" };
+  return found ? { state: "registered", ...found.inbox } : { state: "no-inbox" };
+}
+
+export function register(sessionId, session, env = process.env, uid = process.getuid()) {
+  const state = inboxState(env);
   record(sessionId, state, session, env, uid);
   return state.state;
+}
+
+// A record `recall sessions --adopt` wrote carries a state no hook set, and the daemon keeps
+// rewriting that record from the transcript for as long as it does. The first prompt a current
+// hook sees takes the session back: the state becomes this session's own, the pid becomes the one
+// the hook can see, and the daemon leaves the record alone from there on.
+function taken(stored, env) {
+  if (stored.state !== "adopted") return undefined;
+  const state = messagingEnabled(env) ? inboxState(env) : { state: "off" };
+  return { ...state, pid: sessionPid(env) };
 }
 
 // Each prompt counts, moves the focus on and marks the session active. The branch, the commit and
@@ -218,6 +232,7 @@ export function touch(sessionId, prompt, permissionMode, env = process.env, uid 
     sessionId,
     {
       ...stored,
+      ...taken(stored, env),
       ...head(stored.cwd),
       lastActivityAt: now,
       syncStartedAt: due ? now : stored.syncStartedAt,

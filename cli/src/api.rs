@@ -452,6 +452,28 @@ impl Client {
         Ok(())
     }
 
+    /// Sends what this host's registry says about one session. The record is the document, so the
+    /// command the hooks start and the daemon's own tick send the same reading of it.
+    pub fn sync_record(&self, session_id: &str, record: &crate::sessions::Record) -> Result<()> {
+        self.sync_session(
+            session_id,
+            &SessionBody {
+                host: &record.host,
+                cwd: &record.cwd.to_string_lossy(),
+                repo: &record.repo,
+                branch: &record.branch,
+                commit: &record.commit,
+                started_at: record.started_at,
+                last_activity_at: record.last_activity_at,
+                prompts: record.prompts,
+                focus: &record.focus,
+                mode: &record.mode,
+                permission_mode: &record.permission_mode,
+                pid: i64::from(record.pid),
+            },
+        )
+    }
+
     /// Sends every event of one stretch. The events are the hooks' own: nothing here reads inside
     /// one, so a counter the hooks learn to read needs no change in this binary.
     pub fn post_usage(

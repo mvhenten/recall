@@ -1,3 +1,4 @@
+use crate::adopt;
 use crate::api::{Client, Message};
 use crate::config;
 use crate::seen::Seen;
@@ -7,14 +8,17 @@ use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::Serialize;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const BASE_DELAY: Duration = Duration::from_secs(1);
@@ -50,6 +54,12 @@ pub fn runtime_dir() -> PathBuf {
 
 pub fn lock_path() -> PathBuf {
     runtime_dir().join("listen.lock")
+}
+
+/// The daemon holding the lock names itself here, so an update can end the one it replaced. The
+/// lock is still what says a daemon is running; this only says which process to signal.
+pub fn pid_path() -> PathBuf {
+    runtime_dir().join("listen.pid")
 }
 
 pub fn sessions_dir() -> PathBuf {
@@ -218,6 +228,9 @@ async fn reconnect_loop(url: &str, token: &str, sessions_dir: &Path, seen: &mut 
 /// unlinks it sends both, on a blocking thread so the calls cannot stall message delivery; a delta
 /// the service refuses is reported and dropped, since the record it came from is already gone.
 fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
+    if ended.is_empty() {
+        return;
+    }
     let client = Arc::clone(client);
     tokio::task::spawn_blocking(move || {
         for session in ended {
@@ -241,11 +254,61 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
     });
 }
 
+/// One adoption pass at a time, whatever the tick does: a pass reads transcripts and then waits on
+/// the service, so passes left to pile up behind each other would have two of them writing the
+/// same records.
+struct Pass(Arc<AtomicBool>);
+
+impl Drop for Pass {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The same adoption `recall sessions --adopt` runs, on the tick that already sweeps the registry:
+/// a session the hooks never registered keeps its last activity up with its own transcript until
+/// its process is gone, and the sweep above is what ends it then. The transcript is the only thing
+/// that moves, so a session whose transcript stood still sends nothing. It runs on a blocking
+/// thread, like the end reports, so neither the reading nor the calls can stall message delivery.
+fn adopt_running(client: &Arc<Client>, scope: &Arc<adopt::Scope>, running: &Arc<AtomicBool>) {
+    if running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let pass = Pass(Arc::clone(running));
+    let client = Arc::clone(client);
+    let scope = Arc::clone(scope);
+    tokio::task::spawn_blocking(move || {
+        let _pass = pass;
+        let started = Instant::now();
+        let adopted = match adopt::adopt(&scope) {
+            Ok(adopted) => adopted,
+            Err(error) => return log(&format!("sessions:adopt-failed:{error:#}"), started.elapsed()),
+        };
+        for session in adopted {
+            let id = &session.session_id;
+            let Some(record) = sessions::record(&scope.sessions, id) else {
+                continue;
+            };
+            let started = Instant::now();
+            let outcome = match client.sync_record(id, &record) {
+                Ok(()) => format!("sessions:{}:{id}", session.outcome),
+                Err(error) => format!("sessions:adopt-failed:{id}:{error:#}"),
+            };
+            log(&outcome, started.elapsed());
+        }
+    });
+}
+
 async fn serve() -> Result<()> {
     let config = config::load()?;
     let url = ws::listen_url(&config.endpoint)?;
     let sessions_dir = sessions_dir();
     let client = Arc::new(Client::new(config.clone()));
+    let scope = adopt::Scope::here().map(Arc::new);
+    if let Err(error) = scope.as_ref() {
+        log(&format!("sessions:adopt-failed:{error:#}"), Duration::ZERO);
+    }
+    let adopting = Arc::new(AtomicBool::new(false));
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -254,7 +317,12 @@ async fn serve() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
-        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| report_ended(&client, ended)) => Ok(()),
+        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
+            report_ended(&client, ended);
+            if let Ok(scope) = scope.as_ref() {
+                adopt_running(&client, scope, &adopting);
+            }
+        }) => Ok(()),
         result = &mut work => result,
     }
 }
@@ -262,6 +330,7 @@ async fn serve() -> Result<()> {
 pub const MESSAGING_OFF: &str = "messaging is off; run recall config set messaging.enabled true to turn it on";
 pub const NO_INBOX: &str =
     "Claude set no CLAUDE_CODE_MESSAGING_SOCKET or CLAUDE_CODE_MESSAGING_TOKEN, so this session has no inbox";
+pub const ADOPTED: &str = "adopted from its transcript: this session started before the hooks it would have registered with, so it takes no messages until it restarts";
 
 /// What `--status` reports for one session. The registry record carries the inbox token, so it
 /// never leaves this module: only the session id, its directory, the Claude pid and the state
@@ -281,6 +350,7 @@ pub enum Reported {
     Registered,
     Off,
     NoInbox,
+    Adopted,
     Failed { error: String },
 }
 
@@ -294,6 +364,7 @@ impl From<sessions::Status> for Session {
                 sessions::State::Registered(_) => Reported::Registered,
                 sessions::State::Off => Reported::Off,
                 sessions::State::NoInbox => Reported::NoInbox,
+                sessions::State::Adopted => Reported::Adopted,
                 sessions::State::Failed { error } => Reported::Failed { error },
             },
         }
@@ -312,6 +383,7 @@ fn reason(session: &Session) -> String {
         Reported::Registered => format!("registered, pid {}", session.pid),
         Reported::Off => MESSAGING_OFF.to_string(),
         Reported::NoInbox => NO_INBOX.to_string(),
+        Reported::Adopted => ADOPTED.to_string(),
         Reported::Failed { error } => format!("writing the registration failed: {error}"),
     }
 }
@@ -373,6 +445,7 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
         eprintln!("recall: a listener is already running on this host");
         return Ok(());
     };
+    let _ = std::fs::write(pid_path(), format!("{}\n", std::process::id()));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let outcome = runtime.block_on(serve());
     log(
@@ -382,8 +455,70 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
         },
         Duration::ZERO,
     );
+    let _ = std::fs::remove_file(pid_path());
     lock.release()?;
     outcome
+}
+
+pub const HANDOVER: Duration = Duration::from_secs(5);
+const PROCFS: &str = "/proc";
+
+/// Whether the pid file names this host's own daemon, and not whatever process now owns a pid a
+/// daemon that was killed left behind: the runtime directory can outlive a reboot, so a stale pid
+/// file is ordinary. A pid is only signalled when a daemon really does hold the lock and that pid
+/// really is a recall process.
+fn daemon(lock: &Path, pid_file: &Path, procfs: &Path) -> Option<i32> {
+    let pid = std::fs::read_to_string(pid_file)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 1)?;
+    if !matches!(Lock::acquire(lock), Ok(None)) {
+        return None;
+    }
+    let argv = std::fs::read(procfs.join(pid.to_string()).join("cmdline")).ok()?;
+    let first = argv.split(|byte| *byte == 0).next()?;
+    let command = Path::new(OsStr::from_bytes(first)).file_name()?.to_str()?.to_string();
+    (command == "recall").then_some(pid)
+}
+
+/// Ends this host's daemon and waits for it to let the lock go. A pid file that names no daemon
+/// leaves everything alone, and the caller's own `ensure` is then what brings a listener up.
+fn stop(lock: &Path, pid_file: &Path, procfs: &Path, limit: Duration) -> bool {
+    let Some(pid) = daemon(lock, pid_file, procfs) else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return false;
+    }
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if matches!(Lock::acquire(lock), Ok(Some(_))) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Hands the listener over to the binary now installed. An update replaces the binary under a
+/// daemon that goes on running the code it started with: it holds the lock, so nothing newer can
+/// take over, and its tick is what keeps every adopted session's last activity moving. Nothing
+/// here may fail the update, so the hooks log is where it reports.
+pub fn restart(settings: &Settings) {
+    let started = Instant::now();
+    let stopped = stop(&lock_path(), &pid_path(), Path::new(PROCFS), HANDOVER);
+    if !settings.messaging_enabled() {
+        log(&format!("listen:stopped-for-update:{stopped}"), started.elapsed());
+        return;
+    }
+    let outcome = match ensure(&lock_path(), spawn_daemon) {
+        Ok(true) => "listen:restarted".to_string(),
+        Ok(false) => "listen:still-running".to_string(),
+        Err(error) => format!("listen:restart-failed:{error:#}"),
+    };
+    log(&outcome, started.elapsed());
 }
 
 #[cfg(test)]
@@ -455,9 +590,10 @@ mod tests {
                 ),
                 status("s-off", "/src/other", sessions::State::Off),
                 status("s-no-inbox", "/src/third", sessions::State::NoInbox),
+                status("s-adopted", "/src/fourth", sessions::State::Adopted),
                 status(
                     "s-failed",
-                    "/src/fourth",
+                    "/src/fifth",
                     sessions::State::Failed {
                         error: "EACCES, permission denied".to_string(),
                     },
@@ -476,7 +612,8 @@ mod tests {
                 "s-live  /src/recall  registered, pid 42".to_string(),
                 format!("s-off  /src/other  {MESSAGING_OFF}"),
                 format!("s-no-inbox  /src/third  {NO_INBOX}"),
-                "s-failed  /src/fourth  writing the registration failed: EACCES, permission denied".to_string(),
+                format!("s-adopted  /src/fourth  {ADOPTED}"),
+                "s-failed  /src/fifth  writing the registration failed: EACCES, permission denied".to_string(),
             ]
         );
     }
@@ -529,6 +666,50 @@ mod tests {
                 "no session is running on this host".to_string(),
             ]
         );
+    }
+
+    /// The pid file names this test's own process twice over, so a signal sent where none is due
+    /// would take the test runner down with it: surviving the first two passes is the assertion.
+    #[test]
+    fn only_a_recall_daemon_that_holds_the_lock_is_ever_signalled() {
+        let dir = sandbox("stop");
+        let lock = dir.join("listen.lock");
+        let pid_file = dir.join("listen.pid");
+        let procfs = dir.join("proc");
+        let named = |pid: u32, argv: &str| {
+            let entry = procfs.join(pid.to_string());
+            std::fs::create_dir_all(&entry).unwrap();
+            std::fs::write(entry.join("cmdline"), argv.replace(' ', "\0")).unwrap();
+            std::fs::write(&pid_file, format!("{pid}\n")).unwrap();
+        };
+        let limit = Duration::from_millis(100);
+
+        named(std::process::id(), "node --test");
+        assert!(
+            !stop(&lock, &pid_file, &procfs, limit),
+            "a pid now owned by something else is left alone"
+        );
+
+        named(std::process::id(), "/home/you/.cargo/bin/recall listen");
+        assert!(
+            !stop(&lock, &pid_file, &procfs, limit),
+            "a pid file no daemon stands behind is a stale one, whatever it names"
+        );
+
+        let mut standing_in = Command::new("sleep").arg("60").spawn().unwrap();
+        named(standing_in.id(), "recall listen");
+        let held = Lock::acquire(&lock).unwrap().unwrap();
+        assert!(
+            !stop(&lock, &pid_file, &procfs, limit),
+            "the lock stays held here, so the handover never completes"
+        );
+        assert!(
+            !standing_in.wait().unwrap().success(),
+            "the daemon holding the lock is the one that gets the signal"
+        );
+
+        held.release().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
