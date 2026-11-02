@@ -550,9 +550,13 @@ mod tests {
     }
 
     impl Fake {
-        fn holding(events: HashMap<(String, i64), Value>) -> Fake {
+        /// The same service a run died against, carrying everything that run left on it. Only the
+        /// history row is missing, which is what the sync never wrote.
+        fn resuming(dying: &Fake) -> Fake {
             Fake {
-                events: RefCell::new(events),
+                events: dying.events.clone(),
+                daily: dying.daily.clone(),
+                archive: dying.archive.clone(),
                 ..Fake::default()
             }
         }
@@ -785,6 +789,7 @@ mod tests {
     fn a_second_run_sends_nothing_and_a_run_before_it_sends_the_same_events() {
         let sandbox = Sandbox::new("again");
         sandbox.transcript("-home-you-recall", "s-old", &session());
+        let service = Fake::default();
 
         let first = sandbox.found(&nothing());
         assert_eq!(
@@ -792,11 +797,24 @@ mod tests {
             first,
             "the same transcript regenerates the same chunk numbers, whenever it is read"
         );
+        send(&service, &first, ACCOUNT, |_, _| {}).unwrap();
+        let once = service.rollup();
 
+        let again = sandbox.found(&service.on_record());
+
+        assert!(
+            again.iter().all(|session| session.on_record),
+            "a session the service already holds comes back for its files and no history row"
+        );
+        send(&service, &again, ACCOUNT, |session_id, sent| {
+            assert_eq!(sent, Sent::default(), "{session_id} had something left to send");
+        })
+        .unwrap();
+        assert_eq!(service.rollup(), once, "a second run adds nothing to the rollup");
         assert_eq!(
-            sandbox.found(&on_record(&["s-old"])),
-            Vec::new(),
-            "a session the service already holds on record is passed over"
+            *service.ended.borrow(),
+            vec!["s-old".to_string()],
+            "and writes no history row a second time"
         );
     }
 
@@ -869,7 +887,7 @@ mod tests {
         assert_eq!(dying.on_record(), nothing(), "and the row that stands for them did not");
         assert!(dying.ended.borrow().is_empty());
 
-        let resumed = Fake::holding(posted.clone());
+        let resumed = Fake::resuming(&dying);
         let again = sandbox.found(&resumed.on_record());
         assert_eq!(again, first, "nothing is on record, so the same session is sent again");
         send(&resumed, &again, ACCOUNT, |_, _| {}).unwrap();
@@ -877,15 +895,23 @@ mod tests {
         assert_eq!(
             *resumed.events.borrow(),
             posted,
-            "every event it posted again is a chunk number the service already held"
+            "the service holds bytes of that file, so its tokens were counted and are not posted again"
         );
         assert_eq!(resumed.on_record(), on_record(&["s-old"]));
         assert_eq!(*resumed.ended.borrow(), vec!["s-old".to_string()]);
+
+        let caught_up = resumed.rollup();
+        let after = sandbox.found(&resumed.on_record());
+        send(&resumed, &after, ACCOUNT, |session_id, sent| {
+            assert_eq!(sent, Sent::default(), "{session_id} had something left to send");
+        })
+        .unwrap();
         assert_eq!(
-            sandbox.found(&resumed.on_record()),
-            Vec::new(),
+            resumed.rollup(),
+            caught_up,
             "and the run after it has nothing left to send"
         );
+        assert_eq!(*resumed.ended.borrow(), vec!["s-old".to_string()]);
     }
 
     #[test]
