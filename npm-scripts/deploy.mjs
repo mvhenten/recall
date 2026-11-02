@@ -40,6 +40,11 @@ const buildsToken = process.env.CLOUDFLARE_API_TOKEN;
 const accountId = process.env.RECALL_ACCOUNT_ID;
 const zoneId = process.env.RECALL_ZONE_ID;
 const hostname = process.env.RECALL_HOSTNAME;
+// Optional. Unset leaves artifact publishing off and the deployment as it was.
+const artifactHostname = process.env.RECALL_ARTIFACT_HOSTNAME ?? "";
+if (artifactHostname === hostname) {
+  die("RECALL_ARTIFACT_HOSTNAME serves published pages on a second host, so it cannot be RECALL_HOSTNAME");
+}
 
 const isStrings = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
 const isUsers = (value) =>
@@ -147,6 +152,7 @@ const tofuEnv = {
   TF_IN_AUTOMATION: "1",
   TF_VAR_account_id: accountId,
   TF_VAR_hostname: hostname,
+  TF_VAR_artifact_hostname: artifactHostname,
   TF_VAR_otp_idp_id: otpIdpId,
   TF_VAR_users: JSON.stringify(users),
 };
@@ -189,8 +195,20 @@ const deployConfig = {
   ...base,
   $schema: undefined,
   d1_databases: base.d1_databases.map((database) => ({ ...database, database_id: output("d1_database_id") })),
-  routes: [{ pattern: hostname, custom_domain: true, zone_id: zoneId }],
-  vars: { ACCESS_TEAM_DOMAIN: output("access_team_domain"), ACCESS_AUD: output("access_aud") },
+  routes: [
+    { pattern: hostname, custom_domain: true, zone_id: zoneId },
+    ...(artifactHostname === "" ? [] : [{ pattern: artifactHostname, custom_domain: true, zone_id: zoneId }]),
+  ],
+  ...(artifactHostname === ""
+    ? {}
+    : { r2_buckets: [{ binding: "ARTIFACTS", bucket_name: output("artifact_bucket") }] }),
+  vars: {
+    ACCESS_TEAM_DOMAIN: output("access_team_domain"),
+    ACCESS_AUD: output("access_aud"),
+    ...(artifactHostname === ""
+      ? {}
+      : { ARTIFACT_HOSTNAME: artifactHostname, ARTIFACT_ACCESS_AUD: output("artifact_access_aud") }),
+  },
 };
 const deployConfigPath = join(ROOT, "wrangler.deploy.json");
 writeFileSync(deployConfigPath, `${JSON.stringify(deployConfig, null, 2)}\n`);

@@ -1,4 +1,12 @@
 import {
+  ARTIFACT_CONTENT_TYPE,
+  deleteArtifact,
+  listArtifacts,
+  MAX_ARTIFACT_BYTES,
+  putArtifact,
+  readArtifact,
+} from "./artifacts";
+import {
   dashboardNotice,
   HISTORY_TAB,
   historyPage,
@@ -62,7 +70,7 @@ import {
   USAGE_WEEK_DAYS,
   type Verify,
 } from "./model";
-import { CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
+import { artifactPage, CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
 import {
   decodeCursor,
@@ -91,8 +99,15 @@ import {
   writeLabels,
 } from "./store";
 
+export interface ArtifactHost {
+  hostname: string;
+  verify: Verify;
+  bucket: R2Bucket;
+}
+
 export interface Deps {
   verify: Verify;
+  artifactHost: ArtifactHost | null;
   deviceCodeLimits: DeviceCodeLimits;
   embedder: Embedder;
   now: () => number;
@@ -297,12 +312,34 @@ export const createApp = (deps: Deps): App => {
     return mailboxFor(env, caller.userId).fetch(upgrade);
   };
 
-  const approver = async (request: Request, refuse: Refusal = messagePage): Promise<string | Response> => {
+  const approver = async (
+    request: Request,
+    verify: Verify,
+    refuse: Refusal = messagePage,
+  ): Promise<string | Response> => {
     const assertion = request.headers.get("cf-access-jwt-assertion");
     if (!assertion) return refuse(401, "Sign in first", "This page needs a Cloudflare Access sign-in.");
-    const verified = await deps.verify(assertion);
+    const verified = await verify(assertion);
     if (!verified.ok) return refuse(401, "Sign in again", `Cloudflare Access sign-in rejected: ${verified.reason}.`);
     return verified.email;
+  };
+
+  const invited = async (db: D1Database, email: string, refuse: Refusal): Promise<string | Response> => {
+    const userId = await userForEmail(db, email);
+    return userId ?? refuse(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
+  };
+
+  const artifactSite = async (request: Request, url: URL, db: D1Database, host: ArtifactHost): Promise<Response> => {
+    const lost = (): Response => messagePage(404, "No such page", "This recall publishes no page at this address.");
+    if (request.method !== "GET") return messagePage(405, "Not allowed", "This host only answers a GET.");
+    const email = await approver(request, host.verify);
+    if (email instanceof Response) return email;
+    const userId = await invited(db, email, messagePage);
+    if (userId instanceof Response) return userId;
+    const name = parseName(decodeSegment(url.pathname.slice(1)) ?? "");
+    if (!name.ok) return lost();
+    const object = await readArtifact(host.bucket, userId, name.value);
+    return object === null ? lost() : artifactPage(object.body);
   };
 
   const dashboard = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
@@ -315,12 +352,10 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "GET" && !saving) {
       return lost(405, "Not allowed", "The dashboard only answers a GET, and the Labels tab its own POST.");
     }
-    const email = await approver(request, signIn);
+    const email = await approver(request, deps.verify, signIn);
     if (email instanceof Response) return email;
-    const userId = await userForEmail(db, email);
-    if (userId === null) {
-      return signIn(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
-    }
+    const userId = await invited(db, email, signIn);
+    if (userId instanceof Response) return userId;
     if (saving) return saveLabels(request, url, db, userId, lost);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
@@ -457,12 +492,10 @@ export const createApp = (deps: Deps): App => {
 
   const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
     if (request.method !== "GET" && request.method !== "POST") return error(405, "method not allowed");
-    const email = await approver(request);
+    const email = await approver(request, deps.verify);
     if (email instanceof Response) return email;
-    const userId = await userForEmail(db, email);
-    if (userId === null) {
-      return messagePage(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
-    }
+    const userId = await invited(db, email, messagePage);
+    if (userId instanceof Response) return userId;
     if (request.method === "GET") {
       const raw = url.searchParams.get("code");
       if (raw === null || raw === "") return enterCodePage(email);
@@ -499,6 +532,43 @@ export const createApp = (deps: Deps): App => {
     const vector = await deps.embedder.embed(embeddingText(name, input.value.description, input.value.body));
     const saved = await saveMemory(db, userId, name, input.value, quantize(vector), deps.now());
     return json(saved, saved.created ? 201 : 200);
+  };
+
+  const artifacts = async (request: Request, userId: string, rawName: string | undefined): Promise<Response> => {
+    if (deps.artifactHost === null) {
+      return error(404, "this recall publishes no pages; its deployment names no artifact hostname");
+    }
+    const { bucket } = deps.artifactHost;
+    if (rawName === undefined) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      return json({ artifacts: await listArtifacts(bucket, userId) });
+    }
+    const name = parseName(decodeSegment(rawName) ?? "");
+    if (!name.ok) return error(400, name.error);
+    const tooLarge = (): Response => error(413, `the page must hold at most ${MAX_ARTIFACT_BYTES} bytes`);
+    if (request.method === "PUT") {
+      const declared = Number(request.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > MAX_ARTIFACT_BYTES) return tooLarge();
+      const body = await request.arrayBuffer();
+      if (body.byteLength === 0) return error(400, "the request body must hold the page's HTML");
+      if (body.byteLength > MAX_ARTIFACT_BYTES) return tooLarge();
+      return json({ artifact: await putArtifact(bucket, userId, name.value, body) });
+    }
+    if (request.method === "DELETE") {
+      await deleteArtifact(bucket, userId, name.value);
+      return new Response(null, { status: 204 });
+    }
+    if (request.method !== "GET") return error(405, "method not allowed");
+    const object = await readArtifact(bucket, userId, name.value);
+    if (object === null) return error(404, `no page named ${name.value}`);
+    return new Response(object.body, {
+      headers: {
+        "content-type": ARTIFACT_CONTENT_TYPE,
+        "cache-control": "no-store",
+        "content-security-policy": "default-src 'none'; sandbox",
+        "x-content-type-options": "nosniff",
+      },
+    });
   };
 
   const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
@@ -593,6 +663,8 @@ export const createApp = (deps: Deps): App => {
 
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
     const url = new URL(request.url);
+    const host = deps.artifactHost;
+    if (host !== null && url.hostname === host.hostname) return artifactSite(request, url, env.DB, host);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
       return dashboard(request, url, env.DB);
@@ -631,6 +703,7 @@ export const createApp = (deps: Deps): App => {
       return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
     }
     const { userId } = caller;
+    if (collection === "artifacts") return artifacts(request, userId, rawName);
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");
     }

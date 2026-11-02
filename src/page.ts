@@ -1,3 +1,5 @@
+import { ARTIFACT_CONTENT_TYPE } from "./artifacts";
+
 export const CSRF_COOKIE = "__Host-recall_csrf";
 
 export const escapeHtml = (text: string): string =>
@@ -32,6 +34,26 @@ export const htmlPage = (
       },
     },
   );
+
+// Every user's pages share this hostname, so each one loads into an opaque origin: inline style
+// and script run, and a page reaches neither another host nor the storage, cookies and pages of
+// whoever else publishes here.
+const ARTIFACT_CSP =
+  "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'unsafe-inline'; " +
+  "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data:; " +
+  "form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
+
+export const artifactPage = (body: ReadableStream): Response =>
+  new Response(body, {
+    headers: {
+      "content-type": ARTIFACT_CONTENT_TYPE,
+      "cache-control": "private, no-cache",
+      "content-security-policy": ARTIFACT_CSP,
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+    },
+  });
 
 const page = (status: number, title: string, body: string, headers: Record<string, string> = {}): Response =>
   htmlPage(status, title, DEVICE_STYLE, `<h1>${escapeHtml(title)}</h1>${body}`, headers);

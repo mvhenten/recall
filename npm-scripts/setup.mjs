@@ -5,7 +5,8 @@
 //   CLOUDFLARE_API_TOKEN=... npm run setup -- --hostname recall.example.com --user alice --email alice@example.com
 //
 // Options: --email again for more addresses, --account <id> (when the token sees
-// several), --name <worker> (default recall), --dry-run.
+// several), --name <worker> (default recall), --artifact-hostname
+// <pages.example.com> to publish pages on a second host, --dry-run.
 // The token is read from the environment only and never printed.
 
 import { spawnSync } from "node:child_process";
@@ -28,6 +29,7 @@ const say = (message) => console.log(`setup: ${message}`);
 const { values: options } = parseArgs({
   options: {
     hostname: { type: "string" },
+    "artifact-hostname": { type: "string" },
     user: { type: "string" },
     email: { type: "string", multiple: true, default: [] },
     account: { type: "string" },
@@ -39,8 +41,10 @@ const usage =
   "usage: CLOUDFLARE_API_TOKEN=... npm run setup -- --hostname <host.example.com> --user <user> --email <email>";
 const token = process.env.CLOUDFLARE_API_TOKEN || die(`CLOUDFLARE_API_TOKEN is not set\n${usage}`);
 const { hostname, user, name } = options;
+const artifactHostname = options["artifact-hostname"] ?? "";
 const emails = options.email.map((email) => email.trim().toLowerCase());
 if (!hostname || !user || emails.length === 0) die(usage);
+if (artifactHostname === hostname) die("--artifact-hostname is a second host, so it cannot be --hostname");
 for (const email of emails) if (!/^[^@\s]+@[^@\s]+$/.test(email)) die(`--email ${email} is not an email address`);
 for (const [label, value] of [
   ["--user", user],
@@ -100,11 +104,17 @@ const accountId = await (async () => {
 })();
 const account = `/accounts/${accountId}`;
 
-const zone = (await list(`/zones?account.id=${accountId}`))
-  .filter((z) => hostname === z.name || hostname.endsWith(`.${z.name}`))
-  .sort((a, b) => b.name.length - a.name.length)[0];
-if (!zone) die(`no zone in this account holds ${hostname}; add the domain to Cloudflare first`);
-say(`zone ${zone.name} holds ${hostname}`);
+const zones = await list(`/zones?account.id=${accountId}`);
+const zoneFor = (host) => {
+  const found = zones
+    .filter((z) => host === z.name || host.endsWith(`.${z.name}`))
+    .sort((a, b) => b.name.length - a.name.length)[0];
+  if (!found) die(`no zone in this account holds ${host}; add the domain to Cloudflare first`);
+  say(`zone ${found.name} holds ${host}`);
+  return found;
+};
+const zone = zoneFor(hostname);
+const artifactZone = artifactHostname === "" ? null : zoneFor(artifactHostname);
 
 const organization = await cf("GET", `${account}/access/organizations`, undefined, { optional: true });
 const teamDomain =
@@ -116,6 +126,17 @@ const database =
   (await list(`${account}/d1/database?name=${name}`)).find((db) => db.name === name) ??
   (await create(`D1 database ${name}`, () => cf("POST", `${account}/d1/database`, { name })));
 const databaseId = database?.uuid ?? database?.id ?? "00000000-0000-0000-0000-000000000000";
+
+// R2 is touched only when pages are published, so an account without R2 enabled still sets up.
+const bucketName = `${name}-artifacts`;
+if (artifactHostname !== "") {
+  const existing = await cf("GET", `${account}/r2/buckets/${bucketName}`, undefined, { optional: true });
+  if (!existing) {
+    await create(`R2 bucket ${bucketName}`, () =>
+      cf("POST", `${account}/r2/buckets`, { name: bucketName, locationHint: "weur" }),
+    );
+  }
+}
 
 const otp =
   (await list(`${account}/access/identity_providers`)).find((idp) => idp.type === "onetimepin") ??
@@ -198,6 +219,20 @@ const browserApp = await upsertApp(deviceDomain, {
   policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
 });
 
+const artifactApp =
+  artifactHostname === ""
+    ? null
+    : await upsertApp(artifactHostname, {
+        name: `${name} artifacts`,
+        domain: artifactHostname,
+        type: "self_hosted",
+        session_duration: "24h",
+        app_launcher_visible: false,
+        allowed_idps: otp ? [otp.id] : [],
+        auto_redirect_to_identity: true,
+        policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
+      });
+
 if (dryRun) {
   say(`would deploy the Worker ${name} to ${hostname}`);
   process.exit(0);
@@ -226,8 +261,16 @@ const config = {
     database_id: databaseId,
     migrations_dir: join(ROOT, db.migrations_dir),
   })),
-  routes: [{ pattern: hostname, custom_domain: true, zone_id: zone.id }],
-  vars: { ACCESS_TEAM_DOMAIN: teamDomain, ACCESS_AUD: browserApp.aud },
+  routes: [
+    { pattern: hostname, custom_domain: true, zone_id: zone.id },
+    ...(artifactZone ? [{ pattern: artifactHostname, custom_domain: true, zone_id: artifactZone.id }] : []),
+  ],
+  ...(artifactHostname === "" ? {} : { r2_buckets: [{ binding: "ARTIFACTS", bucket_name: bucketName }] }),
+  vars: {
+    ACCESS_TEAM_DOMAIN: teamDomain,
+    ACCESS_AUD: browserApp.aud,
+    ...(artifactApp ? { ARTIFACT_HOSTNAME: artifactHostname, ARTIFACT_ACCESS_AUD: artifactApp.aud } : {}),
+  },
 };
 mkdirSync(WORK, { recursive: true });
 const configPath = join(WORK, "wrangler.json");
