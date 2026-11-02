@@ -36,7 +36,8 @@ export const listArtifacts = async (bucket: R2Bucket, userId: string): Promise<A
   const artifacts: Artifact[] = [];
   let cursor: string | undefined;
   for (;;) {
-    const page = await bucket.list({ prefix, cursor });
+    // A listing leaves custom metadata out unless it is asked for, and the timestamps live there.
+    const page = await bucket.list({ prefix, cursor, include: ["customMetadata"] });
     artifacts.push(...page.objects.map((object) => toArtifact(userId, object)));
     if (!page.truncated) {
       return artifacts.sort((a, b) => b.updatedAt - a.updatedAt || a.name.localeCompare(b.name));
