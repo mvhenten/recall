@@ -609,6 +609,15 @@ const insightsTab = async (h: Harness, who: Reporter): Promise<string> => {
   return plain(await response.text());
 };
 
+// Insights renders every card into the one page, and the fortnight panels sit beside the all-time
+// ones, so a negative about a window has to be read off that window's own card.
+const cardText = (html: string, title: string, nextTitle: string): string => {
+  const start = html.indexOf(title);
+  const end = html.indexOf(nextTitle, start + title.length);
+  if (start < 0 || end < 0) throw new Error(`the insights page shows no ${title} card before ${nextTitle}`);
+  return html.slice(start, end);
+};
+
 const eventCount = async (userId: string): Promise<number> => {
   const row = await env.DB.prepare("SELECT COUNT(*) AS events FROM usage_events WHERE user_id = ?")
     .bind(userId)
@@ -792,11 +801,11 @@ describe("the insights tab", () => {
       lastActivityAt: NOON,
     });
 
-    const html = await insightsTab(h, owner);
-    expect(html).toContain("acme/infra 3h");
-    expect(html).toContain("acme/app 2h");
-    expect(html).toContain("acme/infra took 3h of the fortnight's 5h of session time.");
-    expect(html).not.toContain("26h");
+    const hours = cardText(await insightsTab(h, owner), "Where the hours went", "Month by month");
+    expect(hours).toContain("acme/infra 3h");
+    expect(hours).toContain("acme/app 2h");
+    expect(hours).toContain("acme/infra took 3h of the fortnight's 5h of session time.");
+    expect(hours).not.toContain("26h");
   });
 
   it("finds the busiest hour of the week", async () => {
