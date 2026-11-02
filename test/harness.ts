@@ -47,6 +47,7 @@ export interface Client {
   get(name: string): Promise<Memory>;
   search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
+  usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
 }
 
 const SESSION_DOCUMENT: Record<string, unknown> = {
@@ -62,6 +63,21 @@ const SESSION_DOCUMENT: Record<string, unknown> = {
   mode: "interactive",
   permissionMode: "default",
   pid: 4242,
+};
+
+const USAGE_DELTA: Record<string, unknown> = {
+  seq: 1,
+  host: "laptop",
+  repo: "repo:github.com/mvhenten/recall",
+  provider: "anthropic",
+  account: "work",
+  model: "claude-opus-4",
+  prompts: 1,
+  inputTokens: 120,
+  outputTokens: 40,
+  cacheWriteTokens: 900,
+  cacheReadTokens: 8_000,
+  at: 1_700_000_060_000,
 };
 
 export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS) => {
@@ -194,6 +210,9 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
       },
       sync(sessionId, fields = {}) {
         return request("PUT", `/v1/sessions/${sessionId}`, { ...SESSION_DOCUMENT, ...fields });
+      },
+      usage(sessionId, fields = {}) {
+        return request("POST", `/v1/sessions/${sessionId}/usage`, { ...USAGE_DELTA, ...fields });
       },
       async search(query, tags, mode = "hybrid") {
         const response = await request("POST", "/v1/search", {

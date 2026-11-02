@@ -11,6 +11,9 @@ import {
   type SessionInput,
   type SessionMode,
   sessionHandle,
+  USAGE_RETENTION_MS,
+  type UsageInput,
+  usageDay,
 } from "./model";
 
 interface MemoryRow {
@@ -370,6 +373,59 @@ export const sessionOnDevice = async (
     .bind(userId, sessionId, deviceId, now - SESSION_TTL_MS)
     .first<{ session_id: string }>();
   return row !== null;
+};
+
+const USAGE_SUMS =
+  "prompts = usage_daily.prompts + excluded.prompts, " +
+  "input_tokens = usage_daily.input_tokens + excluded.input_tokens, " +
+  "output_tokens = usage_daily.output_tokens + excluded.output_tokens, " +
+  "cache_write_tokens = usage_daily.cache_write_tokens + excluded.cache_write_tokens, " +
+  "cache_read_tokens = usage_daily.cache_read_tokens + excluded.cache_read_tokens";
+
+export const recordUsage = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  input: UsageInput,
+  now: number,
+): Promise<void> => {
+  const counters = [
+    input.prompts,
+    input.inputTokens,
+    input.outputTokens,
+    input.cacheWriteTokens,
+    input.cacheReadTokens,
+  ];
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO usage_daily (user_id, day, host, repo, account, provider, model, prompts,
+           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         WHERE NOT EXISTS (SELECT 1 FROM usage_events WHERE user_id = ?1 AND session_id = ?13 AND seq = ?14)
+         ON CONFLICT (user_id, day, host, repo, account, provider, model) DO UPDATE SET ${USAGE_SUMS}`,
+      )
+      .bind(
+        userId,
+        usageDay(input.at),
+        input.host,
+        input.repo,
+        input.account,
+        input.provider,
+        input.model,
+        ...counters,
+        sessionId,
+        input.seq,
+      ),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO usage_events (user_id, session_id, seq, provider, account, model, prompts,
+           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, at, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
+      )
+      .bind(userId, sessionId, input.seq, input.provider, input.account, input.model, ...counters, input.at, now),
+    db.prepare("DELETE FROM usage_events WHERE user_id = ? AND recorded_at < ?").bind(userId, now - USAGE_RETENTION_MS),
+  ]);
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {
