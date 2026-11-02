@@ -6,6 +6,7 @@ use crate::settings::Settings;
 use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
+use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -56,6 +57,10 @@ pub fn sessions_dir() -> PathBuf {
 
 pub fn seen_path() -> PathBuf {
     runtime_dir().join("seen.json")
+}
+
+pub fn log_path() -> PathBuf {
+    state_dir().join("hooks.log")
 }
 
 /// An exclusive flock held for the daemon's lifetime. It is both the mutual exclusion and the
@@ -219,9 +224,74 @@ async fn serve() -> Result<()> {
     }
 }
 
+/// How many skipped sessions `--status` prints before it points at the log for the rest. Every
+/// session still holding a registration is printed whatever its age.
+pub const STATUS_SESSIONS: usize = 10;
+
+/// Why messaging reached, or did not reach, the sessions on this host.
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub messaging_enabled: bool,
+    pub listener_running: bool,
+    pub log: PathBuf,
+    pub sessions: Vec<sessions::Status>,
+}
+
+impl Report {
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            if self.messaging_enabled {
+                "messaging is on".to_string()
+            } else {
+                sessions::MESSAGING_OFF.to_string()
+            },
+            if self.listener_running {
+                "a listener is running on this host".to_string()
+            } else {
+                "no listener is running on this host".to_string()
+            },
+        ];
+        if self.sessions.is_empty() {
+            lines.push(format!("no session is recorded in {}", self.log.display()));
+            return lines;
+        }
+        let mut shown = 0;
+        let mut hidden = 0;
+        for status in &self.sessions {
+            if status.registration.is_none() && shown >= STATUS_SESSIONS {
+                hidden += 1;
+                continue;
+            }
+            shown += 1;
+            lines.push(format!(
+                "{}  {}  {}  {}",
+                status.at, status.session_id, status.state, status.reason
+            ));
+        }
+        if hidden > 0 {
+            lines.push(format!("and {hidden} older sessions in {}", self.log.display()));
+        }
+        lines
+    }
+}
+
+/// A held lock is the daemon's liveness check, so failing to take it means one is already running.
+fn listener_running() -> bool {
+    matches!(Lock::acquire(&lock_path()), Ok(None))
+}
+
+pub fn status(settings: &Settings) -> Report {
+    Report {
+        messaging_enabled: settings.messaging_enabled(),
+        listener_running: listener_running(),
+        log: log_path(),
+        sessions: sessions::status(&sessions_dir(), &log_path()),
+    }
+}
+
 pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
     if !settings.messaging_enabled() {
-        eprintln!("recall: messaging is off; run recall config set messaging.enabled true to turn it on");
+        eprintln!("recall: {}", sessions::MESSAGING_OFF);
         return Ok(());
     }
     let path = lock_path();
@@ -276,6 +346,46 @@ mod tests {
             let jittered = with_jitter(delay, f64::from(step) / 10.0);
             assert!(jittered >= delay && jittered <= Duration::from_secs(10), "{jittered:?}");
         }
+    }
+
+    #[test]
+    fn a_registered_session_is_always_printed_however_many_were_skipped() {
+        let mut sessions: Vec<sessions::Status> = (0..STATUS_SESSIONS + 5)
+            .map(|minute| sessions::Status {
+                session_id: format!("s-skipped-{minute}"),
+                at: format!("2026-11-02T09:{minute:02}:00.000Z"),
+                state: "off".to_string(),
+                reason: sessions::MESSAGING_OFF.to_string(),
+                registration: None,
+            })
+            .collect();
+        sessions.push(sessions::Status {
+            session_id: "s-live".to_string(),
+            at: "2026-11-01T08:00:00.000Z".to_string(),
+            state: "registered".to_string(),
+            reason: "registered, pid 42 in /src".to_string(),
+            registration: Some(sessions::Live {
+                pid: 42,
+                cwd: PathBuf::from("/src"),
+            }),
+        });
+        let report = Report {
+            messaging_enabled: false,
+            listener_running: false,
+            log: PathBuf::from("/state/hooks.log"),
+            sessions,
+        };
+
+        let lines = report.lines();
+
+        assert_eq!(lines[0], sessions::MESSAGING_OFF);
+        assert_eq!(lines[1], "no listener is running on this host");
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("s-skipped-")).count(),
+            STATUS_SESSIONS
+        );
+        assert!(lines.iter().any(|line| line.contains("s-live")), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "and 5 older sessions in /state/hooks.log");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
@@ -112,6 +112,118 @@ pub fn registered(dir: &Path) -> Vec<Registered> {
             .then_with(|| left.1.session_id.cmp(&right.1.session_id))
     });
     live.into_iter().map(|(_, registered)| registered).collect()
+}
+
+pub const MESSAGING_OFF: &str = "messaging is off; run recall config set messaging.enabled true to turn it on";
+pub const NO_INBOX: &str =
+    "Claude set no CLAUDE_CODE_MESSAGING_SOCKET or CLAUDE_CODE_MESSAGING_TOKEN, so this session has no inbox";
+
+/// The registration a session still holds: the process the daemon writes into and where it runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Live {
+    pub pid: i32,
+    pub cwd: PathBuf,
+}
+
+/// What became of one session's registration: the state the hook last recorded for it, in plain
+/// words, next to the registration the daemon can still see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Status {
+    pub session_id: String,
+    pub at: String,
+    pub state: String,
+    pub reason: String,
+    pub registration: Option<Live>,
+}
+
+fn reason(state: &str, registration: Option<&Live>) -> String {
+    if let Some(error) = state.strip_prefix("failed:") {
+        return format!("writing the registration failed: {error}");
+    }
+    match (state, registration) {
+        ("registered", Some(live)) => format!("registered, pid {} in {}", live.pid, live.cwd.display()),
+        ("registered", None) => "registered, then dropped because the session or its socket is gone".to_string(),
+        ("unregistered", _) => "the session ended".to_string(),
+        ("off", _) => MESSAGING_OFF.to_string(),
+        ("no-session", _) => "Claude reported no session id".to_string(),
+        ("no-inbox", _) => NO_INBOX.to_string(),
+        (other, _) => other.to_string(),
+    }
+}
+
+/// Reads `messaging:<state>` back out of one hooks log line, which is a timestamp, a session id,
+/// an outcome that may carry spaces, and a duration. Lines the daemon wrote carry no session id.
+fn hook_state(line: &str) -> Option<(String, String, String)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [at, session_id, rest @ ..] = fields.as_slice() else {
+        return None;
+    };
+    if *session_id == "-" {
+        return None;
+    }
+    let (_duration, outcome) = rest.split_last()?;
+    let state = outcome.join(" ").split_once("messaging:")?.1.to_string();
+    Some((session_id.to_string(), at.to_string(), state))
+}
+
+fn hook_states(log: &Path) -> HashMap<String, (String, String)> {
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return HashMap::new();
+    };
+    let mut latest = HashMap::new();
+    for line in text.lines() {
+        if let Some((session_id, at, state)) = hook_state(line) {
+            latest.insert(session_id, (at, state));
+        }
+    }
+    latest
+}
+
+/// Every session the hooks log still remembers, newest first, each with the reason the hook gave
+/// for registering it or passing it over. Sessions holding a live registration are folded in, so a
+/// registration that outlived its log line is still reported.
+pub fn status(dir: &Path, log: &Path) -> Vec<Status> {
+    let mut live: HashMap<String, Live> = registered(dir)
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.session_id,
+                Live {
+                    pid: entry.session.pid,
+                    cwd: entry.session.cwd,
+                },
+            )
+        })
+        .collect();
+    let mut sessions: Vec<Status> = hook_states(log)
+        .into_iter()
+        .map(|(session_id, (at, state))| {
+            let registration = live.remove(&session_id);
+            Status {
+                session_id,
+                at,
+                reason: reason(&state, registration.as_ref()),
+                state,
+                registration,
+            }
+        })
+        .collect();
+    for (session_id, registration) in live {
+        sessions.push(Status {
+            session_id,
+            at: "-".to_string(),
+            state: "registered".to_string(),
+            reason: reason("registered", Some(&registration)),
+            registration: Some(registration),
+        });
+    }
+    sessions.sort_by(|left, right| {
+        right
+            .at
+            .cmp(&left.at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    sessions
 }
 
 fn frames(registered: &Registered, body: &str) -> String {
@@ -299,6 +411,65 @@ mod tests {
         );
         assert!(!sandbox.sessions().join("s-dead.json").exists());
         assert!(!sandbox.sessions().join("s-socketless.json").exists());
+    }
+
+    #[test]
+    fn every_outcome_the_hook_records_comes_back_as_a_reason() {
+        let sandbox = Sandbox::new("status");
+        let socket = sandbox.dir.join("inbox.sock");
+        std::fs::write(&socket, "").unwrap();
+        let mine = std::process::id() as i32;
+        sandbox.register("s-live", &socket, mine);
+        sandbox.register("s-pruned", &sandbox.dir.join("gone.sock"), mine);
+        let log = sandbox.dir.join("hooks.log");
+        std::fs::write(
+            &log,
+            concat!(
+                "2026-11-02T09:00:00.000Z - listen:connected 0ms\n",
+                "2026-11-02T09:00:30.000Z s-live crib:hook:repo:messaging:off 11ms\n",
+                "2026-11-02T09:01:00.000Z s-off crib:hook:repo:messaging:off 12ms\n",
+                "2026-11-02T09:02:00.000Z s-no-inbox crib:tools:global:messaging:no-inbox 9ms\n",
+                "2026-11-02T09:03:00.000Z s-no-session crib:hook:repo:messaging:no-session 7ms\n",
+                "2026-11-02T09:04:00.000Z s-failed crib:hook:repo:messaging:failed:EACCES, permission denied 8ms\n",
+                "2026-11-02T09:05:00.000Z s-ended messaging:unregistered 2ms\n",
+                "2026-11-02T09:06:00.000Z s-pruned crib:hook:repo:messaging:registered 11ms\n",
+                "2026-11-02T09:07:00.000Z s-live crib:hook:repo:messaging:registered 10ms\n",
+            ),
+        )
+        .unwrap();
+
+        let statuses = status(&sandbox.sessions(), &log);
+        let by_id: HashMap<&str, &Status> = statuses
+            .iter()
+            .map(|status| (status.session_id.as_str(), status))
+            .collect();
+
+        assert_eq!(statuses.len(), 7, "{statuses:?}");
+        assert_eq!(statuses[0].session_id, "s-live", "newest first");
+        assert_eq!(by_id["s-off"].state, "off");
+        assert_eq!(by_id["s-off"].reason, MESSAGING_OFF);
+        assert_eq!(by_id["s-no-inbox"].reason, NO_INBOX);
+        assert_eq!(by_id["s-no-session"].reason, "Claude reported no session id");
+        assert_eq!(
+            by_id["s-failed"].reason,
+            "writing the registration failed: EACCES, permission denied"
+        );
+        assert_eq!(by_id["s-ended"].reason, "the session ended");
+        assert_eq!(
+            by_id["s-pruned"].reason,
+            "registered, then dropped because the session or its socket is gone"
+        );
+        assert_eq!(
+            by_id["s-live"].registration,
+            Some(Live {
+                pid: mine,
+                cwd: sandbox.dir.clone()
+            })
+        );
+        assert_eq!(
+            by_id["s-live"].reason,
+            format!("registered, pid {mine} in {}", sandbox.dir.display())
+        );
     }
 
     #[tokio::test]
