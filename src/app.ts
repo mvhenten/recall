@@ -1,6 +1,8 @@
 import {
   dashboardNotice,
   dashboardPage,
+  type Live,
+  liveSummary,
   MEMORY_TAB,
   memoriesPage,
   memoryBodyPage,
@@ -285,17 +287,20 @@ export const createApp = (deps: Deps): App => {
       return signIn(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
     }
     const tab = tabForPath(url.pathname);
+    const now = deps.now();
+    const sessions = await listSessions(db, userId, now);
+    if (tab?.path === SESSIONS_TAB.path) return sessionsPage(email, sessions, now);
+    // Every page carries the sidebar's live summary, so the session list is read whatever the tab.
+    const live = liveSummary(sessions, now);
     if (tab === null) {
       const prefix = `${MEMORY_TAB.path}/`;
       if (!url.pathname.startsWith(prefix)) {
         return lost(404, "No such page", "The dashboard has no page at this address.");
       }
-      return memoryBody(url.pathname.slice(prefix.length), db, userId, email, lost);
+      return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
     }
-    if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, lost);
-    if (tab.path !== SESSIONS_TAB.path) return dashboardPage(email, tab);
-    const now = deps.now();
-    return sessionsPage(email, await listSessions(db, userId, now), now);
+    if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
+    return dashboardPage(email, tab, live);
   };
 
   const memoryBody = async (
@@ -303,12 +308,13 @@ export const createApp = (deps: Deps): App => {
     db: D1Database,
     userId: string,
     email: string,
+    live: Live,
     lost: Refusal,
   ): Promise<Response> => {
     const name = parseName(decodeSegment(rawName) ?? "");
     const memory = name.ok ? await getMemory(db, userId, name.value) : null;
     if (!memory) return lost(404, "No such memory", "This recall holds no memory at this address.");
-    return memoryBodyPage(email, memory, deps.now());
+    return memoryBodyPage(email, live, memory, deps.now());
   };
 
   const memoryTab = async (
@@ -316,6 +322,7 @@ export const createApp = (deps: Deps): App => {
     db: D1Database,
     userId: string,
     email: string,
+    live: Live,
     lost: Refusal,
   ): Promise<Response> => {
     const input = parseList(url.searchParams);
@@ -328,7 +335,7 @@ export const createApp = (deps: Deps): App => {
       const cursor = decodeCursor(filter.cursor);
       if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the Memory tab.");
       const page = await listMemories(db, userId, filter, cursor);
-      return memoriesPage(email, url, filter, counts, page.memories, page.nextCursor, now);
+      return memoriesPage(email, live, url, filter, counts, page.memories, page.nextCursor, now);
     }
     const searched = parseSearch({
       query,
@@ -341,7 +348,7 @@ export const createApp = (deps: Deps): App => {
     if (!searched.ok) return lost(400, "Search refused", `${searched.error}.`);
     const rankings = await rank(db, userId, searched.value, filter.types);
     const found = await hits(db, userId, rankings.inScope, searched.value.limit);
-    return memorySearchPage(email, url, filter, counts, found, now);
+    return memorySearchPage(email, live, url, filter, counts, found, now);
   };
 
   const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {

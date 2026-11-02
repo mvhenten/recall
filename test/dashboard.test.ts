@@ -42,13 +42,15 @@ describe("the dashboard", () => {
     expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
     const html = await response.text();
     expect(html).toContain(owner.email);
-    expect(html).toContain('<a href="/dashboard/stats" aria-current="page">Stats</a>');
+    expect(html).toContain('<a href="/dashboard/stats" aria-current="page">');
     for (const [path, label] of [
       ["/dashboard", "Sessions"],
+      ["/dashboard/history", "History"],
       ["/dashboard/memory", "Memory"],
       ["/dashboard/insights", "Insights"],
     ]) {
-      expect(html).toContain(`<a href="${path}">${label}</a>`);
+      expect(html).toContain(`<a href="${path}">`);
+      expect(plain(html)).toContain(label);
     }
   });
 
@@ -132,11 +134,15 @@ describe("the sessions tab", () => {
     expect(html).toContain(">busy</p>");
     expect(html).toContain("list the sessions");
     expect(html).toContain("why is the worker test red");
-    expect(html).toContain("repo:github.com/mvhenten/recall@feat/dashboard-sessions · 12m · 3 prompts");
+    expect(html).toContain(">repo:github.com/mvhenten/recall@feat/dashboard-sessions<");
+    expect(html).toContain(">12m<");
+    expect(html).toContain('3<span class="unit"> prompts</span>');
     expect(html).toContain("tower-c4e2");
     expect(html).toContain(">idle 14m</p>");
     expect(html).toContain("draft the release notes");
-    expect(html).toContain("global · 3h · 1 prompt");
+    expect(html).toContain(">global<");
+    expect(html).toContain(">3h<");
+    expect(html).toContain('1<span class="unit"> prompt</span>');
     expect(html.indexOf("laptop-9f8a")).toBeLessThan(html.indexOf("tower-c4e2"));
     expect(html).not.toContain("nomad");
   });
@@ -175,7 +181,7 @@ describe("the sessions tab", () => {
     const owner = await signedIn(h);
     const html = await sessionsTab(h, owner.assertion);
     expect(html).toContain("No session is running on any of your hosts.");
-    expect(html).not.toContain('class="feed"');
+    expect(html).not.toContain('class="sessions"');
   });
 });
 
