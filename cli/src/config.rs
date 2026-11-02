@@ -81,12 +81,15 @@ pub const MODE_KEY: &str = "RECALL_MODE";
 
 pub const AUTO_MEMORY_OFF: &str = "Turn off Claude Code's built-in auto-memory: add \"autoMemoryEnabled\": false to ~/.claude/settings.json, or set CLAUDE_CODE_DISABLE_AUTO_MEMORY=1";
 
-pub fn claude_settings_file() -> PathBuf {
+/// Where Claude Code keeps its own state: the settings, and one transcript directory per project.
+pub fn claude_dir() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
-        .unwrap_or_default()
-        .join("settings.json")
+}
+
+pub fn claude_settings_file() -> PathBuf {
+    claude_dir().unwrap_or_default().join("settings.json")
 }
 
 pub fn auto_memory_enabled(settings_file: &Path, disable_env: Option<&str>) -> bool {

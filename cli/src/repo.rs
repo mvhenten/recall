@@ -54,6 +54,33 @@ pub fn repo_tag(dir: &Path) -> Option<String> {
     repo_tag_for_remote(&remote_url(dir)?)
 }
 
+/// What a session's record says about the work: the subject of the last commit and the branch the
+/// tip points at. Mirrors head() in hooks/messaging.mjs, down to the one git call — %D decorates
+/// the tip with "HEAD -> " and the branch it points at, and the subject comes first so an empty
+/// decoration cannot be mistaken for one. A detached head, a repo with no commits and no repo at
+/// all each give nothing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Head {
+    pub branch: String,
+    pub commit: String,
+}
+
+pub fn head(dir: &Path) -> Head {
+    let Some(shown) = git(dir, &["log", "-1", "--no-color", "--format=%s%n%D"]) else {
+        return Head::default();
+    };
+    let mut lines = shown.lines();
+    let commit = lines.next().unwrap_or_default().trim().to_string();
+    let branch = lines
+        .next()
+        .unwrap_or_default()
+        .split(", ")
+        .find_map(|reference| reference.strip_prefix("HEAD -> "))
+        .unwrap_or_default()
+        .to_string();
+    Head { branch, commit }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +147,9 @@ mod tests {
         let expected = Some("repo:github.com/acme/widget".to_string());
         assert_eq!(repo_tag(&main), expected);
         assert_eq!(repo_tag(&worktree.join("nested/dir")), expected);
+        let head = head(&main);
+        assert_eq!(head.commit, "init");
+        assert!(!head.branch.is_empty(), "a checked-out branch is named: {head:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

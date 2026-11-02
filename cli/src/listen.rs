@@ -1,3 +1,4 @@
+use crate::adopt;
 use crate::api::{Client, Message};
 use crate::config;
 use crate::seen::Seen;
@@ -218,6 +219,9 @@ async fn reconnect_loop(url: &str, token: &str, sessions_dir: &Path, seen: &mut 
 /// unlinks it sends both, on a blocking thread so the calls cannot stall message delivery; a delta
 /// the service refuses is reported and dropped, since the record it came from is already gone.
 fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
+    if ended.is_empty() {
+        return;
+    }
     let client = Arc::clone(client);
     tokio::task::spawn_blocking(move || {
         for session in ended {
@@ -241,11 +245,39 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
     });
 }
 
+/// The same adoption `recall sessions --adopt` runs, on the tick that already sweeps the registry:
+/// a session the hooks never registered keeps its last activity up with its own transcript until
+/// its process is gone, and the sweep above is what ends it then. The transcript is the only thing
+/// that moves, so a session whose transcript stood still sends nothing. It runs on a blocking
+/// thread, like the end reports, so neither the reading nor the calls can stall message delivery.
+fn adopt_running(client: &Arc<Client>, scope: &Arc<adopt::Scope>) {
+    let client = Arc::clone(client);
+    let scope = Arc::clone(scope);
+    tokio::task::spawn_blocking(move || {
+        for session in adopt::adopt(&scope) {
+            let id = &session.session_id;
+            let Some(record) = sessions::record(&scope.sessions, id) else {
+                continue;
+            };
+            let started = Instant::now();
+            let outcome = match client.sync_record(id, &record) {
+                Ok(()) => format!("sessions:{}:{id}", session.outcome),
+                Err(error) => format!("sessions:adopt-failed:{id}:{error:#}"),
+            };
+            log(&outcome, started.elapsed());
+        }
+    });
+}
+
 async fn serve() -> Result<()> {
     let config = config::load()?;
     let url = ws::listen_url(&config.endpoint)?;
     let sessions_dir = sessions_dir();
     let client = Arc::new(Client::new(config.clone()));
+    let scope = adopt::Scope::here().map(Arc::new);
+    if let Err(error) = scope.as_ref() {
+        log(&format!("sessions:adopt-failed:{error:#}"), Duration::ZERO);
+    }
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -254,7 +286,12 @@ async fn serve() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
-        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| report_ended(&client, ended)) => Ok(()),
+        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
+            report_ended(&client, ended);
+            if let Ok(scope) = scope.as_ref() {
+                adopt_running(&client, scope);
+            }
+        }) => Ok(()),
         result = &mut work => result,
     }
 }
@@ -262,6 +299,7 @@ async fn serve() -> Result<()> {
 pub const MESSAGING_OFF: &str = "messaging is off; run recall config set messaging.enabled true to turn it on";
 pub const NO_INBOX: &str =
     "Claude set no CLAUDE_CODE_MESSAGING_SOCKET or CLAUDE_CODE_MESSAGING_TOKEN, so this session has no inbox";
+pub const ADOPTED: &str = "adopted from its transcript: this session started before the hooks it would have registered with, so it takes no messages until it restarts";
 
 /// What `--status` reports for one session. The registry record carries the inbox token, so it
 /// never leaves this module: only the session id, its directory, the Claude pid and the state
@@ -281,6 +319,7 @@ pub enum Reported {
     Registered,
     Off,
     NoInbox,
+    Adopted,
     Failed { error: String },
 }
 
@@ -294,6 +333,7 @@ impl From<sessions::Status> for Session {
                 sessions::State::Registered(_) => Reported::Registered,
                 sessions::State::Off => Reported::Off,
                 sessions::State::NoInbox => Reported::NoInbox,
+                sessions::State::Adopted => Reported::Adopted,
                 sessions::State::Failed { error } => Reported::Failed { error },
             },
         }
@@ -312,6 +352,7 @@ fn reason(session: &Session) -> String {
         Reported::Registered => format!("registered, pid {}", session.pid),
         Reported::Off => MESSAGING_OFF.to_string(),
         Reported::NoInbox => NO_INBOX.to_string(),
+        Reported::Adopted => ADOPTED.to_string(),
         Reported::Failed { error } => format!("writing the registration failed: {error}"),
     }
 }
@@ -455,9 +496,10 @@ mod tests {
                 ),
                 status("s-off", "/src/other", sessions::State::Off),
                 status("s-no-inbox", "/src/third", sessions::State::NoInbox),
+                status("s-adopted", "/src/fourth", sessions::State::Adopted),
                 status(
                     "s-failed",
-                    "/src/fourth",
+                    "/src/fifth",
                     sessions::State::Failed {
                         error: "EACCES, permission denied".to_string(),
                     },
@@ -476,7 +518,8 @@ mod tests {
                 "s-live  /src/recall  registered, pid 42".to_string(),
                 format!("s-off  /src/other  {MESSAGING_OFF}"),
                 format!("s-no-inbox  /src/third  {NO_INBOX}"),
-                "s-failed  /src/fourth  writing the registration failed: EACCES, permission denied".to_string(),
+                format!("s-adopted  /src/fourth  {ADOPTED}"),
+                "s-failed  /src/fifth  writing the registration failed: EACCES, permission denied".to_string(),
             ]
         );
     }
