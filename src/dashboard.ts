@@ -19,7 +19,6 @@ import {
   type ModelTotals,
   memoryTypes,
   type PastSession,
-  SESSION_HISTORY_DAYS,
   type Session,
   STALE_AFTER_DAYS,
   type Stats,
@@ -531,18 +530,11 @@ export const historyPage = (
           filtered ? "No session matches this filter." : "No session is in your history yet.",
           filtered
             ? "Clear the filter to read every host and every repo."
-            : `A session lands here as soon as it syncs, and stays for ${SESSION_HISTORY_DAYS} days.`,
+            : "A session lands here as soon as it syncs, and stays forever.",
         )
       : `<div class="hist">${groups.map(dayBlock).join("")}</div>${older}`;
   const filters = `<div class="toolrow">${historyChips(url, "host", "Filter by host", "All hosts", filter.host, offered(known.hosts, filter.host))}${historyChips(url, "repo", "Filter by repo", "All repos", filter.repo, offered(known.repos, filter.repo))}</div>`;
-  return shell(
-    email,
-    HISTORY_TAB,
-    live,
-    HISTORY_TAB.label,
-    `last ${SESSION_HISTORY_DAYS} days`,
-    `${filters}${listing}`,
-  );
+  return shell(email, HISTORY_TAB, live, HISTORY_TAB.label, "kept forever", `${filters}${listing}`);
 };
 
 const memoryLink = (url: URL, changes: Record<string, string>): string =>
