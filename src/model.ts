@@ -105,6 +105,8 @@ export interface Session extends SessionInput {
 export interface Live {
   sessions: number;
   busy: number;
+  sessionsToday: number;
+  today: ModelTotals[];
 }
 
 export interface PastSession {
@@ -153,6 +155,85 @@ export interface UsageInput {
 }
 
 export const usageDay = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
+export const usageDayStart = (at: number): number => Date.parse(`${usageDay(at)}T00:00:00.000Z`);
+
+export const dayBefore = (at: number, days: number): string => usageDay(at - days * 86_400_000);
+
+// The three windows the stats page answers over. Today is the UTC day the rollup keys on; the
+// wider two are inclusive of today, so seven days means today and the six before it.
+export const USAGE_WEEK_DAYS = 7;
+export const USAGE_CHART_DAYS = 14;
+export const USAGE_MONTH_DAYS = 30;
+export const STALE_AFTER_DAYS = 60;
+export const NEVER_RECALLED_AFTER_DAYS = 14;
+
+export interface TokenCounts {
+  prompts: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+}
+
+export interface ModelTotals extends TokenCounts {
+  provider: string;
+  model: string;
+}
+
+export interface ModelDay extends ModelTotals {
+  day: string;
+}
+
+export const usageSplitFields = ["host", "repo", "account"] as const;
+
+export type UsageSplitField = (typeof usageSplitFields)[number];
+
+export interface UsageSplit extends ModelTotals {
+  field: UsageSplitField;
+  value: string;
+}
+
+export interface DaySessions {
+  day: string;
+  sessions: number;
+}
+
+export interface RepoHours {
+  repo: string;
+  ms: number;
+  sessions: number;
+}
+
+export interface RhythmCell {
+  weekday: number;
+  hour: number;
+  sessions: number;
+}
+
+export interface RecalledMemory {
+  name: string;
+  recalls: number;
+}
+
+export interface WorkingSet {
+  entries: RecalledMemory[];
+  recalls: number;
+  memories: number;
+}
+
+export interface StaleMemory {
+  name: string;
+  recalled: boolean;
+  lastRecalledAt: number;
+  createdAt: number;
+}
+
+export interface GoingStale {
+  entries: StaleMemory[];
+  atRisk: number;
+  total: number;
+}
 
 // The handle that addresses one session: its device name and the head of its session id. It is a
 // function of the session alone, so it names the same session for as long as that session runs and

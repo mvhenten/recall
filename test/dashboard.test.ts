@@ -1,3 +1,4 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { type Client, harness } from "./harness";
 
@@ -554,5 +555,280 @@ describe("one memory's page", () => {
       expect(response.status).toBe(404);
       expect(plain(await response.text())).toContain("This recall holds no memory at this address.");
     }
+  });
+});
+
+const NOON = Date.UTC(2026, 10, 2, 12, 0, 0);
+const OPUS = "claude-opus-4-5-20251101";
+
+interface Reporter {
+  email: string;
+  userId: string;
+  assertion: string;
+  client: Client;
+}
+
+const reporting = async (h: Harness, label = "owner"): Promise<Reporter> => {
+  const userId = `${label}-${crypto.randomUUID()}`;
+  const address = await h.invite(email(label), userId);
+  return {
+    email: address,
+    userId,
+    assertion: await h.assertionFor(address),
+    client: h.clientWithToken(await h.login(address, "laptop")),
+  };
+};
+
+const NOTHING = { prompts: 0, inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0 };
+
+const spender = (who: Reporter): ((fields: Record<string, unknown>) => Promise<void>) => {
+  let seq = 0;
+  return async (fields: Record<string, unknown>): Promise<void> => {
+    seq += 1;
+    const response = await who.client.usage("usage001", {
+      provider: "claude",
+      model: OPUS,
+      ...NOTHING,
+      ...fields,
+      seq,
+    });
+    expect(response.status).toBe(204);
+  };
+};
+
+const statsTab = async (h: Harness, who: Reporter): Promise<string> => {
+  const response = await open(h, "/dashboard/stats", who.assertion);
+  expect(response.status).toBe(200);
+  return plain(await response.text());
+};
+
+const insightsTab = async (h: Harness, who: Reporter): Promise<string> => {
+  const response = await open(h, "/dashboard/insights", who.assertion);
+  expect(response.status).toBe(200);
+  return plain(await response.text());
+};
+
+const eventCount = async (userId: string): Promise<number> => {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS events FROM usage_events WHERE user_id = ?")
+    .bind(userId)
+    .first<{ events: number }>();
+  return row?.events ?? 0;
+};
+
+describe("the stats tab", () => {
+  it("prices every model from its own rates and names the tokens it cannot price", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    const spend = spender(owner);
+    await spend({
+      at: NOON,
+      prompts: 1,
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheWriteTokens: 1_000_000,
+      cacheReadTokens: 1_000_000,
+    });
+    await spend({ at: NOON, model: "mystery-1", inputTokens: 2_000_000 });
+
+    const html = await statsTab(h, owner);
+    expect(html).toContain("Cost today $36.75");
+    expect(html).toContain("2.0M tokens carry no price.");
+    expect(html).toContain("mystery-1");
+    expect(html).toContain("unpriced");
+    expect(html).toContain("Opus 4.5 4.0M $37");
+  });
+
+  it("reads the cache hit and the output-to-input ratio out of the seeded counters", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await spender(owner)({
+      at: NOON,
+      prompts: 10,
+      inputTokens: 1_000_000,
+      outputTokens: 500_000,
+      cacheReadTokens: 9_000_000,
+    });
+
+    const html = await statsTab(h, owner);
+    expect(html).toContain("Cache hit · 7d 90%");
+    expect(html).toContain("Output per input 1 : 2");
+    expect(html).toContain("Cost per prompt $2.20");
+    expect(html).toContain("Cache hit 90.0%");
+  });
+
+  it("keeps today, the last seven days and the last thirty apart", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    const spend = spender(owner);
+    await spend({ at: NOON, inputTokens: 1_000_000 });
+    await spend({ at: NOON - 3 * DAY_MS, inputTokens: 2_000_000 });
+    await spend({ at: NOON - 20 * DAY_MS, inputTokens: 4_000_000 });
+    await spend({ at: NOON - 40 * DAY_MS, inputTokens: 8_000_000 });
+
+    const html = await statsTab(h, owner);
+    expect(html).toContain("Cost today $5.00");
+    expect(html).toContain("Cost · 7 days $15.00");
+    expect(html).toContain("$35 30 days");
+    expect(html).not.toContain("$75");
+  });
+
+  it("still counts a day whose raw events the sweep has dropped", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - 20 * DAY_MS - h.now());
+    const spend = spender(owner);
+    await spend({ at: h.now(), inputTokens: 2_000_000 });
+    h.tick(20 * DAY_MS);
+    await spend({ at: h.now(), inputTokens: 1_000_000 });
+
+    expect(await eventCount(owner.userId)).toBe(1);
+    const html = await statsTab(h, owner);
+    expect(html).toContain("Cost today $5.00");
+    expect(html).toContain("$15 30 days");
+  });
+
+  it("splits the month by account, by host and by repo", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    const spend = spender(owner);
+    await spend({
+      at: NOON,
+      account: "work",
+      host: "laptop",
+      repo: "repo:github.com/acme/app",
+      inputTokens: 1_000_000,
+    });
+    await spend({
+      at: NOON,
+      account: "personal",
+      host: "tower",
+      repo: "repo:github.com/acme/infra",
+      inputTokens: 2_000_000,
+    });
+
+    const html = await statsTab(h, owner);
+    expect(html).toContain("personal 2.0M $10.00");
+    expect(html).toContain("work 1.0M $5.00");
+    expect(html).toContain("tower 2.0M $10.00");
+    expect(html).toContain("repo:github.com/acme/infra 2.0M $10.00");
+  });
+
+  it("says so when nothing is recorded, and never counts a stranger's usage", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    const stranger = await reporting(h, "stranger");
+    h.tick(NOON - h.now());
+    await spender(stranger)({ at: NOON, inputTokens: 1_000_000 });
+
+    const html = await statsTab(h, owner);
+    expect(html).toContain("No usage is recorded yet.");
+    expect(html).not.toContain("$5.00");
+  });
+
+  it("stays behind Access", async () => {
+    const h = await harness();
+    expect((await open(h, "/dashboard/stats", null)).status).toBe(401);
+    expect((await open(h, "/dashboard/stats", await h.assertionFor(email("stranger")))).status).toBe(403);
+  });
+});
+
+describe("the insights tab", () => {
+  const recall = async (who: Reporter, name: string): Promise<void> => {
+    expect((await who.client.request("GET", `/v1/memories/${name}?recall=true`)).status).toBe(200);
+  };
+
+  it("names the working set and its share of every recall", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await owner.client.save("pr-review-threads", {});
+    await owner.client.save("worktree-setup", {});
+    for (const _ of [1, 2, 3]) await recall(owner, "pr-review-threads");
+    await recall(owner, "worktree-setup");
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("pr-review-threads 3 recalls");
+    expect(html).toContain("worktree-setup 1");
+    expect(html).toContain("These 2 carry 100% of every recall in the window.");
+  });
+
+  it("lists what is going stale and what was never recalled", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - 61 * DAY_MS - h.now());
+    await owner.client.save("podcast-rss-layout", {});
+    await recall(owner, "podcast-rss-layout");
+    await owner.client.save("jira-sprint-fields", {});
+    h.tick(61 * DAY_MS);
+    await owner.client.save("fresh-note", {});
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("podcast-rss-layout 61d ago");
+    expect(html).toContain("jira-sprint-fields never · saved 61d");
+    expect(html).toContain("2 of 3 memories are at risk.");
+    expect(html).not.toContain("fresh-note");
+  });
+
+  it("sums session time per repo and finds the busiest hour of the week", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await owner.client.sync("hours001", {
+      repo: "repo:github.com/acme/app",
+      startedAt: NOON - 3 * 3_600_000,
+      lastActivityAt: NOON,
+    });
+    await owner.client.sync("hours002", {
+      repo: "repo:github.com/acme/app",
+      startedAt: NOON - 3 * 3_600_000 + 600_000,
+      lastActivityAt: NOON,
+    });
+    await owner.client.sync("hours003", { repo: "", startedAt: NOON - 3_600_000, lastActivityAt: NOON });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("repo:github.com/acme/app 6h");
+    expect(html).toContain("global 1h");
+    expect(html).toContain("repo:github.com/acme/app took 6h of the fortnight's 7h");
+    expect(html).toContain("The busiest hour is 09:00 on Monday, with 2 sessions started.");
+  });
+
+  it("reports what the cache saved over the fortnight", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    h.tick(NOON - h.now());
+    await spender(owner)({ at: NOON, prompts: 1, inputTokens: 2_000_000, cacheReadTokens: 10_000_000 });
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("Cache reads 10M tokens");
+    expect(html).toContain("Saved vs fresh input ≈ $45.00");
+    expect(html).toContain("Worst day 2026-11-02 · 83.3%");
+    expect(html).toContain("83% of the fortnight's input came back out of the cache");
+  });
+
+  it("renders an empty state per module when there is nothing to say", async () => {
+    const h = await harness();
+    const owner = await reporting(h);
+    const stranger = await reporting(h, "stranger");
+    h.tick(NOON - h.now());
+    await spender(stranger)({ at: NOON, inputTokens: 1_000_000, cacheReadTokens: 1_000_000 });
+    await stranger.client.save("stranger-note", {});
+
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("No memory has been recalled lately.");
+    expect(html).toContain("Nothing is going stale.");
+    expect(html).toContain("No cache read is recorded yet.");
+    expect(html).toContain("No session has been recorded yet.");
+    expect(html).toContain("No session has ended in this window.");
+    expect(html).not.toContain("stranger-note");
+  });
+
+  it("stays behind Access", async () => {
+    const h = await harness();
+    expect((await open(h, "/dashboard/insights", null)).status).toBe(401);
+    expect((await open(h, "/dashboard/insights", await h.assertionFor(email("stranger")))).status).toBe(403);
   });
 });

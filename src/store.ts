@@ -1,5 +1,7 @@
 import type { Caller } from "./device";
 import {
+  type DaySessions,
+  type GoingStale,
   type HistoryFilters,
   type HistoryInput,
   IDLE_AFTER_MS,
@@ -8,7 +10,11 @@ import {
   type Memory,
   type MemoryCounts,
   type MemoryType,
+  type ModelDay,
+  type ModelTotals,
   type PastSession,
+  type RepoHours,
+  type RhythmCell,
   type SaveInput,
   SESSION_HISTORY_TTL_MS,
   SESSION_TTL_MS,
@@ -16,9 +22,14 @@ import {
   type SessionInput,
   type SessionMode,
   sessionHandle,
+  type TokenCounts,
   USAGE_RETENTION_MS,
   type UsageInput,
+  type UsageSplit,
+  type UsageSplitField,
   usageDay,
+  usageDayStart,
+  type WorkingSet,
 } from "./model";
 
 interface MemoryRow {
@@ -430,6 +441,188 @@ export const sessionHistoryFilters = async (db: D1Database, userId: string): Pro
   return { hosts: values("host"), repos: values("repo") };
 };
 
+interface CountRow {
+  prompts: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+}
+
+const COUNT_SUMS = `COALESCE(SUM(prompts), 0) AS prompts,
+  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+  COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens`;
+
+const toCounts = (row: CountRow): TokenCounts => ({
+  prompts: row.prompts,
+  inputTokens: row.input_tokens,
+  outputTokens: row.output_tokens,
+  cacheWriteTokens: row.cache_write_tokens,
+  cacheReadTokens: row.cache_read_tokens,
+});
+
+const todayUsage = async (
+  db: D1Database,
+  userId: string,
+  now: number,
+): Promise<{ sessionsToday: number; today: ModelTotals[] }> => {
+  const { results } = await db
+    .prepare(
+      `SELECT provider, model, ${COUNT_SUMS} FROM usage_daily
+       WHERE user_id = ?1 AND day = ?2 GROUP BY provider, model`,
+    )
+    .bind(userId, usageDay(now))
+    .all<CountRow & { provider: string; model: string }>();
+  const started = await db
+    .prepare("SELECT COUNT(*) AS sessions FROM session_history WHERE user_id = ? AND started_at >= ?")
+    .bind(userId, usageDayStart(now))
+    .first<{ sessions: number }>();
+  return {
+    sessionsToday: started?.sessions ?? 0,
+    today: results.map((row) => ({ provider: row.provider, model: row.model, ...toCounts(row) })),
+  };
+};
+
+// Every window the stats page draws reads the daily rollup and nothing else: the counters land in
+// usage_daily on the same write that records the raw event, so the current day is already live
+// there and the thirty-day window never touches usage_events.
+export const usageByModelDay = async (db: D1Database, userId: string, fromDay: string): Promise<ModelDay[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT day, provider, model, ${COUNT_SUMS} FROM usage_daily
+       WHERE user_id = ?1 AND day >= ?2
+       GROUP BY day, provider, model ORDER BY day, provider, model`,
+    )
+    .bind(userId, fromDay)
+    .all<CountRow & { day: string; provider: string; model: string }>();
+  return results.map((row) => ({ day: row.day, provider: row.provider, model: row.model, ...toCounts(row) }));
+};
+
+export const usageSplits = async (db: D1Database, userId: string, fromDay: string): Promise<UsageSplit[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT 'host' AS field, host AS value, provider, model, ${COUNT_SUMS} FROM usage_daily
+         WHERE user_id = ?1 AND day >= ?2 GROUP BY host, provider, model
+       UNION ALL
+       SELECT 'repo' AS field, repo AS value, provider, model, ${COUNT_SUMS} FROM usage_daily
+         WHERE user_id = ?1 AND day >= ?2 GROUP BY repo, provider, model
+       UNION ALL
+       SELECT 'account' AS field, account AS value, provider, model, ${COUNT_SUMS} FROM usage_daily
+         WHERE user_id = ?1 AND day >= ?2 GROUP BY account, provider, model`,
+    )
+    .bind(userId, fromDay)
+    .all<CountRow & { field: UsageSplitField; value: string; provider: string; model: string }>();
+  return results.map((row) => ({
+    field: row.field,
+    value: row.value,
+    provider: row.provider,
+    model: row.model,
+    ...toCounts(row),
+  }));
+};
+
+export const sessionsPerDay = async (db: D1Database, userId: string, since: number): Promise<DaySessions[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT date(started_at / 1000, 'unixepoch') AS day, COUNT(*) AS sessions
+       FROM session_history WHERE user_id = ? AND started_at >= ?
+       GROUP BY day ORDER BY day`,
+    )
+    .bind(userId, since)
+    .all<DaySessions>();
+  return results;
+};
+
+export const sessionHoursByRepo = async (
+  db: D1Database,
+  userId: string,
+  since: number,
+  limit: number,
+): Promise<RepoHours[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT repo, SUM(MAX(last_activity_at - started_at, 0)) AS ms, COUNT(*) AS sessions
+       FROM session_history WHERE user_id = ? AND last_activity_at >= ?
+       GROUP BY repo ORDER BY ms DESC, repo LIMIT ?`,
+    )
+    .bind(userId, since, limit)
+    .all<RepoHours>();
+  return results;
+};
+
+export const sessionRhythm = async (db: D1Database, userId: string, since: number): Promise<RhythmCell[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT CAST(strftime('%w', started_at / 1000, 'unixepoch') AS INTEGER) AS weekday,
+         CAST(strftime('%H', started_at / 1000, 'unixepoch') AS INTEGER) AS hour,
+         COUNT(*) AS sessions
+       FROM session_history WHERE user_id = ? AND started_at >= ?
+       GROUP BY weekday, hour ORDER BY sessions DESC, weekday, hour`,
+    )
+    .bind(userId, since)
+    .all<RhythmCell>();
+  return results;
+};
+
+export const workingSet = async (db: D1Database, userId: string, since: number, limit: number): Promise<WorkingSet> => {
+  const { results } = await db
+    .prepare(
+      `SELECT name, recall_count,
+         SUM(recall_count) OVER () AS total_recalls, COUNT(*) OVER () AS total_memories
+       FROM memories WHERE user_id = ?1 AND recall_count > 0 AND last_recalled_at >= ?2
+       ORDER BY recall_count DESC, name LIMIT ?3`,
+    )
+    .bind(userId, since, limit)
+    .all<{ name: string; recall_count: number; total_recalls: number; total_memories: number }>();
+  const first = results[0];
+  return {
+    entries: results.map((row) => ({ name: row.name, recalls: row.recall_count })),
+    recalls: first?.total_recalls ?? 0,
+    memories: first?.total_memories ?? 0,
+  };
+};
+
+export const goingStale = async (
+  db: D1Database,
+  userId: string,
+  staleBefore: number,
+  savedBefore: number,
+  limit: number,
+): Promise<GoingStale> => {
+  const [listed, counted] = await db.batch<{
+    name: string;
+    recall_count: number;
+    last_recalled_at: number;
+    created_at: number;
+    at_risk: number;
+  }>([
+    db
+      .prepare(
+        `SELECT name, recall_count, last_recalled_at, created_at, COUNT(*) OVER () AS at_risk
+         FROM memories WHERE user_id = ?1
+           AND ((recall_count > 0 AND last_recalled_at < ?2) OR (recall_count = 0 AND created_at < ?3))
+         ORDER BY (CASE WHEN recall_count = 0 THEN created_at ELSE last_recalled_at END), name
+         LIMIT ?4`,
+      )
+      .bind(userId, staleBefore, savedBefore, limit),
+    db.prepare("SELECT COUNT(*) AS at_risk FROM memories WHERE user_id = ?").bind(userId),
+  ]);
+  const rows = listed?.results ?? [];
+  const first = rows[0];
+  return {
+    entries: rows.map((row) => ({
+      name: row.name,
+      recalled: row.recall_count > 0,
+      lastRecalledAt: row.last_recalled_at,
+      createdAt: row.created_at,
+    })),
+    atRisk: first?.at_risk ?? 0,
+    total: counted?.results[0]?.at_risk ?? 0,
+  };
+};
+
 export const sessionTally = async (db: D1Database, userId: string, now: number): Promise<Live> => {
   const row = await db
     .prepare(
@@ -437,8 +630,9 @@ export const sessionTally = async (db: D1Database, userId: string, now: number):
        FROM sessions WHERE user_id = ?1 AND last_activity_at > ?3`,
     )
     .bind(userId, now - IDLE_AFTER_MS, now - SESSION_TTL_MS)
-    .first<Live>();
-  return row ?? { sessions: 0, busy: 0 };
+    .first<{ sessions: number; busy: number }>();
+  const today = await todayUsage(db, userId, now);
+  return { sessions: row?.sessions ?? 0, busy: row?.busy ?? 0, ...today };
 };
 
 export const sessionOnDevice = async (

@@ -1,14 +1,16 @@
 import {
   dashboardNotice,
-  dashboardPage,
   HISTORY_TAB,
   historyPage,
+  INSIGHTS_TAB,
+  insightsPage,
   MEMORY_TAB,
   memoriesPage,
   memoryBodyPage,
   memorySearchPage,
-  SESSIONS_TAB,
+  STATS_TAB,
   sessionsPage,
+  statsPage,
   tabForPath,
 } from "./dashboard";
 import {
@@ -34,11 +36,13 @@ import {
 import { DEVICE_HEADER, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, NOW_HEADER, parseSend } from "./mailbox";
 import {
   DEFAULT_MIN_SCORE,
+  dayBefore,
   type Embedder,
   FRESH_WINDOW_MS,
   type Live,
   type MemoryHit,
   type MemoryType,
+  NEVER_RECALLED_AFTER_DAYS,
   parseHistory,
   parseList,
   parseName,
@@ -48,6 +52,9 @@ import {
   parseSessionId,
   parseUsage,
   type SearchInput,
+  STALE_AFTER_DAYS,
+  USAGE_CHART_DAYS,
+  USAGE_MONTH_DAYS,
   type Verify,
 } from "./model";
 import { CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
@@ -58,6 +65,7 @@ import {
   describeMemories,
   endSession,
   getMemory,
+  goingStale,
   listMemories,
   listSessionHistory,
   listSessions,
@@ -67,10 +75,16 @@ import {
   recordUsage,
   saveMemory,
   sessionHistoryFilters,
+  sessionHoursByRepo,
   sessionOnDevice,
+  sessionRhythm,
+  sessionsPerDay,
   sessionTally,
   textCandidates,
+  usageByModelDay,
+  usageSplits,
   vectorCandidates,
+  workingSet,
 } from "./store";
 
 export interface Deps {
@@ -109,6 +123,10 @@ const GRANT_ERRORS = {
 } as const;
 
 const ELSEWHERE_LIMIT = 3;
+const DAY_MS = 86_400_000;
+const WORKING_SET_SIZE = 5;
+const STALE_LIST_SIZE = 5;
+const REPO_BAR_COUNT = 5;
 
 type Ranking = Array<[string, number]>;
 
@@ -303,8 +321,45 @@ export const createApp = (deps: Deps): App => {
     }
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
-    if (tab.path === SESSIONS_TAB.path) return sessionsPage(email, live, await listSessions(db, userId, now), now);
-    return dashboardPage(email, tab, live);
+    if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
+    if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
+    return sessionsPage(email, live, await listSessions(db, userId, now), now);
+  };
+
+  const statsTab = async (
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    now: number,
+  ): Promise<Response> => {
+    const fromDay = dayBefore(now, USAGE_MONTH_DAYS - 1);
+    const usage = await usageByModelDay(db, userId, fromDay);
+    const splits = await usageSplits(db, userId, fromDay);
+    const sessions = await sessionsPerDay(db, userId, now - USAGE_MONTH_DAYS * DAY_MS);
+    return statsPage(email, live, { usage, splits, sessions }, now);
+  };
+
+  const insightsTab = async (
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    now: number,
+  ): Promise<Response> => {
+    const usage = await usageByModelDay(db, userId, dayBefore(now, USAGE_CHART_DAYS - 1));
+    const working = await workingSet(db, userId, now - USAGE_MONTH_DAYS * DAY_MS, WORKING_SET_SIZE);
+    const stale = await goingStale(
+      db,
+      userId,
+      now - STALE_AFTER_DAYS * DAY_MS,
+      now - NEVER_RECALLED_AFTER_DAYS * DAY_MS,
+      STALE_LIST_SIZE,
+    );
+    const since = now - USAGE_CHART_DAYS * DAY_MS;
+    const repos = await sessionHoursByRepo(db, userId, since, REPO_BAR_COUNT);
+    const rhythm = await sessionRhythm(db, userId, since);
+    return insightsPage(email, live, { usage, working, stale, repos, rhythm }, now);
   };
 
   const historyTab = async (
