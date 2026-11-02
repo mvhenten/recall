@@ -16,42 +16,66 @@ pub enum State {
     Failed { error: String },
 }
 
-/// `socket` and `token` are `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN` as
-/// the hook inherited them.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Inbox {
-    pub socket: PathBuf,
-    pub token: String,
+impl State {
+    pub fn inbox(&self) -> Option<&Inbox> {
+        match self {
+            State::Registered(inbox) => Some(inbox),
+            _ => None,
+        }
+    }
 }
 
-/// Holds the inbox token back, so no log line or error can carry the credential that writes into
-/// a session.
-impl std::fmt::Debug for Inbox {
+/// The credential that writes into a session, which no log line and no error may carry.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Token(pub String);
+
+impl std::fmt::Debug for Token {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Inbox")
-            .field("socket", &self.socket)
-            .field("token", &"<redacted>")
-            .finish()
+        formatter.write_str("<redacted>")
     }
+}
+
+/// `socket` and `token` are `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN` as
+/// the hook inherited them.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Inbox {
+    pub socket: PathBuf,
+    pub token: Token,
+}
+
+/// The two prompts a focus line is built from: the one that opened the session and the latest.
+/// The hooks truncate both; nothing here calls a model.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Focus {
+    pub first: String,
+    pub latest: String,
 }
 
 /// How `hooks/session-start.mjs` left one Claude Code session. It writes
 /// `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json` at mode 600 for every session, registered
-/// or not, and `hooks/session-end.mjs` removes it; the daemon only ever reads the directory.
-///
-/// ```json
-/// { "state": "registered", "socket": "/run/user/1000/cc-socks/4242.sock",
-///   "token": "<CLAUDE_CODE_MESSAGING_TOKEN>", "pid": 4242, "cwd": "/home/you/src/recall" }
-/// { "state": "no-inbox", "pid": 4242, "cwd": "/home/you/src/recall" }
-/// ```
+/// or not, `hooks/recall-memories.mjs` rewrites the moving fields on every prompt, and
+/// `hooks/session-end.mjs` removes it; the daemon only ever reads the directory.
 ///
 /// `pid` is the Claude process that owns the session, whatever the state, so a record outliving a
-/// session that never reached session end is removed on the next pass.
+/// session that never reached session end is removed on the next pass. `syncStartedAt`, which the hooks
+/// use to throttle their own syncing, is theirs alone and is not read back here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Record {
     pub cwd: PathBuf,
     pub pid: i32,
+    pub session_id: String,
+    pub host: String,
+    pub repo: String,
+    pub branch: String,
+    pub commit: String,
+    pub started_at: i64,
+    pub last_activity_at: i64,
+    pub prompts: i64,
+    pub focus: Focus,
+    pub mode: String,
+    pub permission_mode: String,
     #[serde(flatten)]
     pub state: State,
 }
@@ -91,15 +115,25 @@ fn read(path: &Path) -> Option<Status> {
     Some(Status { session_id, record })
 }
 
-/// Every session still running, newest first. A record whose Claude process is gone, or whose
-/// socket has been removed, is unlinked on the way past, so a session that never reached session
-/// end leaves nothing behind; a record that cannot be parsed is left alone, because a half-written
-/// file becomes readable on the next pass.
-pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
+/// What one pass over the registry found: the sessions still running, newest first, and the ones
+/// it unlinked because their Claude process is gone. A session that ends without its SessionEnd
+/// hook leaves a record here and a row on the service, and `ended` is the only notice either gets.
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub live: Vec<(PathBuf, Status)>,
+    pub ended: Vec<String>,
+}
+
+/// A record whose Claude process is gone, or whose socket has been removed, is unlinked on the way
+/// past, so a session that never reached session end leaves nothing behind; a record that cannot be
+/// parsed is left alone, because a half-written file becomes readable on the next pass. Only a dead
+/// process ends a session: a socket can go while Claude stays, and that session is still running.
+pub fn scan(dir: &Path) -> Scan {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return Scan::default();
     };
     let mut live: Vec<(SystemTime, PathBuf, Status)> = Vec::new();
+    let mut ended = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -112,7 +146,12 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
             State::Registered(inbox) => !inbox.socket.exists(),
             _ => false,
         };
-        if !alive(status.record.pid) || socketless {
+        if !alive(status.record.pid) {
+            let _ = std::fs::remove_file(&path);
+            ended.push(status.session_id);
+            continue;
+        }
+        if socketless {
             let _ = std::fs::remove_file(&path);
             continue;
         }
@@ -128,7 +167,56 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
             .cmp(&left.0)
             .then_with(|| left.2.session_id.cmp(&right.2.session_id))
     });
-    live.into_iter().map(|(_, path, status)| (path, status)).collect()
+    ended.sort();
+    Scan {
+        live: live.into_iter().map(|(_, path, status)| (path, status)).collect(),
+        ended,
+    }
+}
+
+/// Every session still running, newest first.
+pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
+    scan(dir).live
+}
+
+/// The record this host wrote for one session, whatever state the hook left it in.
+pub fn record(dir: &Path, session_id: &str) -> Option<Record> {
+    read(&dir.join(format!("{session_id}.json"))).map(|status| status.record)
+}
+
+pub const IDLE_AFTER: Duration = Duration::from_secs(300);
+pub const FOCUS_SEPARATOR: &str = " → ";
+
+/// State is read, never stored: a session prompted within `IDLE_AFTER` is busy and one that has
+/// sat quiet since is idle. A session that is gone is one its own host deleted, so it is never
+/// listed at all.
+pub fn state(last_activity_at: i64, now: i64) -> &'static str {
+    if now.saturating_sub(last_activity_at) < IDLE_AFTER.as_millis() as i64 {
+        return "busy";
+    }
+    "idle"
+}
+
+/// How long ago, in the largest unit that still reads as a duration: 45s, 12m, 3h, 2d.
+pub fn age(since: i64, now: i64) -> String {
+    let seconds = now.saturating_sub(since).max(0) / 1000;
+    for (unit, size) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if seconds >= size {
+            return format!("{}{unit}", seconds / size);
+        }
+    }
+    format!("{seconds}s")
+}
+
+/// The focus line: the prompt that opened the session, then the latest one.
+pub fn focus_line(focus: &Focus) -> String {
+    if focus.first.is_empty() {
+        return focus.latest.clone();
+    }
+    if focus.latest.is_empty() || focus.latest == focus.first {
+        return focus.first.clone();
+    }
+    format!("{}{FOCUS_SEPARATOR}{}", focus.first, focus.latest)
 }
 
 /// The sessions worth delivering to, newest registration first.
@@ -213,12 +301,22 @@ pub async fn fanout(dir: &Path, body: &str) -> Fanout {
 
 /// Resolves once the registry has held no live session for `idle`, which is the daemon's cue to
 /// let go of the lock. A SessionStart hook brings it straight back with `recall listen --ensure`.
-pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration) {
+/// Each pass hands `ended` the sessions it unlinked, since the same tick that notices a Claude
+/// process is gone is the only thing that can tell the service.
+pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut ended: impl FnMut(Vec<String>)) {
     let mut tick = tokio::time::interval(check);
     let mut empty_since: Option<Instant> = None;
     loop {
         tick.tick().await;
-        if !registered(dir).is_empty() {
+        let scan = scan(dir);
+        if !scan.ended.is_empty() {
+            ended(scan.ended);
+        }
+        if scan
+            .live
+            .iter()
+            .any(|(_, status)| status.record.state.inbox().is_some())
+        {
             empty_since = None;
             continue;
         }
@@ -255,6 +353,20 @@ mod tests {
             let record = Record {
                 cwd: self.dir.clone(),
                 pid,
+                session_id: session_id.to_string(),
+                host: "laptop".to_string(),
+                repo: "repo:github.com/mvhenten/recall".to_string(),
+                branch: "work".to_string(),
+                commit: "feat(sessions): list every host's sessions".to_string(),
+                started_at: 1_762_000_000_000,
+                last_activity_at: 1_762_000_060_000,
+                prompts: 2,
+                focus: Focus {
+                    first: "list the sessions".to_string(),
+                    latest: "why is the worker test red".to_string(),
+                },
+                mode: "interactive".to_string(),
+                permission_mode: "default".to_string(),
                 state,
             };
             std::fs::write(
@@ -270,7 +382,7 @@ mod tests {
                 pid,
                 State::Registered(Inbox {
                     socket: socket.to_path_buf(),
-                    token: "t-inbox".to_string(),
+                    token: Token("t-inbox".to_string()),
                 }),
             );
         }
@@ -385,7 +497,7 @@ mod tests {
                     "s-live",
                     &State::Registered(Inbox {
                         socket: socket.clone(),
-                        token: "t-inbox".to_string(),
+                        token: Token("t-inbox".to_string()),
                     })
                 ),
                 ("s-no-inbox", &State::NoInbox),
@@ -410,33 +522,79 @@ mod tests {
 
     #[test]
     fn the_registry_reads_back_the_json_the_hook_writes() {
-        let registered: Record = serde_json::from_str(
-            r#"{"state":"registered","socket":"/run/user/1000/cc-socks/4242.sock","token":"t","pid":4242,"cwd":"/src"}"#,
-        )
+        const DOCUMENT: &str = r#"{"pid":4242,"cwd":"/src","sessionId":"s-1","host":"laptop",
+            "repo":"repo:github.com/mvhenten/recall","branch":"work","commit":"feat: list sessions",
+            "startedAt":1762000000000,"lastActivityAt":1762000060000,"syncStartedAt":1762000060000,"prompts":2,
+            "focus":{"first":"list the sessions","latest":"why is CI red"},"mode":"interactive",
+            "permissionMode":"default""#;
+        let document = |state: &str| format!("{DOCUMENT},{state}}}");
+
+        let registered: Record = serde_json::from_str(&document(
+            r#""state":"registered","socket":"/run/user/1000/cc-socks/4242.sock","token":"t""#,
+        ))
         .unwrap();
         assert_eq!(
             registered.state,
             State::Registered(Inbox {
                 socket: PathBuf::from("/run/user/1000/cc-socks/4242.sock"),
-                token: "t".to_string(),
+                token: Token("t".to_string()),
             })
         );
         assert_eq!(registered.pid, 4242);
         assert_eq!(registered.cwd, PathBuf::from("/src"));
+        assert_eq!(registered.session_id, "s-1");
+        assert_eq!(registered.started_at, 1_762_000_000_000);
+        assert_eq!(registered.prompts, 2);
+        assert_eq!(registered.focus.latest, "why is CI red");
+        assert_eq!(registered.permission_mode, "default");
         assert!(format!("{registered:?}").contains("<redacted>"), "{registered:?}");
+        assert!(!format!("{registered:?}").contains("\"t\""), "{registered:?}");
 
-        let skipped: Record = serde_json::from_str(r#"{"state":"no-inbox","pid":4242,"cwd":"/src"}"#).unwrap();
+        let skipped: Record = serde_json::from_str(&document(r#""state":"no-inbox""#)).unwrap();
         assert_eq!(skipped.state, State::NoInbox);
         assert_eq!(skipped.pid, 4242);
 
-        let failed: Record =
-            serde_json::from_str(r#"{"state":"failed","error":"EACCES","pid":4242,"cwd":"/src"}"#).unwrap();
+        let failed: Record = serde_json::from_str(&document(r#""state":"failed","error":"EACCES""#)).unwrap();
         assert_eq!(
             failed.state,
             State::Failed {
                 error: "EACCES".to_string()
             }
         );
+    }
+
+    #[test]
+    fn state_is_read_off_the_last_prompt() {
+        let now = 1_762_000_300_000;
+        assert_eq!(state(now, now), "busy");
+        assert_eq!(state(now - 299_999, now), "busy");
+        assert_eq!(state(now - 300_000, now), "idle");
+    }
+
+    #[test]
+    fn an_age_reads_in_the_largest_unit_that_still_fits() {
+        let now = 1_762_000_000_000;
+        assert_eq!(age(now - 45_000, now), "45s");
+        assert_eq!(age(now - 720_000, now), "12m");
+        assert_eq!(age(now - 10_800_000, now), "3h");
+        assert_eq!(age(now - 172_800_000, now), "2d");
+        assert_eq!(age(now + 5_000, now), "0s");
+    }
+
+    #[test]
+    fn a_focus_line_is_the_first_prompt_and_the_latest() {
+        let focus = |first: &str, latest: &str| Focus {
+            first: first.to_string(),
+            latest: latest.to_string(),
+        };
+        assert_eq!(
+            focus_line(&focus("ship it", "why is CI red")),
+            "ship it → why is CI red"
+        );
+        assert_eq!(focus_line(&focus("ship it", "ship it")), "ship it");
+        assert_eq!(focus_line(&focus("ship it", "")), "ship it");
+        assert_eq!(focus_line(&focus("", "ship it")), "ship it");
+        assert_eq!(focus_line(&Focus::default()), "");
     }
 
     #[tokio::test]
@@ -448,12 +606,50 @@ mod tests {
         let socket = sandbox.dir.join("inbox.sock");
         std::fs::write(&socket, "").unwrap();
         sandbox.register("s-live", &socket, std::process::id() as i32);
-        let busy = tokio::time::timeout(Duration::from_millis(120), idle_exit(&sandbox.sessions(), check, idle)).await;
+        let busy = tokio::time::timeout(
+            Duration::from_millis(120),
+            idle_exit(&sandbox.sessions(), check, idle, |_| {}),
+        )
+        .await;
         assert!(busy.is_err(), "a registered session must hold the daemon open");
 
         std::fs::remove_file(sandbox.sessions().join("s-live.json")).unwrap();
-        tokio::time::timeout(Duration::from_millis(500), idle_exit(&sandbox.sessions(), check, idle))
-            .await
-            .expect("an empty registry must let the daemon exit");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            idle_exit(&sandbox.sessions(), check, idle, |_| {}),
+        )
+        .await
+        .expect("an empty registry must let the daemon exit");
+    }
+
+    #[tokio::test]
+    async fn the_tick_that_unlinks_a_dead_session_reports_it_ended() {
+        let sandbox = Sandbox::new("ended");
+        let check = Duration::from_millis(5);
+        let socket = sandbox.dir.join("inbox.sock");
+        std::fs::write(&socket, "").unwrap();
+        sandbox.register("s-dead", &socket, i32::MAX);
+        sandbox.register(
+            "s-socketless",
+            &sandbox.dir.join("gone.sock"),
+            std::process::id() as i32,
+        );
+        sandbox.record("s-skipped", i32::MAX, State::Off);
+
+        let mut reported = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            idle_exit(&sandbox.sessions(), check, Duration::from_millis(40), |ended| {
+                reported.extend(ended);
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            reported,
+            vec!["s-dead".to_string(), "s-skipped".to_string()],
+            "only a session whose process is gone has ended; a socket can go while Claude stays"
+        );
+        assert!(!sandbox.sessions().join("s-socketless.json").exists());
     }
 }

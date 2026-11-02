@@ -1,4 +1,5 @@
-import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
+import { emit, firstLine, logRun, readInput, recall, recallDetached } from "./lib.mjs";
+import { touch } from "./messaging.mjs";
 import { MIN_SCORE, searchQuery, unseen } from "./query.mjs";
 import { readShown, recordShown } from "./shown.mjs";
 
@@ -26,8 +27,23 @@ async function repoTagOf(cwd) {
   return result.ok ? result.stdout.trim() : undefined;
 }
 
-async function run(input) {
-  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+// Every prompt moves the focus line on, including the ones too short to search on. The record is
+// a local write; the sync behind it is started and left to run, at most once every
+// SYNC_INTERVAL_MS, because this hook's budget belongs to the prompt and not to the dashboard.
+function refresh(input, prompt) {
+  if (!input.session_id || !prompt) return "skipped";
+  let touched;
+  try {
+    touched = touch(input.session_id, prompt, input.permission_mode);
+  } catch (error) {
+    return `failed:${firstLine(error.message)}`;
+  }
+  if (!touched) return "unregistered";
+  if (!touched.due) return "throttled";
+  return recallDetached(["sessions", "--sync", input.session_id], input.cwd) ? "syncing" : "not-installed";
+}
+
+async function memories(input, prompt) {
   if (prompt.startsWith("/")) return "skipped:slash-command";
   if (prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) return "skipped:short-prompt";
 
@@ -59,6 +75,12 @@ async function run(input) {
     ...found.elsewhere.map(({ name }) => name),
   ]);
   return `hits=${found.hits.length} elsewhere=${found.elsewhere.length}`;
+}
+
+async function run(input) {
+  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+  const focus = refresh(input, prompt);
+  return `${await memories(input, prompt)} focus:${focus}`;
 }
 
 const started = Date.now();

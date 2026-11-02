@@ -1,4 +1,5 @@
-use crate::api::{Elsewhere, Hit, Memory};
+use crate::api::{Elsewhere, Hit, Memory, Session};
+use crate::sessions;
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -149,6 +150,59 @@ pub fn render_hits(hits: &[Hit]) -> String {
         .collect()
 }
 
+pub fn repo_at_branch(repo: &str, branch: &str) -> String {
+    match (repo.is_empty(), branch.is_empty()) {
+        (true, _) => "global".to_string(),
+        (false, true) => repo.to_string(),
+        (false, false) => format!("{repo}@{branch}"),
+    }
+}
+
+/// One line per session: host, the name `recall send` takes, repo@branch, age, state and what the
+/// session is working on. Every column but the last is padded to its widest value, so the focus
+/// lines start together.
+pub fn render_sessions(sessions: &[Session], now: i64) -> String {
+    let rows: Vec<Vec<String>> = sessions
+        .iter()
+        .map(|session| {
+            vec![
+                session.host.clone(),
+                session.name.clone(),
+                repo_at_branch(&session.repo, &session.branch),
+                sessions::age(session.started_at, now),
+                sessions::state(session.last_activity_at, now).to_string(),
+                sessions::focus_line(&session.focus),
+            ]
+        })
+        .collect();
+    let columns = rows.first().map_or(0, Vec::len);
+    let widths: Vec<usize> = (0..columns.saturating_sub(1))
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    rows.iter()
+        .map(|row| {
+            let mut line: String = widths
+                .iter()
+                .enumerate()
+                .map(|(column, size)| format!("{:width$}", row[column], width = size))
+                .collect::<Vec<String>>()
+                .join("  ");
+            let focus = row.last().map_or("", String::as_str);
+            if !focus.is_empty() {
+                line.push_str("  ");
+                line.push_str(focus);
+            }
+            format!("{line}\n")
+        })
+        .collect()
+}
+
 pub fn render_elsewhere(entries: &[Elsewhere]) -> String {
     if entries.is_empty() {
         return String::new();
@@ -187,6 +241,61 @@ mod tests {
             "Also in other scopes:\n\n- **other-deploy** (reference, score 0.500) deploy notes `[repo:github.com/acme/other]`\n"
         );
         assert_eq!(render_elsewhere(&[]), "");
+    }
+
+    #[test]
+    fn one_line_per_session_lines_the_focus_up() {
+        let now = 1_762_000_000_000;
+        let session = |host: &str, repo: &str, branch: &str, started: i64, active: i64, focus: [&str; 2]| Session {
+            session_id: format!("s-{host}"),
+            name: format!("{host}-2"),
+            device_id: format!("d-{host}"),
+            host: host.to_string(),
+            cwd: format!("/home/you/src/{host}"),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            commit: "feat(sessions): list every host's sessions".to_string(),
+            started_at: started,
+            last_activity_at: active,
+            prompts: 3,
+            focus: sessions::Focus {
+                first: focus[0].to_string(),
+                latest: focus[1].to_string(),
+            },
+            mode: "interactive".to_string(),
+            permission_mode: "default".to_string(),
+            pid: 4242,
+            current: false,
+        };
+        let listed = [
+            session(
+                "laptop",
+                "repo:github.com/mvhenten/recall",
+                "feat/sessions-list",
+                now - 720_000,
+                now - 60_000,
+                ["list the sessions", "why is the worker test red"],
+            ),
+            session(
+                "tower",
+                "",
+                "",
+                now - 10_800_000,
+                now - 3_600_000,
+                ["draft the release notes", ""],
+            ),
+        ];
+
+        assert_eq!(
+            render_sessions(&listed, now),
+            "laptop  laptop-2  repo:github.com/mvhenten/recall@feat/sessions-list  12m  busy  list the sessions → why is the worker test red\n\
+             tower   tower-2   global                                              3h   idle  draft the release notes\n"
+        );
+        assert_eq!(
+            render_sessions(&listed[1..], now),
+            "tower  tower-2  global  3h  idle  draft the release notes\n"
+        );
+        assert_eq!(render_sessions(&[], now), "");
     }
 
     #[test]

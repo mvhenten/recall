@@ -190,6 +190,51 @@ struct Sent {
     message: Message,
 }
 
+/// One Claude Code session on one of the hosts signed in as this user, as the service holds it.
+/// `name` is the device name `recall send` takes, so the listing doubles as an address book.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    pub session_id: String,
+    pub name: String,
+    pub device_id: String,
+    pub host: String,
+    pub cwd: String,
+    pub repo: String,
+    pub branch: String,
+    pub commit: String,
+    pub started_at: i64,
+    pub last_activity_at: i64,
+    pub prompts: i64,
+    pub focus: crate::sessions::Focus,
+    pub mode: String,
+    pub permission_mode: String,
+    pub pid: i64,
+    pub current: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBody<'a> {
+    pub host: &'a str,
+    pub cwd: &'a str,
+    pub repo: &'a str,
+    pub branch: &'a str,
+    pub commit: &'a str,
+    pub started_at: i64,
+    pub last_activity_at: i64,
+    pub prompts: i64,
+    pub focus: &'a crate::sessions::Focus,
+    pub mode: &'a str,
+    pub permission_mode: &'a str,
+    pub pid: i64,
+}
+
+#[derive(Deserialize)]
+struct Sessions {
+    sessions: Vec<Session>,
+}
+
 pub fn resolve_host(devices: &[Device], host: &str) -> Result<String> {
     if devices.iter().any(|device| device.device_id == host) {
         return Ok(host.to_string());
@@ -342,6 +387,35 @@ impl Client {
             .authed(self.agent.post(self.url("/v1/search")))
             .send_json(request)?;
         Ok(check(response, "searching")?.body_mut().read_json()?)
+    }
+
+    fn session_path(session_id: &str) -> String {
+        format!("/v1/sessions/{}", encode(session_id))
+    }
+
+    pub fn sessions(&self) -> Result<Vec<Session>> {
+        let response = self.authed(self.agent.get(self.url("/v1/sessions"))).call()?;
+        let listed: Sessions = check(response, "listing sessions")?.body_mut().read_json()?;
+        Ok(listed.sessions)
+    }
+
+    pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<()> {
+        let response = self
+            .authed(self.agent.put(self.url(&Self::session_path(session_id))))
+            .send_json(body)?;
+        check(response, &format!("syncing session {session_id}"))?;
+        Ok(())
+    }
+
+    pub fn end_session(&self, session_id: &str) -> Result<bool> {
+        let response = self
+            .authed(self.agent.delete(self.url(&Self::session_path(session_id))))
+            .call()?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        check(response, &format!("ending session {session_id}"))?;
+        Ok(true)
     }
 
     pub fn send(&self, to_device_id: &str, body: &str) -> Result<Message> {

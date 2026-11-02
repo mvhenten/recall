@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -39,6 +39,22 @@ export function logRun(sessionId, outcome, started) {
   } catch {
     // A failing log must never change how the hook behaves.
   }
+}
+
+// Starts recall and walks away. The prompt hook has a five second budget that belongs to the
+// prompt, so work the prompt does not wait on must not sit in it; a detached child outlives this
+// process and reports nothing back.
+export function recallDetached(args, cwd) {
+  const binary = recallBinary();
+  if (!binary) return false;
+  const child = spawn(binary, args, {
+    cwd: cwd && existsSync(cwd) ? cwd : homedir(),
+    detached: true,
+    stdio: "ignore",
+  });
+  child.on("error", () => {});
+  child.unref();
+  return true;
 }
 
 export function recall(args, { cwd, timeout, input }) {

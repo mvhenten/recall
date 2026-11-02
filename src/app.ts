@@ -26,6 +26,8 @@ import {
   parseName,
   parseSave,
   parseSearch,
+  parseSession,
+  parseSessionId,
   type SearchInput,
   type Verify,
 } from "./model";
@@ -35,8 +37,11 @@ import {
   decodeCursor,
   deleteMemory,
   describeMemories,
+  endSession,
   getMemory,
   listMemories,
+  listSessions,
+  putSession,
   recall,
   saveMemory,
   textCandidates,
@@ -167,6 +172,29 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "DELETE") return error(405, "method not allowed");
     const target = deviceId === "current" ? caller.deviceId : deviceId;
     if (!(await revokeDevice(db, caller.userId, target))) return error(404, `no device ${target}`);
+    return new Response(null, { status: 204 });
+  };
+
+  const sessions = async (
+    request: Request,
+    db: D1Database,
+    caller: Caller,
+    rawSessionId: string | undefined,
+  ): Promise<Response> => {
+    if (rawSessionId === undefined) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      return json({ sessions: await listSessions(db, caller, deps.now()) });
+    }
+    const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!sessionId.ok) return error(400, sessionId.error);
+    if (request.method === "PUT") {
+      const input = parseSession(await readJson(request));
+      if (!input.ok) return error(400, input.error);
+      await putSession(db, caller, sessionId.value, input.value, deps.now());
+      return new Response(null, { status: 204 });
+    }
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
     return new Response(null, { status: 204 });
   };
 
@@ -354,6 +382,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env.DB, caller, rawName);
+    if (collection === "sessions") return sessions(request, env.DB, caller, rawName);
     if (collection === "messages") {
       if (rawName === "listen") {
         if (request.method !== "GET") return error(405, "method not allowed");

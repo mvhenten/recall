@@ -1,4 +1,4 @@
-import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
+import { emit, firstLine, logRun, readInput, recall, recallDetached } from "./lib.mjs";
 import { messagingEnabled, record, register } from "./messaging.mjs";
 
 const TIMEOUT_MS = 3000;
@@ -47,16 +47,17 @@ function modeOf(result) {
   return { error: result.error };
 }
 
-function registerSession(input) {
+function registerSession(input, repoTag) {
   if (!input.session_id) return "no-session";
+  const permissionMode = input.permission_mode;
   try {
-    if (messagingEnabled()) return register(input.session_id, input.cwd);
-    record(input.session_id, { state: "off" }, input.cwd);
+    if (messagingEnabled()) return register(input.session_id, input.cwd, repoTag, permissionMode);
+    record(input.session_id, { state: "off" }, input.cwd, repoTag, permissionMode);
     return "off";
   } catch (error) {
     const state = { state: "failed", error: firstLine(error.message) };
     try {
-      record(input.session_id, state, input.cwd);
+      record(input.session_id, state, input.cwd, repoTag, permissionMode);
     } catch {
       // The registry is unwritable, so the hooks log is the only place left to say so.
     }
@@ -64,16 +65,20 @@ function registerSession(input) {
   }
 }
 
+// The repo tag is part of the record, so it is read before the session is written rather than
+// beside it. Every session syncs, registered or not, since a host with messaging off still belongs
+// in the list `recall sessions` prints; the sync is left to run, because an unreachable service
+// must not keep the session waiting for its memory context.
 async function run(input) {
-  const messaging = registerSession(input);
-  const work = [
-    recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
-    recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
-  ];
+  const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
+  const repoTag = repo.ok ? repo.stdout.trim() : "";
+  const messaging = registerSession(input, repoTag);
+  if (input.session_id) recallDetached(["sessions", "--sync", input.session_id], input.cwd);
+  const work = [recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS })];
   if (messaging === "registered") {
     work.push(recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }));
   }
-  const [repo, config] = await Promise.all(work);
+  const [config] = await Promise.all(work);
   if (!config.ok && config.error.includes("recall CLI not found")) {
     sessionContext(INSTALL_HINT);
     return "not-installed";
@@ -83,7 +88,6 @@ async function run(input) {
     sessionContext(`recall is misconfigured: ${error}`);
     return `error:${firstLine(error)}`;
   }
-  const repoTag = repo.ok ? repo.stdout.trim() : "";
   sessionContext(context(mode, repoTag));
   return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${messaging}`;
 }

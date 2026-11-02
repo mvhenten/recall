@@ -1,6 +1,11 @@
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
+
+export const FOCUS_PART_CHARS = 72;
+export const SYNC_INTERVAL_MS = 30_000;
+const GIT_TIMEOUT_MS = 2000;
 
 export function configFile(env = process.env) {
   if (env.RECALL_CONFIG_FILE) return env.RECALL_CONFIG_FILE;
@@ -76,23 +81,113 @@ export function sessionPid(env = process.env) {
   return inbox(env)?.pid ?? ancestorPid();
 }
 
+// A prompt cut to what one terminal row can hold. The focus line is the first prompt and the
+// latest; no model is involved.
+export function truncate(text, max = FOCUS_PART_CHARS) {
+  const line = typeof text === "string" ? text.replace(/\s+/g, " ").trim() : "";
+  return line.length <= max ? line : `${line.slice(0, max - 1).trimEnd()}…`;
+}
+
+// One git call for both the branch and the last subject. %D decorates the tip with "HEAD -> " and
+// the branch it points at; a detached head, a repo with no commits and no repo at all give "".
+export function head(cwd) {
+  try {
+    const shown = execFileSync("git", ["-C", cwd, "log", "-1", "--no-color", "--format=%D%n%s"], {
+      encoding: "utf8",
+      timeout: GIT_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).split("\n");
+    const pointer = (shown[0] ?? "").split(", ").find((ref) => ref.startsWith("HEAD -> "));
+    return { branch: pointer ? pointer.slice("HEAD -> ".length) : "", commit: (shown[1] ?? "").trim() };
+  } catch {
+    return { branch: "", commit: "" };
+  }
+}
+
+// `claude -p` runs headless. The process to read is the one that owns the session, not the hook's
+// own parent, which is the shell Claude ran the hook command with.
+export function invocation(pid) {
+  try {
+    const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    return argv.includes("-p") || argv.includes("--print") ? "headless" : "interactive";
+  } catch {
+    return "";
+  }
+}
+
+function read(file) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 // The registry is the one record of what became of a session, so a session the hook passed over
-// gets a file too, carrying the state and no inbox. `recall listen --status` reads them all; the
-// daemon delivers only to the ones carrying a socket.
-export function record(sessionId, state, cwd, env = process.env, uid = process.getuid()) {
+// gets a file too, carrying the state and no inbox. `recall listen --status` reads them all, the
+// daemon delivers only to the ones carrying a socket, and `recall sessions --sync` sends the rest
+// of the document to the service, whatever the state, so every host's sessions are listed.
+export function record(sessionId, state, cwd, repo, permissionMode, env = process.env, uid = process.getuid()) {
   const dir = sessionsDir(env, uid);
   mkdirSync(dir, { recursive: true });
   chmodSync(dir, 0o700);
   const file = registryPath(sessionId, env, uid);
-  writeFileSync(file, `${JSON.stringify({ ...state, pid: sessionPid(env), cwd })}\n`);
+  const pid = sessionPid(env);
+  const now = Date.now();
+  writeFileSync(
+    file,
+    `${JSON.stringify({
+      ...state,
+      pid,
+      cwd,
+      sessionId,
+      host: hostname(),
+      repo: repo ?? "",
+      ...head(cwd),
+      startedAt: now,
+      lastActivityAt: now,
+      syncStartedAt: 0,
+      prompts: 0,
+      focus: { first: "", latest: "" },
+      mode: invocation(pid),
+      permissionMode: permissionMode ?? "",
+    })}\n`,
+  );
   chmodSync(file, 0o600);
 }
 
-export function register(sessionId, cwd, env = process.env, uid = process.getuid()) {
+export function register(sessionId, cwd, repo, permissionMode, env = process.env, uid = process.getuid()) {
   const found = inbox(env);
   const state = found ? { state: "registered", ...found.inbox } : { state: "no-inbox" };
-  record(sessionId, state, cwd, env, uid);
+  record(sessionId, state, cwd, repo, permissionMode, env, uid);
   return state.state;
+}
+
+// Each prompt counts, moves the focus on and marks the session active. The branch, the commit and
+// the permission mode all change under a running session, so they are read again here. `due` says
+// whether the caller should fire a sync: at most one every SYNC_INTERVAL_MS, and the stamp goes in
+// before the spawn, because the hook never learns whether the sync it started arrived.
+export function touch(sessionId, prompt, permissionMode, env = process.env, uid = process.getuid()) {
+  const file = registryPath(sessionId, env, uid);
+  const stored = read(file);
+  if (!stored) return undefined;
+  const now = Date.now();
+  const due = now - (stored.syncStartedAt ?? 0) >= SYNC_INTERVAL_MS;
+  const latest = truncate(prompt);
+  writeFileSync(
+    file,
+    `${JSON.stringify({
+      ...stored,
+      ...head(stored.cwd),
+      lastActivityAt: now,
+      syncStartedAt: due ? now : stored.syncStartedAt,
+      prompts: (stored.prompts ?? 0) + 1,
+      focus: { first: stored.focus?.first || latest, latest },
+      permissionMode: permissionMode ?? "",
+    })}\n`,
+  );
+  chmodSync(file, 0o600);
+  return { due };
 }
 
 export function unregister(sessionId, env = process.env, uid = process.getuid()) {

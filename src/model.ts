@@ -44,6 +44,42 @@ export interface Embedder {
   embed(text: string): Promise<Float32Array>;
 }
 
+export const sessionModes = ["interactive", "headless", ""] as const;
+
+export type SessionMode = (typeof sessionModes)[number];
+
+export const SESSION_TTL_MS = 86_400_000;
+export const MAX_FOCUS_CHARS = 200;
+export const MAX_SESSION_TEXT_CHARS = 500;
+export const MAX_PROMPTS = 1_000_000;
+
+export interface Focus {
+  first: string;
+  latest: string;
+}
+
+export interface SessionInput {
+  host: string;
+  cwd: string;
+  repo: string;
+  branch: string;
+  commit: string;
+  startedAt: number;
+  lastActivityAt: number;
+  prompts: number;
+  focus: Focus;
+  mode: SessionMode;
+  permissionMode: string;
+  pid: number;
+}
+
+export interface Session extends SessionInput {
+  sessionId: string;
+  name: string;
+  deviceId: string;
+  current: boolean;
+}
+
 export type Verification = { ok: true; email: string } | { ok: false; reason: string };
 
 export type Verify = (assertion: string) => Promise<Verification>;
@@ -120,4 +156,60 @@ export const parseList = (params: URLSearchParams): Parsed<ListInput> => {
   if (!isInteger(since, 0, Number.MAX_SAFE_INTEGER)) return fail("since must be a whole number of epoch milliseconds");
   if (!isInteger(limit, 1, 100)) return fail("limit must be a whole number from 1 to 100");
   return { ok: true, value: { tags: tags.value, since, cursor: params.get("cursor") ?? "", limit } };
+};
+
+const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/;
+
+const isText = (value: unknown, max: number): value is string => typeof value === "string" && value.length <= max;
+
+export const parseSessionId = (value: string): Parsed<string> =>
+  SESSION_ID.test(value) ? { ok: true, value } : fail("the session id may hold 1 to 100 letters, digits, - and _");
+
+const parseFocus = (value: unknown): Parsed<Focus> => {
+  if (!isRecord(value) || !isText(value.first, MAX_FOCUS_CHARS) || !isText(value.latest, MAX_FOCUS_CHARS)) {
+    return fail(`focus must be {first, latest}, each a string of at most ${MAX_FOCUS_CHARS} characters`);
+  }
+  return { ok: true, value: { first: value.first, latest: value.latest } };
+};
+
+export const parseSession = (body: unknown): Parsed<SessionInput> => {
+  if (!isRecord(body)) return fail("body must be a JSON object");
+  const { host, cwd, repo, branch, commit, startedAt, lastActivityAt, prompts, mode, permissionMode, pid } = body;
+  if (!isText(host, MAX_SESSION_TEXT_CHARS) || host.length < 1) {
+    return fail(`host must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
+  }
+  const text = (field: string): { ok: false; error: string } =>
+    fail(`${field} must be a string of at most ${MAX_SESSION_TEXT_CHARS} characters, empty when it does not apply`);
+  if (!isText(cwd, MAX_SESSION_TEXT_CHARS)) return text("cwd");
+  if (!isText(repo, MAX_SESSION_TEXT_CHARS)) return text("repo");
+  if (!isText(branch, MAX_SESSION_TEXT_CHARS)) return text("branch");
+  if (!isText(commit, MAX_SESSION_TEXT_CHARS)) return text("commit");
+  if (!isText(permissionMode, MAX_SESSION_TEXT_CHARS)) return text("permissionMode");
+  const epoch = (value: unknown): value is number => isInteger(value, 0, Number.MAX_SAFE_INTEGER);
+  if (!epoch(startedAt) || !epoch(lastActivityAt)) {
+    return fail("startedAt and lastActivityAt must be whole numbers of epoch milliseconds");
+  }
+  if (!isInteger(prompts, 0, MAX_PROMPTS)) return fail(`prompts must be a whole number from 0 to ${MAX_PROMPTS}`);
+  if (!isOneOf(sessionModes, mode))
+    return fail("mode must be interactive, headless, or empty when the host cannot tell");
+  if (!isInteger(pid, 0, Number.MAX_SAFE_INTEGER)) return fail("pid must be a whole number");
+  const focus = parseFocus(body.focus);
+  if (!focus.ok) return focus;
+  return {
+    ok: true,
+    value: {
+      host,
+      cwd,
+      repo,
+      branch,
+      commit,
+      startedAt,
+      lastActivityAt,
+      prompts,
+      focus: focus.value,
+      mode,
+      permissionMode,
+      pid,
+    },
+  };
 };

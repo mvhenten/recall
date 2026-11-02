@@ -4,6 +4,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Config {
     pub endpoint: String,
     pub token: String,

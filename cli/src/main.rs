@@ -12,6 +12,7 @@ mod ws;
 use anyhow::{Context, Result, bail};
 use api::{Client, Memory, SaveBody};
 use clap::{Args, Parser, Subcommand};
+use jiff::Timestamp;
 use settings::{Mode, Settings};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
@@ -124,6 +125,22 @@ enum Command {
     Devices {
         #[arg(long, value_name = "ID", help = "Revoke the device with this id")]
         revoke: Option<String>,
+    },
+    #[command(about = "List the live Claude Code sessions on every host signed in as you")]
+    Sessions {
+        #[arg(
+            long,
+            value_name = "ID",
+            help = "Send this host's record for the session with this id to the service"
+        )]
+        sync: Option<String>,
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with = "sync",
+            help = "Mark the session with this id gone"
+        )]
+        end: Option<String>,
     },
     #[command(about = "Send a message to the Claude Code sessions on another host signed in as you")]
     Send {
@@ -369,6 +386,48 @@ fn message_body(words: &[String]) -> Result<String> {
     Ok(text)
 }
 
+fn sync_session(session_id: &str) -> Result<()> {
+    let Some(record) = sessions::record(&listen::sessions_dir(), session_id) else {
+        bail!("no session {session_id} is registered on this host");
+    };
+    Client::new(config::load()?).sync_session(
+        session_id,
+        &api::SessionBody {
+            host: &record.host,
+            cwd: &record.cwd.to_string_lossy(),
+            repo: &record.repo,
+            branch: &record.branch,
+            commit: &record.commit,
+            started_at: record.started_at,
+            last_activity_at: record.last_activity_at,
+            prompts: record.prompts,
+            focus: &record.focus,
+            mode: &record.mode,
+            permission_mode: &record.permission_mode,
+            pid: i64::from(record.pid),
+        },
+    )?;
+    println!("synced {session_id}");
+    Ok(())
+}
+
+/// The hooks start the session commands detached, with no terminal to read their stderr and no
+/// caller to notice their exit code, so the hooks log is the only record that one ran at all.
+fn logged(done: &str, failed: &str, session_id: &str, work: impl FnOnce() -> Result<()>) -> ExitCode {
+    let started = Instant::now();
+    match work() {
+        Ok(()) => {
+            listen::log(&format!("sessions:{done}:{session_id}"), started.elapsed());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            listen::log(&format!("sessions:{failed}:{session_id}:{error:#}"), started.elapsed());
+            eprintln!("recall: {error:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn require_messaging(settings: &Settings) -> Result<()> {
     if settings.messaging_enabled() {
         return Ok(());
@@ -452,6 +511,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
             } else {
                 listen::run(&settings, ensure)?;
+            }
+        }
+        Command::Sessions { sync, end } => {
+            if let Some(id) = sync {
+                return Ok(logged("synced", "sync-failed", &id, || sync_session(&id)));
+            }
+            if let Some(id) = end {
+                return Ok(logged("ended", "end-failed", &id, || {
+                    let ended = client()?.end_session(&id)?;
+                    println!("{} {id}", if ended { "ended" } else { "already gone" });
+                    Ok(())
+                }));
+            }
+            let client = client()?;
+            let listed = client.sessions()?;
+            if cli.json {
+                print_json(&listed)?;
+            } else if listed.is_empty() {
+                println!("no live sessions");
+            } else {
+                print!(
+                    "{}",
+                    markdown::render_sessions(&listed, Timestamp::now().as_millisecond())
+                );
             }
         }
         Command::Send { host, message } => {
