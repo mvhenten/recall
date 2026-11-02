@@ -13,6 +13,10 @@ export interface Env {
   MAILBOX: DurableObjectNamespace<Mailbox>;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
+  // Set, and bound, only where the deployment publishes pages; see AppEnv in app.ts.
+  ARTIFACT_HOSTNAME: string;
+  ARTIFACT_ACCESS_AUD: string;
+  ARTIFACTS: R2Bucket;
 }
 
 const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
@@ -32,8 +36,13 @@ let app: ReturnType<typeof createApp> | undefined;
 const appFor = (env: Env): ReturnType<typeof createApp> => {
   if (app) return app;
   const issuer = `https://${env.ACCESS_TEAM_DOMAIN}`;
+  const keys = cachedAccessKeys(`${issuer}/cdn-cgi/access/certs`);
   app = createApp({
-    verify: accessVerifier(cachedAccessKeys(`${issuer}/cdn-cgi/access/certs`), issuer, env.ACCESS_AUD),
+    verify: accessVerifier(keys, issuer, env.ACCESS_AUD),
+    artifactHost: {
+      hostname: env.ARTIFACT_HOSTNAME ?? "",
+      verify: accessVerifier(keys, issuer, env.ARTIFACT_ACCESS_AUD ?? ""),
+    },
     deviceCodeLimits: DEVICE_CODE_LIMITS,
     embedder: workersAiEmbedder(env.AI),
     now: Date.now,

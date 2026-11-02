@@ -1,3 +1,5 @@
+import { ARTIFACT_CONTENT_TYPE } from "./artifacts";
+
 export const CSRF_COOKIE = "__Host-recall_csrf";
 
 export const escapeHtml = (text: string): string =>
@@ -32,6 +34,27 @@ export const htmlPage = (
       },
     },
   );
+
+// A published page carries everything it draws, so its own inline style, script and data: assets
+// run while nothing may reach another host. It answers on its own hostname alone, never on the one
+// that holds the dashboard and the API.
+const ARTIFACT_CSP =
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; " +
+  "font-src data:; media-src data:; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
+
+// Every read goes through the Worker and nothing caches at the edge, so a republished page is the
+// one the next reload draws.
+export const artifactPage = (body: ReadableStream, contentType = ARTIFACT_CONTENT_TYPE): Response =>
+  new Response(body, {
+    headers: {
+      "content-type": contentType,
+      "cache-control": "private, no-cache",
+      "content-security-policy": ARTIFACT_CSP,
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+    },
+  });
 
 const page = (status: number, title: string, body: string, headers: Record<string, string> = {}): Response =>
   htmlPage(status, title, DEVICE_STYLE, `<h1>${escapeHtml(title)}</h1>${body}`, headers);

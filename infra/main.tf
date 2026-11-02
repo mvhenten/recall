@@ -16,6 +16,13 @@ resource "cloudflare_d1_database" "recall" {
   }
 }
 
+resource "cloudflare_r2_bucket" "artifacts" {
+  count      = var.artifact_hostname == "" ? 0 : 1
+  account_id = var.account_id
+  name       = "recall-artifacts"
+  location   = "weur"
+}
+
 resource "cloudflare_zero_trust_access_policy" "bypass" {
   account_id = var.account_id
   name       = "recall api"
@@ -41,6 +48,24 @@ resource "cloudflare_zero_trust_access_application" "recall" {
   policies = [
     {
       id         = cloudflare_zero_trust_access_policy.bypass.id
+      precedence = 1
+    }
+  ]
+}
+
+resource "cloudflare_zero_trust_access_application" "artifacts" {
+  count                     = var.artifact_hostname == "" ? 0 : 1
+  account_id                = var.account_id
+  name                      = "recall artifacts"
+  type                      = "self_hosted"
+  domain                    = var.artifact_hostname
+  session_duration          = "24h"
+  app_launcher_visible      = false
+  allowed_idps              = [var.otp_idp_id]
+  auto_redirect_to_identity = true
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.approvers.id
       precedence = 1
     }
   ]

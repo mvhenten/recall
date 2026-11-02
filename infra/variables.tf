@@ -8,6 +8,17 @@ variable "hostname" {
   description = "Hostname the Worker serves; only /device and /dashboard sit behind a Cloudflare Access login."
 }
 
+variable "artifact_hostname" {
+  type        = string
+  default     = ""
+  description = "Hostname that serves published pages, wholly behind its own Access login. Empty leaves it off."
+
+  validation {
+    condition     = var.artifact_hostname == "" || var.artifact_hostname != var.hostname
+    error_message = "The artifact hostname is a second host, so it cannot be the one the dashboard and the API answer on."
+  }
+}
+
 variable "otp_idp_id" {
   type        = string
   description = "Id of the account's one-time PIN Access login method."

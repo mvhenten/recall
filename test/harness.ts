@@ -9,6 +9,8 @@ import { DIMENSIONS, normalize } from "../src/rank";
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const AUDIENCE = "recall-test-aud";
 const ORIGIN = "https://recall.test";
+const ARTIFACT_HOSTNAME = "artifact.recall.test";
+export const ARTIFACT_AUDIENCE = "recall-test-artifact-aud";
 
 export interface DeviceStart {
   device_code: string;
@@ -44,6 +46,7 @@ export interface Hit {
 export interface Client {
   request(method: string, path: string, body?: unknown): Promise<Response>;
   save(name: string, fields: Partial<Pick<Memory, "description" | "type" | "body" | "tags">>): Promise<Memory>;
+  publish(name: string, html: BodyInit): Promise<Response>;
   get(name: string): Promise<Memory>;
   search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
@@ -89,12 +92,13 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     refresh: () => Promise.reject(new Error("Access signing keys answered 503")),
   };
   let clock = 1_700_000_000_000;
+  const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
   const app = createApp({
-    verify: accessVerifier(
-      keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable,
-      ISSUER,
-      AUDIENCE,
-    ),
+    verify: accessVerifier(source, ISSUER, AUDIENCE),
+    artifactHost: {
+      hostname: ARTIFACT_HOSTNAME,
+      verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
+    },
     embedder: wordEmbedder,
     deviceCodeLimits,
     now: () => clock,
@@ -111,6 +115,15 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
 
   const send = (path: string, init: RequestInit = {}): Promise<Response> =>
     app.fetch(new Request(`${ORIGIN}${path}`, init), env);
+
+  const sendToArtifactHost = (path: string, assertion: string | null, init: RequestInit = {}): Promise<Response> =>
+    app.fetch(
+      new Request(`https://${ARTIFACT_HOSTNAME}${path}`, {
+        ...init,
+        headers: { ...init.headers, ...(assertion === null ? {} : { "cf-access-jwt-assertion": assertion }) },
+      }),
+      env,
+    );
 
   const requestDevice = (deviceName: string, clientIp: string): Promise<Response> =>
     send("/v1/device/code", {
@@ -202,6 +215,9 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
         const saved: { memory: Memory } = await response.json();
         return saved.memory;
       },
+      publish(name, html) {
+        return send(`/v1/artifacts/${name}`, { method: "PUT", headers: { ...headers }, body: html });
+      },
       async get(name) {
         const response = await request("GET", `/v1/memories/${name}`);
         if (response.status !== 200) throw new Error(`get ${name}: ${response.status} ${await response.text()}`);
@@ -240,6 +256,7 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     invite,
     requestDevice,
     send,
+    sendToArtifactHost,
     login,
     startDevice,
     poll,

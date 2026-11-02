@@ -55,7 +55,7 @@ npm run setup -- --hostname recall.example.com --user alice --email alice@exampl
 recall login --endpoint https://recall.example.com
 ```
 
-The setup creates the D1 database and two Cloudflare Access applications. One covers the hostname and lets every request through, since the Worker checks device tokens itself. The other covers the two browser pages, `/device` and `/dashboard`: it admits the listed emails through the one-time PIN login method, which the setup switches on. The setup then migrates the database, maps the emails to the user id, deploys the Worker to the hostname and prints the `recall login` command. Run it again at any time: it finds what exists and creates the rest. Run it with a new `--user` and `--email` to add a person; their memories stay apart. `--email` repeats for more addresses, `--dry-run` prints what it would do and `--account <id>` picks an account when the token sees several.
+The setup creates the D1 database and two Cloudflare Access applications. One covers the hostname and lets every request through, since the Worker checks device tokens itself. The other covers the two browser pages, `/device` and `/dashboard`: it admits the listed emails through the one-time PIN login method, which the setup switches on. The setup then migrates the database, maps the emails to the user id, deploys the Worker to the hostname and prints the `recall login` command. Run it again at any time: it finds what exists and creates the rest. Run it with a new `--user` and `--email` to add a person; their memories stay apart. `--email` repeats for more addresses, `--dry-run` prints what it would do and `--account <id>` picks an account when the token sees several. `--artifact-hostname <pages.example.com>` turns on [artifacts](#artifacts) and needs Workers R2 Storage · Edit on the token as well; without it no R2 is touched.
 
 Create the API token under My Profile → API Tokens → Create Custom Token, with:
 
@@ -233,9 +233,17 @@ How far back each page reads:
 | a raw usage event     | 14 days past the server recording it |
 | a daily usage rollup  | for good                             |
 
+## Artifacts
+
+A deployment can publish self-contained HTML pages: a chart, a report, a one-off tool. `PUT /v1/artifacts/<name>` takes the page's HTML as the request body, up to 16 MB, and the bytes go to R2 under `<user id>/<name>`. The pages answer on a second hostname of their own, `https://<artifact hostname>/<name>`, behind its own Cloudflare Access application admitting the emails that reach the dashboard. Each user reads their own pages alone.
+
+The second hostname is the point. A published page carries its own inline style, script and `data:` assets and may reach no other host, so it runs on an origin holding nothing else: the dashboard, the device pages and the API all refuse to answer there, and the main hostname never renders a page. Every read goes through the Worker with `Cache-Control: private, no-cache`, so a republished page is the one the next reload draws.
+
+The feature is off until a deployment names that hostname — `--artifact-hostname` for `npm run setup`, `RECALL_ARTIFACT_HOSTNAME` for a Workers Builds deploy. Without it the deployment is unchanged and no R2 bucket is created, since R2 needs billing switched on even where it costs nothing.
+
 ## API
 
-The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and `/v1/sessions` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
+The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages`, `/v1/sessions` and `/v1/artifacts` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
 
 | Method   | Path                                            |                                                                                                                                          |
 | -------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
@@ -251,6 +259,10 @@ The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages` and
 | `PUT`    | `/v1/sessions/:sessionId`                       | create or replace one session document                                                                                                   |
 | `GET`    | `/v1/sessions?scope=&cursor=`                   | the live sessions, newest activity first; `scope=history` answers `{sessionIds, nextCursor}` over every session on record                |
 | `DELETE` | `/v1/sessions/:sessionId`                       | the session is over; every host stops listing it                                                                                         |
+| `PUT`    | `/v1/artifacts/:name`                           | publish or replace a page; the body is its HTML, at most 16 MB                                                                           |
+| `GET`    | `/v1/artifacts/:name`                           | read one page's HTML back                                                                                                                |
+| `DELETE` | `/v1/artifacts/:name`                           | unpublish one page                                                                                                                       |
+| `GET`    | `/v1/artifacts`                                 | the caller's pages, newest published first, with their size and timestamps                                                               |
 | `POST`   | `/v1/sessions/:sessionId/usage`                 | one token delta `{seq, host, repo, provider, account, model, prompts, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens, at}` |
 
 `scope` on the session listing says which sessions it covers: the live ones by default, and `history` every one the account has on record, as ids alone in id order, a hundred to the page, paged from the `nextCursor` the last answer gave. A scope the service does not know is refused rather than read as the default. The page walks the session id and not the activity time the History tab orders by, since a live session syncing under a caller's paging moves its own last activity and a row that moves under an ordering keyed on it is never read. A client sending a host's past sessions needs the whole set before it starts, since a transcript says nothing about whether the service already holds the session it describes.
@@ -273,6 +285,8 @@ The build reads the instance from build variables and stops with a message namin
 | `RECALL_ZONE_ID`    | `fedcba9876543210fedcba9876543210`             |
 | `RECALL_HOSTNAME`   | `recall.example.com`                           |
 | `RECALL_USERS`      | `{"alice": {"emails": ["alice@example.com"]}}` |
+
+`RECALL_ARTIFACT_HOSTNAME` is the one optional variable. Setting it to a second hostname in the same zone, such as `artifact.recall.example.com`, turns on [artifacts](#artifacts): OpenTofu then creates the R2 bucket and that hostname's Access application, and the Worker takes the hostname as a second custom domain. Leaving it out deploys exactly as before.
 
 The account needs an R2 bucket `recall-tfstate` for the OpenTofu state, and a private R2 bucket `recall-builder-secrets` holding three objects: `CLOUDFLARE_TOFU_TOKEN` (an API token with the permissions above), and `TFSTATE_ACCESS_KEY_ID` and `TFSTATE_SECRET_ACCESS_KEY` (R2 S3 credentials for the state bucket). Each email in `RECALL_USERS` may approve devices and signs in as that user id; adding a person is one entry. Removing a user signs out all their devices.
 
