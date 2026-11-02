@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 const SEND_TOOL: &str = "recall_send";
 
-const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation.";
+const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. Where the deployment hosts pages, recall_publish puts a self-contained HTML file at a URL the user can open.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -125,6 +125,15 @@ pub struct SendParams {
     pub to: String,
     /// The message to deliver there.
     pub message: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PublishParams {
+    /// Path to the HTML file to publish.
+    pub file_path: String,
+    /// Publish under this name, as a kebab-case slug, instead of the file's own name.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -358,6 +367,23 @@ impl Recall {
     }
 
     #[tool(
+        name = "recall_publish",
+        description = "Publish a self-contained HTML page, carrying its own style, script and data: assets, and return the URL the user opens it on. Write the page to a file and pass its path, never its content. Publishing a name that already exists replaces that page at the same URL."
+    )]
+    async fn publish(&self, Parameters(params): Parameters<PublishParams>) -> Result<String, String> {
+        blocking(move || {
+            let path = std::path::Path::new(&params.file_path);
+            let artifact = client()?.publish_file(path, params.name.as_deref())?;
+            to_json(&serde_json::json!({
+                "name": artifact.name,
+                "url": artifact.url,
+                "bytes": artifact.bytes,
+            }))
+        })
+        .await
+    }
+
+    #[tool(
         name = "recall_delete",
         description = "Delete a memory that turned out wrong or no longer holds."
     )]
@@ -452,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn serves_the_six_memory_tools_with_descriptions() {
+    fn serves_every_tool_but_recall_send_with_descriptions() {
         assert_eq!(
             names(false),
             [
@@ -460,6 +486,7 @@ mod tests {
                 "recall_edit",
                 "recall_get",
                 "recall_list",
+                "recall_publish",
                 "recall_save",
                 "recall_search"
             ]
@@ -480,6 +507,7 @@ mod tests {
         assert!(required("recall_list").is_empty());
         assert_eq!(required("recall_save"), ["body", "description", "name", "type"]);
         assert_eq!(required("recall_edit"), ["name"]);
+        assert_eq!(required("recall_publish"), ["file_path"]);
     }
 
     #[test]

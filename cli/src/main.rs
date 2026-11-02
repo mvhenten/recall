@@ -112,6 +112,16 @@ enum Command {
     },
     #[command(about = "Delete a memory")]
     Delete { name: String },
+    #[command(about = "Publish a self-contained HTML page and print the URL it answers on")]
+    Publish {
+        #[arg(value_name = "FILE", help = "The HTML file to publish")]
+        file: PathBuf,
+        #[arg(
+            long,
+            help = "Publish under this name, as a kebab-case slug; defaults to the file's own name, and an existing name is replaced"
+        )]
+        name: Option<String>,
+    },
     #[command(about = "Print the repo tag of the current directory")]
     Repo,
     #[command(about = "Sign this host in through the browser and store its device token")]
@@ -860,6 +870,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 print_json(&serde_json::json!({ "deleted": name }))?;
             } else {
                 println!("deleted {name}");
+            }
+        }
+        Command::Publish { file, name } => {
+            let artifact = client()?.publish_file(&file, name.as_deref())?;
+            if cli.json {
+                print_json(&artifact)?;
+            } else {
+                println!("{}", artifact.url);
             }
         }
     }

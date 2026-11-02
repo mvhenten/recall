@@ -9,7 +9,7 @@ import { DIMENSIONS, normalize } from "../src/rank";
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const AUDIENCE = "recall-test-aud";
 const ORIGIN = "https://recall.test";
-const ARTIFACT_HOSTNAME = "artifact.recall.test";
+export const ARTIFACT_HOSTNAME = "artifact.recall.test";
 export const ARTIFACT_AUDIENCE = "recall-test-artifact-aud";
 
 export interface DeviceStart {
