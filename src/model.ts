@@ -67,6 +67,7 @@ export const sessionModes = ["interactive", "headless", ""] as const;
 export type SessionMode = (typeof sessionModes)[number];
 
 export const SESSION_TTL_MS = 86_400_000;
+export const SESSION_HISTORY_TTL_MS = 180 * 86_400_000;
 // The five minutes of IDLE_AFTER in cli/src/sessions.rs, which is the original: both sides derive
 // busy and idle on read and must agree on where the line falls.
 export const IDLE_AFTER_MS = 300_000;
@@ -99,6 +100,10 @@ export interface Session extends SessionInput {
   name: string;
   deviceId: string;
 }
+
+// What a session leaves behind once it is gone. The live process facts drop out: a permission mode
+// and a pid say nothing about a session nobody can address any more.
+export type SessionHistory = Omit<Session, "permissionMode" | "pid">;
 
 // The handle that addresses one session: its device name and the head of its session id. It is a
 // function of the session alone, so it names the same session for as long as that session runs and

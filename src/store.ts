@@ -5,8 +5,10 @@ import {
   type MemoryCounts,
   type MemoryType,
   type SaveInput,
+  SESSION_HISTORY_TTL_MS,
   SESSION_TTL_MS,
   type Session,
+  type SessionHistory,
   type SessionInput,
   type SessionMode,
   sessionHandle,
@@ -231,7 +233,7 @@ export const describeMemories = async (db: D1Database, userId: string, memoryIds
   return results.map(toMemory);
 };
 
-interface SessionRow {
+interface SessionHistoryRow {
   session_id: string;
   device_name: string;
   device_id: string;
@@ -246,11 +248,18 @@ interface SessionRow {
   focus_first: string;
   focus_latest: string;
   mode: SessionMode;
+}
+
+interface SessionRow extends SessionHistoryRow {
   permission_mode: string;
   pid: number;
 }
 
-const toSession = (row: SessionRow): Session => ({
+const SESSION_HISTORY_COLUMNS = `s.session_id, COALESCE(d.name, '') AS device_name, s.device_id, s.host, s.cwd,
+  s.repo, s.branch, s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest,
+  s.mode`;
+
+const toSessionHistory = (row: SessionHistoryRow): SessionHistory => ({
   sessionId: row.session_id,
   name: sessionHandle(row.device_name, row.session_id),
   deviceId: row.device_id,
@@ -264,12 +273,22 @@ const toSession = (row: SessionRow): Session => ({
   prompts: row.prompts,
   focus: { first: row.focus_first, latest: row.focus_latest },
   mode: row.mode,
+});
+
+const toSession = (row: SessionRow): Session => ({
+  ...toSessionHistory(row),
   permissionMode: row.permission_mode,
   pid: row.pid,
 });
 
 const expireSessions = (db: D1Database, userId: string, now: number): D1PreparedStatement =>
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND last_activity_at <= ?").bind(userId, now - SESSION_TTL_MS);
+
+// Retention rides the write path: the read path derives state and writes nothing.
+const forgetOldHistory = (db: D1Database, userId: string, now: number): D1PreparedStatement =>
+  db
+    .prepare("DELETE FROM session_history WHERE user_id = ? AND last_activity_at <= ?")
+    .bind(userId, now - SESSION_HISTORY_TTL_MS);
 
 export const putSession = async (
   db: D1Database,
@@ -310,6 +329,34 @@ export const putSession = async (
         input.permissionMode,
         input.pid,
       ),
+    forgetOldHistory(db, caller.userId, now),
+    db
+      .prepare(
+        `INSERT INTO session_history (user_id, session_id, device_id, host, cwd, repo, branch, commit_subject,
+           started_at, last_activity_at, prompts, focus_first, focus_latest, mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT (user_id, session_id) DO UPDATE SET
+           device_id = excluded.device_id, host = excluded.host, cwd = excluded.cwd, repo = excluded.repo,
+           branch = excluded.branch, commit_subject = excluded.commit_subject, started_at = excluded.started_at,
+           last_activity_at = excluded.last_activity_at, prompts = excluded.prompts,
+           focus_first = excluded.focus_first, focus_latest = excluded.focus_latest, mode = excluded.mode`,
+      )
+      .bind(
+        caller.userId,
+        sessionId,
+        caller.deviceId,
+        input.host,
+        input.cwd,
+        input.repo,
+        input.branch,
+        input.commit,
+        input.startedAt,
+        input.lastActivityAt,
+        input.prompts,
+        input.focus.first,
+        input.focus.latest,
+        input.mode,
+      ),
   ]);
 };
 
@@ -326,15 +373,25 @@ export const listSessions = async (db: D1Database, userId: string, now: number):
     expireSessions(db, userId, now),
     db
       .prepare(
-        `SELECT s.session_id, COALESCE(d.name, '') AS device_name, s.device_id, s.host, s.cwd, s.repo, s.branch,
-           s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest, s.mode,
-           s.permission_mode, s.pid
+        `SELECT ${SESSION_HISTORY_COLUMNS}, s.permission_mode, s.pid
          FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
          WHERE s.user_id = ? ORDER BY s.last_activity_at DESC, s.session_id`,
       )
       .bind(userId),
   ]);
   return (listed?.results ?? []).map(toSession);
+};
+
+export const listSessionHistory = async (db: D1Database, userId: string, limit: number): Promise<SessionHistory[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT ${SESSION_HISTORY_COLUMNS}
+       FROM session_history s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
+       WHERE s.user_id = ? ORDER BY s.last_activity_at DESC, s.session_id LIMIT ?`,
+    )
+    .bind(userId, limit)
+    .all<SessionHistoryRow>();
+  return results.map(toSessionHistory);
 };
 
 export const sessionOnDevice = async (

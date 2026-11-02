@@ -1,5 +1,13 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session } from "../src/model";
+import {
+  MAX_FOCUS_CHARS,
+  SESSION_HISTORY_TTL_MS,
+  SESSION_TTL_MS,
+  type Session,
+  type SessionHistory,
+} from "../src/model";
+import { listSessionHistory } from "../src/store";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -22,6 +30,21 @@ const account = async (h: Harness): Promise<{ laptop: Client; tower: Client }> =
     tower: h.clientWithToken(await h.login(email, "tower")),
   };
 };
+
+interface Member {
+  client: Client;
+  userId: string;
+}
+
+const member = async (h: Harness, label: string): Promise<Member> => {
+  const userId = `user-${crypto.randomUUID()}`;
+  const email = await h.invite(`${label}-${crypto.randomUUID()}@example.com`, userId);
+  return { client: h.clientWithToken(await h.login(email, "laptop")), userId };
+};
+
+const history = (who: Member): Promise<SessionHistory[]> => listSessionHistory(env.DB, who.userId, 50);
+
+const historyIds = async (who: Member): Promise<string[]> => (await history(who)).map((session) => session.sessionId);
 
 describe("sessions", () => {
   it("lists every host's sessions, newest activity first, each addressable by its handle", async () => {
@@ -123,5 +146,88 @@ describe("sessions", () => {
     expect((await laptop.sync("s-1", { prompts: -1 })).status).toBe(400);
     expect((await laptop.sync("s 1")).status).toBe(400);
     expect((await laptop.request("POST", "/v1/sessions")).status).toBe(405);
+  });
+});
+
+describe("session history", () => {
+  it("keeps what a session was doing once it ends, and once the sweep forgets it", async () => {
+    const h = await harness();
+    const me = await member(h, "history");
+
+    await me.client.sync("s-ended", { lastActivityAt: h.now() });
+    const lastActivityAt = h.tick(60_000);
+    await me.client.sync("s-crashed", { lastActivityAt });
+    expect((await me.client.request("DELETE", "/v1/sessions/s-ended")).status).toBe(204);
+    h.tick(SESSION_TTL_MS + 1000);
+
+    expect(await listed(me.client)).toEqual([]);
+    expect(await history(me)).toEqual([
+      {
+        sessionId: "s-crashed",
+        name: "laptop-scra",
+        deviceId: expect.any(String),
+        host: "laptop",
+        cwd: "/home/you/src/recall",
+        repo: "repo:github.com/mvhenten/recall",
+        branch: "feat/sessions-list",
+        commit: "feat(sessions): list every host's sessions",
+        startedAt: 1_700_000_000_000,
+        lastActivityAt,
+        prompts: 3,
+        focus: { first: "list every host's sessions", latest: "why is the worker test red" },
+        mode: "interactive",
+      },
+      expect.objectContaining({ sessionId: "s-ended" }),
+    ]);
+  });
+
+  it("holds one row per session, so the latest sync wins", async () => {
+    const h = await harness();
+    const me = await member(h, "history");
+
+    await me.client.sync("s-1");
+    await me.client.sync("s-1", {
+      branch: "feat/session-history",
+      prompts: 9,
+      focus: { first: "list every host's sessions", latest: "ship it" },
+      lastActivityAt: h.now(),
+    });
+
+    expect(await history(me)).toMatchObject([
+      {
+        sessionId: "s-1",
+        branch: "feat/session-history",
+        prompts: 9,
+        focus: { first: "list every host's sessions", latest: "ship it" },
+      },
+    ]);
+  });
+
+  it("shows each user only their own sessions", async () => {
+    const h = await harness();
+    const me = await member(h, "history");
+    const stranger = await member(h, "stranger");
+
+    await me.client.sync("s-mine");
+    await stranger.client.sync("s-theirs");
+
+    expect(await historyIds(me)).toEqual(["s-mine"]);
+    expect(await historyIds(stranger)).toEqual(["s-theirs"]);
+  });
+
+  it("drops a row past the retention window on the next sync, and only the caller's", async () => {
+    const h = await harness();
+    const me = await member(h, "history");
+    const stranger = await member(h, "stranger");
+
+    await me.client.sync("s-ancient", { lastActivityAt: h.now() });
+    await stranger.client.sync("s-also-ancient", { lastActivityAt: h.now() });
+    h.tick(SESSION_HISTORY_TTL_MS / 2);
+    await me.client.sync("s-recent", { lastActivityAt: h.now() });
+    h.tick(SESSION_HISTORY_TTL_MS / 2 + 1000);
+    await me.client.sync("s-now", { lastActivityAt: h.now() });
+
+    expect(await historyIds(me)).toEqual(["s-now", "s-recent"]);
+    expect(await historyIds(stranger)).toEqual(["s-also-ancient"]);
   });
 });
