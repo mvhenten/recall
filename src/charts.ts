@@ -35,19 +35,18 @@ const monthLabel = (month: string, withYear: boolean): string => {
   return withYear ? `${name} ${month.slice(2, 4)}` : name;
 };
 
-// One entry per column of a bar chart, empty where the axis skips a tick. The caller picks the
-// bucket, so a chart over days and a chart over months share the one builder and still read right.
-export const dayTicks = (days: string[]): string[] =>
-  days.map((day, index) => (index % 3 === 0 ? dayLabel(day, index === 0 || day.endsWith("-01")) : ""));
+const MONTH_TICKS = 12;
 
-const MONTH_TICK_LIMIT = 12;
-
-export const monthTicks = (months: string[]): string[] => {
-  const every = months.length > MONTH_TICK_LIMIT ? 2 : 1;
-  return months.map((month, index) =>
-    index % every === 0 ? monthLabel(month, index === 0 || month.endsWith("-01")) : "",
-  );
+// A tick a reader recognises on every third day, and on as many months as fit twelve labels.
+const caption = (over: Grain, bucket: string, index: number, count: number): string => {
+  if (over === "days") {
+    return index % 3 === 0 ? dayLabel(bucket, index === 0 || bucket.endsWith("-01")) : "";
+  }
+  const stride = Math.ceil(count / MONTH_TICKS);
+  return index % stride === 0 ? monthLabel(bucket, index === 0 || bucket.endsWith("-01")) : "";
 };
+
+export type Grain = "days" | "months";
 
 const n = (value: number): string => String(Math.round(value * 10) / 10);
 
@@ -92,7 +91,8 @@ const capped = (x: number, width: number, top: number, bottom: number, radius: n
 const STACK_GAP = 2;
 
 export const stackedBars = (
-  ticks: string[],
+  buckets: string[],
+  over: Grain,
   series: Series[],
   label: string,
   money: (value: number) => string,
@@ -101,12 +101,12 @@ export const stackedBars = (
   const right = 394;
   const base = 212;
   const top = 18;
-  const totals = ticks.map((_, index) => series.reduce((sum, band) => sum + (band.values[index] ?? 0), 0));
+  const totals = buckets.map((_, index) => series.reduce((sum, band) => sum + (band.values[index] ?? 0), 0));
   const high = niceTop(Math.max(...totals, 0));
-  const step = (right - left) / Math.max(ticks.length, 1);
+  const step = (right - left) / Math.max(buckets.length, 1);
   const width = step * 0.618;
-  const bars = ticks
-    .map((caption, index) => {
+  const bars = buckets
+    .map((bucket, index) => {
       const x = left + (step - width) / 2 + index * step;
       const present = series.filter((band) => (band.values[index] ?? 0) > 0);
       let bottom = base;
@@ -123,12 +123,13 @@ export const stackedBars = (
         return shape;
       });
       const center = x + width / 2;
+      const text = caption(over, bucket, index, buckets.length);
       const tick =
-        caption === ""
+        text === ""
           ? ""
-          : `<text x="${n(center)}" y="${base + 13}" text-anchor="middle" class="cl-ax">${escapeHtml(caption)}</text>`;
+          : `<text x="${n(center)}" y="${base + 13}" text-anchor="middle" class="cl-ax">${escapeHtml(text)}</text>`;
       const value =
-        index === ticks.length - 1 && totals[index] !== undefined && (totals[index] ?? 0) > 0
+        index === buckets.length - 1 && totals[index] !== undefined && (totals[index] ?? 0) > 0
           ? `<text x="${n(center)}" y="${n(highest - 6)}" text-anchor="middle" class="cl-val">${escapeHtml(money(totals[index] ?? 0))}</text>`
           : "";
       return `${drawn.join("")}${tick}${value}`;
@@ -222,11 +223,17 @@ export const miniBars = (days: string[], values: number[], label: string, last: 
 // its full text left on the row's title so hovering still reads it.
 const LABEL_CHARS = 23;
 
-export const horizontalBars = (bars: Bar[], label: string): string => {
+// A quantity is read against the largest of its own rows; a share is read against the whole, so a
+// column of single-digit percentages must not draw full-width bars. The caller says which by
+// passing the top of the scale, and leaves it out for a quantity.
+export const horizontalBars = (
+  bars: Bar[],
+  label: string,
+  high = Math.max(...bars.map((bar) => bar.value), 0),
+): string => {
   const rowHeight = 30;
   const trackLeft = 160;
   const trackRight = 346;
-  const high = Math.max(...bars.map((bar) => bar.value), 0);
   const rows = bars
     .map((bar, index) => {
       const top = 9 + index * rowHeight;

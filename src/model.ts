@@ -137,6 +137,11 @@ export interface HistoryInput {
 export const USAGE_RETENTION_MS = 1_209_600_000;
 export const MAX_USAGE_TOKENS = 1_000_000_000;
 
+// The client dates its own deltas and the rollup is unbounded, so one delta dated 1970 would
+// stretch every month the insights page draws. recall did not exist before 2020, and a host's clock
+// may run a little fast but never a day fast. A backfill of real months still lands inside this.
+export const USAGE_EPOCH = Date.UTC(2020, 0, 1);
+
 export interface UsageInput {
   seq: number;
   host: string;
@@ -218,12 +223,9 @@ export interface ModelTotals extends TokenCounts {
   model: string;
 }
 
-export interface ModelDay extends ModelTotals {
-  day: string;
-}
-
-export interface ModelMonth extends ModelTotals {
-  month: string;
+// One bucket of the rollup: a UTC day for the windows, a month for the long horizon.
+export interface ModelBucket extends ModelTotals {
+  bucket: string;
 }
 
 export type UsageSplitField = "host" | "repo" | "account";
@@ -282,15 +284,15 @@ export interface StatsWindows {
 
 export interface Stats {
   windows: StatsWindows;
-  usage: ModelDay[];
+  usage: ModelBucket[];
   splits: UsageSplit[];
   sessions: DaySessions[];
 }
 
 export interface Insights {
   fortnight: DayWindow;
-  usage: ModelDay[];
-  monthly: ModelMonth[];
+  usage: ModelBucket[];
+  monthly: ModelBucket[];
   working: WorkingSet;
   stale: GoingStale;
   repos: RepoHours[];
@@ -471,7 +473,7 @@ export const parseSession = (body: unknown): Parsed<SessionInput> => {
   };
 };
 
-export const parseUsage = (body: unknown): Parsed<UsageInput> => {
+export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
   const { seq, host, repo, provider, account, model, prompts, at } = body;
   const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
@@ -492,7 +494,9 @@ export const parseUsage = (body: unknown): Parsed<UsageInput> => {
     return fail(`account must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
   }
   if (!isInteger(prompts, 0, MAX_PROMPTS)) return fail(`prompts must be a whole number from 0 to ${MAX_PROMPTS}`);
-  if (!isInteger(at, 0, Number.MAX_SAFE_INTEGER)) return fail("at must be a whole number of epoch milliseconds");
+  if (!isInteger(at, USAGE_EPOCH, now + DAY_MS)) {
+    return fail("at must be a whole number of epoch milliseconds, no earlier than 2020 and no more than a day ahead");
+  }
   const counter = (value: unknown): value is number => isInteger(value, 0, MAX_USAGE_TOKENS);
   if (!counter(inputTokens) || !counter(outputTokens) || !counter(cacheWriteTokens) || !counter(cacheReadTokens)) {
     return fail(

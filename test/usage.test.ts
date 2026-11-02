@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { MAX_USAGE_TOKENS, USAGE_RETENTION_MS, usageDay } from "../src/model";
+import { MAX_USAGE_TOKENS, USAGE_EPOCH, USAGE_RETENTION_MS, usageDay } from "../src/model";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -21,6 +21,14 @@ interface DailyRow {
 
 const DAY_ONE = Date.UTC(2026, 10, 1, 23, 30);
 const DAY_TWO = Date.UTC(2026, 10, 2, 0, 30);
+
+// A delta may not be dated ahead of now, so the clock stands on the later of the two days these
+// tests straddle before any of them is sent.
+const onDayTwo = async (): Promise<Harness> => {
+  const h = await harness();
+  h.tick(DAY_TWO - h.now());
+  return h;
+};
 
 const account = async (h: Harness, label: string): Promise<{ userId: string; client: Client }> => {
   const userId = `${label}-${crypto.randomUUID()}`;
@@ -50,7 +58,7 @@ const events = async (userId: string): Promise<Array<{ session_id: string; seq: 
 
 describe("usage", () => {
   it("counts a delta once however often the client resends it", async () => {
-    const h = await harness();
+    const h = await onDayTwo();
     const { userId, client } = await account(h, "usage");
     await client.sync("s-1");
 
@@ -76,7 +84,7 @@ describe("usage", () => {
   });
 
   it("sums a session's deltas into the day each one ran, splitting at midnight", async () => {
-    const h = await harness();
+    const h = await onDayTwo();
     const { userId, client } = await account(h, "usage");
     await client.sync("s-1");
 
@@ -95,7 +103,7 @@ describe("usage", () => {
   });
 
   it("counts a delta from its own host and repo, even when the session is gone", async () => {
-    const h = await harness();
+    const h = await onDayTwo();
     const { userId, client } = await account(h, "usage");
 
     const response = await client.usage("s-ended", {
@@ -111,7 +119,7 @@ describe("usage", () => {
   });
 
   it("keeps the first numbers for a seq when a retry disagrees", async () => {
-    const h = await harness();
+    const h = await onDayTwo();
     const { userId, client } = await account(h, "usage");
 
     expect((await client.usage("s-1", { seq: 1, at: DAY_ONE, inputTokens: 120 })).status).toBe(204);
@@ -139,6 +147,9 @@ describe("usage", () => {
     expect((await client.usage("s-1", { cacheWriteTokens: "900" })).status).toBe(400);
     expect((await client.usage("s-1", { cacheReadTokens: null })).status).toBe(400);
     expect((await client.usage("s-1", { at: "2026-11-01T23:30:00+00:00" })).status).toBe(400);
+    expect((await client.usage("s-1", { at: 0 })).status).toBe(400);
+    expect((await client.usage("s-1", { at: USAGE_EPOCH - 1 })).status).toBe(400);
+    expect((await client.usage("s-1", { at: h.now() + 2 * 86_400_000 })).status).toBe(400);
     expect((await client.request("GET", "/v1/sessions/s-1/usage")).status).toBe(405);
     expect((await client.request("POST", "/v1/sessions/s-1/cost", {})).status).toBe(404);
     expect((await client.request("POST", "/v1/memories/a-memory/usage", {})).status).toBe(404);
@@ -148,7 +159,7 @@ describe("usage", () => {
   });
 
   it("keeps one account's usage out of another's, whatever session id it names", async () => {
-    const h = await harness();
+    const h = await onDayTwo();
     const mine = await account(h, "mine");
     const theirs = await account(h, "theirs");
 

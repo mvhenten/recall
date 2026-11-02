@@ -1,14 +1,4 @@
-import {
-  dayTicks,
-  donut,
-  heatmap,
-  horizontalBars,
-  miniBars,
-  monthTicks,
-  type Series,
-  stackedArea,
-  stackedBars,
-} from "./charts";
+import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
 import {
   DAY_MS,
   type DayWindow,
@@ -25,8 +15,7 @@ import {
   type Memory,
   type MemoryCounts,
   type MemoryHit,
-  type ModelDay,
-  type ModelMonth,
+  type ModelBucket,
   type ModelTotals,
   memoryTypes,
   monthsBetween,
@@ -718,12 +707,10 @@ const totalled = (rows: TokenCounts[]): TokenCounts =>
 const countedTokens = (counts: TokenCounts): number =>
   counts.inputTokens + counts.outputTokens + counts.cacheWriteTokens + counts.cacheReadTokens;
 
-const within = (rows: ModelDay[], from: string, to: string): ModelDay[] =>
-  rows.filter((row) => row.day >= from && row.day <= to);
+const within = (rows: ModelBucket[], from: string, to: string): ModelBucket[] =>
+  rows.filter((row) => row.bucket >= from && row.bucket <= to);
 
-const onDay = (rows: ModelDay[], day: string): ModelDay[] => rows.filter((row) => row.day === day);
-
-const inMonth = (rows: ModelMonth[], month: string): ModelMonth[] => rows.filter((row) => row.month === month);
+const inBucket = (rows: ModelBucket[], bucket: string): ModelBucket[] => rows.filter((row) => row.bucket === bucket);
 
 const byModel = (rows: ModelTotals[]): ModelTotals[] => {
   const merged = new Map<string, ModelTotals[]>();
@@ -764,22 +751,34 @@ const inBand = (band: Band, bands: Band[], totals: ModelTotals): boolean =>
 const bandCost = (band: Band, bands: Band[], models: ModelTotals[]): number =>
   models.filter((model) => inBand(band, bands, model)).reduce((sum, model) => sum + (costOf(model) ?? 0), 0);
 
-// One bucket per column, already picked by the caller, so the same bands stack over days and over
-// months without the band logic learning what a bucket is.
-const costSeries = (bands: Band[], buckets: ModelTotals[][]): Series[] =>
+const costSeries = (rows: ModelBucket[], buckets: string[], bands: Band[]): Series[] =>
   bands.map((band) => ({
     label: band.label,
     color: band.color,
-    values: buckets.map((rows) => bandCost(band, bands, rows)),
+    values: buckets.map((bucket) => bandCost(band, bands, inBucket(rows, bucket))),
   }));
 
-const perDay = (rows: ModelDay[], days: string[], pick: (counts: TokenCounts) => number): number[] =>
-  days.map((day) => onDay(rows, day).reduce((sum, row) => sum + pick(row), 0));
+const perBucket = (rows: ModelBucket[], buckets: string[], pick: (counts: TokenCounts) => number): number[] =>
+  buckets.map((bucket) => inBucket(rows, bucket).reduce((sum, row) => sum + pick(row), 0));
 
 const cacheHit = (counts: TokenCounts): number => {
   const fresh = counts.inputTokens + counts.cacheReadTokens;
   return fresh === 0 ? 0 : counts.cacheReadTokens / fresh;
 };
+
+interface Graded {
+  bucket: string;
+  counts: TokenCounts;
+  hit: number;
+}
+
+// A bucket that read nothing out of its cache is a real zero and belongs in the grading; one with
+// no fresh input at all has no ratio to grade, so it is left out rather than shown as 0%.
+const gradedBuckets = (rows: ModelBucket[], buckets: string[]): Graded[] =>
+  buckets
+    .map((bucket) => ({ bucket, counts: totalled(inBucket(rows, bucket)) }))
+    .filter((entry) => entry.counts.inputTokens + entry.counts.cacheReadTokens > 0)
+    .map((entry) => ({ ...entry, hit: cacheHit(entry.counts) }));
 
 // A null change means there is nothing earlier to divide by, which the strip says plainly rather
 // than dressing a first week up as growth.
@@ -882,7 +881,7 @@ export const statsPage = (email: string, live: Live, stats: Stats, now: number):
   const bands = bandsOf(monthModels);
   const monthCost = spent(monthModels);
 
-  const todayRows = onDay(stats.usage, today);
+  const todayRows = inBucket(stats.usage, today);
   const todayCounts = totalled(todayRows);
   const todayCost = spent(byModel(todayRows));
   const weekRows = within(stats.usage, week.from, week.to);
@@ -910,34 +909,18 @@ ${kpi("Sessions today", String(sessionsToday), trend(relative(sessionsToday, ses
 
   const fortnightRows = within(stats.usage, fortnight.from, fortnight.to);
   const peak = fortnight.days
-    .map((day) => ({ day, cost: spent(byModel(onDay(stats.usage, day))) }))
+    .map((day) => ({ day, cost: spent(byModel(inBucket(stats.usage, day))) }))
     .reduce((best, entry) => (entry.cost > best.cost ? entry : best), { cost: 0, day: today });
   const costBars = frame(
     "Cost per day",
     `${USAGE_CHART_DAYS} days`,
-    `${legend(bands)}${stackedBars(
-      dayTicks(fortnight.days),
-      costSeries(
-        bands,
-        fortnight.days.map((day) => onDay(fortnightRows, day)),
-      ),
-      "Cost per day, stacked by model",
-      money,
-    )}
+    `${legend(bands)}${stackedBars(fortnight.days, "days", costSeries(fortnightRows, fortnight.days, bands), "Cost per day, stacked by model", money)}
 <p class="cfoot">${escapeHtml(`list price · peak ${peak.day} ${money(peak.cost)}`)}</p>`,
   );
   const costArea = frame(
     `Cost · ${USAGE_MONTH_DAYS} days`,
     "stacked by model",
-    stackedArea(
-      month.days,
-      costSeries(
-        bands,
-        month.days.map((day) => onDay(stats.usage, day)),
-      ),
-      "Cost over 30 days, stacked by model",
-      money,
-    ),
+    stackedArea(month.days, costSeries(stats.usage, month.days, bands), "Cost over 30 days, stacked by model", money),
   );
   const mix = frame(
     "Model mix",
@@ -955,9 +938,9 @@ ${kpi("Sessions today", String(sessionsToday), trend(relative(sessionsToday, ses
 <table class="mixtable"><tr><th>Model</th><th class="r">Tokens</th><th class="r">Cost</th><th class="r">Share</th></tr>${mixRows(monthModels, bands, monthCost)}</table>`,
   );
 
-  const inputs = perDay(fortnightRows, fortnight.days, (counts) => counts.inputTokens);
-  const outputs = perDay(fortnightRows, fortnight.days, (counts) => counts.outputTokens);
-  const reads = perDay(fortnightRows, fortnight.days, (counts) => counts.cacheReadTokens);
+  const inputs = perBucket(fortnightRows, fortnight.days, (counts) => counts.inputTokens);
+  const outputs = perBucket(fortnightRows, fortnight.days, (counts) => counts.outputTokens);
+  const reads = perBucket(fortnightRows, fortnight.days, (counts) => counts.cacheReadTokens);
   const small = `<div class="charts trio">
 ${frame("Tokens in", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight.days, inputs, "Input tokens per day", tokens(inputs.at(-1) ?? 0))}<p class="cfoot">fresh input, excluding cache reads</p>`)}
 ${frame("Tokens out", `${USAGE_CHART_DAYS} days`, `${miniBars(fortnight.days, outputs, "Output tokens per day", tokens(outputs.at(-1) ?? 0))}<p class="cfoot">completion tokens</p>`)}
@@ -1027,13 +1010,21 @@ const repoBars = (repos: RepoHours[], label: string): string =>
     label,
   );
 
-// The rollup answers oldest month first, so the axis runs from the first month it holds to the
-// current one — the same end every window on the dashboard stops at.
-const monthSpan = (monthly: ModelMonth[], now: number): string[] =>
-  monthsBetween(monthly[0]?.month ?? "", usageMonth(now));
+interface LongHorizon {
+  months: string[];
+  monthly: ModelBucket[];
+}
 
-const monthlyCost = (monthly: ModelMonth[], months: string[]): string => {
-  if (months.length === 0) {
+// Every number beside the axis reads the rows of the months on it, so a delta dated ahead of today
+// cannot lift a headline above the bars.
+const longHorizon = (monthly: ModelBucket[], now: number): LongHorizon => {
+  const months = monthsBetween(monthly[0]?.bucket ?? "", usageMonth(now));
+  return { months, monthly: within(monthly, months[0] ?? "", months.at(-1) ?? "") };
+};
+
+const monthlyCost = (horizon: LongHorizon): string => {
+  const { months, monthly } = horizon;
+  if (monthly.length === 0) {
     return emptyState(
       "No month of usage is on record yet.",
       "A month appears here as soon as a session reports the tokens it spent.",
@@ -1049,29 +1040,14 @@ const monthlyCost = (monthly: ModelMonth[], months: string[]): string => {
   }
   const bands = bandsOf(models);
   const peak = months
-    .map((month) => ({ month, models: byModel(inMonth(monthly, month)) }))
-    .reduce((best, entry) => (spent(entry.models) > spent(best.models) ? entry : best), {
-      month: months[0] ?? "",
-      models: [] as ModelTotals[],
-    });
-  return `${legend(bands)}${stackedBars(
-    monthTicks(months),
-    costSeries(
-      bands,
-      months.map((month) => inMonth(monthly, month)),
-    ),
-    "Cost by month, stacked by model",
-    money,
-  )}
+    .map((month) => ({ month, models: byModel(inBucket(monthly, month)) }))
+    .reduce((best, entry) => (spent(entry.models) > spent(best.models) ? entry : best));
+  return `${legend(bands)}${stackedBars(months, "months", costSeries(monthly, months, bands), "Cost by month, stacked by model", money)}
 <p class="callout"><strong>${escapeHtml(totalCost(models))}</strong> and ${escapeHtml(tokens(countedTokens(totalled(monthly))))} tokens over ${months.length} ${months.length === 1 ? "month" : "months"}, peaking in <strong>${escapeHtml(peak.month)}</strong> at ${escapeHtml(totalCost(peak.models))}.</p>`;
 };
 
-// A month that read nothing out of cache is a real zero and belongs on the axis; a month with no
-// fresh input at all has no ratio to grade, so it is left off rather than drawn as 0%.
-const cacheDrift = (monthly: ModelMonth[], months: string[]): string => {
-  const graded = months
-    .map((month) => ({ month, counts: totalled(inMonth(monthly, month)) }))
-    .filter((entry) => entry.counts.inputTokens + entry.counts.cacheReadTokens > 0);
+const cacheDrift = (horizon: LongHorizon): string => {
+  const graded = gradedBuckets(horizon.monthly, horizon.months);
   const first = graded[0];
   const last = graded.at(-1);
   if (first === undefined || last === undefined) {
@@ -1081,17 +1057,18 @@ const cacheDrift = (monthly: ModelMonth[], months: string[]): string => {
     );
   }
   const drift =
-    first.month === last.month
-      ? `<strong>${escapeHtml(first.month)}</strong> is the only month with input to grade, at ${percent(cacheHit(first.counts), 1)}.`
-      : `The hit rate went from <strong>${percent(cacheHit(first.counts), 1)}</strong> in ${escapeHtml(first.month)} to <strong>${percent(cacheHit(last.counts), 1)}</strong> in ${escapeHtml(last.month)}.`;
+    first.bucket === last.bucket
+      ? `<strong>${escapeHtml(first.bucket)}</strong> is the only month with input to grade, at ${percent(first.hit, 1)}.`
+      : `The hit rate went from <strong>${percent(first.hit, 1)}</strong> in ${escapeHtml(first.bucket)} to <strong>${percent(last.hit, 1)}</strong> in ${escapeHtml(last.bucket)}.`;
   return `${horizontalBars(
     graded.map((entry) => ({
-      label: entry.month,
-      title: `${entry.month} · ${tokens(entry.counts.cacheReadTokens)} cached of ${tokens(entry.counts.inputTokens + entry.counts.cacheReadTokens)}`,
-      value: cacheHit(entry.counts),
-      text: percent(cacheHit(entry.counts), 1),
+      label: entry.bucket,
+      title: `${entry.bucket} · ${tokens(entry.counts.cacheReadTokens)} cached of ${tokens(entry.counts.inputTokens + entry.counts.cacheReadTokens)}`,
+      value: entry.hit,
+      text: percent(entry.hit, 1),
     })),
     "Cache hit rate by month",
+    1,
   )}<p class="callout">${drift}</p>`;
 };
 
@@ -1102,8 +1079,9 @@ const busiestRepos = (repos: RepoHours[]): string => {
   }
   const ms = repos.reduce((sum, repo) => sum + repo.ms, 0);
   const sessions = repos.reduce((sum, repo) => sum + repo.sessions, 0);
+  const held = repos.length === 1 ? "the one repo on record holds" : `these ${repos.length} repos hold`;
   return `${repoBars(repos, "Session time by repo, all time")}
-<p class="callout"><strong>${escapeHtml(repoLabel(leader.repo))}</strong> took ${escapeHtml(roundHours(leader.ms))} of the ${escapeHtml(roundHours(ms))} these ${repos.length} ${repos.length === 1 ? "repo holds" : "repos hold"}, over ${sessions} ${sessions === 1 ? "session" : "sessions"}.</p>`;
+<p class="callout"><strong>${escapeHtml(repoLabel(leader.repo))}</strong> took ${escapeHtml(roundHours(leader.ms))} of the ${escapeHtml(roundHours(ms))} ${held}, over ${sessions} ${sessions === 1 ? "session" : "sessions"}.</p>`;
 };
 
 export const insightsPage = (email: string, live: Live, insights: Insights, now: number): Response => {
@@ -1149,22 +1127,17 @@ export const insightsPage = (email: string, live: Live, insights: Insights, now:
     const price = priceOf(row.provider, row.model);
     return price === null ? sum : sum + (row.cacheReadTokens * (price.input - price.cacheRead)) / MILLION;
   }, 0);
-  // A day that read nothing out of cache is a real zero and belongs in the ranking; a day with no
-  // input at all has no ratio to rank. One graded day is both the best and the worst, which says
-  // nothing, so the pair appears only once there are two days to tell apart.
-  const graded = fortnight.days
-    .map((day) => ({ day, counts: totalled(onDay(insights.usage, day)) }))
-    .filter((entry) => entry.counts.inputTokens + entry.counts.cacheReadTokens > 0)
-    .map((entry) => ({ day: entry.day, hit: cacheHit(entry.counts) }))
-    .sort((left, right) => left.hit - right.hit);
-  const worst = graded[0];
-  const best = graded.at(-1);
+  // One graded day is both the best and the worst, which says nothing, so the pair appears only
+  // once there are two days to tell apart.
+  const ranked = gradedBuckets(insights.usage, fortnight.days).sort((left, right) => left.hit - right.hit);
+  const worst = ranked[0];
+  const best = ranked.at(-1);
   const extremes =
-    best === undefined || worst === undefined || best.day === worst.day
+    best === undefined || worst === undefined || best.bucket === worst.bucket
       ? []
       : [
-          { name: "Best day", value: `${best.day} · ${percent(best.hit, 1)}`, warn: false },
-          { name: "Worst day", value: `${worst.day} · ${percent(worst.hit, 1)}`, warn: true },
+          { name: "Best day", value: `${best.bucket} · ${percent(best.hit, 1)}`, warn: false },
+          { name: "Worst day", value: `${worst.bucket} · ${percent(worst.hit, 1)}`, warn: true },
         ];
   const cache =
     counts.cacheReadTokens === 0
@@ -1196,7 +1169,7 @@ export const insightsPage = (email: string, live: Live, insights: Insights, now:
       : `${repoBars(insights.repos, "Session time by repo")}
 <p class="callout"><strong>${escapeHtml(repoLabel(leader?.repo ?? ""))}</strong> took ${escapeHtml(roundHours(leader?.ms ?? 0))} of the fortnight's ${escapeHtml(roundHours(totalMs))} of session time.</p>`;
 
-  const months = monthSpan(insights.monthly, now);
+  const horizon = longHorizon(insights.monthly, now);
 
   return shell(
     email,
@@ -1214,9 +1187,9 @@ ${insightCard("The rhythm", `sessions by hour and weekday · ${USAGE_CHART_DAYS}
 ${insightCard("Where the hours went", `session time by repo · ${USAGE_CHART_DAYS} days`, hours)}
 </div>
 <div class="charts trio">
-${insightCard("Month by month", "cost by model · every month on record", monthlyCost(insights.monthly, months))}
+${insightCard("Month by month", "cost by model · every month on record", monthlyCost(horizon))}
 ${insightCard("Busiest repos", "session time · every session on record", busiestRepos(insights.allTime))}
-${insightCard("Cache drift", "hit rate by month · every month on record", cacheDrift(insights.monthly, months))}
+${insightCard("Cache drift", "hit rate by month · every month on record", cacheDrift(horizon))}
 </div>`,
   );
 };

@@ -245,9 +245,10 @@ export const createApp = (deps: Deps): App => {
 
   const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
     if (request.method !== "POST") return error(405, "method not allowed");
-    const input = parseUsage(await readJson(request));
+    const now = deps.now();
+    const input = parseUsage(await readJson(request), now);
     if (!input.ok) return error(400, input.error);
-    await recordUsage(db, caller.userId, sessionId, input.value, deps.now());
+    await recordUsage(db, caller.userId, sessionId, input.value, now);
     return new Response(null, { status: 204 });
   };
 

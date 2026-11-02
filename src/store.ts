@@ -444,8 +444,7 @@ type CountRow = {
 };
 
 type ModelRow = CountRow & { provider: string; model: string };
-type ModelDayRow = ModelRow & { day: string };
-type ModelMonthRow = ModelRow & { month: string };
+type ModelBucketRow = ModelRow & { bucket: string };
 type SplitRow = ModelRow & { field: UsageSplitField; value: string };
 type SessionsRow = { day: string; sessions: number };
 type LiveRow = { sessions: number; busy: number; sessions_today: number };
@@ -494,9 +493,9 @@ const toModelTotals = (row: ModelRow): ModelTotals => ({
 const usageDaysStatement = (db: D1Database, userId: string, fromDay: string): D1PreparedStatement =>
   db
     .prepare(
-      `SELECT day, provider, model, ${COUNT_SUMS} FROM usage_daily
+      `SELECT day AS bucket, provider, model, ${COUNT_SUMS} FROM usage_daily
        WHERE user_id = ?1 AND day >= ?2
-       GROUP BY day, provider, model ORDER BY day, provider, model`,
+       GROUP BY bucket, provider, model ORDER BY bucket, provider, model`,
     )
     .bind(userId, fromDay);
 
@@ -505,9 +504,9 @@ const usageDaysStatement = (db: D1Database, userId: string, fromDay: string): D1
 const usageMonthsStatement = (db: D1Database, userId: string): D1PreparedStatement =>
   db
     .prepare(
-      `SELECT substr(day, 1, 7) AS month, provider, model, ${COUNT_SUMS} FROM usage_daily
+      `SELECT substr(day, 1, 7) AS bucket, provider, model, ${COUNT_SUMS} FROM usage_daily
        WHERE user_id = ?1
-       GROUP BY month, provider, model ORDER BY month, provider, model`,
+       GROUP BY bucket, provider, model ORDER BY bucket, provider, model`,
     )
     .bind(userId);
 
@@ -634,7 +633,7 @@ export const readStats = async (db: D1Database, userId: string, windows: StatsWi
   ]);
   return {
     windows,
-    usage: resultRows<ModelDayRow>(usage).map((row) => ({ day: row.day, ...toModelTotals(row) })),
+    usage: resultRows<ModelBucketRow>(usage).map((row) => ({ bucket: row.bucket, ...toModelTotals(row) })),
     splits: resultRows<SplitRow>(splits).map((row) => ({
       field: row.field,
       value: row.value,
@@ -670,8 +669,8 @@ export const readInsights = async (
   const staleRows = resultRows<StaleRow>(stale);
   return {
     fortnight,
-    usage: resultRows<ModelDayRow>(usage).map((row) => ({ day: row.day, ...toModelTotals(row) })),
-    monthly: resultRows<ModelMonthRow>(monthly).map((row) => ({ month: row.month, ...toModelTotals(row) })),
+    usage: resultRows<ModelBucketRow>(usage).map((row) => ({ bucket: row.bucket, ...toModelTotals(row) })),
+    monthly: resultRows<ModelBucketRow>(monthly).map((row) => ({ bucket: row.bucket, ...toModelTotals(row) })),
     working: {
       entries: recalls.map((row) => ({ name: row.name, recalls: row.recall_count })),
       recalls: recalls[0]?.total_recalls ?? 0,

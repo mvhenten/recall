@@ -603,19 +603,22 @@ const statsTab = async (h: Harness, who: Reporter): Promise<string> => {
   return plain(await response.text());
 };
 
-const insightsTab = async (h: Harness, who: Reporter): Promise<string> => {
+const insightsHtml = async (h: Harness, who: Reporter): Promise<string> => {
   const response = await open(h, "/dashboard/insights", who.assertion);
   expect(response.status).toBe(200);
-  return plain(await response.text());
+  return response.text();
 };
 
-// Insights renders every card into the one page, and the fortnight panels sit beside the all-time
-// ones, so a negative about a window has to be read off that window's own card.
-const cardText = (html: string, title: string, nextTitle: string): string => {
-  const start = html.indexOf(title);
-  const end = html.indexOf(nextTitle, start + title.length);
-  if (start < 0 || end < 0) throw new Error(`the insights page shows no ${title} card before ${nextTitle}`);
-  return html.slice(start, end);
+const insightsTab = async (h: Harness, who: Reporter): Promise<string> => plain(await insightsHtml(h, who));
+
+// The track a horizontal bar is drawn on, in the chart's own units. A rate is a share of the whole
+// track, so reading one bar's end back is the only way to tell that scale from a max-relative one.
+const TRACK = 186;
+
+const barShare = (html: string, label: string): number => {
+  const row = new RegExp(`>${label}</text><path d="M160,\\d+ L([\\d.]+),`).exec(html);
+  if (!row?.[1]) throw new Error(`no bar is drawn for ${label}`);
+  return (Number(row[1]) + 3 - 160) / TRACK;
 };
 
 const eventCount = async (userId: string): Promise<number> => {
@@ -801,11 +804,10 @@ describe("the insights tab", () => {
       lastActivityAt: NOON,
     });
 
-    const hours = cardText(await insightsTab(h, owner), "Where the hours went", "Month by month");
-    expect(hours).toContain("acme/infra 3h");
-    expect(hours).toContain("acme/app 2h");
-    expect(hours).toContain("acme/infra took 3h of the fortnight's 5h of session time.");
-    expect(hours).not.toContain("26h");
+    const html = await insightsTab(h, owner);
+    expect(html).toContain("acme/infra 3h");
+    expect(html).toContain("acme/app 2h");
+    expect(html).toContain("acme/infra took 3h of the fortnight's 5h of session time.");
   });
 
   it("finds the busiest hour of the week", async () => {
@@ -924,7 +926,7 @@ describe("the long horizon on the insights tab", () => {
     expect(html).not.toContain("peaking in");
   });
 
-  it("ranks every repo by session time ever recorded, where the fortnight only lends its own stretch", async () => {
+  it("ranks every repo by all the session time on record, clipping a span that runs past now", async () => {
     const h = await harness();
     const owner = await reporting(h);
     h.tick(NOON - h.now());
@@ -943,10 +945,16 @@ describe("the long horizon on the insights tab", () => {
       startedAt: NOON - 2 * 3_600_000,
       lastActivityAt: NOON,
     });
+    await owner.client.sync("ahead001", {
+      repo: "repo:github.com/acme/ahead",
+      startedAt: NOON - 3_600_000,
+      lastActivityAt: NOON + 5 * 3_600_000,
+    });
 
     const html = await insightsTab(h, owner);
-    expect(html).toContain("acme/old took 7h of the 13h these 2 repos hold, over 3 sessions.");
-    expect(html).toContain("acme/app took 6h of the fortnight's 6h of session time.");
+    expect(html).toContain("acme/old took 7h of the 14h these 3 repos hold, over 4 sessions.");
+    expect(html).toContain("acme/ahead 1h");
+    expect(html).not.toContain("acme/ahead 6h");
   });
 
   it("grades the cache hit rate by month, leaving out a month with no input to grade", async () => {
@@ -958,11 +966,14 @@ describe("the long horizon on the insights tab", () => {
     await spend({ at: OCTOBER_LAST, outputTokens: 1_000_000 });
     await spend({ at: NOON, inputTokens: 1_000_000, cacheReadTokens: 9_000_000 });
 
-    const html = await insightsTab(h, owner);
+    const raw = await insightsHtml(h, owner);
+    const html = plain(raw);
     expect(html).toContain("2026-09 50.0%");
     expect(html).toContain("2026-11 90.0%");
     expect(html).toContain("The hit rate went from 50.0% in 2026-09 to 90.0% in 2026-11.");
     expect(html).not.toContain("2026-10 0.0%");
+    expect(barShare(raw, "2026-09")).toBeCloseTo(0.5, 2);
+    expect(barShare(raw, "2026-11")).toBeCloseTo(0.9, 2);
   });
 
   it("names the one month on record rather than a drift between two", async () => {
