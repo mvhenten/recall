@@ -67,6 +67,8 @@ const SESSION_DOCUMENT: Record<string, unknown> = {
 
 const USAGE_DELTA: Record<string, unknown> = {
   seq: 1,
+  host: "laptop",
+  repo: "repo:github.com/mvhenten/recall",
   provider: "anthropic",
   account: "work",
   model: "claude-opus-4",

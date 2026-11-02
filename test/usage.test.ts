@@ -94,16 +94,31 @@ describe("usage", () => {
     ]);
   });
 
-  it("takes the host and repo from the session, so the client sends counters and nothing else", async () => {
+  it("counts a delta from its own host and repo, even when the session is gone", async () => {
     const h = await harness();
     const { userId, client } = await account(h, "usage");
-    await client.sync("s-1", { host: "tower", repo: "repo:github.com/mvhenten/other" });
 
-    expect((await client.usage("s-1", { host: "laptop", repo: "repo:elsewhere", at: DAY_ONE })).status).toBe(204);
+    const response = await client.usage("s-ended", {
+      host: "tower",
+      repo: "repo:github.com/mvhenten/other",
+      at: DAY_ONE,
+    });
 
+    expect(response.status).toBe(204);
     expect((await daily(userId)).map((row) => [row.host, row.repo])).toEqual([
       ["tower", "repo:github.com/mvhenten/other"],
     ]);
+  });
+
+  it("keeps the first numbers for a seq when a retry disagrees", async () => {
+    const h = await harness();
+    const { userId, client } = await account(h, "usage");
+
+    expect((await client.usage("s-1", { seq: 1, at: DAY_ONE, inputTokens: 120 })).status).toBe(204);
+    expect((await client.usage("s-1", { seq: 1, at: DAY_ONE, inputTokens: 999 })).status).toBe(204);
+
+    expect((await events(userId)).map((row) => row.seq)).toEqual([1]);
+    expect((await daily(userId)).map((row) => row.input_tokens)).toEqual([120]);
   });
 
   it("refuses a delta it cannot count", async () => {
@@ -113,7 +128,10 @@ describe("usage", () => {
 
     expect((await client.usage("s-1", { seq: -1 })).status).toBe(400);
     expect((await client.usage("s-1", { seq: 1.5 })).status).toBe(400);
+    expect((await client.usage("s-1", { host: "" })).status).toBe(400);
+    expect((await client.usage("s-1", { repo: 7 })).status).toBe(400);
     expect((await client.usage("s-1", { provider: "" })).status).toBe(400);
+    expect((await client.usage("s-1", { account: "" })).status).toBe(400);
     expect((await client.usage("s-1", { model: "" })).status).toBe(400);
     expect((await client.usage("s-1", { account: 7 })).status).toBe(400);
     expect((await client.usage("s-1", { inputTokens: -1 })).status).toBe(400);
@@ -133,15 +151,12 @@ describe("usage", () => {
     const h = await harness();
     const mine = await account(h, "mine");
     const theirs = await account(h, "theirs");
-    await mine.client.sync("s-shared");
-    await theirs.client.sync("s-theirs");
 
     expect((await mine.client.usage("s-shared", { seq: 1, at: DAY_ONE })).status).toBe(204);
-    expect((await theirs.client.usage("s-shared", { seq: 1, at: DAY_ONE })).status).toBe(404);
-    expect((await theirs.client.usage("s-theirs", { seq: 1, at: DAY_ONE, inputTokens: 1 })).status).toBe(204);
+    expect((await theirs.client.usage("s-shared", { seq: 1, at: DAY_ONE, inputTokens: 1 })).status).toBe(204);
 
     expect((await events(mine.userId)).map((row) => row.session_id)).toEqual(["s-shared"]);
-    expect((await events(theirs.userId)).map((row) => row.session_id)).toEqual(["s-theirs"]);
+    expect((await events(theirs.userId)).map((row) => row.session_id)).toEqual(["s-shared"]);
     expect((await daily(mine.userId))[0]?.input_tokens).toBe(120);
     expect((await daily(theirs.userId))[0]?.input_tokens).toBe(1);
   });

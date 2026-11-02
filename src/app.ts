@@ -230,9 +230,7 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "POST") return error(405, "method not allowed");
     const input = parseUsage(await readJson(request));
     if (!input.ok) return error(400, input.error);
-    if (!(await recordUsage(db, caller.userId, sessionId, input.value, deps.now()))) {
-      return error(404, `no session ${sessionId}`);
-    }
+    await recordUsage(db, caller.userId, sessionId, input.value, deps.now());
     return new Response(null, { status: 204 });
   };
 

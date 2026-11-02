@@ -11,10 +11,11 @@ CREATE TABLE usage_events (
   cache_write_tokens INTEGER NOT NULL,
   cache_read_tokens INTEGER NOT NULL,
   at INTEGER NOT NULL,
+  recorded_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, session_id, seq)
 );
 
-CREATE INDEX usage_events_by_user_age ON usage_events (user_id, at);
+CREATE INDEX usage_events_by_user_recorded ON usage_events (user_id, recorded_at);
 
 CREATE TABLE usage_daily (
   user_id TEXT NOT NULL,

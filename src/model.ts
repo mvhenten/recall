@@ -104,10 +104,11 @@ export interface Session extends SessionInput {
 // dropped and every window wider than that reads only usage_daily.
 export const USAGE_RETENTION_MS = 1_209_600_000;
 export const MAX_USAGE_TOKENS = 1_000_000_000;
-const MAX_EPOCH_MS = 8_640_000_000_000_000;
 
 export interface UsageInput {
   seq: number;
+  host: string;
+  repo: string;
   provider: string;
   account: string;
   model: string;
@@ -119,8 +120,6 @@ export interface UsageInput {
   at: number;
 }
 
-// The UTC day a delta rolls into. A session that runs through midnight sends deltas on both sides
-// of it, and each one carries the `at` that decides which day it joins.
 export const usageDay = (at: number): string => new Date(at).toISOString().slice(0, 10);
 
 // The handle that addresses one session: its device name and the head of its session id. It is a
@@ -283,20 +282,26 @@ export const parseSession = (body: unknown): Parsed<SessionInput> => {
 
 export const parseUsage = (body: unknown): Parsed<UsageInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
-  const { seq, provider, account, model, prompts, at } = body;
+  const { seq, host, repo, provider, account, model, prompts, at } = body;
   const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
   if (!isInteger(seq, 0, Number.MAX_SAFE_INTEGER)) return fail("seq must be the whole number of a delta in a session");
+  if (!isText(host, MAX_SESSION_TEXT_CHARS) || host.length < 1) {
+    return fail(`host must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
+  }
+  if (!isText(repo, MAX_SESSION_TEXT_CHARS)) {
+    return fail(`repo must be a string of at most ${MAX_SESSION_TEXT_CHARS} characters, empty when it does not apply`);
+  }
   if (!isText(provider, MAX_SESSION_TEXT_CHARS) || provider.length < 1) {
     return fail(`provider must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
   }
   if (!isText(model, MAX_SESSION_TEXT_CHARS) || model.length < 1) {
     return fail(`model must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
   }
-  if (!isText(account, MAX_SESSION_TEXT_CHARS)) {
-    return fail(`account must be a string of at most ${MAX_SESSION_TEXT_CHARS} characters, empty when unknown`);
+  if (!isText(account, MAX_SESSION_TEXT_CHARS) || account.length < 1) {
+    return fail(`account must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
   }
   if (!isInteger(prompts, 0, MAX_PROMPTS)) return fail(`prompts must be a whole number from 0 to ${MAX_PROMPTS}`);
-  if (!isInteger(at, 0, MAX_EPOCH_MS)) return fail("at must be a whole number of epoch milliseconds");
+  if (!isInteger(at, 0, Number.MAX_SAFE_INTEGER)) return fail("at must be a whole number of epoch milliseconds");
   const counter = (value: unknown): value is number => isInteger(value, 0, MAX_USAGE_TOKENS);
   if (!counter(inputTokens) || !counter(outputTokens) || !counter(cacheWriteTokens) || !counter(cacheReadTokens)) {
     return fail(
@@ -305,6 +310,19 @@ export const parseUsage = (body: unknown): Parsed<UsageInput> => {
   }
   return {
     ok: true,
-    value: { seq, provider, account, model, prompts, at, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens },
+    value: {
+      seq,
+      host,
+      repo,
+      provider,
+      account,
+      model,
+      prompts,
+      at,
+      inputTokens,
+      outputTokens,
+      cacheWriteTokens,
+      cacheReadTokens,
+    },
   };
 };
