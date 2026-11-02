@@ -423,6 +423,7 @@ mod tests {
                 focus: sessions::Focus::default(),
                 mode: "interactive".to_string(),
                 permission_mode: "default".to_string(),
+                usage_pending: None,
                 state,
             },
         }

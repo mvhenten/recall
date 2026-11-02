@@ -234,6 +234,18 @@ pub struct SessionBody<'a> {
     pub pid: i64,
 }
 
+/// One usage delta. `host` and `repo` ride along rather than being read from the session row, so
+/// a session that already ended still has its closing tokens counted under the host that spent
+/// them.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageBody<'a> {
+    pub host: &'a str,
+    pub repo: &'a str,
+    #[serde(flatten)]
+    pub event: &'a crate::sessions::UsageEvent,
+}
+
 #[derive(Deserialize)]
 struct Sessions {
     sessions: Vec<Session>,
@@ -440,6 +452,17 @@ impl Client {
         Ok(())
     }
 
+    pub fn post_usage(&self, session_id: &str, body: &UsageBody) -> Result<()> {
+        let response = self
+            .authed(
+                self.agent
+                    .post(self.url(&format!("{}/usage", Self::session_path(session_id)))),
+            )
+            .send_json(body)?;
+        check(response, &format!("posting usage for session {session_id}"))?;
+        Ok(())
+    }
+
     pub fn end_session(&self, session_id: &str) -> Result<bool> {
         let response = self
             .authed(self.agent.delete(self.url(&Self::session_path(session_id))))
@@ -575,5 +598,45 @@ mod tests {
             .to_string();
         assert!(error.contains("ambiguous target laptop-c4e2"), "{error}");
         assert!(error.contains("c4e21a99, c4e2ff00"), "{error}");
+    }
+
+    #[test]
+    fn a_usage_delta_is_sent_as_the_host_and_repo_around_what_the_record_holds() {
+        let event = crate::sessions::UsageEvent {
+            seq: 1200,
+            provider: "claude".to_string(),
+            account: "you@example.com".to_string(),
+            model: "claude-opus-4".to_string(),
+            prompts: 2,
+            at: 1_762_000_050_000,
+            input_tokens: 11,
+            output_tokens: 22,
+            cache_write_tokens: 33,
+            cache_read_tokens: 44,
+        };
+        let body = UsageBody {
+            host: "laptop",
+            repo: "repo:github.com/mvhenten/recall",
+            event: &event,
+        };
+
+        let sent: serde_json::Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "host": "laptop",
+                "repo": "repo:github.com/mvhenten/recall",
+                "seq": 1200,
+                "provider": "claude",
+                "account": "you@example.com",
+                "model": "claude-opus-4",
+                "prompts": 2,
+                "at": 1_762_000_050_000_i64,
+                "inputTokens": 11,
+                "outputTokens": 22,
+                "cacheWriteTokens": 33,
+                "cacheReadTokens": 44,
+            })
+        );
     }
 }

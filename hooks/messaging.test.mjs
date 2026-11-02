@@ -18,6 +18,7 @@ import {
   touch,
   truncate,
   unregister,
+  writeRecord,
 } from "./messaging.mjs";
 
 const INBOX = {
@@ -78,7 +79,9 @@ test("a session registers one document the daemon and recall sessions both read"
   assert.equal(runtimeDir({}, 1000), path.join(tmpdir(), "recall-1000"));
 
   const cwd = repository(path.join(dir, "work"), "feat(sessions): list every host's sessions");
-  assert.equal(register("s-1", cwd, REPO, "acceptEdits", env), "registered");
+  const transcriptPath = path.join(dir, "s-1.jsonl");
+  writeFileSync(transcriptPath, `${JSON.stringify({ type: "summary" })}\n`);
+  assert.equal(register("s-1", { cwd, repo: REPO, permissionMode: "acceptEdits", transcriptPath }, env), "registered");
   const file = registryPath("s-1", env);
   const stored = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(stored, {
@@ -99,6 +102,9 @@ test("a session registers one document the daemon and recall sessions both read"
     focus: { first: "", latest: "" },
     mode: stored.mode,
     permissionMode: "acceptEdits",
+    transcriptPath,
+    usageOffset: statSync(transcriptPath).size,
+    usageMessageId: "",
   });
   assert.equal(Math.abs(Date.now() - stored.startedAt) < 60_000, true, "the start is epoch milliseconds");
   assert.equal(sessionPid(env), 42, "a registered session takes its pid from the socket name");
@@ -116,7 +122,7 @@ test("a session the hook passed over is recorded with the reason, a live pid and
   const { dir, env } = sandbox();
   const noInbox = { XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR };
 
-  assert.equal(register("s-2", "/tmp", REPO, "default", noInbox), "no-inbox");
+  assert.equal(register("s-2", { cwd: "/tmp", repo: REPO, permissionMode: "default" }, noInbox), "no-inbox");
   const skipped = JSON.parse(readFileSync(registryPath("s-2", env), "utf8"));
   assert.deepEqual(
     { state: skipped.state, cwd: skipped.cwd, repo: skipped.repo },
@@ -125,12 +131,17 @@ test("a session the hook passed over is recorded with the reason, a live pid and
   assert.equal(existsSync(`/proc/${skipped.pid}`), true, "the recorded pid outlives the hook");
 
   const parentSocket = { ...env, CLAUDE_CODE_MESSAGING_SOCKET: "/run/cc-socks/parent.sock" };
-  assert.equal(register("s-3", "/tmp", REPO, "default", parentSocket), "no-inbox");
+  assert.equal(register("s-3", { cwd: "/tmp", repo: REPO, permissionMode: "default" }, parentSocket), "no-inbox");
 
-  record("s-4", { state: "off" }, "/tmp", "", "default", env);
+  record("s-4", { state: "off" }, { cwd: "/tmp", repo: "", permissionMode: "default" }, env);
   assert.equal(JSON.parse(readFileSync(registryPath("s-4", env), "utf8")).state, "off");
 
-  record("s-5", { state: "failed", error: "EACCES, permission denied" }, "/tmp", "", "default", env);
+  record(
+    "s-5",
+    { state: "failed", error: "EACCES, permission denied" },
+    { cwd: "/tmp", repo: "", permissionMode: "default" },
+    env,
+  );
   const failed = JSON.parse(readFileSync(registryPath("s-5", env), "utf8"));
   assert.deepEqual(
     { state: failed.state, error: failed.error, cwd: failed.cwd },
@@ -147,7 +158,8 @@ test("each prompt counts, moves the focus on and reads the head again", () => {
   const first = `${"why does the deploy time out ".repeat(10)}on stage two`;
 
   assert.equal(touch("s-1", "anything", "default", env), undefined, "with no record there is nothing to move on");
-  register("s-1", cwd, REPO, "default", env);
+  const transcriptPath = path.join(dir, "s-1.jsonl");
+  register("s-1", { cwd, repo: REPO, permissionMode: "default", transcriptPath }, env);
   const read = () => JSON.parse(readFileSync(registryPath("s-1", env), "utf8"));
   const started = read().startedAt;
 
@@ -175,6 +187,39 @@ test("each prompt counts, moves the focus on and reads the head again", () => {
     JSON.stringify({ ...stored, syncStartedAt: Date.now() - SYNC_INTERVAL_MS - 1 }),
   );
   assert.deepEqual(touch("s-1", "ship it", "plan", env), { due: true }, "the throttle window has passed");
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("the record says where in the transcript this host's counting has reached", () => {
+  const { dir, env } = sandbox();
+  const transcriptPath = path.join(dir, "s-6.jsonl");
+  writeFileSync(transcriptPath, `${"x".repeat(199)}\n`);
+  const read = () => JSON.parse(readFileSync(registryPath("s-6", env), "utf8"));
+  const session = { cwd: "/tmp", repo: REPO, permissionMode: "default", transcriptPath };
+
+  record("s-6", { state: "off" }, session, env);
+  assert.equal(read().usageOffset, 200, "a session with nothing posted starts at the end of the file it inherits");
+  assert.equal(read().transcriptPath, transcriptPath);
+
+  writeRecord("s-6", { ...read(), usageOffset: 120, usageMessageId: "msg-2", usagePending: { seq: 120 } }, env);
+  touch("s-6", "count what this costs", "default", env);
+  assert.deepEqual(
+    { offset: read().usageOffset, messageId: read().usageMessageId, pending: read().usagePending },
+    { offset: 120, messageId: "msg-2", pending: { seq: 120 } },
+    "a prompt moves the focus on and leaves the counting where it is",
+  );
+
+  record("s-6", { state: "off" }, session, env);
+  assert.deepEqual(
+    { offset: read().usageOffset, messageId: read().usageMessageId, pending: read().usagePending },
+    { offset: 120, messageId: "msg-2", pending: { seq: 120 } },
+    "a session carried on in the same transcript counts on from where it stopped",
+  );
+
+  record("s-6", { state: "off" }, { ...session, transcriptPath: path.join(dir, "s-6-other.jsonl") }, env);
+  assert.equal(read().usageOffset, 0, "another transcript is another count");
+  assert.equal(read().usageMessageId, "");
 
   rmSync(dir, { recursive: true, force: true });
 });

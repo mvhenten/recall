@@ -141,6 +141,13 @@ enum Command {
             help = "Mark the session with this id gone"
         )]
         end: Option<String>,
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = ["sync", "end"],
+            help = "Send the token usage the hooks read out of the transcript of the session with this id"
+        )]
+        usage: Option<String>,
     },
     #[command(about = "Send a message to another host signed in as you, or to one session on it")]
     Send {
@@ -414,6 +421,59 @@ fn sync_session(session_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn send_usage(
+    client: &Client,
+    session_id: &str,
+    host: &str,
+    repo: &str,
+    pending: &sessions::UsagePending,
+) -> Result<()> {
+    for event in &pending.events {
+        client.post_usage(session_id, &api::UsageBody { host, repo, event })?;
+    }
+    println!("sent {} usage deltas for {session_id}", pending.events.len());
+    Ok(())
+}
+
+/// Sends the delta the hooks fixed, then moves the record on. Nothing here reads the transcript:
+/// the stretch to count is the hooks', and a retry must send it byte for byte, because the service
+/// keeps the first delta it saw for a chunk number and ignores a second one carrying other numbers.
+fn post_usage(session_id: &str) -> Result<()> {
+    let dir = listen::sessions_dir();
+    let Some(record) = sessions::record(&dir, session_id) else {
+        bail!("no session {session_id} is registered on this host");
+    };
+    let Some(pending) = record.usage_pending.as_ref() else {
+        println!("no usage to send for {session_id}");
+        return Ok(());
+    };
+    send_usage(
+        &Client::new(config::load()?),
+        session_id,
+        &record.host,
+        &record.repo,
+        pending,
+    )?;
+    sessions::commit_usage(&dir, session_id, pending)
+}
+
+/// The record is what carries a session's closing usage delta, so it is read before it is taken
+/// out, and the delta follows the end: the service counts usage for a session that has already
+/// ended, and nothing holds up the end itself.
+fn end_session(session_id: &str) -> Result<()> {
+    let dir = listen::sessions_dir();
+    let record = sessions::record(&dir, session_id);
+    sessions::forget(&dir, session_id);
+    let client = Client::new(config::load()?);
+    let ended = client.end_session(session_id)?;
+    println!("{} {session_id}", if ended { "ended" } else { "already gone" });
+    let Some(record) = record else { return Ok(()) };
+    let Some(pending) = record.usage_pending.as_ref() else {
+        return Ok(());
+    };
+    send_usage(&client, session_id, &record.host, &record.repo, pending)
+}
+
 /// The hooks start the session commands detached, with no terminal to read their stderr and no
 /// caller to notice their exit code, so the hooks log is the only record that one ran at all.
 fn logged(done: &str, failed: &str, session_id: &str, work: impl FnOnce() -> Result<()>) -> ExitCode {
@@ -516,16 +576,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 listen::run(&settings, ensure)?;
             }
         }
-        Command::Sessions { sync, end } => {
+        Command::Sessions { sync, end, usage } => {
             if let Some(id) = sync {
                 return Ok(logged("synced", "sync-failed", &id, || sync_session(&id)));
             }
             if let Some(id) = end {
-                return Ok(logged("ended", "end-failed", &id, || {
-                    let ended = client()?.end_session(&id)?;
-                    println!("{} {id}", if ended { "ended" } else { "already gone" });
-                    Ok(())
-                }));
+                return Ok(logged("ended", "end-failed", &id, || end_session(&id)));
+            }
+            if let Some(id) = usage {
+                return Ok(logged("usage", "usage-failed", &id, || post_usage(&id)));
             }
             let client = client()?;
             let listed = client.sessions()?;
