@@ -1,6 +1,8 @@
 import {
   dashboardNotice,
   dashboardPage,
+  HISTORY_TAB,
+  historyPage,
   MEMORY_TAB,
   memoriesPage,
   memoryBodyPage,
@@ -37,6 +39,7 @@ import {
   type Live,
   type MemoryHit,
   type MemoryType,
+  parseHistory,
   parseList,
   parseName,
   parseSave,
@@ -56,12 +59,14 @@ import {
   endSession,
   getMemory,
   listMemories,
+  listSessionHistory,
   listSessions,
   memoryCounts,
   putSession,
   recall,
   recordUsage,
   saveMemory,
+  sessionHistoryFilters,
   sessionOnDevice,
   sessionTally,
   textCandidates,
@@ -297,8 +302,26 @@ export const createApp = (deps: Deps): App => {
       return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
     }
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
+    if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
     if (tab.path === SESSIONS_TAB.path) return sessionsPage(email, live, await listSessions(db, userId, now), now);
     return dashboardPage(email, tab, live);
+  };
+
+  const historyTab = async (
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const input = parseHistory(url.searchParams);
+    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
+    const cursor = decodeCursor(input.value.cursor);
+    if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the History tab.");
+    const page = await listSessionHistory(db, userId, input.value, cursor, deps.now());
+    const known = await sessionHistoryFilters(db, userId);
+    return historyPage(email, live, url, input.value, known, page.sessions, page.nextCursor);
   };
 
   const memoryBody = async (

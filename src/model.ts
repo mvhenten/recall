@@ -67,7 +67,8 @@ export const sessionModes = ["interactive", "headless", ""] as const;
 export type SessionMode = (typeof sessionModes)[number];
 
 export const SESSION_TTL_MS = 86_400_000;
-export const SESSION_HISTORY_TTL_MS = 180 * 86_400_000;
+export const SESSION_HISTORY_DAYS = 180;
+export const SESSION_HISTORY_TTL_MS = SESSION_HISTORY_DAYS * 86_400_000;
 // The five minutes of IDLE_AFTER in cli/src/sessions.rs, which is the original: both sides derive
 // busy and idle on read and must agree on where the line falls.
 export const IDLE_AFTER_MS = 300_000;
@@ -104,6 +105,31 @@ export interface Session extends SessionInput {
 export interface Live {
   sessions: number;
   busy: number;
+}
+
+export interface PastSession {
+  sessionId: string;
+  name: string;
+  host: string;
+  repo: string;
+  branch: string;
+  startedAt: number;
+  lastActivityAt: number;
+  prompts: number;
+  focus: Focus;
+  running: boolean;
+}
+
+export interface HistoryFilters {
+  hosts: string[];
+  repos: string[];
+}
+
+export interface HistoryInput {
+  host: string;
+  repo: string;
+  cursor: string;
+  limit: number;
 }
 
 // Raw events are detail and the daily rollup is the long window, so events past two weeks are
@@ -230,6 +256,19 @@ export const parseList = (params: URLSearchParams): Parsed<ListInput> => {
     ok: true,
     value: { tags: tags.value, types: types.value, since, cursor: params.get("cursor") ?? "", limit },
   };
+};
+
+export const HISTORY_PARAMS = ["host", "repo", "limit"] as const;
+
+export const parseHistory = (params: URLSearchParams): Parsed<HistoryInput> => {
+  const host = params.get("host") ?? "";
+  const repo = params.get("repo") ?? "";
+  if (host.length > MAX_SESSION_TEXT_CHARS || repo.length > MAX_SESSION_TEXT_CHARS) {
+    return fail(`host and repo must each hold at most ${MAX_SESSION_TEXT_CHARS} characters`);
+  }
+  const limit = Number(params.get("limit") ?? 20);
+  if (!isInteger(limit, 1, 100)) return fail("limit must be a whole number from 1 to 100");
+  return { ok: true, value: { host, repo, cursor: params.get("cursor") ?? "", limit } };
 };
 
 const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/;

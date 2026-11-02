@@ -1,11 +1,14 @@
 import type { Caller } from "./device";
 import {
+  type HistoryFilters,
+  type HistoryInput,
   IDLE_AFTER_MS,
   type ListInput,
   type Live,
   type Memory,
   type MemoryCounts,
   type MemoryType,
+  type PastSession,
   type SaveInput,
   SESSION_HISTORY_TTL_MS,
   SESSION_TTL_MS,
@@ -103,7 +106,7 @@ export const deleteMemory = async (db: D1Database, userId: string, memoryId: str
   await db.prepare("DELETE FROM memories WHERE user_id = ? AND memory_id = ?").bind(userId, memoryId).run();
 };
 
-const encodeCursor = (memory: Memory): string => btoa(JSON.stringify([memory.createdAt, memory.memoryId]));
+const encodeCursor = (at: number, id: string): string => btoa(JSON.stringify([at, id]));
 
 const readCursorJson = (cursor: string): unknown => {
   try {
@@ -146,7 +149,7 @@ export const listMemories = async (
     .all<MemoryRow>();
   const memories = results.slice(0, input.limit).map(toMemory);
   const last = memories.at(-1);
-  const nextCursor = results.length > input.limit && last ? encodeCursor(last) : "";
+  const nextCursor = results.length > input.limit && last ? encodeCursor(last.createdAt, last.memoryId) : "";
   return { memories, nextCursor };
 };
 
@@ -358,6 +361,73 @@ export const listSessions = async (db: D1Database, userId: string, now: number):
       .bind(userId),
   ]);
   return (listed?.results ?? []).map(toSession);
+};
+
+interface PastSessionRow {
+  session_id: string;
+  device_name: string;
+  host: string;
+  repo: string;
+  branch: string;
+  started_at: number;
+  last_activity_at: number;
+  prompts: number;
+  focus_first: string;
+  focus_latest: string;
+  running: number;
+}
+
+const toPastSession = (row: PastSessionRow): PastSession => ({
+  sessionId: row.session_id,
+  name: sessionHandle(row.device_name, row.session_id),
+  host: row.host,
+  repo: row.repo,
+  branch: row.branch,
+  startedAt: row.started_at,
+  lastActivityAt: row.last_activity_at,
+  prompts: row.prompts,
+  focus: { first: row.focus_first, latest: row.focus_latest },
+  running: row.running === 1,
+});
+
+export const listSessionHistory = async (
+  db: D1Database,
+  userId: string,
+  input: HistoryInput,
+  [cursorLastActivityAt, cursorSessionId]: [number, string],
+  now: number,
+): Promise<{ sessions: PastSession[]; nextCursor: string }> => {
+  const { results } = await db
+    .prepare(
+      `SELECT h.session_id, h.device_name, h.host, h.repo, h.branch, h.started_at, h.last_activity_at, h.prompts,
+         h.focus_first, h.focus_latest, s.session_id IS NOT NULL AS running
+       FROM session_history h
+       LEFT JOIN sessions s ON s.user_id = h.user_id AND s.session_id = h.session_id AND s.last_activity_at > ?7
+       WHERE h.user_id = ?1 AND (?2 = '' OR h.host = ?2) AND (?3 = '' OR h.repo = ?3)
+         AND (h.last_activity_at < ?4 OR (h.last_activity_at = ?4 AND h.session_id < ?5))
+       ORDER BY h.last_activity_at DESC, h.session_id DESC
+       LIMIT ?6`,
+    )
+    .bind(userId, input.host, input.repo, cursorLastActivityAt, cursorSessionId, input.limit + 1, now - SESSION_TTL_MS)
+    .all<PastSessionRow>();
+  const sessions = results.slice(0, input.limit).map(toPastSession);
+  const last = sessions.at(-1);
+  const nextCursor = results.length > input.limit && last ? encodeCursor(last.lastActivityAt, last.sessionId) : "";
+  return { sessions, nextCursor };
+};
+
+export const sessionHistoryFilters = async (db: D1Database, userId: string): Promise<HistoryFilters> => {
+  const { results } = await db
+    .prepare(
+      `SELECT DISTINCT 'host' AS field, host AS value FROM session_history WHERE user_id = ?1 AND host <> ''
+       UNION
+       SELECT DISTINCT 'repo' AS field, repo AS value FROM session_history WHERE user_id = ?1 AND repo <> ''
+       ORDER BY field, value`,
+    )
+    .bind(userId)
+    .all<{ field: string; value: string }>();
+  const values = (field: string): string[] => results.filter((row) => row.field === field).map((row) => row.value);
+  return { hosts: values("host"), repos: values("repo") };
 };
 
 export const sessionTally = async (db: D1Database, userId: string, now: number): Promise<Live> => {

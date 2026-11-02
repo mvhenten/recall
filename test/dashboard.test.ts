@@ -195,6 +195,151 @@ describe("the sessions tab", () => {
   });
 });
 
+const DAY_MS = 86_400_000;
+
+const historyTab = async (h: Harness, assertion: string, search = ""): Promise<string> => {
+  const response = await open(h, `/dashboard/history${search}`, assertion);
+  expect(response.status).toBe(200);
+  return plain(await response.text());
+};
+
+const olderSessions = (html: string): string => {
+  const href = /href="(\/dashboard\/history\?[^"]+)">Older sessions/.exec(html);
+  if (!href?.[1]) throw new Error("the history shows no link to the older page");
+  return href[1].replaceAll("&amp;", "&");
+};
+
+describe("the history tab", () => {
+  it("groups the past sessions by day, newest day first, with its span, scope and prompts", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const stranger = h.clientWithToken(await h.login(await h.invite(email("stranger")), "nomad"));
+    const noon = Date.UTC(2026, 9, 30, 12, 0, 0);
+    h.tick(noon - h.now());
+    await owner.laptop.sync("9f8a1b2c", {
+      host: "laptop",
+      repo: "repo:github.com/mvhenten/recall",
+      branch: "feat/dashboard-history",
+      prompts: 31,
+      focus: { first: "show the session history", latest: "group it by day" },
+      startedAt: noon - 3_600_000,
+      lastActivityAt: noon,
+    });
+    await owner.tower.sync("c4e21a99", {
+      host: "tower",
+      repo: "",
+      branch: "",
+      prompts: 1,
+      focus: { first: "draft the release notes", latest: "" },
+      startedAt: noon - DAY_MS - 2_700_000,
+      lastActivityAt: noon - DAY_MS,
+    });
+    await stranger.sync("aa11bb22", { host: "nomad", startedAt: noon, lastActivityAt: noon });
+    await owner.laptop.request("DELETE", "/v1/sessions/9f8a1b2c");
+    await owner.tower.request("DELETE", "/v1/sessions/c4e21a99");
+
+    const html = await historyTab(h, owner.assertion);
+    expect(html).toContain("2026-10-30 · Fri 11:00–12:00 laptop-9f8a laptop");
+    expect(html).toContain("show the session history → group it by day");
+    expect(html).toContain("repo:github.com/mvhenten/recall@feat/dashboard-history 1h 00m 31 prompts");
+    expect(html).toContain("2026-10-29 · Thu 11:15–12:00 tower-c4e2 tower");
+    expect(html).toContain("global 45m 1 prompt");
+    expect(html.indexOf("2026-10-30")).toBeLessThan(html.indexOf("2026-10-29"));
+    expect(html).not.toContain("nomad");
+  });
+
+  it("marks a session that is still running and leaves the ended ones unmarked", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.laptop.sync("1111aaaa", { startedAt: now - 600_000, lastActivityAt: now });
+    await owner.laptop.sync("2222bbbb", { startedAt: now - 600_000, lastActivityAt: now });
+    await owner.laptop.request("DELETE", "/v1/sessions/2222bbbb");
+
+    const html = await historyTab(h, owner.assertion);
+    expect(html).toContain("laptop-1111 laptop running");
+    expect(html).not.toContain("laptop-2222 laptop running");
+  });
+
+  it("follows the cursor across a day boundary without repeating or skipping a session", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const noon = Date.UTC(2026, 9, 30, 12, 0, 0);
+    h.tick(noon - h.now());
+    const ago: Array<[string, number]> = [
+      ["aa110000", 0],
+      ["bb220000", 60_000],
+      ["cc330000", 120_000],
+      ["dd440000", DAY_MS],
+      ["ee550000", DAY_MS + 60_000],
+    ];
+    for (const [sessionId, since] of ago) {
+      await owner.laptop.sync(sessionId, { startedAt: noon - since - 600_000, lastActivityAt: noon - since });
+    }
+
+    const response = await open(h, "/dashboard/history?limit=2", owner.assertion);
+    const markup = await response.text();
+    const first = plain(markup);
+    expect(first).toContain("2026-10-30 · Fri");
+    expect(first).toContain("laptop-aa11");
+    expect(first).toContain("laptop-bb22");
+    expect(first).not.toContain("laptop-cc33");
+    expect(first).not.toContain("2026-10-29");
+
+    const second = await historyTab(h, owner.assertion, olderSessions(markup).replace("/dashboard/history", ""));
+    expect(second).toContain("2026-10-30 · Fri");
+    expect(second).toContain("laptop-cc33");
+    expect(second).toContain("2026-10-29 · Thu");
+    expect(second).toContain("laptop-dd44");
+    expect(second).not.toContain("laptop-aa11");
+    expect(second).not.toContain("laptop-ee55");
+  });
+
+  it("narrows the days to one host and to one repo, offering only the values it holds", async () => {
+    const h = await harness();
+    const owner = await hosts(h);
+    const now = h.now();
+    await owner.laptop.sync("abc10000", {
+      host: "laptop",
+      repo: "repo:github.com/acme/app",
+      focus: { first: "the laptop session", latest: "" },
+      startedAt: now - 600_000,
+      lastActivityAt: now,
+    });
+    await owner.tower.sync("def20000", {
+      host: "tower",
+      repo: "repo:github.com/acme/infra",
+      focus: { first: "the tower session", latest: "" },
+      startedAt: now - 600_000,
+      lastActivityAt: now - 60_000,
+    });
+
+    const all = await historyTab(h, owner.assertion);
+    expect(all).toContain("All hosts laptop tower");
+    expect(all).toContain("All repos repo:github.com/acme/app repo:github.com/acme/infra");
+
+    const byHost = await historyTab(h, owner.assertion, "?host=tower");
+    expect(byHost).toContain("the tower session");
+    expect(byHost).not.toContain("the laptop session");
+
+    const byRepo = await historyTab(h, owner.assertion, "?repo=repo:github.com/acme/app");
+    expect(byRepo).toContain("the laptop session");
+    expect(byRepo).not.toContain("the tower session");
+
+    const nothing = await historyTab(h, owner.assertion, "?host=nowhere");
+    expect(nothing).toContain("No session matches this filter.");
+    expect(nothing).not.toContain("the laptop session");
+  });
+
+  it("says so when the history is empty, and stays behind Access", async () => {
+    const h = await harness();
+    const owner = await signedIn(h);
+    expect(await historyTab(h, owner.assertion)).toContain("No session is in your history yet.");
+    expect((await open(h, "/dashboard/history", null)).status).toBe(401);
+    expect((await open(h, "/dashboard/history", await h.assertionFor(email("stranger")))).status).toBe(403);
+  });
+});
+
 interface Owner {
   email: string;
   assertion: string;
