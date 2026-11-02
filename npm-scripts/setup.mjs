@@ -161,7 +161,12 @@ const upsertApp = async (domain, body) => {
   if (!existing) return create(`Access application for ${domain}`, () => cf("POST", `${account}/access/apps`, body));
   const policyIds = (existing.policies ?? []).map((p) => p.id);
   const wanted = body.policies.map((p) => p.id);
-  if (policyIds.length === wanted.length && wanted.every((id) => policyIds.includes(id))) return existing;
+  const samePolicies = policyIds.length === wanted.length && wanted.every((id) => policyIds.includes(id));
+  const wantedUris = body.destinations?.map((destination) => destination.uri) ?? null;
+  const uris = (existing.destinations ?? []).map((destination) => destination.uri);
+  const sameDestinations =
+    wantedUris === null || (wantedUris.length === uris.length && wantedUris.every((uri) => uris.includes(uri)));
+  if (samePolicies && sameDestinations && existing.name === body.name) return existing;
   if (dryRun) {
     say(`would update the Access application for ${domain}`);
     return existing;
@@ -179,14 +184,17 @@ await upsertApp(hostname, {
   policies: bypass ? [{ id: bypass.id, precedence: 1 }] : [],
 });
 const deviceDomain = `${hostname}/device`;
-const deviceApp = await upsertApp(deviceDomain, {
-  name: `${name} device approval`,
-  domain: deviceDomain,
+const browserApp = await upsertApp(deviceDomain, {
+  name: `${name} browser pages`,
   type: "self_hosted",
   session_duration: "24h",
   app_launcher_visible: false,
   allowed_idps: otp ? [otp.id] : [],
   auto_redirect_to_identity: true,
+  destinations: [
+    { type: "public", uri: deviceDomain },
+    { type: "public", uri: `${hostname}/dashboard` },
+  ],
   policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
 });
 
@@ -219,7 +227,7 @@ const config = {
     migrations_dir: join(ROOT, db.migrations_dir),
   })),
   routes: [{ pattern: hostname, custom_domain: true, zone_id: zone.id }],
-  vars: { ACCESS_TEAM_DOMAIN: teamDomain, ACCESS_AUD: deviceApp.aud },
+  vars: { ACCESS_TEAM_DOMAIN: teamDomain, ACCESS_AUD: browserApp.aud },
 };
 mkdirSync(WORK, { recursive: true });
 const configPath = join(WORK, "wrangler.json");

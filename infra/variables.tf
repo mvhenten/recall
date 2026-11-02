@@ -5,7 +5,7 @@ variable "account_id" {
 
 variable "hostname" {
   type        = string
-  description = "Hostname the Worker serves; only /device sits behind a Cloudflare Access login."
+  description = "Hostname the Worker serves; only /device and /dashboard sit behind a Cloudflare Access login."
 }
 
 variable "otp_idp_id" {
