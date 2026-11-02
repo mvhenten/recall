@@ -4,13 +4,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { readRecord, record, writeRecord } from "./messaging.mjs";
-import { account, aggregate, events, PROVIDER, prepareUsage, tail, UNKNOWN_ACCOUNT } from "./usage.mjs";
+import { account, aggregate, events, PROVIDER, prepareUsage, tail } from "./usage.mjs";
 
 const UID = process.getuid();
 
 function sandbox() {
   const dir = mkdtempSync(path.join(tmpdir(), "recall-usage-"));
-  return { dir, env: { XDG_RUNTIME_DIR: path.join(dir, "run") }, transcript: path.join(dir, "session.jsonl") };
+  return {
+    dir,
+    env: { XDG_RUNTIME_DIR: path.join(dir, "run"), HOME: dir },
+    transcript: path.join(dir, "session.jsonl"),
+  };
 }
 
 // The shape Claude Code writes: one API response arrives as several entries, one per content
@@ -38,26 +42,23 @@ function answer(id, model, usage, { blocks = 1, at = "2026-11-02T10:32:44.529Z" 
 }
 
 const prompt = (text) => ({ type: "user", message: { role: "user", content: text } });
-const toolResult = () => ({
-  type: "user",
-  message: { role: "user", content: [{ type: "tool_result", content: "ok" }] },
-});
 const lines = (entries) => `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+const session = (dir, transcript) => ({ cwd: dir, repo: "", permissionMode: "default", transcriptPath: transcript });
 
 const OPUS = "claude-opus-4";
 const HAIKU = "claude-haiku-4";
+const HOME = { oauthAccount: { emailAddress: "you@example.com" } };
+
+const withAccount = (dir) => writeFileSync(path.join(dir, ".claude.json"), JSON.stringify(HOME));
 
 test("usage is summed per model over a transcript, counting one answer once", () => {
   const text = lines([
     { type: "summary", summary: "an entry with no usage at all" },
     prompt("count what this session costs"),
     ...answer("msg-1", OPUS, [10, 20, 30, 40], { blocks: 3 }),
-    toolResult(),
     ...answer("msg-2", OPUS, [1, 2, 3, 4]),
-    { type: "user", isMeta: true, message: { role: "user", content: "a note the harness wrote" } },
     ...answer("msg-3", HAIKU, [5, 6, 7, 8]),
     { type: "assistant", message: { id: "msg-4", model: "<synthetic>", content: [] } },
-    prompt("ship it"),
   ]);
 
   const aggregated = aggregate(text);
@@ -80,7 +81,6 @@ test("usage is summed per model over a transcript, counting one answer once", ()
       cacheReadTokens: 8,
     },
   ]);
-  assert.equal(aggregated.prompts, 2, "a tool result and a note the harness wrote are not prompts");
   assert.equal(aggregated.messageId, "msg-4", "the last message read is where the next range carries on");
 });
 
@@ -100,16 +100,11 @@ test("an answer split across the end of a range is counted once", () => {
 });
 
 test("a delta is one event per model, carrying the prompts of the range once", () => {
-  const aggregated = aggregate(
-    lines([
-      prompt("one"),
-      ...answer("msg-1", OPUS, [1, 1, 1, 1]),
-      prompt("two"),
-      ...answer("msg-2", HAIKU, [2, 2, 2, 2]),
-    ]),
+  const { models } = aggregate(
+    lines([...answer("msg-1", OPUS, [1, 1, 1, 1]), ...answer("msg-2", HAIKU, [2, 2, 2, 2])]),
   );
 
-  const sent = events(aggregated, { seq: 1200, now: 1_762_000_000_000, account: "you@example.com" });
+  const sent = events(models, { seq: 1200, now: 1_762_000_000_000, prompts: 2, account: "you@example.com" });
 
   assert.deepEqual(
     sent.map(({ seq, model, prompts, provider, account: on }) => ({ seq, model, prompts, provider, on })),
@@ -124,7 +119,7 @@ test("a delta is one event per model, carrying the prompts of the range once", (
   const undated = { model: OPUS, at: 0, inputTokens: 1, outputTokens: 1, cacheWriteTokens: 1, cacheReadTokens: 1 };
   const now = 1_762_000_000_000;
   assert.equal(
-    events({ models: [undated], prompts: 0 }, { seq: 0, now, account: "you@example.com" })[0].at,
+    events([undated], { seq: 0, now, prompts: 0, account: "you@example.com" })[0].at,
     now,
     "an entry with no timestamp of its own is counted as the delta's own time",
   );
@@ -145,7 +140,8 @@ test("the tail stops at the last complete line and resets on a shorter file", ()
 
 test("the range is fixed before the post and re-sent unchanged until it lands", () => {
   const { dir, env, transcript } = sandbox();
-  record("s-1", { state: "off" }, { cwd: dir, repo: "", permissionMode: "default", transcriptPath: transcript }, env);
+  withAccount(dir);
+  record("s-1", { state: "off" }, session(dir, transcript), env);
   writeFileSync(transcript, lines([prompt("count this"), ...answer("msg-1", OPUS, [10, 20, 30, 40], { blocks: 2 })]));
 
   assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_000_000), "pending");
@@ -153,14 +149,8 @@ test("the range is fixed before the post and re-sent unchanged until it lands", 
   assert.equal(fixed.seq, 0);
   assert.equal(fixed.end, statSync(transcript).size, "the end is fixed at the last complete line");
   assert.deepEqual(
-    fixed.events.map(({ seq, model, prompts, inputTokens, cacheReadTokens }) => ({
-      seq,
-      model,
-      prompts,
-      inputTokens,
-      cacheReadTokens,
-    })),
-    [{ seq: 0, model: OPUS, prompts: 1, inputTokens: 10, cacheReadTokens: 40 }],
+    fixed.events.map(({ seq, model, inputTokens, cacheReadTokens }) => ({ seq, model, inputTokens, cacheReadTokens })),
+    [{ seq: 0, model: OPUS, inputTokens: 10, cacheReadTokens: 40 }],
   );
 
   appendFileSync(transcript, lines(answer("msg-2", HAIKU, [1, 2, 3, 4])));
@@ -174,23 +164,31 @@ test("the range is fixed before the post and re-sent unchanged until it lands", 
   rmSync(dir, { recursive: true, force: true });
 });
 
+// What `recall sessions --sync` writes back once the service has taken every event of a range.
+function landed(sessionId, env) {
+  const stored = readRecord(sessionId, env, UID);
+  const { end, highWater, prompts, messageId } = stored.usagePending;
+  const posted = {
+    ...stored,
+    usageOffset: end,
+    usageHighWater: highWater,
+    usagePrompts: prompts,
+    usageMessageId: messageId,
+  };
+  delete posted.usagePending;
+  writeRecord(sessionId, posted, env, UID);
+  return stored.usagePending;
+}
+
 test("the next range starts where the one that landed ended", () => {
   const { dir, env, transcript } = sandbox();
-  record("s-1", { state: "off" }, { cwd: dir, repo: "", permissionMode: "default", transcriptPath: transcript }, env);
+  withAccount(dir);
+  record("s-1", { state: "off" }, session(dir, transcript), env);
   writeFileSync(transcript, lines([prompt("count this"), ...answer("msg-1", OPUS, [10, 20, 30, 40], { blocks: 2 })]));
   prepareUsage("s-1", transcript, env, UID, 1_762_000_000_000);
+  const first = landed("s-1", env);
 
-  // What `recall sessions --usage` writes back once the service has taken every event.
-  const landed = readRecord("s-1", env, UID).usagePending;
-  const posted = { ...readRecord("s-1", env, UID), usageOffset: landed.end, usageMessageId: landed.messageId };
-  delete posted.usagePending;
-  writeRecord("s-1", posted, env, UID);
-
-  assert.equal(
-    prepareUsage("s-1", transcript, env, UID, 1_762_000_100_000),
-    "none",
-    "a file that has not grown owes nothing",
-  );
+  assert.equal(prepareUsage("s-1", transcript, env, UID), "none", "a file that has not grown owes nothing");
 
   appendFileSync(
     transcript,
@@ -198,19 +196,80 @@ test("the next range starts where the one that landed ended", () => {
   );
   assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_200_000), "pending");
   const next = readRecord("s-1", env, UID).usagePending;
-  assert.equal(next.seq, landed.end, "the chunk number is the offset the range started from");
+  assert.equal(next.seq, first.end, "the chunk number is the offset the range started from");
   assert.deepEqual(
-    next.events.map(({ model, inputTokens, prompts }) => ({ model, inputTokens, prompts })),
-    [{ model: HAIKU, inputTokens: 1, prompts: 0 }],
+    next.events.map(({ model, inputTokens }) => ({ model, inputTokens })),
+    [{ model: HAIKU, inputTokens: 1 }],
     "the answer the range before it counted is not counted again",
   );
 
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("the prompts a delta carries are the ones the record counted and no delta has taken", () => {
+  const { dir, env, transcript } = sandbox();
+  withAccount(dir);
+  record("s-1", { state: "off" }, session(dir, transcript), env);
+  writeFileSync(transcript, lines(answer("msg-1", OPUS, [10, 20, 30, 40])));
+  writeRecord("s-1", { ...readRecord("s-1", env, UID), prompts: 3 }, env, UID);
+
+  prepareUsage("s-1", transcript, env, UID, 1_762_000_000_000);
+  assert.equal(readRecord("s-1", env, UID).usagePending.events[0].prompts, 3, "three prompts, none taken yet");
+  landed("s-1", env);
+  assert.equal(readRecord("s-1", env, UID).usagePrompts, 3);
+
+  writeRecord("s-1", { ...readRecord("s-1", env, UID), prompts: 5 }, env, UID);
+  appendFileSync(transcript, lines(answer("msg-2", OPUS, [1, 1, 1, 1])));
+  prepareUsage("s-1", transcript, env, UID, 1_762_000_100_000);
+  assert.equal(
+    readRecord("s-1", env, UID).usagePending.events[0].prompts,
+    2,
+    "only the prompts counted since the last delta",
+  );
+
+  landed("s-1", env);
+  writeRecord("s-1", { ...readRecord("s-1", env, UID), prompts: 1 }, env, UID);
+  appendFileSync(transcript, lines(answer("msg-3", OPUS, [1, 1, 1, 1])));
+  prepareUsage("s-1", transcript, env, UID, 1_762_000_200_000);
+  assert.equal(
+    readRecord("s-1", env, UID).usagePending.events[0].prompts,
+    1,
+    "a prompt count that restarted under a resumed session owes what it has, not a negative",
+  );
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("chunk numbers climb past a transcript that was rewritten shorter", () => {
+  const { dir, env, transcript } = sandbox();
+  withAccount(dir);
+  record("s-1", { state: "off" }, session(dir, transcript), env);
+  writeFileSync(transcript, lines(answer("msg-1", OPUS, [10, 20, 30, 40], { blocks: 4 })));
+  prepareUsage("s-1", transcript, env, UID, 1_762_000_000_000);
+  const first = landed("s-1", env);
+
+  writeFileSync(transcript, lines(answer("msg-2", OPUS, [1, 1, 1, 1])));
+  assert.equal(prepareUsage("s-1", transcript, env, UID), "reset");
+  assert.equal(readRecord("s-1", env, UID).usageOffset, statSync(transcript).size);
+
+  appendFileSync(transcript, lines(answer("msg-3", HAIKU, [2, 2, 2, 2])));
+  assert.equal(prepareUsage("s-1", transcript, env, UID, 1_762_000_200_000), "pending");
+  const next = readRecord("s-1", env, UID).usagePending;
+  assert.equal(
+    next.seq,
+    first.highWater,
+    "a reader back at the start of a shorter file carries on from the numbers already spent",
+  );
+  assert.equal(next.events[0].seq, first.highWater);
+  assert.equal(next.highWater > first.highWater, true, "the mark climbs with every range");
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("a transcript that is gone, unreadable or rewritten shorter never fails a session", () => {
   const { dir, env, transcript } = sandbox();
-  record("s-1", { state: "off" }, { cwd: dir, repo: "", permissionMode: "default", transcriptPath: transcript }, env);
+  withAccount(dir);
+  record("s-1", { state: "off" }, session(dir, transcript), env);
 
   assert.equal(prepareUsage("s-2", transcript, env, UID), "unregistered");
   assert.equal(prepareUsage("s-1", undefined, env, UID), "no-transcript");
@@ -233,16 +292,20 @@ test("a transcript that is gone, unreadable or rewritten shorter never fails a s
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("the account is the one the host signed in with", () => {
-  const { dir } = sandbox();
+test("the account is the identity the host signed in with", () => {
+  const { dir, env, transcript } = sandbox();
 
-  assert.equal(account(dir), UNKNOWN_ACCOUNT, "a host that cannot name its account still counts");
-  writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "you@example.com" } }));
+  writeFileSync(path.join(dir, ".claude.json"), JSON.stringify(HOME));
   assert.equal(account(dir), "you@example.com");
-  writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ oauthAccount: {} }));
-  assert.equal(account(dir), UNKNOWN_ACCOUNT);
+  writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ userID: "7f3a" }));
+  assert.equal(account(dir), "7f3a", "a host whose account was swapped out still has its user id");
   writeFileSync(path.join(dir, ".claude.json"), "not json");
-  assert.equal(account(dir), UNKNOWN_ACCOUNT);
+  assert.equal(account(dir), "");
+
+  record("s-1", { state: "off" }, session(dir, transcript), env);
+  writeFileSync(transcript, lines(answer("msg-1", OPUS, [10, 20, 30, 40])));
+  assert.equal(prepareUsage("s-1", transcript, env, UID), "no-account", "a delta no account can be named for waits");
+  assert.equal(readRecord("s-1", env, UID).usagePending, undefined);
 
   rmSync(dir, { recursive: true, force: true });
 });

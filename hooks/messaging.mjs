@@ -142,21 +142,23 @@ function size(file) {
 }
 
 // Where the usage reader picks the transcript up. A session carried on in the same file — a resume,
-// a restart, a clear — keeps the offset this host already posted from. Anything else starts at the
-// file's end: what came before was posted by the run that wrote it, and reading it again would
-// replay chunk numbers the service already holds, which it ignores, taking the new tail down with
-// them.
+// a restart, a clear — keeps the offset this host already counted from. Anything else starts at
+// the file's end: what came before was counted by the run that wrote it. The chunk numbers already
+// spent come along whatever the transcript, since they are the session's and may never be reused,
+// and the prompt mark starts at nothing because the prompt count does.
 function transcript(stored, transcriptPath) {
-  if (!transcriptPath) return { transcriptPath: "", usageOffset: 0, usageMessageId: "" };
+  const spent = { usageHighWater: stored?.usageHighWater ?? 0, usagePrompts: 0 };
+  if (!transcriptPath) return { ...spent, transcriptPath: "", usageOffset: 0, usageMessageId: "" };
   if (stored?.transcriptPath === transcriptPath && Number.isInteger(stored.usageOffset)) {
     return {
+      ...spent,
       transcriptPath,
       usageOffset: stored.usageOffset,
       usageMessageId: stored.usageMessageId ?? "",
       usagePending: stored.usagePending,
     };
   }
-  return { transcriptPath, usageOffset: size(transcriptPath), usageMessageId: "" };
+  return { ...spent, transcriptPath, usageOffset: size(transcriptPath), usageMessageId: "" };
 }
 
 // The registry is the one record of what became of a session, so a session the hook passed over

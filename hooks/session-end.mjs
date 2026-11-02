@@ -1,6 +1,6 @@
 import { firstLine, logRun, readInput, recallDetached } from "./lib.mjs";
 import { unregister } from "./messaging.mjs";
-import { prepareUsage } from "./usage.mjs";
+import { countUsage } from "./usage.mjs";
 
 // The closing stretch of the transcript is read here, so a session's last tokens are counted. The
 // record is what carries that delta, so the arm that ends the session is also the one that takes
@@ -11,12 +11,7 @@ import { prepareUsage } from "./usage.mjs";
 // not hold up the session's end.
 function run(input) {
   if (!input.session_id) return "messaging:no-session";
-  let usage;
-  try {
-    usage = prepareUsage(input.session_id, input.transcript_path);
-  } catch (error) {
-    usage = `failed:${firstLine(error.message)}`;
-  }
+  const usage = countUsage(input.session_id, input.transcript_path);
   const ending = recallDetached(["sessions", "--end", input.session_id], input.cwd);
   if (!ending) unregister(input.session_id);
   return `messaging:${ending ? "ending" : "unregistered:not-installed"} usage:${usage}`;

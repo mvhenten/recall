@@ -103,6 +103,8 @@ test("a session registers one document the daemon and recall sessions both read"
     mode: stored.mode,
     permissionMode: "acceptEdits",
     transcriptPath,
+    usageHighWater: 0,
+    usagePrompts: 0,
     usageOffset: statSync(transcriptPath).size,
     usageMessageId: "",
   });
@@ -202,24 +204,45 @@ test("the record says where in the transcript this host's counting has reached",
   assert.equal(read().usageOffset, 200, "a session with nothing posted starts at the end of the file it inherits");
   assert.equal(read().transcriptPath, transcriptPath);
 
-  writeRecord("s-6", { ...read(), usageOffset: 120, usageMessageId: "msg-2", usagePending: { seq: 120 } }, env);
+  const counting = () => ({
+    offset: read().usageOffset,
+    messageId: read().usageMessageId,
+    highWater: read().usageHighWater,
+    prompts: read().usagePrompts,
+    pending: read().usagePending,
+  });
+  const reached = { offset: 120, messageId: "msg-2", highWater: 4000, prompts: 0, pending: { seq: 4000 } };
+  writeRecord(
+    "s-6",
+    {
+      ...read(),
+      usageOffset: 120,
+      usageMessageId: "msg-2",
+      usageHighWater: 4000,
+      usagePrompts: 7,
+      usagePending: { seq: 4000 },
+    },
+    env,
+  );
+
   touch("s-6", "count what this costs", "default", env);
   assert.deepEqual(
-    { offset: read().usageOffset, messageId: read().usageMessageId, pending: read().usagePending },
-    { offset: 120, messageId: "msg-2", pending: { seq: 120 } },
-    "a prompt moves the focus on and leaves the counting where it is",
+    { ...counting(), prompts: 0 },
+    reached,
+    "a prompt moves the focus on and leaves the counting and the chunk numbers where they are",
   );
 
   record("s-6", { state: "off" }, session, env);
   assert.deepEqual(
-    { offset: read().usageOffset, messageId: read().usageMessageId, pending: read().usagePending },
-    { offset: 120, messageId: "msg-2", pending: { seq: 120 } },
-    "a session carried on in the same transcript counts on from where it stopped",
+    counting(),
+    reached,
+    "a session carried on in the same transcript counts on from where it stopped, and owes no prompt it already sent",
   );
 
   record("s-6", { state: "off" }, { ...session, transcriptPath: path.join(dir, "s-6-other.jsonl") }, env);
   assert.equal(read().usageOffset, 0, "another transcript is another count");
   assert.equal(read().usageMessageId, "");
+  assert.equal(read().usageHighWater, 4000, "the chunk numbers already spent are the session's, not the file's");
 
   rmSync(dir, { recursive: true, force: true });
 });

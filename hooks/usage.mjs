@@ -1,24 +1,23 @@
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { firstLine, recallDetached } from "./lib.mjs";
+import { firstLine } from "./lib.mjs";
 import { readRecord, writeRecord } from "./messaging.mjs";
 
 export const PROVIDER = "claude";
-// The service takes no empty account, so a host that cannot name the subscription it spends on
-// counts under one name rather than losing the delta.
-export const UNKNOWN_ACCOUNT = "unknown";
 
 const NEWLINE = 0x0a;
 const COUNTERS = ["inputTokens", "outputTokens", "cacheWriteTokens", "cacheReadTokens"];
 
+// The subscription the tokens are spent on. A host whose account was swapped out has no
+// `oauthAccount` left, so the user id the harness always writes is the identity to fall back on.
 export function account(home = homedir()) {
   try {
-    const { oauthAccount } = JSON.parse(readFileSync(path.join(home, ".claude.json"), "utf8"));
-    const email = oauthAccount?.emailAddress;
-    return typeof email === "string" && email.length > 0 ? email : UNKNOWN_ACCOUNT;
+    const { oauthAccount, userID } = JSON.parse(readFileSync(path.join(home, ".claude.json"), "utf8"));
+    const named = oauthAccount?.emailAddress ?? userID;
+    return typeof named === "string" ? named : "";
   } catch {
-    return UNKNOWN_ACCOUNT;
+    return "";
   }
 }
 
@@ -61,16 +60,6 @@ function counted(message) {
   return COUNTERS.some((key) => counters[key] > 0) ? counters : undefined;
 }
 
-// What the person typed, which is every user entry that is not a tool result the harness wrote
-// back, a note it added itself, or a turn inside a subagent.
-function isPrompt(entry) {
-  if (entry.isMeta || entry.isSidechain || entry.isCompactSummary) return false;
-  const content = entry.message?.content;
-  if (typeof content === "string") return content.length > 0;
-  if (!Array.isArray(content) || content.length === 0) return false;
-  return content.every((part) => part?.type === "text");
-}
-
 // One API response is written as several transcript entries, one per content block, each carrying
 // the same usage, so a message counts once by its id. The entries of a message are contiguous, so
 // carrying the last counted id into the next range is enough to keep a message that straddles the
@@ -79,17 +68,12 @@ export function aggregate(text, lastMessageId = "") {
   const models = new Map();
   const seen = new Set(lastMessageId ? [lastMessageId] : []);
   let messageId = lastMessageId;
-  let prompts = 0;
   for (const line of text.split("\n")) {
     if (!line) continue;
     let entry;
     try {
       entry = JSON.parse(line);
     } catch {
-      continue;
-    }
-    if (entry?.type === "user") {
-      if (isPrompt(entry)) prompts += 1;
       continue;
     }
     if (entry?.type !== "assistant") continue;
@@ -115,13 +99,12 @@ export function aggregate(text, lastMessageId = "") {
     if (Number.isFinite(at)) found.at = Math.max(found.at, at);
     models.set(model, found);
   }
-  return { models: [...models.values()], prompts, messageId };
+  return { models: [...models.values()], messageId };
 }
 
-// One delta per model, each needing a chunk number of its own: the service holds a delta by session
-// and seq and ignores a second one on the same pair. Every model here took at least one line of the
-// range, so `seq + index` always stays below the offset the next range starts from.
-export function events({ models, prompts }, { seq, now, account: on }) {
+// One event per model, each needing a chunk number of its own. Every model here took at least one
+// line of the stretch, so `seq + index` stays below the number the next stretch starts from.
+export function events(models, { seq, now, prompts, account: on }) {
   return models.map((model, index) => ({
     seq: seq + index,
     provider: PROVIDER,
@@ -136,47 +119,59 @@ export function events({ models, prompts }, { seq, now, account: on }) {
   }));
 }
 
-// Fixes the range before anything is posted: its end, its models and its prompt count go into the
-// record, and only a post that landed moves the offset past them. A retry sends the identical
-// range, because the service keeps the first delta it saw for a chunk number and silently ignores
-// a second one carrying other numbers.
+// The prompts this range answers: every prompt the session has counted that no delta has carried
+// yet. A record whose prompt count restarted under a resumed session carries what it has now and
+// sets the mark back to it, rather than owing a count that will never arrive.
+function owed(stored) {
+  const counted = stored.prompts ?? 0;
+  const sent = stored.usagePrompts ?? 0;
+  return counted >= sent ? counted - sent : counted;
+}
+
+// Fixes the stretch before anything is sent: its end, its models and the prompts it answers go
+// into the record, and only a delta that landed moves the record past them. A retry sends the
+// stretch that is already there, never a re-read to the end of the file.
 export function prepareUsage(sessionId, transcriptPath, env = process.env, uid = process.getuid(), now = Date.now()) {
   const stored = readRecord(sessionId, env, uid);
   if (!stored) return "unregistered";
   if (stored.usagePending?.events?.length) return "retry";
   if (!transcriptPath) return "no-transcript";
-  const seq = Number.isInteger(stored.usageOffset) ? stored.usageOffset : 0;
-  const found = tail(transcriptPath, seq);
+  const offset = Number.isInteger(stored.usageOffset) ? stored.usageOffset : 0;
+  const found = tail(transcriptPath, offset);
   if (found.missing) return "no-transcript";
   if (found.reset !== undefined) {
     writeRecord(sessionId, { ...stored, transcriptPath, usageOffset: found.reset, usageMessageId: "" }, env, uid);
     return "reset";
   }
-  const aggregated = aggregate(found.text, stored.usageMessageId ?? "");
-  // A range holding prompts but no usage yet is left where it is, so the prompts are counted with
-  // the answer they paid for rather than dropped ahead of it.
-  if (aggregated.models.length === 0) return "none";
+  const on = account(env.HOME);
+  if (!on) return "no-account";
+  const { models, messageId } = aggregate(found.text, stored.usageMessageId ?? "");
+  // A stretch with no answer in it yet is left where it is, so the prompts it holds are counted
+  // with the tokens they paid for rather than ahead of them.
+  if (models.length === 0) return "none";
+  // A transcript rewritten shorter leaves the reader behind the chunk numbers already spent, and
+  // those may never be reused.
+  const seq = Math.max(offset, stored.usageHighWater ?? 0);
   const pending = {
     seq,
     end: found.end,
-    messageId: aggregated.messageId,
-    events: events(aggregated, { seq, now, account: account() }),
+    highWater: seq + (found.end - offset),
+    messageId,
+    prompts: stored.prompts ?? 0,
+    events: events(models, { seq, now, prompts: owed(stored), account: on }),
   };
   writeRecord(sessionId, { ...stored, transcriptPath, usagePending: pending }, env, uid);
   return "pending";
 }
 
-// The hook never waits for the post: the range is fixed on disk and the arm that sends it is
-// started detached, the way the session sync is. An unreadable transcript or an unwritable record
-// is reported to the hooks log and nothing more, because counting tokens must never cost a prompt.
-export function flushUsage(sessionId, transcriptPath, cwd) {
+// Counting tokens must never cost a prompt, so an unreadable transcript or an unwritable record is
+// reported to the hooks log and nothing more. The delta waits in the record for the sync the hook
+// starts next, which is the one that sends it.
+export function countUsage(sessionId, transcriptPath) {
   if (!sessionId) return "no-session";
-  let prepared;
   try {
-    prepared = prepareUsage(sessionId, transcriptPath);
+    return prepareUsage(sessionId, transcriptPath);
   } catch (error) {
     return `failed:${firstLine(error.message)}`;
   }
-  if (prepared !== "pending" && prepared !== "retry") return prepared;
-  return recallDetached(["sessions", "--usage", sessionId], cwd) ? prepared : "not-installed";
 }
