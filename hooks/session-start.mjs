@@ -1,5 +1,5 @@
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
-import { messagingEnabled, register } from "./messaging.mjs";
+import { messagingEnabled, record, register } from "./messaging.mjs";
 
 const TIMEOUT_MS = 3000;
 const INSTALL_HINT = "recall CLI not found; install it from https://github.com/mvhenten/recall#install";
@@ -48,12 +48,19 @@ function modeOf(result) {
 }
 
 function registerSession(input) {
-  if (!messagingEnabled()) return "off";
   if (!input.session_id) return "no-session";
   try {
-    return register(input.session_id, input.cwd) ? "registered" : "no-inbox";
+    if (messagingEnabled()) return register(input.session_id, input.cwd);
+    record(input.session_id, { state: "off" }, input.cwd);
+    return "off";
   } catch (error) {
-    return `failed:${firstLine(error.message)}`;
+    const state = { state: "failed", error: firstLine(error.message) };
+    try {
+      record(input.session_id, state, input.cwd);
+    } catch {
+      // The registry is unwritable, so the hooks log is the only place left to say so.
+    }
+    return `failed:${state.error}`;
   }
 }
 

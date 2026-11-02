@@ -140,9 +140,15 @@ enum Command {
     Listen {
         #[arg(
             long,
+            conflicts_with = "status",
             help = "Start the listener in the background unless one already holds the lock, then exit"
         )]
         ensure: bool,
+        #[arg(
+            long,
+            help = "Print which sessions are registered for messages and why the hook passed the rest over, then exit"
+        )]
+        status: bool,
     },
     #[command(about = "Update recall to the latest release")]
     Update,
@@ -433,7 +439,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Update => return update(),
         Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
         Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
-        Command::Listen { ensure } => listen::run(&settings::load(&cli.settings)?, ensure)?,
+        Command::Listen { ensure, status } => {
+            let settings = settings::load(&cli.settings)?;
+            if status {
+                let report = listen::status(&settings)?;
+                if cli.json {
+                    print_json(&report)?;
+                } else {
+                    for line in report.lines() {
+                        println!("{line}");
+                    }
+                }
+            } else {
+                listen::run(&settings, ensure)?;
+            }
+        }
         Command::Send { host, message } => {
             require_messaging(&settings::load(&cli.settings)?)?;
             let body = message_body(&message)?;

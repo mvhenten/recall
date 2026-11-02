@@ -6,6 +6,7 @@ use crate::settings::Settings;
 use crate::ws::{self, Ended};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
+use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -219,9 +220,107 @@ async fn serve() -> Result<()> {
     }
 }
 
+pub const MESSAGING_OFF: &str = "messaging is off; run recall config set messaging.enabled true to turn it on";
+pub const NO_INBOX: &str =
+    "Claude set no CLAUDE_CODE_MESSAGING_SOCKET or CLAUDE_CODE_MESSAGING_TOKEN, so this session has no inbox";
+
+/// What `--status` reports for one session. The registry record carries the inbox token, so it
+/// never leaves this module: only the session id, its directory, the Claude pid and the state
+/// reach the report.
+#[derive(Debug, Serialize)]
+pub struct Session {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub pid: i32,
+    #[serde(flatten)]
+    pub state: Reported,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum Reported {
+    Registered,
+    Off,
+    NoInbox,
+    Failed { error: String },
+}
+
+impl From<sessions::Status> for Session {
+    fn from(status: sessions::Status) -> Session {
+        Session {
+            session_id: status.session_id,
+            cwd: status.record.cwd,
+            pid: status.record.pid,
+            state: match status.record.state {
+                sessions::State::Registered(_) => Reported::Registered,
+                sessions::State::Off => Reported::Off,
+                sessions::State::NoInbox => Reported::NoInbox,
+                sessions::State::Failed { error } => Reported::Failed { error },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub messaging_enabled: bool,
+    pub listener_running: bool,
+    pub sessions: Vec<Session>,
+}
+
+fn reason(session: &Session) -> String {
+    match &session.state {
+        Reported::Registered => format!("registered, pid {}", session.pid),
+        Reported::Off => MESSAGING_OFF.to_string(),
+        Reported::NoInbox => NO_INBOX.to_string(),
+        Reported::Failed { error } => format!("writing the registration failed: {error}"),
+    }
+}
+
+impl Report {
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            if self.messaging_enabled {
+                "messaging is on".to_string()
+            } else {
+                MESSAGING_OFF.to_string()
+            },
+            if self.listener_running {
+                "a listener is running on this host".to_string()
+            } else {
+                "no listener is running on this host".to_string()
+            },
+        ];
+        if self.sessions.is_empty() {
+            lines.push("no session is running on this host".to_string());
+            return lines;
+        }
+        for session in &self.sessions {
+            lines.push(format!(
+                "{}  {}  {}",
+                session.session_id,
+                session.cwd.display(),
+                reason(session)
+            ));
+        }
+        lines
+    }
+}
+
+pub fn status(settings: &Settings) -> Result<Report> {
+    Ok(Report {
+        messaging_enabled: settings.messaging_enabled(),
+        listener_running: Lock::acquire(&lock_path())?.is_none(),
+        sessions: sessions::status(&sessions_dir())
+            .into_iter()
+            .map(|(_, status)| Session::from(status))
+            .collect(),
+    })
+}
+
 pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
     if !settings.messaging_enabled() {
-        eprintln!("recall: messaging is off; run recall config set messaging.enabled true to turn it on");
+        eprintln!("recall: {MESSAGING_OFF}");
         return Ok(());
     }
     let path = lock_path();
@@ -276,6 +375,109 @@ mod tests {
             let jittered = with_jitter(delay, f64::from(step) / 10.0);
             assert!(jittered >= delay && jittered <= Duration::from_secs(10), "{jittered:?}");
         }
+    }
+
+    fn status(session_id: &str, cwd: &str, state: sessions::State) -> sessions::Status {
+        sessions::Status {
+            session_id: session_id.to_string(),
+            record: sessions::Record {
+                cwd: PathBuf::from(cwd),
+                pid: 42,
+                state,
+            },
+        }
+    }
+
+    #[test]
+    fn each_running_session_prints_the_reason_the_hook_gave() {
+        let report = Report {
+            messaging_enabled: true,
+            listener_running: false,
+            sessions: vec![
+                status(
+                    "s-live",
+                    "/src/recall",
+                    sessions::State::Registered(sessions::Inbox {
+                        socket: PathBuf::from("/run/user/1000/cc-socks/42.sock"),
+                        token: "t-inbox".to_string(),
+                    }),
+                ),
+                status("s-off", "/src/other", sessions::State::Off),
+                status("s-no-inbox", "/src/third", sessions::State::NoInbox),
+                status(
+                    "s-failed",
+                    "/src/fourth",
+                    sessions::State::Failed {
+                        error: "EACCES, permission denied".to_string(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(Session::from)
+            .collect(),
+        };
+
+        assert_eq!(
+            report.lines(),
+            vec![
+                "messaging is on".to_string(),
+                "no listener is running on this host".to_string(),
+                "s-live  /src/recall  registered, pid 42".to_string(),
+                format!("s-off  /src/other  {MESSAGING_OFF}"),
+                format!("s-no-inbox  /src/third  {NO_INBOX}"),
+                "s-failed  /src/fourth  writing the registration failed: EACCES, permission denied".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_report_never_carries_the_inbox_token_or_socket() {
+        let report = Report {
+            messaging_enabled: true,
+            listener_running: true,
+            sessions: vec![status(
+                "s-live",
+                "/src/recall",
+                sessions::State::Registered(sessions::Inbox {
+                    socket: PathBuf::from("/run/user/1000/cc-socks/42.sock"),
+                    token: "t-inbox".to_string(),
+                }),
+            )]
+            .into_iter()
+            .map(Session::from)
+            .collect(),
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(!json.contains("t-inbox"), "{json}");
+        assert!(!json.contains("cc-socks"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["sessions"][0],
+            serde_json::json!({
+                "session_id": "s-live",
+                "cwd": "/src/recall",
+                "pid": 42,
+                "state": "registered",
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_registry_says_no_session_is_running() {
+        let report = Report {
+            messaging_enabled: false,
+            listener_running: true,
+            sessions: Vec::new(),
+        };
+        assert_eq!(
+            report.lines(),
+            vec![
+                MESSAGING_OFF.to_string(),
+                "a listener is running on this host".to_string(),
+                "no session is running on this host".to_string(),
+            ]
+        );
     }
 
     #[test]
