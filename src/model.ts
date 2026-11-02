@@ -101,10 +101,6 @@ export interface Session extends SessionInput {
   deviceId: string;
 }
 
-// What a session leaves behind once it is gone. The live process facts drop out: a permission mode
-// and a pid say nothing about a session nobody can address any more.
-export type SessionHistory = Omit<Session, "permissionMode" | "pid">;
-
 // The handle that addresses one session: its device name and the head of its session id. It is a
 // function of the session alone, so it names the same session for as long as that session runs and
 // never moves to another one.

@@ -2,6 +2,7 @@ CREATE TABLE session_history (
   user_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
   device_id TEXT NOT NULL,
+  device_name TEXT NOT NULL,
   host TEXT NOT NULL,
   cwd TEXT NOT NULL,
   repo TEXT NOT NULL,
@@ -15,5 +16,3 @@ CREATE TABLE session_history (
   mode TEXT NOT NULL,
   PRIMARY KEY (user_id, session_id)
 );
-
-CREATE INDEX session_history_by_user_activity ON session_history (user_id, last_activity_at DESC, session_id);
