@@ -2,7 +2,7 @@ import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs"
 import { homedir } from "node:os";
 import path from "node:path";
 import { firstLine } from "./lib.mjs";
-import { readRecord, transcriptFiles, writeRecord } from "./messaging.mjs";
+import { MAIN, readRecord, transcriptFiles, writeRecord } from "./messaging.mjs";
 
 export const PROVIDER = "claude";
 
@@ -143,6 +143,16 @@ function fold(models, counted) {
   }
 }
 
+// A record written before the files were read apart carries one mark, for the session's own
+// transcript. Carrying it across is what keeps the upgrade from counting that file over again,
+// and it is the only reading of the old field: its chunk numbers counted bytes, and a byte count
+// standing in for a chunk number would land among the ones a whole-file reading spends.
+function carried(stored) {
+  if (stored.usageFiles) return stored.usageFiles;
+  if (!Number.isInteger(stored.usageOffset)) return {};
+  return { [MAIN]: { offset: stored.usageOffset, messageId: stored.usageMessageId ?? "" } };
+}
+
 // Fixes the stretch before anything is sent: where each of the session's transcript files now
 // reaches, the models that answered in them and the prompts the stretch answers go into the
 // record, and only a delta that landed moves the record past them. A retry sends the stretch that
@@ -152,7 +162,7 @@ export function prepareUsage(sessionId, transcriptPath, env = process.env, uid =
   if (!stored) return "unregistered";
   if (stored.usagePending?.events?.length) return "retry";
   if (!transcriptPath) return "no-transcript";
-  const marks = { ...(stored.usageFiles ?? {}) };
+  const marks = { ...carried(stored) };
   const stretches = [];
   let readable = 0;
   let reset = false;
@@ -184,9 +194,8 @@ export function prepareUsage(sessionId, transcriptPath, env = process.env, uid =
     if (reset) writeRecord(sessionId, { ...stored, transcriptPath, usageFiles: marks }, env, uid);
     return reset ? "reset" : "none";
   }
-  // A record written before the files were read apart counted bytes into its chunk numbers, so the
-  // mark it left is the floor this counter carries on from; those numbers may never be reused.
-  const seq = Math.max(stored.usageHighWater ?? 0, stored.usageOffset ?? 0);
+  // Chunk numbers climb and are never reused, whatever the files do under them.
+  const seq = stored.usageHighWater ?? 0;
   const counted = events([...models.values()], { seq, now, prompts: owed(stored), account: on });
   const pending = {
     seq,

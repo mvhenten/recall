@@ -859,11 +859,24 @@ export const recordUsage = async (
     db
       .prepare(
         `INSERT OR IGNORE INTO usage_events (user_id, session_id, seq, provider, account, model, prompts,
-           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, at, recorded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
+           input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, at, recorded_at, durable)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
       )
-      .bind(userId, sessionId, input.seq, input.provider, input.account, input.model, ...counters, input.at, now),
-    db.prepare("DELETE FROM usage_events WHERE user_id = ? AND recorded_at < ?").bind(userId, now - USAGE_RETENTION_MS),
+      .bind(
+        userId,
+        sessionId,
+        input.seq,
+        input.provider,
+        input.account,
+        input.model,
+        ...counters,
+        input.at,
+        now,
+        input.durable ? 1 : 0,
+      ),
+    db
+      .prepare("DELETE FROM usage_events WHERE user_id = ? AND recorded_at < ? AND durable = 0")
+      .bind(userId, now - USAGE_RETENTION_MS),
   ]);
 };
 

@@ -568,6 +568,7 @@ fn refresh(scope: &Scope, session_id: &str, stored: &Value) -> Result<Option<Ado
 /// file the session opens after it starts at nothing, which is where its own count begins.
 fn usage_marks(transcript: &Path) -> Value {
     let marks: serde_json::Map<String, Value> = transcripts::sources(transcript)
+        .unwrap_or_default()
         .into_iter()
         .map(|source| (source.file, json!({ "offset": source.size, "messageId": "" })))
         .collect();

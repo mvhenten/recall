@@ -47,33 +47,39 @@ fn subagents(transcript: &Path) -> Option<PathBuf> {
 }
 
 /// Every file one session writes, its own first and the delegated turns after it in name order.
-/// The order is what the chunk numbers of a whole-transcript reading are handed out in, so it may
-/// not depend on which of the files happen to exist yet.
-pub fn sources(transcript: &Path) -> Vec<Source> {
+///
+/// A session that delegated nothing has no directory for them, which is the common case and no
+/// error. A directory that is there and cannot be read is one: it is exactly the undercount this
+/// reader exists to end, and answering with the session's own transcript alone would hide it.
+pub fn sources(transcript: &Path) -> Result<Vec<Source>> {
     let mut found = vec![Source {
         file: MAIN.to_string(),
         path: transcript.to_path_buf(),
         size: size_of(transcript),
     }];
     let Some(dir) = subagents(transcript) else {
-        return found;
+        return Ok(found);
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return found;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
     };
-    let mut delegated: Vec<Source> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension() == Some(OsStr::new("jsonl")))
-        .filter_map(|path| {
-            let file = path.file_stem()?.to_str()?.to_string();
-            let size = size_of(&path);
-            Some(Source { file, path, size })
-        })
-        .collect();
+    let mut delegated = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
+        if path.extension() != Some(OsStr::new("jsonl")) {
+            continue;
+        }
+        let Some(file) = path.file_stem().and_then(|stem| stem.to_str()).map(str::to_string) else {
+            continue;
+        };
+        let size = size_of(&path);
+        delegated.push(Source { file, path, size });
+    }
     delegated.sort_by(|left, right| left.file.cmp(&right.file));
     found.extend(delegated);
-    found
+    Ok(found)
 }
 
 /// What the service answers about one session's files, and what it takes.
@@ -120,7 +126,17 @@ pub struct Reached {
 
 /// Sends what the service does not hold of one file, from where it says the file ends to where it
 /// ends here. A file the service is already level with costs nothing.
+///
+/// A file shorter than where the service says it ends is not that file any more: a transcript
+/// rewritten or truncated under the archive. The stretches already written stay as they are and
+/// nothing is spliced onto them, since the offsets they are keyed by no longer describe anything
+/// in the new file and a splice would read as lines the session never wrote. `hooks/usage.mjs`
+/// reads the same shape the same way, counting the new file from its end rather than counting the
+/// old one over again.
 pub fn send_file(store: &impl Store, session_id: &str, source: &Source, held: i64) -> Result<Reached> {
+    if source.size < held {
+        return Ok(Reached { end: held, bytes: 0 });
+    }
     let mut at = held;
     let mut bytes = 0;
     while at < source.size {
@@ -155,7 +171,7 @@ impl Archive {
         if transcript.as_os_str().is_empty() {
             return Ok(0);
         }
-        let sources = sources(transcript);
+        let sources = sources(transcript)?;
         let known = self.seen.entry(session_id.to_string()).or_default();
         if sources
             .iter()
@@ -186,6 +202,7 @@ impl Archive {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
 
     struct Sandbox {
         dir: PathBuf,
@@ -264,7 +281,11 @@ mod tests {
         sandbox.delegated("s-1", "agent-b", "bee\n");
         sandbox.delegated("s-1", "agent-a", "ay\n");
 
-        let named: Vec<String> = sources(&transcript).into_iter().map(|source| source.file).collect();
+        let named: Vec<String> = sources(&transcript)
+            .unwrap()
+            .into_iter()
+            .map(|source| source.file)
+            .collect();
 
         assert_eq!(
             named,
@@ -335,13 +356,70 @@ mod tests {
 
         // The pass reads from nothing, since that is what a host with no answer yet would do.
         assert_eq!(
-            send_file(&service, "s-1", &sources(&transcript).remove(0), 0).unwrap(),
+            send_file(&service, "s-1", &sources(&transcript).unwrap().remove(0), 0).unwrap(),
             Reached { end: 4, bytes: 0 },
             "nothing is written, and the end the service named is what the next pass reads from"
         );
 
         assert_eq!(*service.refused.borrow(), 1);
         assert_eq!(service.body("main"), "one\n", "a stretch that would overlap is refused");
+    }
+
+    #[test]
+    fn a_transcript_rewritten_shorter_is_left_where_it_is_rather_than_spliced() {
+        let sandbox = Sandbox::new("truncated");
+        let transcript = sandbox.transcript("s-1", "one\ntwo\nthree\n");
+        let service = Fake::default();
+        let mut archive = Archive::default();
+        archive.send(&service, "s-1", &transcript).unwrap();
+
+        std::fs::write(&transcript, "other\n").unwrap();
+
+        assert_eq!(
+            archive.send(&service, "s-1", &transcript).unwrap(),
+            0,
+            "a file shorter than where the service says it ends is another file"
+        );
+        assert_eq!(
+            service.body("main"),
+            "one\ntwo\nthree\n",
+            "the stretches already written are left alone, never spliced onto at an offset the new file has no line at"
+        );
+        assert_eq!(*service.refused.borrow(), 0, "and nothing is offered that would be");
+    }
+
+    #[test]
+    fn a_directory_of_delegated_turns_that_cannot_be_read_fails_rather_than_counting_none() {
+        let sandbox = Sandbox::new("unreadable");
+        let transcript = sandbox.transcript("s-1", "one\n");
+        sandbox.delegated("s-1", "agent-a", "ay\n");
+        let dir = sandbox.dir.join("project").join("s-1").join("subagents");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let refused = sources(&transcript);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = format!(
+            "{:#}",
+            refused.expect_err("an unreadable directory is not an empty one")
+        );
+        assert!(error.contains("subagents"), "{error}");
+        assert_eq!(
+            sources(&transcript).unwrap().len(),
+            2,
+            "and a directory that can be read again names its files"
+        );
+    }
+
+    #[test]
+    fn a_session_that_delegated_nothing_has_no_directory_and_that_is_no_error() {
+        let sandbox = Sandbox::new("none");
+        let transcript = sandbox.transcript("s-1", "one\n");
+
+        let found = sources(&transcript).unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file, MAIN);
     }
 
     #[test]

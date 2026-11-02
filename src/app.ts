@@ -304,7 +304,7 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "GET" && request.method !== "PUT") return error(405, "method not allowed");
     if (!(await sessionOnRecord(env.DB, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
     if (request.method === "GET") {
-      return json({ files: await transcriptFiles(env.TRANSCRIPTS, caller.userId, sessionId) });
+      return json({ files: await transcriptFiles(env.DB, caller.userId, sessionId) });
     }
     const file = parseTranscriptFile(url.searchParams.get("file"));
     if (!file.ok) return error(400, file.error);
@@ -314,7 +314,15 @@ export const createApp = (deps: Deps): App => {
     if (Number(request.headers.get("content-length") ?? 0) > MAX_CHUNK_BYTES) return tooLarge;
     const body = await request.arrayBuffer();
     if (body.byteLength > MAX_CHUNK_BYTES) return tooLarge;
-    const appended = await appendChunk(env.TRANSCRIPTS, caller.userId, sessionId, file.value, offset.value, body);
+    const appended = await appendChunk(
+      env.DB,
+      env.TRANSCRIPTS,
+      caller.userId,
+      sessionId,
+      file.value,
+      offset.value,
+      body,
+    );
     if (!appended.ok) {
       return json(
         {

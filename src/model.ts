@@ -155,7 +155,10 @@ export interface LabelTargets {
 }
 
 // Raw events are detail and the daily rollup is the long window, so events past two weeks are
-// dropped and every window wider than that reads only usage_daily.
+// dropped and every window wider than that reads only usage_daily. A durable event is the
+// exception: its chunk number is derived from the transcript it was read out of, so the same
+// reading arrives again whenever that host backfills, and the row is the only thing that can tell
+// the rollup it has already counted it. One row per model, day and file is small enough to keep.
 export const USAGE_RETENTION_MS = 1_209_600_000;
 export const MAX_USAGE_TOKENS = 1_000_000_000;
 
@@ -177,6 +180,7 @@ export interface UsageInput {
   cacheWriteTokens: number;
   cacheReadTokens: number;
   at: number;
+  durable: boolean;
 }
 
 export const DAY_MS = 86_400_000;
@@ -548,8 +552,9 @@ export const parseSession = (body: unknown): Parsed<SessionInput> => {
 
 export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
-  const { seq, host, repo, provider, account, model, prompts, at } = body;
+  const { seq, host, repo, provider, account, model, prompts, at, durable } = body;
   const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
+  if (durable !== undefined && typeof durable !== "boolean") return fail("durable must be true or false");
   if (!isInteger(seq, 0, Number.MAX_SAFE_INTEGER)) return fail("seq must be the whole number of a delta in a session");
   if (!isText(host, MAX_SESSION_TEXT_CHARS) || host.length < 1) {
     return fail(`host must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
@@ -591,6 +596,7 @@ export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
       outputTokens,
       cacheWriteTokens,
       cacheReadTokens,
+      durable: durable === true,
     },
   };
 };
