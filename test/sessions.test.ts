@@ -97,14 +97,18 @@ describe("sessions", () => {
     expect(await listed(tower)).toEqual([]);
   });
 
-  it("forgets a session whose host died before it could end it", async () => {
+  it("forgets a session whose host died before it could end it, and only that user's", async () => {
     const h = await harness();
     const { laptop } = await account(h);
+    const stranger = await h.user("stranger");
     await sync(laptop, "s-crashed", { lastActivityAt: h.now() });
+    await sync(stranger, "s-also-crashed", { lastActivityAt: h.now() });
 
     h.tick(SESSION_TTL_MS + 1000);
-
     expect(await listed(laptop)).toEqual([]);
+
+    h.tick(-(SESSION_TTL_MS + 1000));
+    expect(await listed(stranger)).toHaveLength(1);
   });
 
   it("refuses a document it cannot put on one line", async () => {

@@ -1,4 +1,4 @@
-import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
+import { emit, firstLine, logRun, readInput, recall, recallDetached } from "./lib.mjs";
 import { messagingEnabled, record, register } from "./messaging.mjs";
 
 const TIMEOUT_MS = 3000;
@@ -66,18 +66,17 @@ function registerSession(input, repoTag) {
 }
 
 // The repo tag is part of the record, so it is read before the session is written rather than
-// beside it. Every session syncs, registered or not: a host with messaging off still belongs in
-// the list `recall sessions` prints.
+// beside it. Every session syncs, registered or not, since a host with messaging off still belongs
+// in the list `recall sessions` prints; the sync is left to run, because an unreachable service
+// must not keep the session waiting for its memory context.
 async function run(input) {
   const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
   const repoTag = repo.ok ? repo.stdout.trim() : "";
   const messaging = registerSession(input, repoTag);
+  if (input.session_id) recallDetached(["sessions", "--sync", input.session_id], input.cwd);
   const work = [recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS })];
   if (messaging === "registered") {
     work.push(recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }));
-  }
-  if (input.session_id) {
-    work.push(recall(["sessions", "--sync", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS }));
   }
   const [config] = await Promise.all(work);
   if (!config.ok && config.error.includes("recall CLI not found")) {

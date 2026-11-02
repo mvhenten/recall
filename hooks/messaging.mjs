@@ -146,7 +146,7 @@ export function record(sessionId, state, cwd, repo, permissionMode, env = proces
       ...head(cwd),
       startedAt: now,
       lastActivityAt: now,
-      syncedAt: 0,
+      syncStartedAt: 0,
       prompts: 0,
       focus: { first: "", latest: "" },
       mode: invocation(pid),
@@ -164,15 +164,15 @@ export function register(sessionId, cwd, repo, permissionMode, env = process.env
 }
 
 // Each prompt counts, moves the focus on and marks the session active. The branch, the commit and
-// the permission mode all change under a running session, so they are read again here. `synced`
-// says whether the caller owes the service a sync: at most one every SYNC_INTERVAL_MS, since the
-// prompt hook spawns it and never waits for it.
+// the permission mode all change under a running session, so they are read again here. `due` says
+// whether the caller should fire a sync: at most one every SYNC_INTERVAL_MS, and the stamp goes in
+// before the spawn, because the hook never learns whether the sync it started arrived.
 export function touch(sessionId, prompt, permissionMode, env = process.env, uid = process.getuid()) {
   const file = registryPath(sessionId, env, uid);
   const stored = read(file);
   if (!stored) return undefined;
   const now = Date.now();
-  const due = now - (stored.syncedAt ?? 0) >= SYNC_INTERVAL_MS;
+  const due = now - (stored.syncStartedAt ?? 0) >= SYNC_INTERVAL_MS;
   const latest = truncate(prompt);
   writeFileSync(
     file,
@@ -180,7 +180,7 @@ export function touch(sessionId, prompt, permissionMode, env = process.env, uid 
       ...stored,
       ...head(stored.cwd),
       lastActivityAt: now,
-      syncedAt: due ? now : stored.syncedAt,
+      syncStartedAt: due ? now : stored.syncStartedAt,
       prompts: (stored.prompts ?? 0) + 1,
       focus: { first: stored.focus?.first || latest, latest },
       permissionMode: permissionMode ?? "",

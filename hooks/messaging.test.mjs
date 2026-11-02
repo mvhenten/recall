@@ -81,60 +81,25 @@ test("a session registers one document the daemon and recall sessions both read"
   assert.equal(register("s-1", cwd, REPO, "acceptEdits", env), "registered");
   const file = registryPath("s-1", env);
   const stored = JSON.parse(readFileSync(file, "utf8"));
-  assert.deepEqual(Object.keys(stored).sort(), [
-    "branch",
-    "commit",
-    "cwd",
-    "focus",
-    "host",
-    "lastActivityAt",
-    "mode",
-    "permissionMode",
-    "pid",
-    "prompts",
-    "repo",
-    "sessionId",
-    "socket",
-    "startedAt",
-    "state",
-    "syncedAt",
-    "token",
-  ]);
-  assert.deepEqual(
-    {
-      state: stored.state,
-      socket: stored.socket,
-      token: stored.token,
-      pid: stored.pid,
-      sessionId: stored.sessionId,
-      host: stored.host,
-      cwd: stored.cwd,
-      repo: stored.repo,
-      branch: stored.branch,
-      commit: stored.commit,
-      prompts: stored.prompts,
-      focus: stored.focus,
-      permissionMode: stored.permissionMode,
-      syncedAt: stored.syncedAt,
-    },
-    {
-      state: "registered",
-      socket: INBOX.CLAUDE_CODE_MESSAGING_SOCKET,
-      token: INBOX.CLAUDE_CODE_MESSAGING_TOKEN,
-      pid: 42,
-      sessionId: "s-1",
-      host: hostname(),
-      cwd,
-      repo: REPO,
-      branch: "work",
-      commit: "feat(sessions): list every host's sessions",
-      prompts: 0,
-      focus: { first: "", latest: "" },
-      permissionMode: "acceptEdits",
-      syncedAt: 0,
-    },
-  );
-  assert.equal(stored.lastActivityAt, stored.startedAt);
+  assert.deepEqual(stored, {
+    state: "registered",
+    socket: INBOX.CLAUDE_CODE_MESSAGING_SOCKET,
+    token: INBOX.CLAUDE_CODE_MESSAGING_TOKEN,
+    pid: 42,
+    sessionId: "s-1",
+    host: hostname(),
+    cwd,
+    repo: REPO,
+    branch: "work",
+    commit: "feat(sessions): list every host's sessions",
+    startedAt: stored.startedAt,
+    lastActivityAt: stored.startedAt,
+    syncStartedAt: 0,
+    prompts: 0,
+    focus: { first: "", latest: "" },
+    mode: stored.mode,
+    permissionMode: "acceptEdits",
+  });
   assert.equal(Math.abs(Date.now() - stored.startedAt) < 60_000, true, "the start is epoch milliseconds");
   assert.equal(sessionPid(env), 42, "a registered session takes its pid from the socket name");
   assert.equal(statSync(file).mode & 0o777, 0o600);
@@ -190,7 +155,7 @@ test("each prompt counts, moves the focus on and reads the head again", () => {
   assert.equal(read().focus.first, truncate(first));
   assert.equal(read().focus.latest, truncate(first));
   assert.equal(read().prompts, 1);
-  assert.equal(read().syncedAt >= started, true);
+  assert.equal(read().syncStartedAt >= started, true);
 
   repository(cwd, "fix(sessions): keep the first prompt");
   assert.deepEqual(touch("s-1", "why is CI red", "plan", env), { due: false }, "a sync has just gone out");
@@ -205,7 +170,10 @@ test("each prompt counts, moves the focus on and reads the head again", () => {
   assert.equal(stored.token, INBOX.CLAUDE_CODE_MESSAGING_TOKEN);
   assert.equal(statSync(registryPath("s-1", env)).mode & 0o777, 0o600);
 
-  writeFileSync(registryPath("s-1", env), JSON.stringify({ ...stored, syncedAt: Date.now() - SYNC_INTERVAL_MS - 1 }));
+  writeFileSync(
+    registryPath("s-1", env),
+    JSON.stringify({ ...stored, syncStartedAt: Date.now() - SYNC_INTERVAL_MS - 1 }),
+  );
   assert.deepEqual(touch("s-1", "ship it", "plan", env), { due: true }, "the throttle window has passed");
 
   rmSync(dir, { recursive: true, force: true });

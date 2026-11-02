@@ -226,13 +226,8 @@ const toSession = (row: SessionRow, caller: Caller): Session => ({
   current: row.device_id === caller.deviceId,
 });
 
-const SESSION_COLUMNS = `s.session_id, COALESCE(d.name, '') AS name, s.device_id, s.host, s.cwd, s.repo, s.branch,
-  s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest, s.mode,
-  s.permission_mode, s.pid
-  FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id`;
-
-const expireSessions = (db: D1Database, now: number): D1PreparedStatement =>
-  db.prepare("DELETE FROM sessions WHERE last_activity_at <= ?").bind(now - SESSION_TTL_MS);
+const expireSessions = (db: D1Database, userId: string, now: number): D1PreparedStatement =>
+  db.prepare("DELETE FROM sessions WHERE user_id = ? AND last_activity_at <= ?").bind(userId, now - SESSION_TTL_MS);
 
 export const putSession = async (
   db: D1Database,
@@ -242,7 +237,7 @@ export const putSession = async (
   now: number,
 ): Promise<void> => {
   await db.batch([
-    expireSessions(db, now),
+    expireSessions(db, caller.userId, now),
     db
       .prepare(
         `INSERT INTO sessions (user_id, session_id, device_id, host, cwd, repo, branch, commit_subject,
@@ -286,9 +281,15 @@ export const endSession = async (db: D1Database, userId: string, sessionId: stri
 
 export const listSessions = async (db: D1Database, caller: Caller, now: number): Promise<Session[]> => {
   const [, listed] = await db.batch<SessionRow>([
-    expireSessions(db, now),
+    expireSessions(db, caller.userId, now),
     db
-      .prepare(`SELECT ${SESSION_COLUMNS} WHERE s.user_id = ? ORDER BY s.last_activity_at DESC, s.session_id`)
+      .prepare(
+        `SELECT s.session_id, COALESCE(d.name, '') AS name, s.device_id, s.host, s.cwd, s.repo, s.branch,
+           s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest, s.mode,
+           s.permission_mode, s.pid
+         FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
+         WHERE s.user_id = ? ORDER BY s.last_activity_at DESC, s.session_id`,
+      )
       .bind(caller.userId),
   ]);
   return (listed?.results ?? []).map((row) => toSession(row, caller));

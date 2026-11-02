@@ -1,4 +1,4 @@
-use crate::api::Message;
+use crate::api::{Client, Message};
 use crate::config;
 use crate::seen::Seen;
 use crate::sessions;
@@ -14,6 +14,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const BASE_DELAY: Duration = Duration::from_secs(1);
@@ -145,8 +146,9 @@ fn now_iso() -> String {
     Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()
 }
 
-/// Appends the line shape hooks/lib.mjs writes, so the daemon and the hooks share one log.
-fn log(outcome: &str, took: Duration) {
+/// Appends the line shape hooks/lib.mjs writes, so the daemon, the hooks and the commands the
+/// hooks start detached all share one log. A detached command has nowhere else to report.
+pub fn log(outcome: &str, took: Duration) {
     let dir = state_dir();
     let line = format!("{} - {outcome} {}ms\n", now_iso(), took.as_millis());
     let _ = std::fs::create_dir_all(&dir);
@@ -203,10 +205,30 @@ async fn reconnect_loop(url: &str, token: &str, sessions_dir: &Path, seen: &mut 
     }
 }
 
+/// A session whose Claude process died never ran its SessionEnd hook, so its row would sit on the
+/// service reading idle until it expired a day later, indistinguishable from a session that is
+/// merely quiet. The tick that unlinks the record tells the service too, on a blocking thread so
+/// the call cannot stall message delivery.
+fn report_ended(client: &Arc<Client>, ended: Vec<String>) {
+    let client = Arc::clone(client);
+    tokio::task::spawn_blocking(move || {
+        for session_id in ended {
+            let started = Instant::now();
+            let outcome = match client.end_session(&session_id) {
+                Ok(true) => format!("sessions:ended:{session_id}"),
+                Ok(false) => format!("sessions:already-gone:{session_id}"),
+                Err(error) => format!("sessions:end-failed:{session_id}:{error:#}"),
+            };
+            log(&outcome, started.elapsed());
+        }
+    });
+}
+
 async fn serve() -> Result<()> {
     let config = config::load()?;
     let url = ws::listen_url(&config.endpoint)?;
     let sessions_dir = sessions_dir();
+    let client = Arc::new(Client::new(config.clone()));
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -215,7 +237,7 @@ async fn serve() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
-        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT) => Ok(()),
+        _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| report_ended(&client, ended)) => Ok(()),
         result = &mut work => result,
     }
 }

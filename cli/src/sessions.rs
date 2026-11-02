@@ -16,6 +16,15 @@ pub enum State {
     Failed { error: String },
 }
 
+impl State {
+    pub fn inbox(&self) -> Option<&Inbox> {
+        match self {
+            State::Registered(inbox) => Some(inbox),
+            _ => None,
+        }
+    }
+}
+
 /// The credential that writes into a session, which no log line and no error may carry.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -49,7 +58,7 @@ pub struct Focus {
 /// `hooks/session-end.mjs` removes it; the daemon only ever reads the directory.
 ///
 /// `pid` is the Claude process that owns the session, whatever the state, so a record outliving a
-/// session that never reached session end is removed on the next pass. `syncedAt`, which the hooks
+/// session that never reached session end is removed on the next pass. `syncStartedAt`, which the hooks
 /// use to throttle their own syncing, is theirs alone and is not read back here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -106,15 +115,25 @@ fn read(path: &Path) -> Option<Status> {
     Some(Status { session_id, record })
 }
 
-/// Every session still running, newest first. A record whose Claude process is gone, or whose
-/// socket has been removed, is unlinked on the way past, so a session that never reached session
-/// end leaves nothing behind; a record that cannot be parsed is left alone, because a half-written
-/// file becomes readable on the next pass.
-pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
+/// What one pass over the registry found: the sessions still running, newest first, and the ones
+/// it unlinked because their Claude process is gone. A session that ends without its SessionEnd
+/// hook leaves a record here and a row on the service, and `ended` is the only notice either gets.
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub live: Vec<(PathBuf, Status)>,
+    pub ended: Vec<String>,
+}
+
+/// A record whose Claude process is gone, or whose socket has been removed, is unlinked on the way
+/// past, so a session that never reached session end leaves nothing behind; a record that cannot be
+/// parsed is left alone, because a half-written file becomes readable on the next pass. Only a dead
+/// process ends a session: a socket can go while Claude stays, and that session is still running.
+pub fn scan(dir: &Path) -> Scan {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return Scan::default();
     };
     let mut live: Vec<(SystemTime, PathBuf, Status)> = Vec::new();
+    let mut ended = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -127,7 +146,12 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
             State::Registered(inbox) => !inbox.socket.exists(),
             _ => false,
         };
-        if !alive(status.record.pid) || socketless {
+        if !alive(status.record.pid) {
+            let _ = std::fs::remove_file(&path);
+            ended.push(status.session_id);
+            continue;
+        }
+        if socketless {
             let _ = std::fs::remove_file(&path);
             continue;
         }
@@ -143,7 +167,16 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
             .cmp(&left.0)
             .then_with(|| left.2.session_id.cmp(&right.2.session_id))
     });
-    live.into_iter().map(|(_, path, status)| (path, status)).collect()
+    ended.sort();
+    Scan {
+        live: live.into_iter().map(|(_, path, status)| (path, status)).collect(),
+        ended,
+    }
+}
+
+/// Every session still running, newest first.
+pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
+    scan(dir).live
 }
 
 /// The record this host wrote for one session, whatever state the hook left it in.
@@ -268,12 +301,22 @@ pub async fn fanout(dir: &Path, body: &str) -> Fanout {
 
 /// Resolves once the registry has held no live session for `idle`, which is the daemon's cue to
 /// let go of the lock. A SessionStart hook brings it straight back with `recall listen --ensure`.
-pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration) {
+/// Each pass hands `ended` the sessions it unlinked, since the same tick that notices a Claude
+/// process is gone is the only thing that can tell the service.
+pub async fn idle_exit(dir: &Path, check: Duration, idle: Duration, mut ended: impl FnMut(Vec<String>)) {
     let mut tick = tokio::time::interval(check);
     let mut empty_since: Option<Instant> = None;
     loop {
         tick.tick().await;
-        if !registered(dir).is_empty() {
+        let scan = scan(dir);
+        if !scan.ended.is_empty() {
+            ended(scan.ended);
+        }
+        if scan
+            .live
+            .iter()
+            .any(|(_, status)| status.record.state.inbox().is_some())
+        {
             empty_since = None;
             continue;
         }
@@ -481,7 +524,7 @@ mod tests {
     fn the_registry_reads_back_the_json_the_hook_writes() {
         const DOCUMENT: &str = r#"{"pid":4242,"cwd":"/src","sessionId":"s-1","host":"laptop",
             "repo":"repo:github.com/mvhenten/recall","branch":"work","commit":"feat: list sessions",
-            "startedAt":1762000000000,"lastActivityAt":1762000060000,"syncedAt":1762000060000,"prompts":2,
+            "startedAt":1762000000000,"lastActivityAt":1762000060000,"syncStartedAt":1762000060000,"prompts":2,
             "focus":{"first":"list the sessions","latest":"why is CI red"},"mode":"interactive",
             "permissionMode":"default""#;
         let document = |state: &str| format!("{DOCUMENT},{state}}}");
@@ -563,12 +606,50 @@ mod tests {
         let socket = sandbox.dir.join("inbox.sock");
         std::fs::write(&socket, "").unwrap();
         sandbox.register("s-live", &socket, std::process::id() as i32);
-        let busy = tokio::time::timeout(Duration::from_millis(120), idle_exit(&sandbox.sessions(), check, idle)).await;
+        let busy = tokio::time::timeout(
+            Duration::from_millis(120),
+            idle_exit(&sandbox.sessions(), check, idle, |_| {}),
+        )
+        .await;
         assert!(busy.is_err(), "a registered session must hold the daemon open");
 
         std::fs::remove_file(sandbox.sessions().join("s-live.json")).unwrap();
-        tokio::time::timeout(Duration::from_millis(500), idle_exit(&sandbox.sessions(), check, idle))
-            .await
-            .expect("an empty registry must let the daemon exit");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            idle_exit(&sandbox.sessions(), check, idle, |_| {}),
+        )
+        .await
+        .expect("an empty registry must let the daemon exit");
+    }
+
+    #[tokio::test]
+    async fn the_tick_that_unlinks_a_dead_session_reports_it_ended() {
+        let sandbox = Sandbox::new("ended");
+        let check = Duration::from_millis(5);
+        let socket = sandbox.dir.join("inbox.sock");
+        std::fs::write(&socket, "").unwrap();
+        sandbox.register("s-dead", &socket, i32::MAX);
+        sandbox.register(
+            "s-socketless",
+            &sandbox.dir.join("gone.sock"),
+            std::process::id() as i32,
+        );
+        sandbox.record("s-skipped", i32::MAX, State::Off);
+
+        let mut reported = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            idle_exit(&sandbox.sessions(), check, Duration::from_millis(40), |ended| {
+                reported.extend(ended);
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            reported,
+            vec!["s-dead".to_string(), "s-skipped".to_string()],
+            "only a session whose process is gone has ended; a socket can go while Claude stays"
+        );
+        assert!(!sandbox.sessions().join("s-socketless.json").exists());
     }
 }
