@@ -49,6 +49,7 @@ export const sessionModes = ["interactive", "headless", ""] as const;
 export type SessionMode = (typeof sessionModes)[number];
 
 export const SESSION_TTL_MS = 86_400_000;
+export const IDLE_AFTER_MS = 300_000;
 export const MAX_FOCUS_CHARS = 200;
 export const MAX_SESSION_TEXT_CHARS = 500;
 export const MAX_PROMPTS = 1_000_000;

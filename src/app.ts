@@ -1,4 +1,4 @@
-import { dashboardNotice, dashboardPage, tabForPath } from "./dashboard";
+import { dashboardNotice, dashboardPage, SESSIONS_TAB, tabForPath } from "./dashboard";
 import {
   type Caller,
   DEVICE_CODE_TTL_MS,
@@ -248,12 +248,15 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "GET") return lost(405, "Not allowed", "The dashboard only answers a GET.");
     const email = await approver(request, signIn);
     if (email instanceof Response) return email;
-    if ((await userForEmail(db, email)) === null) {
+    const userId = await userForEmail(db, email);
+    if (userId === null) {
       return signIn(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
     }
     const tab = tabForPath(url.pathname);
     if (!tab) return lost(404, "No such page", "The dashboard has no page at this address.");
-    return dashboardPage(email, tab);
+    const now = deps.now();
+    const sessions = tab.path === SESSIONS_TAB ? await listSessions(db, { userId, deviceId: "" }, now) : [];
+    return dashboardPage(email, tab, sessions, now);
   };
 
   const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
