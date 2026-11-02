@@ -220,7 +220,7 @@ pub fn focus_line(focus: &Focus) -> String {
 }
 
 /// The sessions worth delivering to, newest registration first.
-pub fn registered(dir: &Path) -> Vec<Registered> {
+fn registered(dir: &Path) -> Vec<Registered> {
     status(dir)
         .into_iter()
         .filter_map(|(path, status)| match status.record.state {

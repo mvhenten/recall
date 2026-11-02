@@ -126,6 +126,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       `CREATE TABLE IF NOT EXISTS messages (
          message_id TEXT PRIMARY KEY,
          to_device_id TEXT NOT NULL,
+         to_session_id TEXT NOT NULL DEFAULT '',
          from_device_id TEXT NOT NULL,
          body TEXT NOT NULL,
          created_at INTEGER NOT NULL,
@@ -133,9 +134,9 @@ export class Mailbox extends DurableObject<MailboxEnv> {
        )`,
     );
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
-    // A mailbox older than per-session addressing has no to_session_id, and its queued messages are
-    // all for the whole host. `PRAGMA user_version` is one of the pragmas a Durable Object refuses,
-    // so the column itself is the version marker.
+    // A mailbox created before per-session addressing has no to_session_id, and its queued messages
+    // are all for the whole host. `PRAGMA user_version` is one of the pragmas a Durable Object
+    // refuses, so the column itself is the version marker.
     const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(messages)").toArray();
     if (!columns.some((column) => column.name === "to_session_id")) {
       this.sql.exec("ALTER TABLE messages ADD COLUMN to_session_id TEXT NOT NULL DEFAULT ''");
