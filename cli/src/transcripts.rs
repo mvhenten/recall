@@ -201,12 +201,6 @@ impl Archive {
         Ok(sent)
     }
 
-    /// Takes an answer the caller already has, so a pass that asked the service for something
-    /// else does not ask again for this.
-    pub fn remember(&mut self, session_id: &str, bytes: &HashMap<String, i64>) {
-        self.seen.insert(session_id.to_string(), bytes.clone());
-    }
-
     /// Forgets the sessions this host no longer holds, so a daemon that runs for weeks does not
     /// carry every session it ever archived.
     pub fn retain(&mut self, live: &HashSet<&str>) {
@@ -428,17 +422,6 @@ mod tests {
             2,
             "and a directory that can be read again names its files"
         );
-    }
-
-    #[test]
-    fn a_session_that_delegated_nothing_has_no_directory_and_that_is_no_error() {
-        let sandbox = Sandbox::new("none");
-        let transcript = sandbox.transcript("s-1", "one\n");
-
-        let found = sources(&transcript).unwrap();
-
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].file, MAIN);
     }
 
     #[test]

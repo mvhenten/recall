@@ -580,8 +580,7 @@ fn backfill_sessions() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let mut touched = 0;
-    let mut archive = transcripts::Archive::default();
-    backfill::send(&client, &mut archive, &past, &account, |session_id, sent| {
+    backfill::send(&client, &past, &account, |session_id, sent| {
         if sent.events == 0 && sent.bytes == 0 {
             return;
         }

@@ -40,13 +40,50 @@ const heldBytes = async (db: D1Database, userId: string, sessionId: string, file
   return row?.bytes ?? 0;
 };
 
-// The store is append-only: a stretch lands only where the file already ends, so two writers racing
-// on the same file cannot leave an overlap for a reader to see twice. A caller writing anywhere
-// else is told where the file ends and reads on from there.
+// Moving the end of a file from where a stretch starts to where it finishes, and only from there.
+// Two writers reaching the same file at once — the listener's beat and a session ending — both
+// read the same end and offer a stretch from it; this is what picks one. The loser changes no row
+// and is told where the file ends now.
+const claim = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  file: string,
+  offset: number,
+  end: number,
+): Promise<boolean> => {
+  // A file the service holds nothing of has no row, and the only stretch that may open one is the
+  // one starting at nothing. An update alone would let a stretch from the middle of a file open a
+  // file that begins at its own offset.
+  const claimed =
+    offset === 0
+      ? await db
+          .prepare(
+            `INSERT INTO transcript_files (user_id, session_id, file, bytes) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (user_id, session_id, file) DO UPDATE SET bytes = ?4 WHERE transcript_files.bytes = 0`,
+          )
+          .bind(userId, sessionId, file, end)
+          .run()
+      : await db
+          .prepare(
+            `UPDATE transcript_files SET bytes = ?4
+             WHERE user_id = ?1 AND session_id = ?2 AND file = ?3 AND bytes = ?5`,
+          )
+          .bind(userId, sessionId, file, end, offset)
+          .run();
+  return claimed.meta.changes === 1;
+};
+
+// The store is append-only: a stretch lands only where the file already ends, so two writers
+// racing on the same file cannot leave an overlap, or a hole, for a reader to find. A caller
+// writing anywhere else is told where the file ends and reads on from there.
 //
-// The object goes down before the end moves. A write that lands and then fails to move the end
-// leaves the next stretch starting where this one did, which rewrites the same key with the same
-// lines and more of them; the other order would leave a gap no reader could see.
+// The end moves before the object goes down, and that order is the whole of it. Writing first
+// would have the slower of two writers put its shorter stretch over the longer one already
+// there, leaving the file ending past bytes nothing holds — a hole no reader could see, since
+// every object either side of it is exactly where it should be. Claiming first means the loser
+// never writes at all. A put that then fails gives the claim back, so the next stretch starts
+// where this one did rather than beyond a gap.
 export const appendChunk = async (
   db: D1Database,
   bucket: R2Bucket,
@@ -56,19 +93,21 @@ export const appendChunk = async (
   offset: number,
   body: ArrayBuffer,
 ): Promise<Appended> => {
-  const held = await heldBytes(db, userId, sessionId, file);
-  if (offset !== held) return { ok: false, offset: held };
-  if (body.byteLength === 0) return { ok: true, offset: held };
-  await bucket.put(chunkKey(userId, sessionId, file, offset), body, {
-    httpMetadata: { contentType: "application/x-ndjson" },
-  });
+  if (body.byteLength === 0) {
+    const held = await heldBytes(db, userId, sessionId, file);
+    return offset === held ? { ok: true, offset: held } : { ok: false, offset: held };
+  }
   const end = offset + body.byteLength;
-  await db
-    .prepare(
-      `INSERT INTO transcript_files (user_id, session_id, file, bytes) VALUES (?1, ?2, ?3, ?4)
-       ON CONFLICT (user_id, session_id, file) DO UPDATE SET bytes = ?4 WHERE transcript_files.bytes = ?5`,
-    )
-    .bind(userId, sessionId, file, end, offset)
-    .run();
+  if (!(await claim(db, userId, sessionId, file, offset, end))) {
+    return { ok: false, offset: await heldBytes(db, userId, sessionId, file) };
+  }
+  await bucket
+    .put(chunkKey(userId, sessionId, file, offset), body, {
+      httpMetadata: { contentType: "application/x-ndjson" },
+    })
+    .catch(async (failure: unknown) => {
+      await claim(db, userId, sessionId, file, end, offset);
+      throw failure;
+    });
   return { ok: true, offset: end };
 };

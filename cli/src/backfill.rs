@@ -38,6 +38,12 @@ const BLOCKS: i64 = ((1_i64 << 53) - BACKFILL_BASE) / SPANS_PER_FILE;
 /// position would move every later file's block the moment a delegated turn with an earlier name
 /// joined the set, and those numbers would land on ones another file had already spent. The
 /// session's own transcript takes block zero, so the files that come and go never touch it.
+///
+/// Two delegated turns of one session hashing to the same block would have the second one's
+/// events land on chunk numbers the first already holds, which the insert ignores: that turn's
+/// tokens are dropped, quietly and for good. With a block space of 2^37 that needs around fifty
+/// thousand files in a single session before it is as likely as not, against a few dozen in a
+/// heavy one, so nothing here guards against it.
 fn block(file: &str) -> i64 {
     if file == MAIN {
         return 0;
@@ -83,8 +89,6 @@ pub struct Past {
     pub prompts: i64,
     pub focus: Focus,
     pub permission_mode: String,
-    /// The session's own transcript, which is what names the set its files are found from.
-    pub main: PathBuf,
     /// Whether the service already holds the session. Its own transcript was counted by whatever
     /// put it there and is never read again; its delegated turns are another matter, since no run
     /// before this one ever counted one at all.
@@ -356,7 +360,6 @@ fn synthesize(
         prompts: reading.prompts,
         focus: reading.focus,
         permission_mode: reading.permission_mode,
-        main: path.to_path_buf(),
         on_record,
         parts: parts(path)?,
     }))
@@ -439,16 +442,10 @@ fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<(Vec<&'a Part>,
 /// run reads as already sent, so it may not land ahead of the tokens it stands for; the archive
 /// goes last because the route that takes it answers only for a session on record, and the end
 /// is what puts a new one there.
-pub fn send(
-    service: &impl Service,
-    archive: &mut transcripts::Archive,
-    past: &[Past],
-    account: &str,
-    mut sent: impl FnMut(&str, Sent),
-) -> Result<()> {
+pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl FnMut(&str, Sent)) -> Result<()> {
     for session in past {
         let id = &session.session_id;
-        let (owed, held) = owed(service, session)?;
+        let (owed, mut held) = owed(service, session)?;
         let mut done = Sent::default();
         for part in owed {
             let prompts = if part.source.file == MAIN { session.prompts } else { 0 };
@@ -459,10 +456,15 @@ pub fn send(
         if !session.on_record {
             service.sync(id, &session.body())?;
             service.end(id)?;
-        } else {
-            archive.remember(id, &held.bytes);
+            held = service.held(id)?;
         }
-        done.bytes = archive.send(service, id, &session.main)?;
+        // The files this session was found to have, and not whatever is on disk by now: the set
+        // the archive writes is then the set the tokens were decided over, and the two cannot
+        // drift apart under a run.
+        for part in &session.parts {
+            let at = held.bytes.get(&part.source.file).copied().unwrap_or(0);
+            done.bytes += transcripts::send_file(service, id, &part.source, at)?.bytes;
+        }
         sent(id, done);
     }
     Ok(())
@@ -832,24 +834,13 @@ mod tests {
             first,
             "the same transcript regenerates the same chunk numbers, whenever it is read"
         );
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &first,
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&service, &first, ACCOUNT, |_, _| {}).unwrap();
         let once = service.rollup();
 
         let again = sandbox.found(&service.on_record());
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &again,
-            ACCOUNT,
-            |session_id, sent| assert_eq!(sent.events, 0, "{session_id} had tokens left to send"),
-        )
+        send(&service, &again, ACCOUNT, |session_id, sent| {
+            assert_eq!(sent.events, 0, "{session_id} had tokens left to send")
+        })
         .unwrap();
 
         assert_eq!(service.rollup(), once, "a second run adds nothing to the rollup");
@@ -867,25 +858,11 @@ mod tests {
         let service = Fake::default();
         // The run a host made before a delegated turn was ever read: its own transcript counted,
         // and the service left holding the session on record.
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &sandbox.found(&nothing()),
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&service, &sandbox.found(&nothing()), ACCOUNT, |_, _| {}).unwrap();
         assert_eq!(spent(&service, "claude-opus-4"), 150);
         sandbox.subagent("-home-you-recall", "s-old", "agent-7f21", &delegated());
 
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &sandbox.found(&service.on_record()),
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&service, &sandbox.found(&service.on_record()), ACCOUNT, |_, _| {}).unwrap();
 
         assert_eq!(
             spent(&service, "claude-opus-4"),
@@ -895,7 +872,6 @@ mod tests {
         let recovered = service.rollup();
         send(
             &service,
-            &mut transcripts::Archive::default(),
             &sandbox.found(&service.on_record()),
             ACCOUNT,
             |session_id, sent| assert_eq!(sent.events, 0, "{session_id} had tokens left to send"),
@@ -919,12 +895,15 @@ mod tests {
                 .borrow_mut()
                 .insert(("s-old".to_string(), file.to_string()));
         }
-        *self_spent(&service) += 850;
+        *service
+            .daily
+            .borrow_mut()
+            .entry((day(1_790_850_605_000), "claude-opus-4".to_string()))
+            .or_default() += 850;
         let counted = service.rollup();
 
         send(
             &service,
-            &mut transcripts::Archive::default(),
             &sandbox.found(&service.on_record()),
             ACCOUNT,
             |session_id, sent| assert_eq!(sent.events, 0, "{session_id} had tokens left to send"),
@@ -946,24 +925,10 @@ mod tests {
         let service = Fake::default();
         let found = sandbox.found(&nothing());
 
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &found,
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&service, &found, ACCOUNT, |_, _| {}).unwrap();
         let once = service.rollup();
         // A run that died before the history row landed sends the same session again.
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &found,
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&service, &found, ACCOUNT, |_, _| {}).unwrap();
 
         assert_eq!(
             spent(&service, "claude-opus-4"),
@@ -1041,7 +1006,7 @@ mod tests {
 
         let first = sandbox.found(&dying.on_record());
         assert!(
-            send(&dying, &mut transcripts::Archive::default(), &first, ACCOUNT, |_, _| {}).is_err(),
+            send(&dying, &first, ACCOUNT, |_, _| {}).is_err(),
             "a sync the service refuses fails the run"
         );
         let posted = dying.events.borrow().clone();
@@ -1052,14 +1017,7 @@ mod tests {
         let resumed = Fake::resuming(&dying);
         let again = sandbox.found(&resumed.on_record());
         assert_eq!(again, first, "nothing is on record, so the same session is sent again");
-        send(
-            &resumed,
-            &mut transcripts::Archive::default(),
-            &again,
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&resumed, &again, ACCOUNT, |_, _| {}).unwrap();
 
         assert_eq!(
             *resumed.events.borrow(),
@@ -1071,15 +1029,9 @@ mod tests {
 
         let caught_up = resumed.rollup();
         let after = sandbox.found(&resumed.on_record());
-        send(
-            &resumed,
-            &mut transcripts::Archive::default(),
-            &after,
-            ACCOUNT,
-            |session_id, sent| {
-                assert_eq!(sent, Sent::default(), "{session_id} had something left to send");
-            },
-        )
+        send(&resumed, &after, ACCOUNT, |session_id, sent| {
+            assert_eq!(sent, Sent::default(), "{session_id} had something left to send");
+        })
         .unwrap();
         assert_eq!(
             resumed.rollup(),
@@ -1172,15 +1124,6 @@ mod tests {
         vec![answer("2026-10-01T10:05:00.000Z", "msg-a1", "claude-opus-4", 700, 70)]
     }
 
-    /// The rollup cell `session()` and its delegated turn both land in.
-    fn self_spent(service: &Fake) -> std::cell::RefMut<'_, i64> {
-        std::cell::RefMut::map(service.daily.borrow_mut(), |daily| {
-            daily
-                .entry((day(1_790_850_605_000), "claude-opus-4".to_string()))
-                .or_default()
-        })
-    }
-
     fn spent(service: &Fake, model: &str) -> i64 {
         service
             .rollup()
@@ -1196,23 +1139,9 @@ mod tests {
         sandbox.subagent("-home-you-recall", "s-old", "agent-7f21", &delegated());
         let service = Fake::default();
 
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &sandbox.found(&nothing()),
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&service, &sandbox.found(&nothing()), ACCOUNT, |_, _| {}).unwrap();
         let once = service.rollup();
-        send(
-            &service,
-            &mut transcripts::Archive::default(),
-            &sandbox.found(&service.on_record()),
-            ACCOUNT,
-            |_, _| {},
-        )
-        .unwrap();
+        send(&service, &sandbox.found(&service.on_record()), ACCOUNT, |_, _| {}).unwrap();
 
         assert_eq!(
             spent(&service, "claude-opus-4"),
