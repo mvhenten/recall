@@ -1,6 +1,6 @@
 {
   "name": "recall",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Sync Claude auto-memory to the recall service and recall matching memories on every prompt",
   "author": {
     "name": "Matthijs van Henten"
