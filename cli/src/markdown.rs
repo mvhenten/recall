@@ -158,8 +158,6 @@ pub fn repo_at_branch(repo: &str, branch: &str) -> String {
     }
 }
 
-/// What a listing prints for a host: the name the user gave it on the dashboard, with the raw one
-/// alongside so no host reads as another, and the raw one alone when it carries no label.
 pub fn host_column(label: &str, host: &str) -> String {
     if label.is_empty() || label == host {
         return host.to_string();

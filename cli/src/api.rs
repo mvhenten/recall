@@ -220,14 +220,24 @@ pub enum Poll {
 pub struct Device {
     pub device_id: String,
     pub name: String,
+    /// The machine this login was made from. Signing in twice from one machine takes two names,
+    /// core-box and core-box-2, under the one host core-box.
+    #[serde(default)]
+    pub host: String,
     /// The name the user gave this host on the dashboard's labels tab, empty when it carries none.
-    /// It addresses the host alongside the raw name, and a service too old to send one leaves it
-    /// empty rather than failing the listing.
     #[serde(default)]
     pub label: String,
     pub created_at: i64,
     pub last_used_at: i64,
     pub current: bool,
+}
+
+impl Device {
+    /// The machine a login belongs to, which a service too old to name one answers for with the
+    /// login's own name.
+    fn machine(&self) -> &str {
+        if self.host.is_empty() { &self.name } else { &self.host }
+    }
 }
 
 #[derive(Deserialize)]
@@ -361,11 +371,15 @@ pub struct Target {
     pub session_id: String,
 }
 
-/// `to` is a device id, a device name, or the label that host carries, any of which reach every
-/// session on that host, or a session handle or session id, which reaches that one session. A
-/// device answers first, so `sessions` is called only for a target no device claims and an ordinary
-/// host send costs no listing. A name or label two hosts answer to names them both rather than
-/// picking one; only the device id, which is unique, settles it on its own.
+/// `to` is a device id, a host's name or the label it carries, any of which reach every session on
+/// that host, or a session handle or session id, which reaches that one session. A device answers
+/// first, so `sessions` is called only for a target no device claims and an ordinary host send
+/// costs no listing.
+///
+/// A machine signing in more than once holds a login per sign-in, all under the one host, and only
+/// the newest of them has a daemon reading its queue — so they collapse to that one rather than
+/// reading as a crowd. Two distinct hosts answering to one name or label is the real ambiguity:
+/// that names them both rather than picking one, and only the device id settles it on its own.
 pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<Session>>, to: &str) -> Result<Target> {
     let host = |device_id: &str| {
         Ok(Target {
@@ -378,19 +392,30 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
     }
     let named: Vec<&Device> = devices
         .iter()
-        .filter(|device| device.name == to || (!device.label.is_empty() && device.label == to))
+        .filter(|device| {
+            device.name == to || device.machine() == to || (!device.label.is_empty() && device.label == to)
+        })
         .collect();
-    match named.as_slice() {
-        [device] => return host(&device.device_id),
+    let mut machines: Vec<&str> = named.iter().map(|device| device.machine()).collect();
+    machines.sort_unstable();
+    machines.dedup();
+    match machines.as_slice() {
+        [_] => {
+            let newest = named
+                .iter()
+                .max_by_key(|device| device.last_used_at)
+                .expect("a named machine holds at least one login");
+            return host(&newest.device_id);
+        }
         [] => {}
-        many => {
-            let candidates: Vec<String> = many
+        _ => {
+            let candidates: Vec<String> = named
                 .iter()
                 .map(|device| format!("{} ({})", device.name, device.device_id))
                 .collect();
             bail!(
                 "ambiguous target {to}: {} hosts answer to it; pass one of these device ids instead: {}",
-                many.len(),
+                machines.len(),
                 candidates.join(", ")
             )
         }
@@ -751,10 +776,21 @@ mod tests {
         Device {
             device_id: device_id.to_string(),
             name: name.to_string(),
+            host: name.to_string(),
             label: String::new(),
             created_at: 0,
             last_used_at: 0,
             current: false,
+        }
+    }
+
+    /// One further sign-in from a machine already signed in: its own name, the same host.
+    fn relogin(device_id: &str, name: &str, host: &str, last_used_at: i64, label: &str) -> Device {
+        Device {
+            host: host.to_string(),
+            label: label.to_string(),
+            last_used_at,
+            ..device(device_id, name)
         }
     }
 
@@ -861,10 +897,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unlabelled_host_is_not_reached_by_an_empty_label() {
-        let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
-        let error = resolve_target(&devices, || Ok(Vec::new()), "").unwrap_err().to_string();
-        assert!(error.contains("no host or session named"), "{error}");
+    fn a_machine_signed_in_twice_answers_on_its_newest_login() {
+        let devices = [
+            relogin("d-1", "core-box", "core-box", 10, "core"),
+            relogin("d-2", "core-box-2", "core-box", 20, "core"),
+        ];
+        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+
+        assert_eq!(resolve_target(&devices, refuse, "core").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, refuse, "core-box").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
     }
 
     #[test]

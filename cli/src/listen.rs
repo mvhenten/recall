@@ -172,26 +172,20 @@ pub fn log(outcome: &str, took: Duration) {
 
 /// The line a delivered message arrives under. A session reading one otherwise sees a bare user
 /// turn with nothing saying where it came from, and Claude Code's own cross-session tools reach
-/// only sessions on the same machine, so the route back has to be spelled out. The handle is
-/// preferred because it reaches the one session that asked; a sender that named no session is
-/// answered on its host, which `recall send` takes by label as readily as by name.
+/// only sessions on the same machine, so the route back has to be spelled out. The handle answers
+/// the one session that asked; a sender that named none is answered on its device id, which is
+/// unique and unchanging, where its label is neither and only ever reads as prose.
 pub fn header(message: &Message) -> String {
-    let from = if message.from_host.is_empty() {
-        &message.from_device_id
-    } else {
-        &message.from_host
-    };
-    let reply = if message.from_name.is_empty() {
-        from
-    } else {
-        &message.from_name
-    };
-    let origin = if message.from_name.is_empty() {
-        from.clone()
-    } else {
-        format!("{from}/{}", message.from_name)
-    };
-    format!("[recall from {origin}; reply with recall_send to \"{reply}\"]")
+    if message.from_name.is_empty() {
+        return format!(
+            "[recall from {}; reply with recall_send to \"{}\"]",
+            message.from_host, message.from_device_id
+        );
+    }
+    format!(
+        "[recall from {}/{}; reply with recall_send to \"{}\"]",
+        message.from_host, message.from_name, message.from_name
+    )
 }
 
 fn delivered_body(message: &Message) -> String {
@@ -740,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_names_the_handle_to_answer_on_and_falls_back_to_the_host() {
+    fn the_header_answers_on_the_handle_and_falls_back_to_the_device_id() {
         let message = |from_host: &str, from_name: &str| Message {
             message_id: "m-1".to_string(),
             to_device_id: "d-2".to_string(),
@@ -759,11 +753,7 @@ mod tests {
         );
         assert_eq!(
             header(&message("core", "")),
-            "[recall from core; reply with recall_send to \"core\"]"
-        );
-        assert_eq!(
-            header(&message("", "")),
-            "[recall from d-1; reply with recall_send to \"d-1\"]"
+            "[recall from core; reply with recall_send to \"d-1\"]"
         );
         assert_eq!(delivered_body(&message("core", "")).lines().last().unwrap(), "ship it");
     }

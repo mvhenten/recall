@@ -23,9 +23,13 @@ export interface DeviceCode {
   lastPolledAt: number;
 }
 
+// `name` is unique across the account and `host` is not: a machine signing in twice is named
+// core-box and core-box-2, and both say their host is core-box. Everything addressed to a machine
+// rather than to one of its logins — a label above all — keys on `host`.
 export interface Device {
   deviceId: string;
   name: string;
+  host: string;
   createdAt: number;
   lastUsedAt: number;
 }
@@ -33,6 +37,8 @@ export interface Device {
 export interface Caller {
   userId: string;
   deviceId: string;
+  name: string;
+  host: string;
 }
 
 export type PollOutcome =
@@ -216,14 +222,14 @@ export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: nu
   const [issued] = await db.batch([
     db
       .prepare(
-        `INSERT INTO devices (device_id, token_sha256, user_id, name, created_at, last_used_at)
-         SELECT ?1, ?2, user_id, ?3, ?4, ?4 FROM device_codes
+        `INSERT INTO devices (device_id, token_sha256, user_id, name, host, created_at, last_used_at)
+         SELECT ?1, ?2, user_id, ?3, ?6, ?4, ?4 FROM device_codes
          WHERE device_code_sha256 = ?5 AND status = 'approved'
            AND NOT EXISTS (
              SELECT 1 FROM devices WHERE devices.user_id = device_codes.user_id AND devices.name = ?3
            )`,
       )
-      .bind(crypto.randomUUID(), await sha256Hex(accessToken), name, now, codeHash),
+      .bind(crypto.randomUUID(), await sha256Hex(accessToken), name, now, codeHash, code.deviceName),
     db.prepare("DELETE FROM device_codes WHERE device_code_sha256 = ?").bind(codeHash),
   ]);
   if (issued?.meta.changes !== 1) return { ok: false, error: "invalid_grant" };
@@ -240,26 +246,28 @@ export const userForEmail = async (db: D1Database, email: string): Promise<strin
 
 export const deviceForToken = async (db: D1Database, token: string, now: number): Promise<Caller | null> => {
   const row = await db
-    .prepare("SELECT device_id, user_id, last_used_at FROM devices WHERE token_sha256 = ?")
+    .prepare("SELECT device_id, user_id, name, host, last_used_at FROM devices WHERE token_sha256 = ?")
     .bind(await sha256Hex(token))
-    .first<{ device_id: string; user_id: string; last_used_at: number }>();
+    .first<{ device_id: string; user_id: string; name: string; host: string; last_used_at: number }>();
   if (!row) return null;
   if (now - row.last_used_at >= LAST_USED_RESOLUTION_MS) {
     await db.prepare("UPDATE devices SET last_used_at = ? WHERE device_id = ?").bind(now, row.device_id).run();
   }
-  return { userId: row.user_id, deviceId: row.device_id };
+  return { userId: row.user_id, deviceId: row.device_id, name: row.name, host: row.host };
 };
 
 export const listDevices = async (db: D1Database, userId: string): Promise<Device[]> => {
   const { results } = await db
     .prepare(
-      "SELECT device_id, name, created_at, last_used_at FROM devices WHERE user_id = ? ORDER BY created_at, device_id",
+      `SELECT device_id, name, host, created_at, last_used_at FROM devices
+       WHERE user_id = ? ORDER BY created_at, device_id`,
     )
     .bind(userId)
-    .all<{ device_id: string; name: string; created_at: number; last_used_at: number }>();
+    .all<{ device_id: string; name: string; host: string; created_at: number; last_used_at: number }>();
   return results.map((row) => ({
     deviceId: row.device_id,
     name: row.name,
+    host: row.host,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
   }));

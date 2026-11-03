@@ -104,6 +104,24 @@ describe("device login", () => {
     ]);
   });
 
+  it("keeps a host's label on every login it makes, not only the one that took the plain name", async () => {
+    const h = await harness();
+    const userId = `owner-${crypto.randomUUID()}`;
+    const owner = await h.invite(email("owner"), userId);
+    await h.login(owner, "core-box");
+    const client = h.clientWithToken(await h.login(owner, "core-box"));
+    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
+      .bind(userId, "core-box", "core")
+      .run();
+
+    expect(
+      (await devicesOf(await client.request("GET", "/v1/devices"))).map((device) => [device.name, device.label]),
+    ).toEqual([
+      ["core-box", "core"],
+      ["core-box-2", "core"],
+    ]);
+  });
+
   it("suffixes a device name another device on the same account already holds", async () => {
     const h = await harness();
     const owner = await h.invite(email("alice"));

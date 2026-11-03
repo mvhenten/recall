@@ -29,8 +29,6 @@ export interface Message {
   expiresAt: number;
 }
 
-// The sender as a delivered message names it: the host as its owner calls it, label first, and the
-// handle of the session that sent it, empty when the send named none.
 export interface Sender {
   deviceId: string;
   host: string;
@@ -94,9 +92,6 @@ const parseToSessionId = (value: unknown): Parsed<string> => {
   return parseSessionId(value);
 };
 
-// The session the sender is running inside, so the delivered message can name a handle to answer
-// on. A sender that cannot tell which of its sessions asked leaves it out and the header names its
-// host instead.
 const parseFromSessionId = (value: unknown): Parsed<string> => {
   if (value === undefined || value === "") return { ok: true, value: "" };
   if (typeof value !== "string") {

@@ -247,7 +247,7 @@ export const createApp = (deps: Deps): App => {
       return json({
         devices: listed.map((device) => ({
           ...device,
-          label: labels.hosts.get(device.name) ?? "",
+          label: labels.hosts.get(device.host) ?? "",
           current: device.deviceId === caller.deviceId,
         })),
       });
@@ -365,20 +365,16 @@ export const createApp = (deps: Deps): App => {
   const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
     env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
-  // Who the delivered message says it came from. The host carries the label its owner gave it, so
-  // a reply is addressed the way the user thinks of the machine, and the handle is minted the same
-  // way the sessions listing mints it, so `recall send` takes it back verbatim. A sender naming a
-  // session it does not have live is named by its host alone.
+  // The handle is minted the same way the sessions listing mints it, so `recall send` takes it back
+  // verbatim. A sender naming a session it does not have live is named by its host alone.
   const senderOf = async (db: D1Database, caller: Caller, fromSessionId: string, now: number): Promise<Sender> => {
-    const [listed, labels] = await Promise.all([listDevices(db, caller.userId), readLabels(db, caller.userId)]);
-    const device = listed.find((entry) => entry.deviceId === caller.deviceId);
-    if (device === undefined) throw new Error(`device ${caller.deviceId} authenticated but is not on record`);
+    const labels = await readLabels(db, caller.userId);
     const named =
       fromSessionId !== "" && (await sessionOnDevice(db, caller.userId, fromSessionId, caller.deviceId, now));
     return {
       deviceId: caller.deviceId,
-      host: labels.hosts.get(device.name) ?? device.name,
-      name: named ? sessionHandle(device.name, fromSessionId) : "",
+      host: labels.hosts.get(caller.host) ?? caller.host,
+      name: named ? sessionHandle(caller.name, fromSessionId) : "",
     };
   };
 
