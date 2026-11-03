@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::transcripts::Appended;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -779,8 +780,9 @@ impl Client {
     }
 
     /// What the service holds of one session: how far into each transcript file it has been
-    /// written, and which files have had their tokens counted. It answers only for a session the
-    /// account already has on record.
+    /// written, counted off the stored objects, and which files have had their tokens counted. It
+    /// answers only for a session the account already has on record. The count is a listing, so
+    /// it is asked once per session and read from there.
     pub fn transcript_held(&self, session_id: &str) -> Result<crate::transcripts::Held> {
         let response = self
             .authed(
@@ -797,16 +799,12 @@ impl Client {
         })
     }
 
-    /// Appends one stretch to one of a session's transcript files. The store takes a stretch only
-    /// where the file already ends, so a stretch that landed already is refused rather than
-    /// written a second time, and the refusal carries the end to read on from.
-    pub fn append_transcript(
-        &self,
-        session_id: &str,
-        file: &str,
-        offset: i64,
-        bytes: &[u8],
-    ) -> Result<crate::transcripts::Appended> {
+    /// Appends one stretch to one of a session's transcript files and answers where the file
+    /// reaches once it is in. A stretch is stored under the offset it was sent at and only where
+    /// nothing is yet, so one already there — a retry, or another writer that reached the offset
+    /// first — is refused with where the file now reaches. That is the same answer: it is where
+    /// the next stretch goes.
+    pub fn append_transcript(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended> {
         let path = format!(
             "{}/transcript?file={}&offset={offset}",
             Self::session_path(session_id),
@@ -818,12 +816,12 @@ impl Client {
             .send(bytes)?;
         if response.status().as_u16() == 409 {
             let extent: Extent = response.body_mut().read_json()?;
-            return Ok(crate::transcripts::Appended::Behind(extent.offset));
+            return Ok(Appended::Refused(extent.offset));
         }
         let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
             .body_mut()
             .read_json()?;
-        Ok(crate::transcripts::Appended::Wrote(extent.offset))
+        Ok(Appended::Written(extent.offset))
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {

@@ -366,7 +366,7 @@ const fail = (error: string): { ok: false; error: string } => ({ ok: false, erro
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const TAG = /^[a-z0-9][a-z0-9._:/-]*$/;
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const isOneOf = <T extends string>(options: readonly T[], value: unknown): value is T =>

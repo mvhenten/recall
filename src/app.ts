@@ -61,6 +61,7 @@ import {
   dayWindow,
   type Embedder,
   FRESH_WINDOW_MS,
+  isRecord,
   type Live,
   type MemoryHit,
   type MemoryType,
@@ -95,16 +96,16 @@ import {
   chunkMatches,
   chunkVectors,
   countedFiles,
-  type DueSession,
   decodeCursor,
   deleteMemory,
   describeMemories,
   describeSessions,
-  dueSessions,
   endSession,
   findSession,
   getMemory,
   type IndexedChunk,
+  type IndexMark,
+  indexMark,
   labelTargets,
   listMemories,
   listSessionHistory,
@@ -123,13 +124,22 @@ import {
   sessionHistoryFilters,
   sessionOnDevice,
   sessionOnRecord,
-  takingOn,
   textCandidates,
   vectorCandidates,
   writeChunks,
   writeLabels,
 } from "./store";
-import { appendChunk, MAIN_FILE, MAX_CHUNK_BYTES, readStretch, readTranscript, transcriptFiles } from "./transcripts";
+import {
+  archivedFiles,
+  type Chunk,
+  cacheChunk,
+  MAIN_FILE,
+  MAX_CHUNK_BYTES,
+  parseChunkKey,
+  putChunk,
+  readStretch,
+  readTranscript,
+} from "./transcripts";
 
 export interface ArtifactHost {
   hostname: string;
@@ -151,9 +161,11 @@ export interface AppEnv {
   TRANSCRIPTS: R2Bucket;
 }
 
+export type Delivered = Pick<Message<unknown>, "body" | "ack" | "retry">;
+
 export interface App {
   fetch(request: Request, env: AppEnv): Promise<Response>;
-  index(env: AppEnv): Promise<number>;
+  consume(env: AppEnv, delivered: readonly Delivered[]): Promise<void>;
 }
 
 type Refusal = (status: number, title: string, text: string) => Response;
@@ -177,12 +189,10 @@ const GRANT_ERRORS = {
 
 const ELSEWHERE_LIMIT = 3;
 
-// How many sessions one indexing pass takes on, and how much of each it reads. A pass runs on a
-// minute's beat and never on a session prompted in the last few minutes, so this is the ceiling
-// on what a tick does: three reads of a megabyte, the embeddings of what prose is in them, and
-// three batches of inserts. A transcript of any length is caught up over as many ticks as it
-// takes, which is what keeps one long session off the whole account's beat.
-const INDEX_SESSIONS_PER_PASS = 3;
+// How much of one file an indexing pass reads. A stretch is at most a megabyte, so a session
+// keeping up with its own events is caught up in one pass per event; a session far behind — one
+// backfilled from years of transcripts — is caught up over as many passes as it takes, each
+// committing its own mark, so the work survives a consumer that runs out of time and resumes.
 const INDEX_BYTES_PER_PASS = 1_048_576;
 
 // The largest set of chunks one embedding call carries.
@@ -328,7 +338,7 @@ export const createApp = (deps: Deps): App => {
       if (subresource !== "transcript") return error(404, "not found");
       return transcript(request, url, env, caller, sessionId.value);
     }
-    if (request.method === "GET") return session(db, caller, sessionId.value);
+    if (request.method === "GET") return session(env, caller, sessionId.value);
     if (request.method === "PUT") {
       const input = parseSession(await readJson(request));
       if (!input.ok) return error(400, input.error);
@@ -345,12 +355,15 @@ export const createApp = (deps: Deps): App => {
 
   // One session, addressed by its Claude Code session id, by the name the harness gave it, or by
   // the handle `recall send` takes. It answers with the transcript files the archive holds too, so
-  // a host restoring the session asks once and then reads them.
-  const session = async (db: D1Database, caller: Caller, target: string): Promise<Response> => {
+  // a host restoring the session asks once and then reads them. Those are counted off the objects:
+  // a restore writes the files it is given to disk, so a count a second behind would write a
+  // session short of its last stretch.
+  const session = async (env: AppEnv, caller: Caller, target: string): Promise<Response> => {
+    const db = env.DB;
     const found = await findSession(db, caller.userId, target, deps.now());
     if (!found) return error(404, `no session named ${target}`);
     const [files, labels] = await Promise.all([
-      transcriptFiles(db, caller.userId, found.session.sessionId),
+      archivedFiles(env.TRANSCRIPTS, caller.userId, found.session.sessionId),
       readLabels(db, caller.userId),
     ]);
     return json({
@@ -417,23 +430,22 @@ export const createApp = (deps: Deps): App => {
     return json({ hits });
   };
 
-  // One session's prose, read out of the archive and written into the index. A pass reads from
-  // where the last one stopped and at most one bite of the file, so a session of any length is
-  // caught up over as many passes as it takes and none of them costs more than the last. The
-  // mark it leaves is where the bite ended in the file and never how much it read, so a pass over
-  // a stretch the archive lost moves on rather than reading the same bite again.
-  const indexSession = async (env: AppEnv, due: DueSession): Promise<number> => {
-    const { user_id: userId, session_id: sessionId } = due;
+  // One bite of one session's prose, read out of the archive and written into the index. It
+  // reads from where the last bite stopped and at most a megabyte, and the mark it leaves is
+  // where the bite ended in the file and never how much it read, so a pass over a hole in the
+  // archive moves on rather than reading the same bite again. The pass answers where it reached,
+  // which is what says whether there is more.
+  const indexBite = async (env: AppEnv, userId: string, sessionId: string, mark: IndexMark): Promise<number> => {
     const bite = await readStretch(
       env.TRANSCRIPTS,
       userId,
       sessionId,
       MAIN_FILE,
-      due.indexed,
-      due.archived,
+      mark.indexed,
+      mark.archived,
       INDEX_BYTES_PER_PASS,
     );
-    if (due.indexed === 0 && bite.text !== "") {
+    if (mark.indexed === 0 && bite.text !== "") {
       const named = agentName(bite.text.slice(0, HEAD_BYTES));
       if (named !== "") await nameSession(env.DB, userId, sessionId, named);
     }
@@ -448,8 +460,21 @@ export const createApp = (deps: Deps): App => {
         indexed.push({ ...chunk, embedding: quantize(vector) });
       });
     }
-    await writeChunks(env.DB, userId, sessionId, due.chunks, indexed, bite.through, deps.now());
-    return indexed.length;
+    await writeChunks(env.DB, userId, sessionId, mark.chunks, indexed, bite.through);
+    return bite.through;
+  };
+
+  // One session, caught up with its archive. The event that wrote the stretch is what brings the
+  // indexer here, so there is no queue to read and no session to pick; a session with nothing new
+  // costs the row that says so. A bite that reaches no further than the last is the end of what
+  // the objects hold, whatever the cache says, and stops the pass rather than repeating it.
+  const indexSession = async (env: AppEnv, userId: string, sessionId: string): Promise<boolean> => {
+    for (;;) {
+      const mark = await indexMark(env.DB, userId, sessionId);
+      if (mark === null || mark.indexed >= mark.archived) return true;
+      const through = await indexBite(env, userId, sessionId, mark);
+      if (through <= mark.indexed) return true;
+    }
   };
 
   const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
@@ -464,6 +489,13 @@ export const createApp = (deps: Deps): App => {
   // A session's transcript, read back as the stretches already written and appended to one stretch
   // at a time. The host that holds the file asks where it left off and sends on from there; it is
   // its own mark, so what the usage counter has read of the same file moves apart from it.
+  //
+  // The listing is counted off the objects, since a host deciding where to write next cannot be
+  // a second behind the archive. An append writes the object and nothing else: it claims no
+  // offset, so there is no second write to disagree with the first and nothing to give back when
+  // one fails, and where the file reaches afterwards is arithmetic rather than a read. The one
+  // append that costs a listing is the one beaten to its offset, which is told where the file
+  // reaches so it can carry on from there.
   const transcript = async (
     request: Request,
     url: URL,
@@ -476,7 +508,7 @@ export const createApp = (deps: Deps): App => {
     const wanted = url.searchParams.get("file");
     if (request.method === "GET" && wanted === null) {
       const [files, counted] = await Promise.all([
-        transcriptFiles(env.DB, caller.userId, sessionId),
+        archivedFiles(env.TRANSCRIPTS, caller.userId, sessionId),
         countedFiles(env.DB, caller.userId, sessionId),
       ]);
       return json({ files, counted });
@@ -496,25 +528,22 @@ export const createApp = (deps: Deps): App => {
     if (Number(request.headers.get("content-length") ?? 0) > MAX_CHUNK_BYTES) return tooLarge;
     const body = await request.arrayBuffer();
     if (body.byteLength > MAX_CHUNK_BYTES) return tooLarge;
-    const appended = await appendChunk(
-      env.DB,
-      env.TRANSCRIPTS,
-      caller.userId,
-      sessionId,
-      file.value,
-      offset.value,
-      body,
-    );
-    if (!appended.ok) {
-      return json(
-        {
-          error: `${file.value} holds ${appended.offset} bytes; send the stretch starting there`,
-          offset: appended.offset,
-        },
-        409,
+    const end = await putChunk(env.TRANSCRIPTS, caller.userId, sessionId, file.value, offset.value, body);
+    if (end !== null) return json({ file: file.value, offset: end });
+    const held = await archivedFiles(env.TRANSCRIPTS, caller.userId, sessionId);
+    const reaches = held.find((archived) => archived.file === file.value)?.bytes;
+    // The put was refused because an object already sits at that key, and the listing that found
+    // it out is strongly consistent, so the file is always among them. Answering `offset` where it
+    // is not would send the client back to the stretch it was just refused, forever.
+    if (reaches === undefined) {
+      throw new Error(
+        `the archive refused a stretch of ${file.value} but holds no ${file.value} of session ${sessionId}`,
       );
     }
-    return json({ file: file.value, offset: appended.offset });
+    return json(
+      { error: `${file.value} holds ${reaches} bytes; send the stretch starting there`, offset: reaches },
+      409,
+    );
   };
 
   const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
@@ -980,29 +1009,50 @@ export const createApp = (deps: Deps): App => {
   };
 
   return {
-    // One tick of the index. Each session is taken on before it is read and caught on its own:
-    // a lost stretch, an embedding call that fails or a session too strange to get through costs
-    // its own pass and leaves every other session's untouched, and because the session was marked
-    // as taken on first it goes to the back of the queue rather than holding the front of it.
-    async index(env: AppEnv): Promise<number> {
-      const due = await dueSessions(env.DB, deps.now(), INDEX_SESSIONS_PER_PASS);
-      let indexed = 0;
-      for (const session of due) {
-        await takingOn(env.DB, session.user_id, session.session_id, deps.now());
-        try {
-          indexed += await indexSession(env, session);
-        } catch (failure: unknown) {
+    // Everything the service derives from a stretch, done when the stretch lands. The storage
+    // event carries the object key, the key carries who wrote what where, and both the cache and
+    // the index are computed from that alone — never from what the consumer did last — so an
+    // event delivered twice writes the same rows and indexes nothing a second time.
+    //
+    // The cache goes down for the whole delivery in one batch; a D1 failure there fails the
+    // delivery and the retry writes the same rows again. Indexing is caught per session, and the
+    // messages that brought a session here are sent back for redelivery when it fails: a
+    // transcript the indexer cannot get through — a hole in the archive, an embedding call the
+    // model refuses — is tried again on its own while every other session's message acks.
+    async consume(env: AppEnv, delivered: readonly Delivered[]): Promise<void> {
+      const landed: Chunk[] = [];
+      const sessions = new Map<string, { chunk: Chunk; messages: Delivered[] }>();
+      for (const message of delivered) {
+        const event = isRecord(message.body) && isRecord(message.body.object) ? message.body.object : {};
+        const { key, size } = event;
+        const chunk = typeof key === "string" && typeof size === "number" ? parseChunkKey(key, size) : null;
+        if (chunk === null) {
+          console.error(JSON.stringify({ error: "no transcript stretch in this storage event", event: message.body }));
+          message.ack();
+          continue;
+        }
+        landed.push(chunk);
+        if (chunk.file !== MAIN_FILE) continue;
+        const session = sessions.get(`${chunk.userId}/${chunk.sessionId}`);
+        if (session === undefined) sessions.set(`${chunk.userId}/${chunk.sessionId}`, { chunk, messages: [message] });
+        else session.messages.push(message);
+      }
+      if (landed.length === 0) return;
+      const cached = landed.flatMap((chunk) => cacheChunk(env.DB, chunk));
+      if (cached.length > 0) await env.DB.batch(cached);
+      for (const { chunk, messages } of sessions.values()) {
+        const caughtUp = await indexSession(env, chunk.userId, chunk.sessionId).catch((failure: unknown) => {
           console.error(
             JSON.stringify({
               error: failure instanceof Error ? failure.message : String(failure),
-              indexing: session.session_id,
-              from: session.indexed,
+              indexing: chunk.sessionId,
               stack: failure instanceof Error ? failure.stack : "",
             }),
           );
-        }
+          return false;
+        });
+        if (!caughtUp) for (const message of messages) message.retry();
       }
-      return indexed;
     },
     async fetch(request: Request, env: AppEnv): Promise<Response> {
       return route(request, env).catch((failure: unknown) => {

@@ -41,7 +41,10 @@ describe("transcript archive", () => {
     expect(await held(await client.transcript("s-1"))).toEqual({ main: 14, "agent-7f21": 10 });
   });
 
-  it("refuses a stretch that does not start where the file ends, and says where it does", async () => {
+  // The whole of what a retry costs: a stretch is stored under the offset it was sent at and only
+  // where nothing is yet, so sending it again is refused with where the file reaches rather than
+  // leaving a second copy of the same lines beside it.
+  it("refuses a stretch sent twice, and says where the file reaches", async () => {
     const h = await harness();
     const client = await h.user("retrier");
     await client.sync("s-2");
@@ -52,6 +55,7 @@ describe("transcript archive", () => {
     expect(again.status).toBe(409);
     expect(await again.json()).toMatchObject({ offset: 8 });
     expect(await held(await client.transcript("s-2"))).toEqual({ main: 8 });
+    expect(await (await client.readTranscript("s-2", "main")).text()).toBe("one\ntwo\n");
     const resumed = await client.archive("s-2", "main", 8, "three\n");
     expect(resumed.status).toBe(200);
     expect(await held(await client.transcript("s-2"))).toEqual({ main: 14 });
@@ -120,7 +124,13 @@ describe("transcript archive", () => {
     expect(await rollup(userId)).toEqual(recovered);
   });
 
-  it("lets one of two writers at the same offset win, and leaves the other no hole", async () => {
+  // Two writers reaching one file at the same offset — the listener's beat and a session ending —
+  // holding stretches of different lengths, because they read the file at different instants.
+  // Neither re-reads where the file ends afterwards: each takes what its own append answered and
+  // sends the next stretch from there. One object lands and the other writer is answered with
+  // where the file reaches, so both carry on from the same place and no run of bytes is left in
+  // no object at all.
+  it("lets one of two writers at the same offset win, and sends the other on from the end", async () => {
     const h = await harness();
     const userId = `racer-${crypto.randomUUID()}`;
     const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
@@ -131,14 +141,14 @@ describe("transcript archive", () => {
       client.archive("s-race", "main", 0, "four"),
     ]);
 
-    const outcomes = [longer.status, shorter.status].sort();
-    expect(outcomes).toEqual([200, 409]);
-    const bytes = (await held(await client.transcript("s-race"))).main ?? 0;
+    expect([longer.status, shorter.status].sort()).toEqual([200, 409]);
     const stored = await env.TRANSCRIPTS.list({ prefix: `${userId}/s-race/main/` });
-    expect(stored.objects.reduce((all, object) => all + object.size, 0)).toBe(bytes);
-    // The loser reads the end back and carries on from it, so the file runs whole.
-    expect((await client.archive("s-race", "main", bytes, "!")).status).toBe(200);
-    expect((await held(await client.transcript("s-race"))).main).toBe(bytes + 1);
+    expect(stored.objects).toHaveLength(1);
+    const [told, also] = (await Promise.all([longer.json(), shorter.json()])) as Array<{ offset: number }>;
+    expect(told?.offset).toBe(stored.objects[0]?.size);
+    expect(also?.offset).toBe(told?.offset);
+    expect((await client.archive("s-race", "main", told?.offset ?? 0, "!")).status).toBe(200);
+    expect((await held(await client.transcript("s-race"))).main).toBe((told?.offset ?? 0) + 1);
   });
 
   it("keeps a session's files once its row has moved to the history", async () => {

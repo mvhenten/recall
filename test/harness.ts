@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { accessVerifier, type KeySource, localKeys } from "../src/access";
-import { createApp } from "../src/app";
+import { createApp, type Delivered } from "../src/app";
 import { DEVICE_CODE_LIMITS, type DeviceCodeLimits } from "../src/device";
 import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
@@ -104,6 +104,7 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     refresh: () => Promise.reject(new Error("Access signing keys answered 503")),
   };
   let clock = 1_700_000_000_000;
+  let retried = 0;
   const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
   const app = createApp({
     verify: accessVerifier(source, ISSUER, AUDIENCE),
@@ -145,8 +146,13 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
       body: JSON.stringify({ device_name: deviceName }),
     });
 
+  // The bucket is shared by every test in the run, so the harness remembers who it invited and
+  // announces only what they wrote.
+  const invited = new Set<string>();
+
   const invite = async (email: string, userId = `user-${crypto.randomUUID()}`): Promise<string> => {
     await env.DB.prepare("INSERT INTO principals (email, user_id) VALUES (?, ?)").bind(email, userId).run();
+    invited.add(userId);
     return email;
   };
 
@@ -298,11 +304,40 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     clientWithToken,
     clientWithHeaders,
     assertionFor,
-    index: () => app.index(env),
+    // What R2 does when a stretch lands, stood in for: every object this harness's users wrote is
+    // announced to the consumer in the shape Cloudflare's event notifications carry. Announcing
+    // all of them on every call is deliberate — a consumer deriving anything from what it had seen
+    // before, rather than from the key in front of it, comes apart here.
+    deliver: async (): Promise<void> => {
+      const delivered: Delivered[] = [];
+      retried = 0;
+      for (const userId of invited) {
+        let cursor: string | undefined;
+        do {
+          const page = await env.TRANSCRIPTS.list({ prefix: `${userId}/`, cursor });
+          for (const object of page.objects) {
+            delivered.push({
+              body: {
+                account: "test",
+                action: "PutObject",
+                bucket: "recall-transcripts",
+                object: { key: object.key, size: object.size, eTag: object.etag },
+                eventTime: new Date(clock).toISOString(),
+              },
+              ack: () => {},
+              retry: () => {
+                retried += 1;
+              },
+            });
+          }
+          cursor = page.truncated ? page.cursor : undefined;
+        } while (cursor !== undefined);
+      }
+      await app.consume(env, delivered);
+    },
+    retried: () => retried,
     indexMark: async (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
-      env.DB.prepare(
-        "SELECT archived, bytes, chunks, indexed_at FROM session_index WHERE user_id = ? AND session_id = ?",
-      )
+      env.DB.prepare("SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?")
         .bind(userId, sessionId)
         .first<Record<string, number>>(),
     chunks: async (userId: string, sessionId: string): Promise<string[]> => {

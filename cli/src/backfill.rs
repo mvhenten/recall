@@ -620,11 +620,9 @@ mod tests {
         fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<transcripts::Appended> {
             let mut archive = self.archive.borrow_mut();
             let body = archive.entry((session_id.to_string(), file.to_string())).or_default();
-            if offset != body.len() as i64 {
-                return Ok(transcripts::Appended::Behind(body.len() as i64));
-            }
+            body.truncate(offset as usize);
             body.extend_from_slice(bytes);
-            Ok(transcripts::Appended::Wrote(body.len() as i64))
+            Ok(transcripts::Appended::Written(offset + bytes.len() as i64))
         }
     }
 
