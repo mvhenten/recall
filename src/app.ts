@@ -8,6 +8,7 @@ import {
   readArtifact,
   type Stored,
 } from "./artifacts";
+import { agentName, chunkTurns, readTurns } from "./chunks";
 import {
   dashboardNotice,
   HISTORY_TAB,
@@ -73,9 +74,11 @@ import {
   parseSession,
   parseSessionId,
   parseSessionScope,
+  parseSessionSearch,
   parseTranscriptFile,
   parseUsage,
   type SearchInput,
+  type SessionHit,
   type StatsWindows,
   sessionHandle,
   USAGE_CHART_DAYS,
@@ -86,12 +89,22 @@ import {
 import { artifactPage, CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
 import {
+  type ChunkCandidate,
+  type ChunkMatch,
+  chunkExcerpts,
+  chunkMatches,
+  chunkVectors,
   countedFiles,
+  type DueSession,
   decodeCursor,
   deleteMemory,
   describeMemories,
+  describeSessions,
+  dueSessions,
   endSession,
+  findSession,
   getMemory,
+  type IndexedChunk,
   labelTargets,
   listMemories,
   listSessionHistory,
@@ -99,6 +112,7 @@ import {
   listSessions,
   liveTally,
   memoryCounts,
+  nameSession,
   putSession,
   readInsights,
   readLabels,
@@ -109,11 +123,13 @@ import {
   sessionHistoryFilters,
   sessionOnDevice,
   sessionOnRecord,
+  sessionVectors,
   textCandidates,
   vectorCandidates,
+  writeChunks,
   writeLabels,
 } from "./store";
-import { appendChunk, MAX_CHUNK_BYTES, transcriptFiles } from "./transcripts";
+import { appendChunk, MAIN_FILE, MAX_CHUNK_BYTES, readStretch, readTranscript, transcriptFiles } from "./transcripts";
 
 export interface ArtifactHost {
   hostname: string;
@@ -137,6 +153,7 @@ export interface AppEnv {
 
 export interface App {
   fetch(request: Request, env: AppEnv): Promise<Response>;
+  index(env: AppEnv): Promise<number>;
 }
 
 type Refusal = (status: number, title: string, text: string) => Response;
@@ -159,6 +176,26 @@ const GRANT_ERRORS = {
 } as const;
 
 const ELSEWHERE_LIMIT = 3;
+
+// How many sessions one indexing pass takes on, and how much of each it reads. A pass runs on a
+// minute's beat and never on a session that was prompted in the last few minutes, so this is what
+// a busy account costs the index: one read, one batch of embeddings and one batch of inserts per
+// session, however long the session ran.
+const INDEX_SESSIONS_PER_PASS = 3;
+const INDEX_BYTES_PER_PASS = 4_194_304;
+
+// The largest set of chunks one embedding call carries.
+const EMBED_BATCH = 96;
+
+// How much of a transcript's head is read for the name the harness gave the session. The harness
+// writes it among the first entries; mirrors HEAD in cli/src/adopt.rs.
+const HEAD_BYTES = 8_192;
+
+// How many sessions the first pass of a search shortlists, and how many chunks the full-text pass
+// returns. Both bound what the second pass reads: a search costs the vectors of a couple of dozen
+// sessions' chunks, never every chunk the account holds.
+const SESSION_CANDIDATES = 24;
+const CHUNK_MATCHES = 100;
 
 type Ranking = Array<[string, number]>;
 
@@ -272,6 +309,7 @@ export const createApp = (deps: Deps): App => {
       const scope = parseSessionScope(url.searchParams.get("scope"));
       if (!scope.ok) return error(400, scope.error);
       if (scope.value === "history") return sessionHistoryIds(url, db, caller);
+      if (scope.value === "search") return searchSessions(url, db, caller.userId);
       const [listed, labels] = await Promise.all([
         listSessions(db, caller.userId, deps.now()),
         readLabels(db, caller.userId),
@@ -291,6 +329,7 @@ export const createApp = (deps: Deps): App => {
       if (subresource !== "transcript") return error(404, "not found");
       return transcript(request, url, env, caller, sessionId.value);
     }
+    if (request.method === "GET") return session(db, caller, sessionId.value);
     if (request.method === "PUT") {
       const input = parseSession(await readJson(request));
       if (!input.ok) return error(400, input.error);
@@ -304,6 +343,110 @@ export const createApp = (deps: Deps): App => {
 
   const sessionHistoryIds = async (url: URL, db: D1Database, caller: Caller): Promise<Response> =>
     json(await listSessionHistoryIds(db, caller.userId, url.searchParams.get("cursor") ?? ""));
+
+  // One session, addressed by its Claude Code session id, by the name the harness gave it, or by
+  // the handle `recall send` takes. It answers with the transcript files the archive holds too, so
+  // a host restoring the session asks once and then reads them.
+  const session = async (db: D1Database, caller: Caller, target: string): Promise<Response> => {
+    const found = await findSession(db, caller.userId, target, deps.now());
+    if (!found) return error(404, `no session named ${target}`);
+    const [files, labels] = await Promise.all([
+      transcriptFiles(db, caller.userId, found.sessionId),
+      readLabels(db, caller.userId),
+    ]);
+    return json({ session: { ...found, hostLabel: labels.hosts.get(found.host) ?? "" }, files });
+  };
+
+  // Sessions by meaning, in two passes. The first scores the query against one vector per session
+  // and runs the full-text query over every chunk; the second reads the chunk vectors of the
+  // sessions those shortlisted and nothing else. The user's own prompts rank a third time, so a
+  // session that was asked for a thing outranks one that merely mentioned it.
+  const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+    const parsed = parseSessionSearch(url.searchParams);
+    if (!parsed.ok) return error(400, parsed.error);
+    const input = parsed.value;
+    const [vector] = await deps.embedder.embed([input.query]);
+    if (!vector) throw new Error("the embedder answered the query with no vector");
+    const match = ftsQuery(input.query);
+    const [sessions, matched] = await Promise.all([
+      sessionVectors(db, userId),
+      match === null ? Promise.resolve<ChunkMatch[]>([]) : chunkMatches(db, userId, match, CHUNK_MATCHES),
+    ]);
+    const nearest = sessions
+      .map((held): [string, number] => [held.sessionId, dot(vector, held.embedding)])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, SESSION_CANDIDATES)
+      .map(([id]) => id);
+    const candidates = [...new Set([...nearest, ...matched.map((hit) => hit.sessionId)])];
+    if (candidates.length === 0) return json({ hits: [] });
+    const chunks = await chunkVectors(db, userId, candidates);
+    const scored = chunks
+      .map((chunk): [ChunkCandidate, number] => [chunk, dot(vector, chunk.embedding)])
+      .sort((a, b) => b[1] - a[1]);
+    const ids = (held: Array<[ChunkCandidate, number]>): string[] => held.map(([chunk]) => String(chunk.chunkSeq));
+    const fused = reciprocalRankFusion([
+      ids(scored),
+      ids(scored.filter(([chunk]) => chunk.speaker === "user")),
+      matched.map((hit) => String(hit.chunkSeq)),
+    ]);
+    const bySeq = new Map(chunks.map((chunk) => [chunk.chunkSeq, chunk]));
+    const best = new Map<string, { chunkSeq: number; score: number }>();
+    for (const [id, score] of fused) {
+      const chunk = bySeq.get(Number(id));
+      if (chunk && !best.has(chunk.sessionId)) best.set(chunk.sessionId, { chunkSeq: chunk.chunkSeq, score });
+    }
+    const top = [...best.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, input.limit);
+    const [described, excerpts] = await Promise.all([
+      describeSessions(
+        db,
+        userId,
+        top.map(([id]) => id),
+        deps.now(),
+      ),
+      chunkExcerpts(
+        db,
+        userId,
+        top.map(([, hit]) => hit.chunkSeq),
+      ),
+    ]);
+    const hits: SessionHit[] = top.flatMap(([sessionId, hit]) => {
+      const found = described.get(sessionId);
+      const excerpt = excerpts.get(hit.chunkSeq);
+      return found && excerpt ? [{ session: found, score: hit.score, excerpt }] : [];
+    });
+    return json({ hits });
+  };
+
+  // One session's prose, read out of the archive and written into the index. A pass reads from
+  // where the last one stopped and at most one bite of the file, so a session of any length is
+  // caught up over as many passes as it takes and none of them costs more than the last.
+  const indexSession = async (env: AppEnv, due: DueSession): Promise<number> => {
+    const { user_id: userId, session_id: sessionId } = due;
+    const stretch = await readStretch(env.TRANSCRIPTS, userId, sessionId, MAIN_FILE, due.indexed, INDEX_BYTES_PER_PASS);
+    if (stretch.bytes === 0) {
+      // A bite holding no complete line is one entry longer than the whole bite: a tool result
+      // this reader skips anyway. The mark moves past it so the next pass reads on.
+      await writeChunks(env.DB, userId, sessionId, due.chunks, [], due.indexed + stretch.read, deps.now());
+      return 0;
+    }
+    if (due.indexed === 0) {
+      const named = agentName(stretch.text.slice(0, HEAD_BYTES));
+      if (named !== "") await nameSession(env.DB, userId, sessionId, named);
+    }
+    const chunks = chunkTurns(readTurns(stretch.text));
+    const indexed: IndexedChunk[] = [];
+    for (let at = 0; at < chunks.length; at += EMBED_BATCH) {
+      const batch = chunks.slice(at, at + EMBED_BATCH);
+      const vectors = await deps.embedder.embed(batch.map((chunk) => chunk.text));
+      batch.forEach((chunk, index) => {
+        const vector = vectors[index];
+        if (!vector) throw new Error(`the embedder answered ${batch.length} chunks with ${vectors.length} vectors`);
+        indexed.push({ ...chunk, embedding: quantize(vector) });
+      });
+    }
+    await writeChunks(env.DB, userId, sessionId, due.chunks, indexed, due.indexed + stretch.bytes, deps.now());
+    return indexed.length;
+  };
 
   const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
     if (request.method !== "POST") return error(405, "method not allowed");
@@ -326,15 +469,23 @@ export const createApp = (deps: Deps): App => {
   ): Promise<Response> => {
     if (request.method !== "GET" && request.method !== "PUT") return error(405, "method not allowed");
     if (!(await sessionOnRecord(env.DB, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
-    if (request.method === "GET") {
+    const wanted = url.searchParams.get("file");
+    if (request.method === "GET" && wanted === null) {
       const [files, counted] = await Promise.all([
         transcriptFiles(env.DB, caller.userId, sessionId),
         countedFiles(env.DB, caller.userId, sessionId),
       ]);
       return json({ files, counted });
     }
-    const file = parseTranscriptFile(url.searchParams.get("file"));
+    const file = parseTranscriptFile(wanted);
     if (!file.ok) return error(400, file.error);
+    if (request.method === "GET") {
+      const body = await readTranscript(env.TRANSCRIPTS, caller.userId, sessionId, file.value);
+      if (body === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
+      return new Response(body, {
+        headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
+      });
+    }
     const offset = parseChunkOffset(url.searchParams.get("offset"));
     if (!offset.ok) return error(400, offset.error);
     const tooLarge = error(413, `a transcript stretch must hold at most ${MAX_CHUNK_BYTES} bytes`);
@@ -358,6 +509,13 @@ export const createApp = (deps: Deps): App => {
         },
         409,
       );
+    }
+    // The name the harness gave the session rides in the head of its own transcript, so the first
+    // stretch of it is where a live session gets its name. One archived before this existed is
+    // named on its first indexing pass instead, which reads the same head.
+    if (file.value === MAIN_FILE && offset.value === 0) {
+      const named = agentName(new TextDecoder().decode(body.slice(0, HEAD_BYTES)));
+      if (named !== "") await nameSession(env.DB, caller.userId, sessionId, named);
     }
     return json({ file: file.value, offset: appended.offset });
   };
@@ -624,7 +782,8 @@ export const createApp = (deps: Deps): App => {
   const save = async (request: Request, db: D1Database, userId: string, name: string): Promise<Response> => {
     const input = parseSave(await readJson(request));
     if (!input.ok) return error(400, input.error);
-    const vector = await deps.embedder.embed(embeddingText(name, input.value.description, input.value.body));
+    const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
+    if (!vector) throw new Error("the embedder answered the memory with no vector");
     const saved = await saveMemory(db, userId, name, input.value, quantize(vector), deps.now());
     return json(saved, saved.created ? 201 : 200);
   };
@@ -681,7 +840,8 @@ export const createApp = (deps: Deps): App => {
     input: SearchInput,
     types: MemoryType[],
   ): Promise<Rankings> => {
-    const vector = await deps.embedder.embed(input.query);
+    const [vector] = await deps.embedder.embed([input.query]);
+    if (!vector) throw new Error("the embedder answered the query with no vector");
     const inScope: Ranking = [];
     const elsewhere: Ranking = [];
     for (const candidate of await vectorCandidates(db, userId, input.tags, types)) {
@@ -823,6 +983,12 @@ export const createApp = (deps: Deps): App => {
   };
 
   return {
+    async index(env: AppEnv): Promise<number> {
+      const due = await dueSessions(env.DB, deps.now(), INDEX_SESSIONS_PER_PASS);
+      let indexed = 0;
+      for (const session of due) indexed += await indexSession(env, session);
+      return indexed;
+    },
     async fetch(request: Request, env: AppEnv): Promise<Response> {
       return route(request, env).catch((failure: unknown) => {
         const requestId = crypto.randomUUID();

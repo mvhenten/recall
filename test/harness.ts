@@ -24,15 +24,17 @@ export interface DeviceStart {
 // Embeds plain words only: tokens holding a digit are invisible to it, the way
 // rare identifiers barely register with a real embedding model.
 const wordEmbedder: Embedder = {
-  async embed(text: string): Promise<Float32Array> {
-    const vector = new Array<number>(DIMENSIONS).fill(0);
-    for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
-      if (/[0-9]/.test(word)) continue;
-      let hash = 0;
-      for (const char of word) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-      vector[hash % DIMENSIONS] = (vector[hash % DIMENSIONS] ?? 0) + 1;
-    }
-    return normalize(vector);
+  async embed(texts: string[]): Promise<Float32Array[]> {
+    return texts.map((text) => {
+      const vector = new Array<number>(DIMENSIONS).fill(0);
+      for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
+        if (/[0-9]/.test(word)) continue;
+        let hash = 0;
+        for (const char of word) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+        vector[hash % DIMENSIONS] = (vector[hash % DIMENSIONS] ?? 0) + 1;
+      }
+      return normalize(vector);
+    });
   },
 };
 
@@ -53,6 +55,9 @@ export interface Client {
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   archive(sessionId: string, file: string, offset: number, body: BodyInit): Promise<Response>;
   transcript(sessionId: string): Promise<Response>;
+  readTranscript(sessionId: string, file: string): Promise<Response>;
+  session(target: string): Promise<Response>;
+  searchSessions(query: string, limit?: number): Promise<Response>;
 }
 
 const SESSION_DOCUMENT: Record<string, unknown> = {
@@ -243,6 +248,15 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
       transcript(sessionId) {
         return request("GET", `/v1/sessions/${sessionId}/transcript`);
       },
+      readTranscript(sessionId, file) {
+        return request("GET", `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}`);
+      },
+      session(target) {
+        return request("GET", `/v1/sessions/${encodeURIComponent(target)}`);
+      },
+      searchSessions(query, limit = 10) {
+        return request("GET", `/v1/sessions?scope=search&q=${encodeURIComponent(query)}&limit=${limit}`);
+      },
       async search(query, tags, mode = "hybrid") {
         const response = await request("POST", "/v1/search", {
           query,
@@ -279,6 +293,15 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     clientWithToken,
     clientWithHeaders,
     assertionFor,
+    index: () => app.index(env),
+    chunks: async (userId: string, sessionId: string): Promise<string[]> => {
+      const { results } = await env.DB.prepare(
+        "SELECT text FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
+      )
+        .bind(userId, sessionId)
+        .all<{ text: string }>();
+      return results.map((row) => row.text);
+    },
     tick: (ms: number) => {
       clock += ms;
       return clock;

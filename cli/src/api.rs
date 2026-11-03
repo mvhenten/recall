@@ -172,7 +172,8 @@ fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq
     bail!("{what} failed with {status}: {}{hint}", text.trim())
 }
 
-/// A page runs to 16 MB, which the twenty seconds every other call gets will not carry.
+/// A page runs to 16 MB, and a long session's transcript to several; neither fits in the twenty
+/// seconds every other call gets.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn agent() -> Agent {
@@ -277,6 +278,10 @@ struct Sent {
 pub struct Session {
     pub session_id: String,
     pub name: String,
+    /// The name Claude Code gave the session, which is what its owner calls it. Empty for a
+    /// session whose transcript the service has not read a name out of yet.
+    #[serde(default)]
+    pub agent_name: String,
     pub device_id: String,
     pub host: String,
     /// The name the user gave `host` on the dashboard's labels tab, empty when it carries none.
@@ -294,6 +299,61 @@ pub struct Session {
     pub permission_mode: String,
     pub pid: i64,
     pub current: bool,
+}
+
+/// One session the account has on record, running or long over, as a lookup or a search gives it
+/// back. `name` is the handle `recall send` takes and `agent_name` the name Claude Code gave the
+/// session; either addresses it, as does the session id itself.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PastSession {
+    pub session_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub agent_name: String,
+    pub host: String,
+    #[serde(default)]
+    pub host_label: String,
+    pub cwd: String,
+    pub repo: String,
+    pub branch: String,
+    pub started_at: i64,
+    pub last_activity_at: i64,
+    pub prompts: i64,
+    pub focus: crate::sessions::Focus,
+    pub running: bool,
+}
+
+/// One session a search found, and the stretch of its transcript that answered. The excerpt is
+/// what the session said, verbatim.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionHit {
+    pub session: PastSession,
+    pub score: f64,
+    pub excerpt: Excerpt,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Excerpt {
+    pub speaker: String,
+    pub text: String,
+    pub at: i64,
+}
+
+/// One session and the transcript files the archive holds of it, which is everything a host needs
+/// to put the session back on disk.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredSession {
+    pub session: PastSession,
+    pub files: Vec<HeldFile>,
+}
+
+#[derive(Deserialize)]
+struct SessionHits {
+    hits: Vec<SessionHit>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,10 +402,10 @@ struct HistoryIds {
 
 /// How far into one of a session's transcript files the service has been written. It is the only
 /// mark an archive resumes from, so nothing a host keeps locally can put the two out of step.
-#[derive(Deserialize)]
-struct HeldFile {
-    file: String,
-    bytes: i64,
+#[derive(Debug, Deserialize)]
+pub struct HeldFile {
+    pub file: String,
+    pub bytes: i64,
 }
 
 #[derive(Deserialize)]
@@ -369,7 +429,8 @@ pub struct Target {
 }
 
 /// `to` is a device id, a host's name or the label it carries, any of which reach every session on
-/// that host, or a session handle or session id, which reaches that one session. A device answers
+/// that host, or a session handle, the name Claude Code gave a session or a session id, any of
+/// which reach that one session. A device answers
 /// first, so `sessions` is called only for a target no device claims and an ordinary host send
 /// costs no listing.
 ///
@@ -422,7 +483,7 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
     let listed = sessions()?;
     let addressed: Vec<&Session> = listed
         .iter()
-        .filter(|session| session.name == to || session.session_id == to)
+        .filter(|session| session.name == to || session.agent_name == to || session.session_id == to)
         .collect();
     match addressed.as_slice() {
         [session] => Ok(Target {
@@ -609,6 +670,46 @@ impl Client {
             }
             cursor = page.next_cursor;
         }
+    }
+
+    /// One session, by its session id, by the name Claude Code gave it, or by the handle
+    /// `recall send` takes. A name that answers for more than one session gives back the most
+    /// recently active of them, which is the one a caller typing a name from memory means.
+    pub fn session(&self, target: &str) -> Result<Option<StoredSession>> {
+        let response = self
+            .authed(self.agent.get(self.url(&Self::session_path(target))))
+            .call()?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        Ok(Some(
+            check(response, &format!("reading session {target}"))?
+                .body_mut()
+                .read_json()?,
+        ))
+    }
+
+    /// The sessions whose transcripts answer a query, across every host signed in as this user.
+    pub fn search_sessions(&self, query: &str, limit: u32) -> Result<Vec<SessionHit>> {
+        let path = format!("/v1/sessions?scope=search&q={}&limit={limit}", encode(query));
+        let response = self.authed(self.agent.get(self.url(&path))).call()?;
+        let found: SessionHits = check(response, "searching sessions")?.body_mut().read_json()?;
+        Ok(found.hits)
+    }
+
+    /// One of a session's transcript files, written out as it arrives. A transcript runs to
+    /// megabytes, so it is streamed into the file rather than gathered in memory first.
+    pub fn read_transcript(&self, session_id: &str, file: &str, into: &mut impl std::io::Write) -> Result<u64> {
+        let path = format!("{}/transcript?file={}", Self::session_path(session_id), encode(file));
+        let request = self
+            .agent
+            .get(self.url(&path))
+            .config()
+            .timeout_global(Some(PUBLISH_TIMEOUT))
+            .build();
+        let response = self.authed(request).call()?;
+        let mut body = check(response, &format!("reading {file} of session {session_id}"))?.into_body();
+        Ok(std::io::copy(&mut body.as_reader(), into)?)
     }
 
     pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<()> {
@@ -803,6 +904,7 @@ mod tests {
         Session {
             session_id: session_id.to_string(),
             name: name.to_string(),
+            agent_name: String::new(),
             device_id: device_id.to_string(),
             host: "laptop".to_string(),
             host_label: String::new(),

@@ -12,6 +12,10 @@ const OFFSET_DIGITS = 16;
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
 export const MAX_CHUNK_BYTES = 1_048_576;
 
+// The name a session's own transcript is held under; mirrors MAIN in cli/src/transcripts.rs. Every
+// other name is a delegated turn, which the index never reads.
+export const MAIN_FILE = "main";
+
 export interface TranscriptFile {
   file: string;
   bytes: number;
@@ -21,6 +25,93 @@ export type Appended = { ok: true; offset: number } | { ok: false; offset: numbe
 
 const chunkKey = (userId: string, sessionId: string, file: string, offset: number): string =>
   `${userId}/${sessionId}/${file}/${String(offset).padStart(OFFSET_DIGITS, "0")}`;
+
+const filePrefix = (userId: string, sessionId: string, file: string): string => `${userId}/${sessionId}/${file}/`;
+
+interface Stretch {
+  key: string;
+  from: number;
+  bytes: number;
+}
+
+// The stretches one file was written as, in the order they were written. A stretch is keyed by
+// where it starts, so the key names its place and the listing comes back sorted by it.
+const stretches = async (bucket: R2Bucket, userId: string, sessionId: string, file: string): Promise<Stretch[]> => {
+  const prefix = filePrefix(userId, sessionId, file);
+  const found: Stretch[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor });
+    for (const object of page.objects) {
+      found.push({ key: object.key, from: Number(object.key.slice(prefix.length)), bytes: object.size });
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor !== undefined);
+  return found;
+};
+
+// One of a session's transcript files, read back whole as the concatenation of its stretches. The
+// body is streamed rather than gathered: a long session's transcript runs to megabytes, and a
+// reader restoring one writes it out as it arrives.
+export const readTranscript = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+): Promise<ReadableStream<Uint8Array> | null> => {
+  const parts = await stretches(bucket, userId, sessionId, file);
+  if (parts.length === 0) return null;
+  let next = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const part = parts[next];
+      if (part === undefined) {
+        controller.close();
+        return;
+      }
+      next += 1;
+      const object = await bucket.get(part.key);
+      if (object === null) throw new Error(`the archive lost ${part.key}`);
+      controller.enqueue(new Uint8Array(await object.arrayBuffer()));
+    },
+  });
+};
+
+// The bytes of one file from `from`, at most `limit` of them and cut back to the last complete
+// line. The indexer reads a transcript this way so that one pass over a long session costs a
+// bounded amount of memory and the next pass carries on where this one stopped.
+export const readStretch = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  from: number,
+  limit: number,
+): Promise<{ text: string; bytes: number; read: number }> => {
+  const parts = (await stretches(bucket, userId, sessionId, file))
+    .filter((part) => part.from + part.bytes > from && part.from < from + limit)
+    .sort((left, right) => left.from - right.from);
+  const read: Uint8Array[] = [];
+  let held = 0;
+  for (const part of parts) {
+    const offset = Math.max(0, from - part.from);
+    const length = Math.min(part.bytes - offset, limit - held);
+    if (length <= 0) break;
+    const object = await bucket.get(part.key, { range: { offset, length } });
+    if (object === null) throw new Error(`the archive lost ${part.key}`);
+    const body = new Uint8Array(await object.arrayBuffer());
+    read.push(body);
+    held += body.byteLength;
+  }
+  const bytes = new Uint8Array(held);
+  let written = 0;
+  for (const body of read) {
+    bytes.set(body, written);
+    written += body.byteLength;
+  }
+  const end = bytes.lastIndexOf(10) + 1;
+  return { text: new TextDecoder().decode(bytes.subarray(0, end)), bytes: end, read: held };
+};
 
 // How far into each of a session's transcript files this service has been written, which is where
 // the host that holds them picks up. A file nothing was ever written for is simply absent.

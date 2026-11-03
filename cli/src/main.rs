@@ -6,6 +6,7 @@ mod listen;
 mod markdown;
 mod mcp;
 mod repo;
+mod restore;
 mod seen;
 mod sessions;
 mod settings;
@@ -166,6 +167,36 @@ enum Command {
             help = "Send the history and usage of every past session this host holds a transcript for"
         )]
         backfill: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["sync", "end", "adopt", "backfill"],
+            help = "Print one session, by its name, its handle or its Claude Code session id"
+        )]
+        find: Option<String>,
+        #[arg(
+            long,
+            value_name = "QUERY",
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find"],
+            help = "Find sessions on every host by what was said in them"
+        )]
+        search: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search"],
+            help = "Write a stored session's transcript back onto this host, so claude --resume takes it"
+        )]
+        restore: Option<String>,
+        #[arg(
+            long,
+            value_name = "DIR",
+            requires = "restore",
+            help = "Restore under this working directory instead of the one the session ran in"
+        )]
+        cwd: Option<String>,
+        #[arg(long, default_value_t = 10, help = "How many sessions --search answers with")]
+        limit: u32,
     },
     #[command(about = "Send a message to another host signed in as you, or to one session on it")]
     Send {
@@ -604,6 +635,68 @@ fn backfill_sessions() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// One session the account has on record, wherever it ran, by any of the names that reach it.
+fn find_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
+    let Some(stored) = client.session(target)? else {
+        eprintln!("recall: no session named {target}");
+        return Ok(ExitCode::from(1));
+    };
+    if json {
+        print_json(&stored.session)?;
+    } else {
+        print!("{}", markdown::render_session(&stored.session, &stored.files));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The sessions whose transcripts answer a query, on every host signed in as this user.
+fn search_sessions(client: &Client, query: &str, limit: u32, json: bool) -> Result<ExitCode> {
+    let hits = client.search_sessions(query, limit)?;
+    if json {
+        print_json(&hits)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if hits.is_empty() {
+        println!("no sessions matched");
+        return Ok(ExitCode::SUCCESS);
+    }
+    print!("{}", markdown::render_session_hits(&hits));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A stored session written back onto this host, transcript and delegated turns alike, so that
+/// `claude --resume` takes it from the directory it is restored under.
+fn restore_session(client: &Client, target: &str, cwd: Option<&str>, json: bool) -> Result<ExitCode> {
+    let Some(stored) = client.session(target)? else {
+        eprintln!("recall: no session named {target}");
+        return Ok(ExitCode::from(1));
+    };
+    let projects = config::claude_dir()
+        .context("neither CLAUDE_CONFIG_DIR nor HOME is set, so there is nowhere to restore a session")?
+        .join("projects");
+    let written = restore::restore(client, &projects, &stored.session, &stored.files, cwd)?;
+    let under = cwd.unwrap_or(&stored.session.cwd);
+    if json {
+        print_json(&serde_json::json!({
+            "sessionId": stored.session.session_id,
+            "cwd": under,
+            "files": written.iter().map(|file| file.path.to_string_lossy()).collect::<Vec<_>>(),
+        }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    for file in &written {
+        println!("restored {} ({} bytes)", file.path.display(), file.bytes);
+    }
+    if written.is_empty() {
+        println!("this host already holds every file of {}", stored.session.session_id);
+    }
+    println!(
+        "resume it with: cd {under} && claude --resume {}",
+        stored.session.session_id
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn require_messaging(settings: &Settings) -> Result<()> {
     if settings.messaging_enabled() {
         return Ok(());
@@ -694,6 +787,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             end,
             adopt,
             backfill,
+            find,
+            search,
+            restore,
+            cwd,
+            limit,
         } => {
             if let Some(id) = sync {
                 return Ok(logged("synced", "sync-failed", &id, || sync_session(&id)));
@@ -706,6 +804,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if backfill {
                 return backfill_sessions();
+            }
+            if let Some(target) = find {
+                return find_session(&client()?, &target, cli.json);
+            }
+            if let Some(query) = search {
+                return search_sessions(&client()?, &query, limit, cli.json);
+            }
+            if let Some(target) = restore {
+                return restore_session(&client()?, &target, cwd.as_deref(), cli.json);
             }
             let client = client()?;
             let listed = client.sessions()?;

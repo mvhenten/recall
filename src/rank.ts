@@ -24,6 +24,14 @@ export const quantize = (vector: Float32Array): Uint8Array => {
   return bytes;
 };
 
+export const unquantize = (stored: Uint8Array): Float32Array => {
+  const scale = new DataView(stored.buffer, stored.byteOffset, 4).getFloat32(0, true);
+  const values = new Int8Array(stored.buffer, stored.byteOffset + 4, stored.length - 4);
+  const out = new Float32Array(values.length);
+  for (let i = 0; i < values.length; i++) out[i] = (values[i] ?? 0) * scale;
+  return out;
+};
+
 export const dot = (query: Float32Array, stored: Uint8Array): number => {
   if (stored.length !== query.length + 4) throw new Error(`stored embedding holds ${stored.length} bytes`);
   const scale = new DataView(stored.buffer, stored.byteOffset, 4).getFloat32(0, true);
@@ -41,10 +49,16 @@ const STOPWORDS = new Set(
   while who whom why will with would you your yours`.split(/\s+/),
 );
 
+export const contentWords = (text: string): Set<string> =>
+  new Set(
+    text
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((term) => term !== "" && !STOPWORDS.has(term)),
+  );
+
 export const ftsQuery = (query: string): string | null => {
-  const terms = [...new Set(query.toLowerCase().split(/[^\p{L}\p{N}]+/u))]
-    .filter((term) => term !== "" && !STOPWORDS.has(term))
-    .sort();
+  const terms = [...contentWords(query)].sort();
   if (terms.length === 0) return null;
   return terms.map((term) => `"${term}"`).join(" OR ");
 };
