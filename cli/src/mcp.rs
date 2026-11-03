@@ -120,8 +120,9 @@ pub struct EditParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SendParams {
-    /// The session to reach, named by the handle recall sessions shows, or a host named as recall
-    /// devices shows it to reach every session on that host.
+    /// The session to reach, named by the handle recall sessions shows, or a host to reach every
+    /// session on it, named either by the label its owner gave it or by the name recall devices
+    /// shows. A message that arrived here names in its header the handle to answer on.
     pub to: String,
     /// The message to deliver there.
     pub message: String,
@@ -350,13 +351,13 @@ impl Recall {
 
     #[tool(
         name = "recall_send",
-        description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named as recall devices shows it. The message arrives as a user turn there."
+        description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named by its label or as recall devices shows it. The message arrives as a user turn there. This is the only route to a session on another machine: Claude Code's own SendMessage and ListAgents see only sessions on this one, so answering a message from another host through them reaches a local session instead."
     )]
     async fn send(&self, Parameters(params): Parameters<SendParams>) -> Result<String, String> {
         blocking(move || {
             let client = client()?;
             let target = api::resolve_target(&client.devices()?, || client.sessions(), &params.to)?;
-            let sent = client.send(&target, &params.message)?;
+            let sent = client.send(&target, &crate::sending_session(), &params.message)?;
             to_json(&serde_json::json!({
                 "messageId": sent.message_id,
                 "toDeviceId": sent.to_device_id,

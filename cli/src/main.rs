@@ -18,7 +18,7 @@ use clap::{Args, Parser, Subcommand};
 use jiff::Timestamp;
 use settings::{Mode, Settings};
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -171,7 +171,7 @@ enum Command {
     Send {
         #[arg(
             value_name = "TO",
-            help = "Session handle from recall sessions for one session, or a device name or id from recall devices for every session on that host"
+            help = "Session handle from recall sessions for one session, or a host from recall devices — its label, its name or its id — for every session on that host"
         )]
         to: String,
         #[arg(
@@ -221,6 +221,16 @@ enum ConfigAction {
     },
     #[command(about = "Print the JSON Schema of ~/.config/recall/config.json")]
     Schema,
+}
+
+/// The session a send is running inside, so the message can tell its reader which handle to answer
+/// on. Claude passes the inbox socket down to the hooks and to every server it starts, and the
+/// socket names the process that owns the session; without it, and on a host whose registry cannot
+/// settle on one session, the message is answered on this host instead.
+pub fn sending_session() -> String {
+    std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET")
+        .and_then(|socket| sessions::sending_session(&listen::sessions_dir(), Path::new(&socket)))
+        .unwrap_or_default()
 }
 
 pub fn host_name() -> String {
@@ -715,7 +725,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let body = message_body(&message)?;
             let client = client()?;
             let target = api::resolve_target(&client.devices()?, || client.sessions(), &to)?;
-            let sent = client.send(&target, &body)?;
+            let sent = client.send(&target, &sending_session(), &body)?;
             if cli.json {
                 print_json(&sent)?;
             } else {
@@ -751,7 +761,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!(
                         "{}  {}  created {}  last used {}{}",
                         device.device_id,
-                        device.name,
+                        markdown::host_column(&device.label, &device.name),
                         markdown::iso(device.created_at),
                         markdown::iso(device.last_used_at),
                         if device.current { "  (this device)" } else { "" }

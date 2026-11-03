@@ -45,7 +45,15 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
-import { DEVICE_HEADER, MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, NOW_HEADER, parseSend } from "./mailbox";
+import {
+  DEVICE_HEADER,
+  MAX_BODY_BYTES,
+  MAX_QUEUED_MESSAGES,
+  type Mailbox,
+  NOW_HEADER,
+  parseSend,
+  type Sender,
+} from "./mailbox";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -69,6 +77,7 @@ import {
   parseUsage,
   type SearchInput,
   type StatsWindows,
+  sessionHandle,
   USAGE_CHART_DAYS,
   USAGE_MONTH_DAYS,
   USAGE_WEEK_DAYS,
@@ -234,8 +243,14 @@ export const createApp = (deps: Deps): App => {
   ): Promise<Response> => {
     if (deviceId === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
-      const listed = await listDevices(db, caller.userId);
-      return json({ devices: listed.map((device) => ({ ...device, current: device.deviceId === caller.deviceId })) });
+      const [listed, labels] = await Promise.all([listDevices(db, caller.userId), readLabels(db, caller.userId)]);
+      return json({
+        devices: listed.map((device) => ({
+          ...device,
+          label: labels.hosts.get(device.host) ?? "",
+          current: device.deviceId === caller.deviceId,
+        })),
+      });
     }
     if (request.method !== "DELETE") return error(405, "method not allowed");
     const target = deviceId === "current" ? caller.deviceId : deviceId;
@@ -257,9 +272,16 @@ export const createApp = (deps: Deps): App => {
       const scope = parseSessionScope(url.searchParams.get("scope"));
       if (!scope.ok) return error(400, scope.error);
       if (scope.value === "history") return sessionHistoryIds(url, db, caller);
-      const listed = await listSessions(db, caller.userId, deps.now());
+      const [listed, labels] = await Promise.all([
+        listSessions(db, caller.userId, deps.now()),
+        readLabels(db, caller.userId),
+      ]);
       return json({
-        sessions: listed.map((session) => ({ ...session, current: session.deviceId === caller.deviceId })),
+        sessions: listed.map((session) => ({
+          ...session,
+          hostLabel: labels.hosts.get(session.host) ?? "",
+          current: session.deviceId === caller.deviceId,
+        })),
       });
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
@@ -343,18 +365,33 @@ export const createApp = (deps: Deps): App => {
   const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
     env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
+  // The handle is minted the same way the sessions listing mints it, so `recall send` takes it back
+  // verbatim. A sender naming a session it does not have live is named by its host alone.
+  const senderOf = async (db: D1Database, caller: Caller, fromSessionId: string, now: number): Promise<Sender> => {
+    const labels = await readLabels(db, caller.userId);
+    const named =
+      fromSessionId !== "" && (await sessionOnDevice(db, caller.userId, fromSessionId, caller.deviceId, now));
+    return {
+      deviceId: caller.deviceId,
+      host: labels.hosts.get(caller.host) ?? caller.host,
+      name: named ? sessionHandle(caller.name, fromSessionId) : "",
+    };
+  };
+
   const sendMessage = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
     const input = parseSend(await readJson(request));
     if (!input.ok) return error(400, input.error);
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
-    const { toDeviceId, toSessionId } = input.value;
+    const { toDeviceId, toSessionId, fromSessionId } = input.value;
+    const now = deps.now();
     if (!(await hasDevice(env.DB, caller.userId, toDeviceId))) return error(404, `no device ${toDeviceId}`);
-    if (toSessionId !== "" && !(await sessionOnDevice(env.DB, caller.userId, toSessionId, toDeviceId, deps.now()))) {
+    if (toSessionId !== "" && !(await sessionOnDevice(env.DB, caller.userId, toSessionId, toDeviceId, now))) {
       return error(404, `no session ${toSessionId} on device ${toDeviceId}`);
     }
-    const message = await mailboxFor(env, caller.userId).enqueue(input.value, caller, deps.now());
+    const sender = await senderOf(env.DB, caller, fromSessionId, now);
+    const message = await mailboxFor(env, caller.userId).enqueue(input.value, sender, now);
     if (message === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
     return json({ message }, 201);
   };

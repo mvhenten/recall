@@ -262,6 +262,23 @@ pub fn record(dir: &Path, session_id: &str) -> Option<Record> {
     read(&record_path(dir, session_id)).map(|status| status.record)
 }
 
+/// The session a send is running inside, found by the inbox socket Claude passes down to
+/// everything that session starts. Only a registered session is a candidate, so the handle the
+/// header hands back always names a session that can receive the reply. A socket carrying more
+/// than one registered session, as a delegated turn does, names none of them, because there is no
+/// telling from here which of them asked. The registry is read and not swept: only the daemon may
+/// retire a record, since it is also what tells the service the session is over.
+pub fn sending_session(dir: &Path, socket: &Path) -> Option<String> {
+    let mut owned = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| read(&entry.path()))
+        .filter(|status| status.record.state.inbox().is_some_and(|inbox| inbox.socket == socket))
+        .map(|status| status.session_id);
+    let only = owned.next()?;
+    owned.next().is_none().then_some(only)
+}
+
 fn record_path(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.json"))
 }
@@ -945,6 +962,22 @@ mod tests {
         assert_eq!(focus_line(&focus("ship it", "")), "ship it");
         assert_eq!(focus_line(&focus("", "ship it")), "ship it");
         assert_eq!(focus_line(&Focus::default()), "");
+    }
+
+    #[test]
+    fn the_socket_names_the_sending_session_only_while_one_registered_session_holds_it() {
+        let sandbox = Sandbox::new("sending-session");
+        let dir = sandbox.sessions();
+        let mine = std::process::id() as i32;
+        let socket = sandbox.dir.join("inbox.sock");
+        sandbox.register("s-here", &socket, mine);
+        sandbox.register("s-elsewhere", &sandbox.dir.join("other.sock"), mine);
+
+        assert_eq!(sending_session(&dir, &socket), Some("s-here".to_string()));
+        assert_eq!(sending_session(&dir, &sandbox.dir.join("unknown.sock")), None);
+
+        sandbox.register("s-delegated", &socket, mine);
+        assert_eq!(sending_session(&dir, &socket), None);
     }
 
     #[tokio::test]
