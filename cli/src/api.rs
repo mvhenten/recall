@@ -220,6 +220,11 @@ pub enum Poll {
 pub struct Device {
     pub device_id: String,
     pub name: String,
+    /// The name the user gave this host on the dashboard's labels tab, empty when it carries none.
+    /// It addresses the host alongside the raw name, and a service too old to send one leaves it
+    /// empty rather than failing the listing.
+    #[serde(default)]
+    pub label: String,
     pub created_at: i64,
     pub last_used_at: i64,
     pub current: bool,
@@ -239,6 +244,14 @@ pub struct Message {
     pub to_device_id: String,
     pub to_session_id: String,
     pub from_device_id: String,
+    /// The sending host as its owner names it, its label first; empty from a service too old to
+    /// name a sender, and the header then falls back to the device id.
+    #[serde(default)]
+    pub from_host: String,
+    /// The handle of the session that sent it, which `recall send` takes back verbatim; empty when
+    /// the sender named no session.
+    #[serde(default)]
+    pub from_name: String,
     pub body: String,
     pub created_at: i64,
     pub expires_at: i64,
@@ -259,6 +272,9 @@ pub struct Session {
     pub name: String,
     pub device_id: String,
     pub host: String,
+    /// The name the user gave `host` on the dashboard's labels tab, empty when it carries none.
+    #[serde(default)]
+    pub host_label: String,
     pub cwd: String,
     pub repo: String,
     pub branch: String,
@@ -345,9 +361,11 @@ pub struct Target {
     pub session_id: String,
 }
 
-/// `to` is a device id or device name, which reaches every session on that host, or a session
-/// handle or session id, which reaches that one session. A device answers first, so `sessions` is
-/// called only for a target no device claims and an ordinary host send costs no listing.
+/// `to` is a device id, a device name, or the label that host carries, any of which reach every
+/// session on that host, or a session handle or session id, which reaches that one session. A
+/// device answers first, so `sessions` is called only for a target no device claims and an ordinary
+/// host send costs no listing. A name or label two hosts answer to names them both rather than
+/// picking one; only the device id, which is unique, settles it on its own.
 pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<Session>>, to: &str) -> Result<Target> {
     let host = |device_id: &str| {
         Ok(Target {
@@ -358,8 +376,24 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
     if devices.iter().any(|device| device.device_id == to) {
         return host(to);
     }
-    if let Some(device) = devices.iter().find(|device| device.name == to) {
-        return host(&device.device_id);
+    let named: Vec<&Device> = devices
+        .iter()
+        .filter(|device| device.name == to || (!device.label.is_empty() && device.label == to))
+        .collect();
+    match named.as_slice() {
+        [device] => return host(&device.device_id),
+        [] => {}
+        many => {
+            let candidates: Vec<String> = many
+                .iter()
+                .map(|device| format!("{} ({})", device.name, device.device_id))
+                .collect();
+            bail!(
+                "ambiguous target {to}: {} hosts answer to it; pass one of these device ids instead: {}",
+                many.len(),
+                candidates.join(", ")
+            )
+        }
     }
     let listed = sessions()?;
     let addressed: Vec<&Session> = listed
@@ -372,7 +406,7 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
             session_id: session.session_id.clone(),
         }),
         [] => bail!(
-            "no host or session named {to}; recall devices lists the hosts signed in as you and recall sessions the handle of each live session"
+            "no host or session named {to}; recall devices lists the hosts signed in as you with any label they carry and recall sessions the handle of each live session"
         ),
         many => {
             let ids: Vec<&str> = many.iter().map(|session| session.session_id.as_str()).collect();
@@ -669,12 +703,16 @@ impl Client {
         Ok(true)
     }
 
-    pub fn send(&self, target: &Target, body: &str) -> Result<Message> {
+    /// `from_session_id` is the session this send is running inside, which the service turns into
+    /// the handle the delivered message tells its reader to answer on. It is empty where the
+    /// sending process cannot say which session asked, and the header then names the host.
+    pub fn send(&self, target: &Target, from_session_id: &str, body: &str) -> Result<Message> {
         let response = self
             .authed(self.agent.post(self.url("/v1/messages")))
             .send_json(serde_json::json!({
                 "toDeviceId": target.device_id,
                 "toSessionId": target.session_id,
+                "fromSessionId": from_session_id,
                 "body": body,
             }))?;
         let sent: Sent = check(response, &format!("sending to {}", target.device_id))?
@@ -713,9 +751,17 @@ mod tests {
         Device {
             device_id: device_id.to_string(),
             name: name.to_string(),
+            label: String::new(),
             created_at: 0,
             last_used_at: 0,
             current: false,
+        }
+    }
+
+    fn labelled_device(device_id: &str, name: &str, label: &str) -> Device {
+        Device {
+            label: label.to_string(),
+            ..device(device_id, name)
         }
     }
 
@@ -725,6 +771,7 @@ mod tests {
             name: name.to_string(),
             device_id: device_id.to_string(),
             host: "laptop".to_string(),
+            host_label: String::new(),
             cwd: "/home/you/src/recall".to_string(),
             repo: "repo:github.com/mvhenten/recall".to_string(),
             branch: "work".to_string(),
@@ -802,6 +849,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no host or session named desktop-9f8b"), "{error}");
+    }
+
+    #[test]
+    fn a_label_reaches_the_host_that_carries_it() {
+        let devices = [labelled_device("d-1", "ip-10-0-7-31", "core"), device("d-2", "desktop")];
+        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+
+        assert_eq!(resolve_target(&devices, refuse, "core").unwrap(), host("d-1"));
+        assert_eq!(resolve_target(&devices, refuse, "ip-10-0-7-31").unwrap(), host("d-1"));
+    }
+
+    #[test]
+    fn an_unlabelled_host_is_not_reached_by_an_empty_label() {
+        let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
+        let error = resolve_target(&devices, || Ok(Vec::new()), "").unwrap_err().to_string();
+        assert!(error.contains("no host or session named"), "{error}");
+    }
+
+    #[test]
+    fn two_hosts_that_answer_to_one_label_are_refused() {
+        let devices = [
+            labelled_device("d-1", "ip-10-0-7-31", "core"),
+            labelled_device("d-2", "ip-10-0-7-32", "core"),
+        ];
+        let error = resolve_target(&devices, || Ok(Vec::new()), "core")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous target core"), "{error}");
+        assert!(error.contains("ip-10-0-7-31 (d-1), ip-10-0-7-32 (d-2)"), "{error}");
+    }
+
+    #[test]
+    fn a_label_that_collides_with_another_hosts_name_is_refused() {
+        let devices = [device("d-1", "core"), labelled_device("d-2", "tower", "core")];
+        let error = resolve_target(&devices, || Ok(Vec::new()), "core")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous target core"), "{error}");
+        assert!(error.contains("core (d-1), tower (d-2)"), "{error}");
     }
 
     #[test]

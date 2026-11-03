@@ -6,6 +6,7 @@ import { type Client, harness } from "./harness";
 type Harness = Awaited<ReturnType<typeof harness>>;
 
 interface ListedSession extends Session {
+  hostLabel: string;
   current: boolean;
 }
 
@@ -31,6 +32,25 @@ const account = async (h: Harness): Promise<{ laptop: Client; tower: Client }> =
 };
 
 describe("sessions", () => {
+  it("carries the label a host was given, and leaves the raw host beside it", async () => {
+    const h = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const email = await h.invite(`sessions-${crypto.randomUUID()}@example.com`, userId);
+    const laptop = h.clientWithToken(await h.login(email, "ip-10-0-7-31"));
+    const tower = h.clientWithToken(await h.login(email, "tower"));
+    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
+      .bind(userId, "ip-10-0-7-31", "core")
+      .run();
+
+    expect((await laptop.sync("s-core", { host: "ip-10-0-7-31", lastActivityAt: h.now() })).status).toBe(204);
+    expect((await tower.sync("s-tower", { host: "tower", lastActivityAt: h.now() - 60_000 })).status).toBe(204);
+
+    expect((await listed(laptop)).map((session) => [session.host, session.hostLabel])).toEqual([
+      ["ip-10-0-7-31", "core"],
+      ["tower", ""],
+    ]);
+  });
+
   it("lists every host's sessions, newest activity first, each addressable by its handle", async () => {
     const h = await harness();
     const { laptop, tower } = await account(h);

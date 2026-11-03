@@ -28,8 +28,13 @@ const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.ge
 const queued = (userId: string, toDeviceId: string, now: number): Promise<Message[]> =>
   runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => mailbox.list(toDeviceId, now));
 
-const send = (client: Client, toDeviceId: string, body: string, toSessionId = ""): Promise<Response> =>
-  client.request("POST", "/v1/messages", { toDeviceId, toSessionId, body });
+const send = (
+  client: Client,
+  toDeviceId: string,
+  body: string,
+  toSessionId = "",
+  fromSessionId = "",
+): Promise<Response> => client.request("POST", "/v1/messages", { toDeviceId, toSessionId, fromSessionId, body });
 
 const sentMessage = async (response: Response): Promise<Message> => {
   expect(response.status).toBe(201);
@@ -38,6 +43,28 @@ const sentMessage = async (response: Response): Promise<Message> => {
 };
 
 describe("messages", () => {
+  it("names its sender by the label the host carries and the handle of the session that sent it", async () => {
+    const h = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const email = await h.invite(`${userId}@example.com`, userId);
+    const laptop = h.clientWithToken(await h.login(email, "ip-10-0-7-31"));
+    await h.login(email, "desktop");
+    const desktopId = await deviceId(laptop, "desktop");
+    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
+      .bind(userId, "ip-10-0-7-31", "core")
+      .run();
+    expect((await laptop.sync("9f8a1b2c")).status).toBe(204);
+
+    const named = await sentMessage(await send(laptop, desktopId, "ship it", "", "9f8a1b2c"));
+    expect(named).toMatchObject({ fromHost: "core", fromName: "ip-10-0-7-31-9f8a" });
+
+    const hostOnly = await sentMessage(await send(laptop, desktopId, "ship it"));
+    expect(hostOnly).toMatchObject({ fromHost: "core", fromName: "" });
+
+    const stale = await sentMessage(await send(laptop, desktopId, "ship it", "", "deadbeef"));
+    expect(stale).toMatchObject({ fromHost: "core", fromName: "" });
+  });
+
   it("queues a sent message against the target device only, until that device acks it", async () => {
     const h = await harness();
     const userId = `user-${crypto.randomUUID()}`;
@@ -87,8 +114,8 @@ describe("messages", () => {
     await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
       for (let index = 0; index < MAX_QUEUED_MESSAGES; index += 1) {
         await mailbox.enqueue(
-          { toDeviceId: desktopId, toSessionId: "", body: `queued ${index}` },
-          { userId, deviceId: desktopId },
+          { toDeviceId: desktopId, toSessionId: "", fromSessionId: "", body: `queued ${index}` },
+          { deviceId: desktopId, host: "desktop", name: "" },
           h.now(),
         );
       }

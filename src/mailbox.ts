@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { type Caller, listDevices } from "./device";
+import { listDevices } from "./device";
 import { type Parsed, parseSessionId } from "./model";
 
 export const MESSAGE_TTL_MS = 259_200_000;
@@ -14,20 +14,33 @@ export const CLOSE_BAD_FRAME = 4000;
 export const CLOSE_REVOKED = 4001;
 
 // `toSessionId` is the one session the message is addressed to, or empty for every session the
-// host has registered.
+// host has registered. `fromHost` and `fromName` are what the receiver prints over the body, so a
+// session reading a message knows who sent it and what to answer; both are resolved at send time
+// and ride with the message, leaving the receiver nothing to look up.
 export interface Message {
   messageId: string;
   toDeviceId: string;
   toSessionId: string;
   fromDeviceId: string;
+  fromHost: string;
+  fromName: string;
   body: string;
   createdAt: number;
   expiresAt: number;
 }
 
+// The sender as a delivered message names it: the host as its owner calls it, label first, and the
+// handle of the session that sent it, empty when the send named none.
+export interface Sender {
+  deviceId: string;
+  host: string;
+  name: string;
+}
+
 export interface SendInput {
   toDeviceId: string;
   toSessionId: string;
+  fromSessionId: string;
   body: string;
 }
 
@@ -50,6 +63,8 @@ interface MessageRow extends Record<string, string | number> {
   to_device_id: string;
   to_session_id: string;
   from_device_id: string;
+  from_host: string;
+  from_name: string;
   body: string;
   created_at: number;
   expires_at: number;
@@ -64,6 +79,8 @@ const toMessage = (row: MessageRow): Message => ({
   toDeviceId: row.to_device_id,
   toSessionId: row.to_session_id,
   fromDeviceId: row.from_device_id,
+  fromHost: row.from_host,
+  fromName: row.from_name,
   body: row.body,
   createdAt: row.created_at,
   expiresAt: row.expires_at,
@@ -77,18 +94,31 @@ const parseToSessionId = (value: unknown): Parsed<string> => {
   return parseSessionId(value);
 };
 
+// The session the sender is running inside, so the delivered message can name a handle to answer
+// on. A sender that cannot tell which of its sessions asked leaves it out and the header names its
+// host instead.
+const parseFromSessionId = (value: unknown): Parsed<string> => {
+  if (value === undefined || value === "") return { ok: true, value: "" };
+  if (typeof value !== "string") {
+    return { ok: false, error: "fromSessionId must be the id of a session on the sending host" };
+  }
+  return parseSessionId(value);
+};
+
 export const parseSend = (input: unknown): Parsed<SendInput> => {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return { ok: false, error: "body must be a JSON object" };
   }
-  const { toDeviceId, toSessionId, body } = input as Record<string, unknown>;
+  const { toDeviceId, toSessionId, fromSessionId, body } = input as Record<string, unknown>;
   if (typeof toDeviceId !== "string" || toDeviceId.length < 1) {
     return { ok: false, error: "toDeviceId must be the id of a device on this account; see GET /v1/devices" };
   }
   if (typeof body !== "string" || body.length < 1) return { ok: false, error: "body must hold at least one character" };
   const session = parseToSessionId(toSessionId);
   if (!session.ok) return session;
-  return { ok: true, value: { toDeviceId, toSessionId: session.value, body } };
+  const from = parseFromSessionId(fromSessionId);
+  if (!from.ok) return from;
+  return { ok: true, value: { toDeviceId, toSessionId: session.value, fromSessionId: from.value, body } };
 };
 
 const readJson = (raw: string): unknown => {
@@ -128,6 +158,8 @@ export class Mailbox extends DurableObject<MailboxEnv> {
          to_device_id TEXT NOT NULL,
          to_session_id TEXT NOT NULL DEFAULT '',
          from_device_id TEXT NOT NULL,
+         from_host TEXT NOT NULL DEFAULT '',
+         from_name TEXT NOT NULL DEFAULT '',
          body TEXT NOT NULL,
          created_at INTEGER NOT NULL,
          expires_at INTEGER NOT NULL
@@ -135,11 +167,22 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     );
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
     // A mailbox created before per-session addressing has no to_session_id, and its queued messages
-    // are all for the whole host. `PRAGMA user_version` is one of the pragmas a Durable Object
-    // refuses, so the column itself is the version marker.
-    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(messages)").toArray();
-    if (!columns.some((column) => column.name === "to_session_id")) {
+    // are all for the whole host; one created before a message named its sender has no from_host or
+    // from_name, and its queued messages are delivered under a header that names neither.
+    // `PRAGMA user_version` is one of the pragmas a Durable Object refuses, so the columns
+    // themselves are the version marker.
+    const columns = new Set(
+      this.sql
+        .exec<{ name: string }>("PRAGMA table_info(messages)")
+        .toArray()
+        .map((column) => column.name),
+    );
+    if (!columns.has("to_session_id")) {
       this.sql.exec("ALTER TABLE messages ADD COLUMN to_session_id TEXT NOT NULL DEFAULT ''");
+    }
+    if (!columns.has("from_host")) {
+      this.sql.exec("ALTER TABLE messages ADD COLUMN from_host TEXT NOT NULL DEFAULT ''");
+      this.sql.exec("ALTER TABLE messages ADD COLUMN from_name TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -181,7 +224,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     await this.scheduleSweep();
   }
 
-  async enqueue(input: SendInput, from: Caller, now: number): Promise<Message | null> {
+  async enqueue(input: SendInput, from: Sender, now: number): Promise<Message | null> {
     this.expire(now);
     if (this.queued() >= MAX_QUEUED_MESSAGES) return null;
     const message: Message = {
@@ -189,17 +232,22 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       toDeviceId: input.toDeviceId,
       toSessionId: input.toSessionId,
       fromDeviceId: from.deviceId,
+      fromHost: from.host,
+      fromName: from.name,
       body: input.body,
       createdAt: now,
       expiresAt: now + MESSAGE_TTL_MS,
     };
     this.sql.exec(
-      `INSERT INTO messages (message_id, to_device_id, to_session_id, from_device_id, body, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages
+         (message_id, to_device_id, to_session_id, from_device_id, from_host, from_name, body, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       message.messageId,
       message.toDeviceId,
       message.toSessionId,
       message.fromDeviceId,
+      message.fromHost,
+      message.fromName,
       message.body,
       message.createdAt,
       message.expiresAt,
@@ -213,8 +261,9 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     this.expire(now);
     return this.sql
       .exec<MessageRow>(
-        `SELECT message_id, to_device_id, to_session_id, from_device_id, body, created_at, expires_at FROM messages
-         WHERE to_device_id = ? ORDER BY created_at, rowid`,
+        `SELECT message_id, to_device_id, to_session_id, from_device_id, from_host, from_name, body, created_at,
+           expires_at
+         FROM messages WHERE to_device_id = ? ORDER BY created_at, rowid`,
         toDeviceId,
       )
       .toArray()

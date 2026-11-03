@@ -170,15 +170,44 @@ pub fn log(outcome: &str, took: Duration) {
         .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
+/// The line a delivered message arrives under. A session reading one otherwise sees a bare user
+/// turn with nothing saying where it came from, and Claude Code's own cross-session tools reach
+/// only sessions on the same machine, so the route back has to be spelled out. The handle is
+/// preferred because it reaches the one session that asked; a sender that named no session is
+/// answered on its host, which `recall send` takes by label as readily as by name.
+pub fn header(message: &Message) -> String {
+    let from = if message.from_host.is_empty() {
+        &message.from_device_id
+    } else {
+        &message.from_host
+    };
+    let reply = if message.from_name.is_empty() {
+        from
+    } else {
+        &message.from_name
+    };
+    let origin = if message.from_name.is_empty() {
+        from.clone()
+    } else {
+        format!("{from}/{}", message.from_name)
+    };
+    format!("[recall from {origin}; reply with recall_send to \"{reply}\"]")
+}
+
+fn delivered_body(message: &Message) -> String {
+    format!("{}\n{}", header(message), message.body)
+}
+
 async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
     let started = Instant::now();
     if seen.contains(&message.message_id) {
         log(&format!("message:replayed:{}", message.message_id), started.elapsed());
         return;
     }
+    let body = delivered_body(message);
     let (target, fanout) = if message.to_session_id.is_empty() {
         let now = Timestamp::now().as_millisecond();
-        let Some(fanout) = sessions::to_host(sessions_dir, &message.body, message.created_at, now).await else {
+        let Some(fanout) = sessions::to_host(sessions_dir, &body, message.created_at, now).await else {
             seen.record(&message.message_id);
             log(&format!("message:retired:{}", message.message_id), started.elapsed());
             return;
@@ -187,7 +216,7 @@ async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
     } else {
         (
             format!("session:{}", message.to_session_id),
-            sessions::to_session(sessions_dir, &message.to_session_id, &message.body).await,
+            sessions::to_session(sessions_dir, &message.to_session_id, &body).await,
         )
     };
     seen.record(&message.message_id);
@@ -708,6 +737,35 @@ mod tests {
                 "state": "registered",
             })
         );
+    }
+
+    #[test]
+    fn the_header_names_the_handle_to_answer_on_and_falls_back_to_the_host() {
+        let message = |from_host: &str, from_name: &str| Message {
+            message_id: "m-1".to_string(),
+            to_device_id: "d-2".to_string(),
+            to_session_id: String::new(),
+            from_device_id: "d-1".to_string(),
+            from_host: from_host.to_string(),
+            from_name: from_name.to_string(),
+            body: "ship it".to_string(),
+            created_at: 1_762_000_000_000,
+            expires_at: 1_762_259_200_000,
+        };
+
+        assert_eq!(
+            header(&message("core", "ip-10-0-7-31-9f8a")),
+            "[recall from core/ip-10-0-7-31-9f8a; reply with recall_send to \"ip-10-0-7-31-9f8a\"]"
+        );
+        assert_eq!(
+            header(&message("core", "")),
+            "[recall from core; reply with recall_send to \"core\"]"
+        );
+        assert_eq!(
+            header(&message("", "")),
+            "[recall from d-1; reply with recall_send to \"d-1\"]"
+        );
+        assert_eq!(delivered_body(&message("core", "")).lines().last().unwrap(), "ship it");
     }
 
     #[test]

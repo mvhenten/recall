@@ -158,6 +158,15 @@ pub fn repo_at_branch(repo: &str, branch: &str) -> String {
     }
 }
 
+/// What a listing prints for a host: the name the user gave it on the dashboard, with the raw one
+/// alongside so no host reads as another, and the raw one alone when it carries no label.
+pub fn host_column(label: &str, host: &str) -> String {
+    if label.is_empty() || label == host {
+        return host.to_string();
+    }
+    format!("{label} ({host})")
+}
+
 /// One line per session: host, the handle `recall send` takes to reach that session, repo@branch,
 /// age, state and what the session is working on. Every column but the last is padded to its
 /// widest value, so the focus lines start together.
@@ -166,7 +175,7 @@ pub fn render_sessions(sessions: &[Session], now: i64) -> String {
         .iter()
         .map(|session| {
             vec![
-                session.host.clone(),
+                host_column(&session.host_label, &session.host),
                 session.name.clone(),
                 repo_at_branch(&session.repo, &session.branch),
                 sessions::age(session.started_at, now),
@@ -251,6 +260,7 @@ mod tests {
             name: format!("{host}-2"),
             device_id: format!("d-{host}"),
             host: host.to_string(),
+            host_label: String::new(),
             cwd: format!("/home/you/src/{host}"),
             repo: repo.to_string(),
             branch: branch.to_string(),

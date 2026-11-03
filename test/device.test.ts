@@ -6,6 +6,7 @@ import { harness } from "./harness";
 interface ListedDevice {
   deviceId: string;
   name: string;
+  label: string;
   createdAt: number;
   lastUsedAt: number;
   current: boolean;
@@ -82,6 +83,24 @@ describe("device login", () => {
     expect((await devicesOf(await second.request("GET", "/v1/devices"))).map((device) => device.name)).toEqual([
       "desktop",
       "laptop",
+    ]);
+  });
+
+  it("carries the label a host was given, and leaves the raw name beside it", async () => {
+    const h = await harness();
+    const userId = `owner-${crypto.randomUUID()}`;
+    const owner = await h.invite(email("owner"), userId);
+    await h.login(owner, "ip-10-0-7-31");
+    const client = h.clientWithToken(await h.login(owner, "tower"));
+    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
+      .bind(userId, "ip-10-0-7-31", "core")
+      .run();
+
+    expect(
+      (await devicesOf(await client.request("GET", "/v1/devices"))).map((device) => [device.name, device.label]),
+    ).toEqual([
+      ["ip-10-0-7-31", "core"],
+      ["tower", ""],
     ]);
   });
 
