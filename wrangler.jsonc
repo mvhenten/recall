@@ -6,7 +6,20 @@
   "workers_dev": false,
   "observability": { "enabled": true },
   "ai": { "binding": "AI" },
-  "triggers": { "crons": ["* * * * *"] },
+  // Every write to the transcript bucket arrives here. The queue and its dead letter queue are
+  // created by infra/, and deploy.mjs writes the names it got back in. A redelivery costs only
+  // the rows it writes again, so the retry count sits well past what a transient D1 failure needs.
+  "queues": {
+    "consumers": [
+      {
+        "queue": "recall-transcripts",
+        "max_batch_size": 25,
+        "max_batch_timeout": 5,
+        "max_retries": 20,
+        "dead_letter_queue": "recall-transcripts-dead"
+      }
+    ]
+  },
   "d1_databases": [
     {
       "binding": "DB",

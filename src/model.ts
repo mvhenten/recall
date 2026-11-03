@@ -550,6 +550,32 @@ export const parseChunkOffset = (value: string | null): Parsed<number> => {
     : fail("offset must be a whole number of bytes into the file");
 };
 
+// The R2 actions that put an object there. The notification rule asks for object-create, which
+// also covers a copy and a finished multipart upload; a delete carries no size and derives
+// nothing.
+const WROTE_OBJECT = new Set(["PutObject", "CopyObject", "CompleteMultipartUpload"]);
+
+// One object, as the storage event reports it being written. The shape is Cloudflare's, at
+// https://developers.cloudflare.com/r2/buckets/event-notifications/. Only the key and the size
+// are read: the two together are the whole of what the derived state is computed from, which is
+// what makes the same event delivered twice cost nothing.
+export interface ObjectEvent {
+  key: string;
+  size: number;
+}
+
+export const parseObjectEvent = (body: unknown): Parsed<ObjectEvent> => {
+  if (!isRecord(body) || typeof body.action !== "string" || !isRecord(body.object)) {
+    return fail("an R2 event notification carries an action and an object");
+  }
+  if (!WROTE_OBJECT.has(body.action)) return fail(`${body.action} writes no object`);
+  const { key, size } = body.object;
+  if (typeof key !== "string" || key === "" || !isInteger(size, 0, Number.MAX_SAFE_INTEGER)) {
+    return fail("the object of an R2 event notification carries a key and a size in bytes");
+  }
+  return { ok: true, value: { key, size } };
+};
+
 const parseFocus = (value: unknown): Parsed<Focus> => {
   if (!isRecord(value) || !isText(value.first, MAX_FOCUS_CHARS) || !isText(value.latest, MAX_FOCUS_CHARS)) {
     return fail(`focus must be {first, latest}, each a string of at most ${MAX_FOCUS_CHARS} characters`);

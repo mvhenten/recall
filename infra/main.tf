@@ -33,6 +33,41 @@ resource "cloudflare_r2_bucket" "transcripts" {
   }
 }
 
+resource "cloudflare_queue" "transcripts" {
+  account_id = var.account_id
+  queue_name = "recall-transcripts"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_queue" "transcripts_dead" {
+  account_id = var.account_id
+  queue_name = "recall-transcripts-dead"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Every stretch written to the archive wakes the Worker that derives the rest of the service's
+# view of it. The consumer is declared in wrangler.jsonc and attached by `wrangler deploy`, since
+# the consumer is the script itself; this side is the queue and the rule that feeds it.
+#
+# `queue_name` reads back as unknown on every plan, so the resource shows an in-place update that
+# changes nothing: cloudflare/terraform-provider-cloudflare#7263.
+resource "cloudflare_r2_bucket_event_notification" "transcripts" {
+  account_id  = var.account_id
+  bucket_name = cloudflare_r2_bucket.transcripts.name
+  queue_id    = cloudflare_queue.transcripts.queue_id
+
+  rules = [{
+    actions     = ["PutObject", "CompleteMultipartUpload"]
+    description = "a transcript stretch landed"
+  }]
+}
+
 resource "cloudflare_zero_trust_access_policy" "bypass" {
   account_id = var.account_id
   name       = "recall api"

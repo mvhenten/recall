@@ -298,11 +298,30 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     clientWithToken,
     clientWithHeaders,
     assertionFor,
-    index: () => app.index(env),
+    // What R2 does when a stretch lands, stood in for: every object in the archive is announced
+    // to the consumer in the shape Cloudflare's event notifications carry. Announcing the whole
+    // bucket on every call is deliberate — a consumer deriving anything from what it had seen
+    // before, rather than from the key in front of it, comes apart here.
+    deliver: async (): Promise<number> => {
+      const events: unknown[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await env.TRANSCRIPTS.list({ cursor });
+        for (const object of page.objects) {
+          events.push({
+            account: "test",
+            action: "PutObject",
+            bucket: "recall-transcripts",
+            object: { key: object.key, size: object.size, eTag: object.etag },
+            eventTime: new Date(clock).toISOString(),
+          });
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor !== undefined);
+      return app.consume(env, events);
+    },
     indexMark: async (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
-      env.DB.prepare(
-        "SELECT archived, bytes, chunks, indexed_at FROM session_index WHERE user_id = ? AND session_id = ?",
-      )
+      env.DB.prepare("SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?")
         .bind(userId, sessionId)
         .first<Record<string, number>>(),
     chunks: async (userId: string, sessionId: string): Promise<string[]> => {

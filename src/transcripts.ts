@@ -1,12 +1,14 @@
 // R2 has no append, so a session's transcript is kept as one object per appended stretch, under
 // `<user id>/<session id>/<file>/<start offset>`. The offset is zero-padded, so listing the prefix
 // gives the stretches in the order they were written and reading one file is a concatenation. A
-// stretch is keyed by where it starts and nothing else, so a tick that retries one writes the same
-// key again instead of a second copy of the same lines.
+// stretch is keyed by where it starts and nothing else, so a caller that retries one writes the
+// same key again instead of a second copy of the same lines.
 //
-// Where a file ends is kept in D1 beside the session rather than counted off the objects. A
-// running session appends every few seconds, so listing the prefix on every call would cost a
-// listing that grows with the session and make archiving a long one quadratic.
+// The object is the only write an append makes, and the key says everything about it: who, which
+// session, which file and where in it. Everything else the service holds about a transcript is
+// derived from that key by the consumer the storage event wakes, and nothing derived is ever
+// asked a question the objects can answer, so a row that disagrees with them is wrong by
+// definition and is written over by the listing that found it out.
 const OFFSET_DIGITS = 16;
 
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
@@ -21,12 +23,36 @@ export interface TranscriptFile {
   bytes: number;
 }
 
-export type Appended = { ok: true; offset: number } | { ok: false; offset: number };
+// One stretch, read back off the key that names it. `end` is where the file reaches once this
+// object is in it, which is the whole of what the key and the object's size say.
+export interface Chunk {
+  userId: string;
+  sessionId: string;
+  file: string;
+  offset: number;
+  end: number;
+}
 
 const chunkKey = (userId: string, sessionId: string, file: string, offset: number): string =>
   `${userId}/${sessionId}/${file}/${String(offset).padStart(OFFSET_DIGITS, "0")}`;
 
 const filePrefix = (userId: string, sessionId: string, file: string): string => `${userId}/${sessionId}/${file}/`;
+
+const sessionPrefix = (userId: string, sessionId: string): string => `${userId}/${sessionId}/`;
+
+const OFFSET_SEGMENT = new RegExp(`^[0-9]{${OFFSET_DIGITS}}$`);
+
+// The stretch one key names. A key the archive did not write — a listing that caught something
+// else, an event for an object this service knows nothing about — is no stretch and is passed
+// over rather than guessed at.
+export const parseChunkKey = (key: string, size: number): Chunk | null => {
+  const [userId, sessionId, file, offset, ...rest] = key.split("/");
+  if (userId === undefined || sessionId === undefined || file === undefined || offset === undefined) return null;
+  if (rest.length > 0 || userId === "" || sessionId === "" || file === "") return null;
+  if (!OFFSET_SEGMENT.test(offset) || !Number.isSafeInteger(size) || size < 0) return null;
+  const from = Number(offset);
+  return { userId, sessionId, file, offset: from, end: from + size };
+};
 
 interface Stretch {
   key: string;
@@ -86,13 +112,12 @@ export interface Bite {
 }
 
 // One bite of a file, from `from` and at most `limit` bytes, for a reader that will come back for
-// the rest. `through` always moves: a reader that takes it as its mark cannot be handed the same
-// bite twice, whatever the archive holds.
+// the rest. `through` always moves while stretches are left: a reader that takes it as its mark
+// cannot be handed the same bite twice, whatever the archive holds.
 //
-// A hole is a stretch whose end was claimed and whose object never landed, which is what an
-// isolate killed between the two leaves behind. Those bytes exist nowhere and never will, so the
-// read steps over the hole to the next stretch rather than reading across it as though the file
-// ran on; a reader stopping short of it instead would find the session due for good.
+// A hole is a run of bytes no object covers, which is what a stretch sent past the end of the
+// file leaves behind. Those bytes exist nowhere, so the read steps over the hole to the next
+// stretch rather than reading across it as though the file ran on.
 export const readStretch = async (
   bucket: R2Bucket,
   userId: string,
@@ -136,107 +161,81 @@ export const readStretch = async (
   return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
 };
 
-// How far the archive holds a session's own transcript, which is what puts the session in the
-// indexer's queue. It is moved by the append that wrote those bytes, so the queue costs the
-// indexer no scan of its own, and it never moves backwards: a stretch refused for landing
-// anywhere but the end of the file says nothing about where the file ends.
-const markArchived = (db: D1Database, userId: string, sessionId: string, end: number): Promise<unknown> =>
-  db
-    .prepare(
-      `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks, indexed_at)
-       VALUES (?1, ?2, ?3, 0, 0, 0)
-       ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
-    )
-    .bind(userId, sessionId, end)
-    .run();
-
-// How far into each of a session's transcript files this service has been written, which is where
-// the host that holds them picks up. A file nothing was ever written for is simply absent.
-export const transcriptFiles = async (db: D1Database, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
-  const { results } = await db
-    .prepare("SELECT file, bytes FROM transcript_files WHERE user_id = ? AND session_id = ? ORDER BY file")
-    .bind(userId, sessionId)
-    .all<TranscriptFile>();
-  return results;
-};
-
-const heldBytes = async (db: D1Database, userId: string, sessionId: string, file: string): Promise<number> => {
-  const row = await db
-    .prepare("SELECT bytes FROM transcript_files WHERE user_id = ? AND session_id = ? AND file = ?")
-    .bind(userId, sessionId, file)
-    .first<{ bytes: number }>();
-  return row?.bytes ?? 0;
-};
-
-// Moving the end of a file from where a stretch starts to where it finishes, and only from there.
-// Two writers reaching the same file at once — the listener's beat and a session ending — both
-// read the same end and offer a stretch from it; this is what picks one. The loser changes no row
-// and is told where the file ends now.
-const claim = async (
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-  file: string,
-  offset: number,
-  end: number,
-): Promise<boolean> => {
-  // A file the service holds nothing of has no row, and the only stretch that may open one is the
-  // one starting at nothing. An update alone would let a stretch from the middle of a file open a
-  // file that begins at its own offset.
-  const claimed =
-    offset === 0
-      ? await db
-          .prepare(
-            `INSERT INTO transcript_files (user_id, session_id, file, bytes) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (user_id, session_id, file) DO UPDATE SET bytes = ?4 WHERE transcript_files.bytes = 0`,
-          )
-          .bind(userId, sessionId, file, end)
-          .run()
-      : await db
-          .prepare(
-            `UPDATE transcript_files SET bytes = ?4
-             WHERE user_id = ?1 AND session_id = ?2 AND file = ?3 AND bytes = ?5`,
-          )
-          .bind(userId, sessionId, file, end, offset)
-          .run();
-  return claimed.meta.changes === 1;
-};
-
-// The store is append-only: a stretch lands only where the file already ends, so two writers
-// racing on the same file cannot leave an overlap, or a hole, for a reader to find. A caller
-// writing anywhere else is told where the file ends and reads on from there.
-//
-// The end moves before the object goes down, and that order is the whole of it. Writing first
-// would have the slower of two writers put its shorter stretch over the longer one already
-// there, leaving the file ending past bytes nothing holds — a hole no reader could see, since
-// every object either side of it is exactly where it should be. Claiming first means the loser
-// never writes at all. A put that then fails gives the claim back, so the next stretch starts
-// where this one did rather than beyond a gap.
-export const appendChunk = async (
-  db: D1Database,
+// The one write an append makes. Where the stretch starts is the caller's to say and the key
+// carries it, so nothing is read first and nothing is claimed; a stretch written twice overwrites
+// itself. Where the file ends afterwards is arithmetic, so the answer costs no read either.
+export const putChunk = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
   offset: number,
   body: ArrayBuffer,
-): Promise<Appended> => {
-  if (body.byteLength === 0) {
-    const held = await heldBytes(db, userId, sessionId, file);
-    return offset === held ? { ok: true, offset: held } : { ok: false, offset: held };
+): Promise<number> => {
+  if (body.byteLength === 0) return offset;
+  await bucket.put(chunkKey(userId, sessionId, file, offset), body, {
+    httpMetadata: { contentType: "application/x-ndjson" },
+  });
+  return offset + body.byteLength;
+};
+
+// The one thing worth keeping off the objects: how far a session's own transcript runs. The
+// indexer reads it on every pass and must not pay for a listing, and the stretch that moved it is
+// what wakes the indexer anyway. It is folded in with MAX, so an event delivered twice, or behind
+// one for a later stretch, leaves the row where the objects already put it.
+//
+// A delegated turn derives nothing — the index never reads one — so its stretch writes no row at
+// all. The archive answers for those files by listing them, which is the only reading that can
+// answer without lagging.
+export const cacheChunk = (db: D1Database, chunk: Chunk): D1PreparedStatement[] =>
+  chunk.file === MAIN_FILE
+    ? [
+        db
+          .prepare(
+            `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)
+             ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
+          )
+          .bind(chunk.userId, chunk.sessionId, chunk.end),
+      ]
+    : [];
+
+// How far into each of a session's files the archive runs, counted off the objects. Every caller
+// that acts on the answer reads it here — a host working out where to send the rest of a file, a
+// restore writing them back to disk — because a count a second behind would have one of them
+// write over a stretch or stop short of one.
+//
+// It is also what puts the indexer's mark back where it belongs when the two disagree: a listing
+// is the archive itself, so it may lower the mark as well as raise it, and a mark left ahead of
+// the objects by a write that was announced and then lost is exactly the drift this undoes.
+export const archivedFiles = async (
+  bucket: R2Bucket,
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+): Promise<TranscriptFile[]> => {
+  const prefix = sessionPrefix(userId, sessionId);
+  const ends = new Map<string, number>();
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor });
+    for (const object of page.objects) {
+      const chunk = parseChunkKey(object.key, object.size);
+      if (chunk === null) continue;
+      ends.set(chunk.file, Math.max(ends.get(chunk.file) ?? 0, chunk.end));
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor !== undefined);
+  const archived = ends.get(MAIN_FILE);
+  if (archived !== undefined) {
+    await db
+      .prepare(
+        `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)
+         ON CONFLICT (user_id, session_id) DO UPDATE SET archived = excluded.archived`,
+      )
+      .bind(userId, sessionId, archived)
+      .run();
   }
-  const end = offset + body.byteLength;
-  if (!(await claim(db, userId, sessionId, file, offset, end))) {
-    return { ok: false, offset: await heldBytes(db, userId, sessionId, file) };
-  }
-  await bucket
-    .put(chunkKey(userId, sessionId, file, offset), body, {
-      httpMetadata: { contentType: "application/x-ndjson" },
-    })
-    .catch(async (failure: unknown) => {
-      await claim(db, userId, sessionId, file, end, offset);
-      throw failure;
-    });
-  if (file === MAIN_FILE) await markArchived(db, userId, sessionId, end);
-  return { ok: true, offset: end };
+  return [...ends]
+    .map(([file, bytes]): TranscriptFile => ({ file, bytes }))
+    .sort((left, right) => (left.file < right.file ? -1 : 1));
 };

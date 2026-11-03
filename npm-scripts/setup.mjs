@@ -139,6 +139,27 @@ const transcriptBucket = await ensureBucket(`${name}-transcripts`);
 // The artifact bucket is touched only when pages are published.
 const artifactBucket = artifactHostname === "" ? "" : await ensureBucket(`${name}-artifacts`);
 
+const ensureQueue = async (queue) =>
+  (await list(`${account}/queues`)).find((found) => found.queue_name === queue) ??
+  (await create(`queue ${queue}`, () => cf("POST", `${account}/queues`, { queue_name: queue })));
+
+const transcriptQueue = await ensureQueue(`${name}-transcripts`);
+const deadQueue = await ensureQueue(`${name}-transcripts-dead`);
+
+// Every stretch written to the archive wakes the Worker that derives the rest from it. The rules
+// are written whole rather than added to, so running the setup again leaves this one rule and no
+// copy of it.
+const notificationPath = `${account}/event_notifications/r2/${transcriptBucket}/configuration/queues/${transcriptQueue?.queue_id}`;
+const notification = {
+  rules: [{ actions: ["PutObject", "CompleteMultipartUpload"], description: "a transcript stretch landed" }],
+};
+if (dryRun) {
+  say(`would send ${transcriptBucket} writes to queue ${name}-transcripts`);
+} else {
+  await cf("PUT", notificationPath, notification);
+  say(`${transcriptBucket} writes go to queue ${transcriptQueue.queue_name}`);
+}
+
 const otp =
   (await list(`${account}/access/identity_providers`)).find((idp) => idp.type === "onetimepin") ??
   (await create("the One-time PIN login method", () =>
@@ -250,7 +271,12 @@ const run = (args) => {
   if (result.status !== 0) die(`wrangler ${args.join(" ")} exited with ${result.status}`);
 };
 
-const base = JSON.parse(readFileSync(join(ROOT, "wrangler.jsonc"), "utf8"));
+const base = JSON.parse(
+  readFileSync(join(ROOT, "wrangler.jsonc"), "utf8")
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("//"))
+    .join("\n"),
+);
 const config = {
   ...base,
   $schema: undefined,
@@ -266,6 +292,13 @@ const config = {
     { binding: "TRANSCRIPTS", bucket_name: transcriptBucket },
     ...(artifactBucket === "" ? [] : [{ binding: "ARTIFACTS", bucket_name: artifactBucket }]),
   ],
+  queues: {
+    consumers: base.queues.consumers.map((consumer) => ({
+      ...consumer,
+      queue: `${name}-transcripts`,
+      dead_letter_queue: deadQueue?.queue_name ?? `${name}-transcripts-dead`,
+    })),
+  },
   routes: [
     { pattern: hostname, custom_domain: true, zone_id: zone.id },
     ...(artifactZone ? [{ pattern: artifactHostname, custom_domain: true, zone_id: artifactZone.id }] : []),

@@ -6,9 +6,14 @@
 //! read; `hooks/usage.mjs` enumerates the same set for the counting it does.
 //!
 //! The service has no append, so a file is sent as a run of stretches, each one starting where the
-//! file already ends there. Where it ends is the service's own answer, kept apart from the mark
-//! the usage counter keeps in the session record, so moving either can neither skip nor replay the
-//! other.
+//! file already ends there. The service takes a stretch wherever it is offered and answers where
+//! the file reaches once that stretch is in it, so this host carries its own position and asks the
+//! service only about a session it has no position for — a daemon's first pass over one, and never
+//! again while that daemon runs. The answer is counted off the stored objects, the only reading
+//! that cannot lag; everything else the service holds about a file is derived behind it.
+//!
+//! The position is kept apart from the mark the usage counter keeps in the session record, so
+//! moving either can neither skip nor replay the other.
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -92,19 +97,11 @@ pub struct Held {
     pub counted: HashSet<String>,
 }
 
-/// What the service answers about one session's files, and what it takes.
+/// What the service answers about one session's files, and what it takes. `append` answers where
+/// the file reaches once the stretch is in it.
 pub trait Store {
     fn held(&self, session_id: &str) -> Result<Held>;
-    fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended>;
-}
-
-/// `Behind` carries where the service says the file now ends: another writer got there first, and
-/// the stretch this run read is no longer the one that fits. Nothing is retried here — the next
-/// pass reads from the new end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Appended {
-    Wrote(i64),
-    Behind(i64),
+    fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<i64>;
 }
 
 /// The stretch of one file past `offset`, at most `MAX_CHUNK` and cut back to the last complete
@@ -154,21 +151,18 @@ pub fn send_file(store: &impl Store, session_id: &str, source: &Source, held: i6
         if stretch.is_empty() {
             break;
         }
-        match store.append(session_id, &source.file, at, &stretch)? {
-            Appended::Wrote(end) => {
-                bytes += stretch.len() as i64;
-                at = end;
-            }
-            Appended::Behind(end) => return Ok(Reached { end, bytes }),
-        }
+        at = store.append(session_id, &source.file, at, &stretch)?;
+        bytes += stretch.len() as i64;
     }
     Ok(Reached { end: at, bytes })
 }
 
-/// A run of passes over the sessions on this host. It remembers where the service was last seen
-/// to hold each file, so a pass over a session that has not written since the one before costs no
-/// call at all — which is what lets the archive run on a short beat. The memory is only a floor:
-/// a pass with anything to send asks the service, and takes its answer over this.
+/// A run of passes over the sessions on this host. It carries where each file now ends on the
+/// service, which is what every append answers, so a pass over a session that has not written
+/// since the one before costs no call at all and a pass that has something to send costs only the
+/// writes. The service is asked about a session this run has never seen, and about no other: it
+/// is the one thing this run cannot work out for itself, and the listing behind the answer is far
+/// too dear to pay for on every beat.
 #[derive(Debug, Default)]
 pub struct Archive {
     seen: HashMap<String, HashMap<String, i64>>,
@@ -182,14 +176,18 @@ impl Archive {
             return Ok(0);
         }
         let sources = sources(transcript)?;
-        let known = self.seen.entry(session_id.to_string()).or_default();
-        if sources
-            .iter()
-            .all(|source| known.get(&source.file).is_some_and(|end| *end >= source.size))
-        {
-            return Ok(0);
-        }
-        let held = store.held(session_id)?.bytes;
+        let held = match self.seen.get(session_id) {
+            Some(known) => {
+                if sources
+                    .iter()
+                    .all(|source| known.get(&source.file).is_some_and(|end| *end >= source.size))
+                {
+                    return Ok(0);
+                }
+                known.clone()
+            }
+            None => store.held(session_id)?.bytes,
+        };
         let mut sent = 0;
         let mut ends = HashMap::new();
         for source in &sources {
@@ -245,19 +243,33 @@ mod tests {
         }
     }
 
-    /// The service as a host can see it: one growing body per file, which is what a reader
-    /// concatenating the stretches would get, and the appends refused for landing anywhere but the
-    /// end of a file.
+    /// The service as a host can see it: one object per stretch, keyed by where the stretch
+    /// starts, which is what the store really holds. A stretch offered where one already sits
+    /// overwrites it rather than landing beside it, and how far a file reaches is counted off
+    /// those objects, the way a listing counts it.
     #[derive(Debug, Default)]
     struct Fake {
-        files: RefCell<HashMap<String, Vec<u8>>>,
-        refused: RefCell<usize>,
+        objects: RefCell<HashMap<(String, i64), Vec<u8>>>,
         asked: RefCell<usize>,
     }
 
     impl Fake {
         fn body(&self, file: &str) -> String {
-            String::from_utf8(self.files.borrow().get(file).cloned().unwrap_or_default()).unwrap()
+            let objects = self.objects.borrow();
+            let mut stretches: Vec<_> = objects.iter().filter(|((held, _), _)| held == file).collect();
+            stretches.sort_by_key(|((_, offset), _)| *offset);
+            String::from_utf8(stretches.into_iter().flat_map(|(_, body)| body.clone()).collect()).unwrap()
+        }
+
+        fn ends(&self) -> HashMap<String, i64> {
+            let mut ends = HashMap::new();
+            for ((file, offset), body) in self.objects.borrow().iter() {
+                let end = offset + body.len() as i64;
+                ends.entry(file.clone())
+                    .and_modify(|held| *held = end.max(*held))
+                    .or_insert(end);
+            }
+            ends
         }
     }
 
@@ -265,25 +277,16 @@ mod tests {
         fn held(&self, _session_id: &str) -> Result<Held> {
             *self.asked.borrow_mut() += 1;
             Ok(Held {
-                bytes: self
-                    .files
-                    .borrow()
-                    .iter()
-                    .map(|(file, body)| (file.clone(), body.len() as i64))
-                    .collect(),
+                bytes: self.ends(),
                 counted: HashSet::new(),
             })
         }
 
-        fn append(&self, _session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended> {
-            let mut files = self.files.borrow_mut();
-            let body = files.entry(file.to_string()).or_default();
-            if offset != body.len() as i64 {
-                *self.refused.borrow_mut() += 1;
-                return Ok(Appended::Behind(body.len() as i64));
-            }
-            body.extend_from_slice(bytes);
-            Ok(Appended::Wrote(body.len() as i64))
+        fn append(&self, _session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<i64> {
+            self.objects
+                .borrow_mut()
+                .insert((file.to_string(), offset), bytes.to_vec());
+            Ok(offset + bytes.len() as i64)
         }
     }
 
@@ -349,33 +352,38 @@ mod tests {
         );
         std::fs::write(&transcript, "one\ntwo\n").unwrap();
         assert_eq!(archive.send(&service, "s-1", &transcript).unwrap(), 4);
-        assert_eq!(*service.asked.borrow(), asked + 1, "and a session that wrote asks once");
+        assert_eq!(
+            *service.asked.borrow(),
+            asked,
+            "a session this run already placed is never asked about again, however much it writes"
+        );
 
         archive.retain(&HashSet::new());
         archive.send(&service, "s-1", &transcript).unwrap();
         assert_eq!(
             *service.asked.borrow(),
-            asked + 2,
-            "a session forgotten is asked about again"
+            asked + 1,
+            "a session forgotten is asked about once, and that is the only call the listing pays for"
         );
     }
 
     #[test]
-    fn a_stretch_the_service_has_already_taken_is_dropped_rather_than_duplicated() {
-        let sandbox = Sandbox::new("behind");
+    fn a_stretch_sent_again_lands_on_itself_rather_than_beside_itself() {
+        let sandbox = Sandbox::new("replayed");
         let transcript = sandbox.transcript("s-1", "one\ntwo\n");
         let service = Fake::default();
-        service.files.borrow_mut().insert("main".to_string(), b"one\n".to_vec());
+        let source = sources(&transcript).unwrap().remove(0);
 
-        // The pass reads from nothing, since that is what a host with no answer yet would do.
         assert_eq!(
-            send_file(&service, "s-1", &sources(&transcript).unwrap().remove(0), 0).unwrap(),
-            Reached { end: 4, bytes: 0 },
-            "nothing is written, and the end the service named is what the next pass reads from"
+            send_file(&service, "s-1", &source, 0).unwrap(),
+            Reached { end: 8, bytes: 8 },
+            "the file reaches where the stretch ends, which the append answers without a read"
         );
+        // A host that lost its place and read the file from nothing again, which is the whole of
+        // what a replay looks like now that no offset is claimed.
+        send_file(&service, "s-1", &source, 0).unwrap();
 
-        assert_eq!(*service.refused.borrow(), 1);
-        assert_eq!(service.body("main"), "one\n", "a stretch that would overlap is refused");
+        assert_eq!(service.body("main"), "one\ntwo\n", "no line is written twice");
     }
 
     #[test]
@@ -398,7 +406,6 @@ mod tests {
             "one\ntwo\nthree\n",
             "the stretches already written are left alone, never spliced onto at an offset the new file has no line at"
         );
-        assert_eq!(*service.refused.borrow(), 0, "and nothing is offered that would be");
     }
 
     #[test]

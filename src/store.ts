@@ -985,47 +985,20 @@ export const recordUsage = async (
 // hooks as the session ran, or a run reading the file back long after. It is the only thing a
 // later reading can ask, since the raw events are swept at two weeks and never said which file
 // they read.
-// One session whose archive has grown past what the index has read. A session prompted in the
-// last few minutes is left alone: it will be quiet soon enough, and indexing it on every pass
-// would cut a chunk at every pass boundary for as long as it runs.
-//
-// The queue is `session_index` and nothing else. `session_index_due` indexes the sessions behind
-// their archive by the pass that last took them on, so a tick with nothing due reads no row, and
-// one with work reads the few rows it takes on.
-export interface DueSession {
-  user_id: string;
-  session_id: string;
+// How far one session's archive runs and how far the index has read of it. `archived` is a cache
+// of the objects, moved by the storage event that wrote them; `indexed` and `chunks` are the
+// index's own and no listing could recover them.
+export interface IndexMark {
   archived: number;
   indexed: number;
   chunks: number;
 }
 
-export const dueSessions = async (db: D1Database, now: number, limit: number): Promise<DueSession[]> => {
-  const { results } = await db
-    .prepare(
-      `SELECT i.user_id, i.session_id, i.archived, i.bytes AS indexed, i.chunks
-       FROM session_index i
-       LEFT JOIN sessions s ON s.user_id = i.user_id AND s.session_id = i.session_id
-       WHERE i.bytes < i.archived AND (s.session_id IS NULL OR s.last_activity_at <= ?1)
-       ORDER BY i.indexed_at
-       LIMIT ?2`,
-    )
-    .bind(now - IDLE_AFTER_MS, limit)
-    .all<DueSession>();
-  return results;
-};
-
-// Marks a session as taken on, before the pass that takes it on does any work. A session the
-// indexer cannot get through — a stretch the archive lost, an embedding call that keeps failing —
-// would otherwise keep its old mark, sort to the front of the queue again on the next tick and
-// hold every session behind it there for good. Stamped first, it costs one wasted pass per cycle
-// and nothing else waits on it.
-export const takingOn = async (db: D1Database, userId: string, sessionId: string, now: number): Promise<void> => {
-  await db
-    .prepare("UPDATE session_index SET indexed_at = ?3 WHERE user_id = ?1 AND session_id = ?2")
-    .bind(userId, sessionId, now)
-    .run();
-};
+export const indexMark = async (db: D1Database, userId: string, sessionId: string): Promise<IndexMark | null> =>
+  db
+    .prepare("SELECT archived, bytes AS indexed, chunks FROM session_index WHERE user_id = ?1 AND session_id = ?2")
+    .bind(userId, sessionId)
+    .first<IndexMark>();
 
 export interface IndexedChunk {
   speaker: string;
@@ -1044,7 +1017,6 @@ export const writeChunks = async (
   from: number,
   chunks: IndexedChunk[],
   reached: number,
-  now: number,
 ): Promise<void> => {
   if (chunks.length > 0) {
     await db.batch(
@@ -1060,11 +1032,8 @@ export const writeChunks = async (
     );
   }
   await db
-    .prepare(
-      `UPDATE session_index SET bytes = ?3, chunks = ?4, indexed_at = ?5
-       WHERE user_id = ?1 AND session_id = ?2`,
-    )
-    .bind(userId, sessionId, reached, from + chunks.length, now)
+    .prepare("UPDATE session_index SET bytes = ?3, chunks = ?4 WHERE user_id = ?1 AND session_id = ?2")
+    .bind(userId, sessionId, reached, from + chunks.length)
     .run();
 };
 

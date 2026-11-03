@@ -65,11 +65,13 @@ export default {
   fetch(request, env) {
     return appFor(env).fetch(request, env);
   },
-  // Indexing a session's prose runs here and not on the archive's beat: a running session appends
-  // every few seconds, and cutting a chunk at every one of those would leave the index a heap of
-  // stubs. The queue is one partial index over `session_index`, which the append itself keeps
-  // current, so a tick reads the sessions it takes on and no other row.
-  async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(appFor(env).index(env));
+  // Every stretch written to the archive arrives here as an R2 event notification, and everything
+  // the service derives from a transcript is derived off it. There is no beat and nothing asks
+  // what is due: the write that made the work is what schedules it.
+  async queue(batch, env) {
+    await appFor(env).consume(
+      env,
+      batch.messages.map((message) => message.body),
+    );
   },
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<Env, unknown>;

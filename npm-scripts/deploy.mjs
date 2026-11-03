@@ -217,6 +217,15 @@ const deployConfig = {
     { binding: "TRANSCRIPTS", bucket_name: output("transcript_bucket") },
     ...(artifactHostname === "" ? [] : [{ binding: "ARTIFACTS", bucket_name: output("artifact_bucket") }]),
   ],
+  // The deploy is what attaches the Worker to the queue the archive's events land on, so the
+  // names come from the apply that created it rather than from the checked-in config.
+  queues: {
+    consumers: base.queues.consumers.map((consumer) => ({
+      ...consumer,
+      queue: output("transcript_queue"),
+      dead_letter_queue: output("transcript_dead_queue"),
+    })),
+  },
   routes: [
     { pattern: hostname, custom_domain: true, zone_id: zoneId },
     ...(artifactHostname === "" ? [] : [{ pattern: artifactHostname, custom_domain: true, zone_id: zoneId }]),
