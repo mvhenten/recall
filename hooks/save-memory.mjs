@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
 import { GLOBAL_TYPES, isMemoryFile, memoryType, resolveReal } from "./memory-files.mjs";
+import { memoryName } from "./memory-name.mjs";
 
 const TIMEOUT_MS = 5000;
 
@@ -12,8 +13,8 @@ async function run(input) {
   if (!isMemoryFile(file)) return "skipped";
 
   const started = Date.now();
-  const name = path.basename(file, ".md");
-  const args = ["save", file];
+  const name = memoryName(file);
+  const args = ["save", file, "--name", name];
   if (GLOBAL_TYPES.has(memoryType(readFileSync(file, "utf8")))) {
     args.push("--global");
   } else {
@@ -23,7 +24,9 @@ async function run(input) {
 
   const saved = await recall(args, { cwd: input.cwd, timeout: Math.max(TIMEOUT_MS - (Date.now() - started), 500) });
   if (!saved.ok) {
-    emit({ systemMessage: `recall: memory ${name} was saved locally but not synced: ${saved.error}` });
+    emit({
+      systemMessage: `recall: memory ${path.basename(file)} was saved locally but not synced: ${firstLine(saved.error)}`,
+    });
     return `error:${firstLine(saved.error)}`;
   }
   return `saved:${name}`;
