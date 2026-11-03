@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::transcripts::Appended;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -803,7 +804,7 @@ impl Client {
     /// nothing is yet, so one already there — a retry, or another writer that reached the offset
     /// first — is refused with where the file now reaches. That is the same answer: it is where
     /// the next stretch goes.
-    pub fn append_transcript(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<i64> {
+    pub fn append_transcript(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended> {
         let path = format!(
             "{}/transcript?file={}&offset={offset}",
             Self::session_path(session_id),
@@ -815,12 +816,12 @@ impl Client {
             .send(bytes)?;
         if response.status().as_u16() == 409 {
             let extent: Extent = response.body_mut().read_json()?;
-            return Ok(extent.offset);
+            return Ok(Appended::Refused(extent.offset));
         }
         let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
             .body_mut()
             .read_json()?;
-        Ok(extent.offset)
+        Ok(Appended::Written(extent.offset))
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {

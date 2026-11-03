@@ -97,11 +97,19 @@ pub struct Held {
     pub counted: HashSet<String>,
 }
 
-/// What the service answers about one session's files, and what it takes. `append` answers where
-/// the file reaches once the stretch is in it.
+/// What an append answers: where the file reaches afterwards, and whether these bytes are what
+/// put it there. A stretch beaten to its offset is refused, and the file then reaches where the
+/// writer that got there first left it — which is still where the next stretch goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Appended {
+    Written(i64),
+    Refused(i64),
+}
+
+/// What the service answers about one session's files, and what it takes.
 pub trait Store {
     fn held(&self, session_id: &str) -> Result<Held>;
-    fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<i64>;
+    fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended>;
 }
 
 /// The stretch of one file past `offset`, at most `MAX_CHUNK` and cut back to the last complete
@@ -151,8 +159,13 @@ pub fn send_file(store: &impl Store, session_id: &str, source: &Source, held: i6
         if stretch.is_empty() {
             break;
         }
-        at = store.append(session_id, &source.file, at, &stretch)?;
-        bytes += stretch.len() as i64;
+        at = match store.append(session_id, &source.file, at, &stretch)? {
+            Appended::Written(end) => {
+                bytes += stretch.len() as i64;
+                end
+            }
+            Appended::Refused(end) => end,
+        };
     }
     Ok(Reached { end: at, bytes })
 }
@@ -282,14 +295,14 @@ mod tests {
             })
         }
 
-        fn append(&self, _session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<i64> {
+        fn append(&self, _session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended> {
             if self.objects.borrow().contains_key(&(file.to_string(), offset)) {
-                return Ok(self.ends().get(file).copied().unwrap_or(offset));
+                return Ok(Appended::Refused(self.ends().get(file).copied().unwrap_or(offset)));
             }
             self.objects
                 .borrow_mut()
                 .insert((file.to_string(), offset), bytes.to_vec());
-            Ok(offset + bytes.len() as i64)
+            Ok(Appended::Written(offset + bytes.len() as i64))
         }
     }
 
@@ -384,7 +397,11 @@ mod tests {
         );
         // A host that lost its place and read the file from nothing again. The stretch is refused
         // with where the file reaches, which is where this pass ends up without writing anything.
-        assert_eq!(send_file(&service, "s-1", &source, 0).unwrap().end, 8);
+        assert_eq!(
+            send_file(&service, "s-1", &source, 0).unwrap(),
+            Reached { end: 8, bytes: 0 },
+            "a refused stretch put nothing in the archive, so the pass counts none of it"
+        );
 
         assert_eq!(service.body("main"), "one\ntwo\n", "no line is written twice");
     }

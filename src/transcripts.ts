@@ -45,8 +45,7 @@ const OFFSET_SEGMENT = new RegExp(`^[0-9]{${OFFSET_DIGITS}}$`);
 // The stretch one key names, read off whatever named it: an object a listing caught, or the key
 // and size a storage event carries. A key the archive did not write, and an event for anything
 // but a write, is no stretch and is passed over rather than guessed at.
-export const parseChunkKey = (key: unknown, size: unknown): Chunk | null => {
-  if (typeof key !== "string" || typeof size !== "number") return null;
+export const parseChunkKey = (key: string, size: number): Chunk | null => {
   const [userId, sessionId, file, offset, ...rest] = key.split("/");
   if (userId === undefined || sessionId === undefined || file === undefined || offset === undefined) return null;
   if (rest.length > 0 || userId === "" || sessionId === "" || file === "") return null;
@@ -199,7 +198,7 @@ export const cacheChunk = (db: D1Database, chunk: Chunk): D1PreparedStatement[] 
     ? [
         db
           .prepare(
-            `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks, indexed_at) VALUES (?1, ?2, ?3, 0, 0, 0)
+            `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)
              ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
           )
           .bind(chunk.userId, chunk.sessionId, chunk.end),

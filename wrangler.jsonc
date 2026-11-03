@@ -13,6 +13,10 @@
         "max_batch_size": 25,
         "max_batch_timeout": 5,
         "max_retries": 20,
+        // A redelivery waits a minute, so the twenty a message gets span twenty minutes of a
+        // dependency that keeps failing rather than the second or two it takes to burn them
+        // back-to-back and land in a dead letter queue nothing reads.
+        "retry_delay": 60,
         "dead_letter_queue": "recall-transcripts-dead"
       }
     ]

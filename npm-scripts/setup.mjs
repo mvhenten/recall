@@ -10,10 +10,11 @@
 // The token is read from the environment only and never printed.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { readWranglerConfig } from "./wrangler-config.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const WORK = join(ROOT, ".tmp", "setup");
@@ -271,7 +272,7 @@ const run = (args) => {
   if (result.status !== 0) die(`wrangler ${args.join(" ")} exited with ${result.status}`);
 };
 
-const base = JSON.parse(readFileSync(join(ROOT, "wrangler.jsonc"), "utf8"));
+const base = readWranglerConfig();
 const config = {
   ...base,
   $schema: undefined,

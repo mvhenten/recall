@@ -308,7 +308,7 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     // announced to the consumer in the shape Cloudflare's event notifications carry. Announcing
     // all of them on every call is deliberate — a consumer deriving anything from what it had seen
     // before, rather than from the key in front of it, comes apart here.
-    deliver: async (): Promise<number> => {
+    deliver: async (): Promise<void> => {
       const delivered: Delivered[] = [];
       retried = 0;
       for (const userId of invited) {
@@ -333,7 +333,7 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
           cursor = page.truncated ? page.cursor : undefined;
         } while (cursor !== undefined);
       }
-      return app.consume(env, delivered);
+      await app.consume(env, delivered);
     },
     retried: () => retried,
     indexMark: async (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
