@@ -41,7 +41,7 @@ export const putArtifact = async (
   bucket: R2Bucket,
   userId: string,
   name: string,
-  body: ArrayBuffer,
+  body: ArrayBuffer | string,
 ): Promise<Stored> => {
   const object = await bucket.put(keyFor(userId, name), body);
   if (object === null) throw new Error(`R2 stored no page at ${keyFor(userId, name)}`);

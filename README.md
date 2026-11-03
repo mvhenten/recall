@@ -55,7 +55,7 @@ npm run setup -- --hostname recall.example.com --user alice --email alice@exampl
 recall login --endpoint https://recall.example.com
 ```
 
-The setup creates the D1 database, the R2 bucket the transcript archive lives in, and two Cloudflare Access applications. One covers the hostname and lets every request through, since the Worker checks device tokens itself. The other covers the two browser pages, `/device` and `/dashboard`: it admits the listed emails through the one-time PIN login method, which the setup switches on. The setup then migrates the database, maps the emails to the user id, deploys the Worker to the hostname and prints the `recall login` command. Run it again at any time: it finds what exists and creates the rest. Run it with a new `--user` and `--email` to add a person; their memories stay apart. `--email` repeats for more addresses, `--dry-run` prints what it would do and `--account <id>` picks an account when the token sees several. `--artifact-hostname <pages.example.com>` turns on [artifacts](#artifacts) and adds a second bucket and a second hostname.
+The setup creates the D1 database, the R2 bucket the transcript archive lives in, and two Cloudflare Access applications. One covers the hostname and lets every request through, since the Worker checks device tokens itself. The other covers the two browser pages, `/device` and `/dashboard`: it admits the listed emails through the one-time PIN login method, which the setup switches on. The setup then migrates the database, maps the emails to the user id, deploys the Worker to the hostname and prints the `recall login` command. Run it again at any time: it finds what exists and creates the rest. Run it with a new `--user` and `--email` to add a person; their memories stay apart. `--email` repeats for more addresses, `--dry-run` prints what it would do and `--account <id>` picks an account when the token sees several. `--artifact-hostname <pages.example.com>` turns on [artifacts](#artifacts) and adds a second bucket and a second hostname, and `--mcp-connector` turns on the [desktop connector](#desktop-connector) at `<hostname>/mcp`.
 
 Create the API token under My Profile → API Tokens → Create Custom Token, with:
 
@@ -67,6 +67,7 @@ Create the API token under My Profile → API Tokens → Create Custom Token, wi
 | Account | Workers Scripts · Edit                                       |
 | Account | Workers AI · Read                                            |
 | Account | Access: Apps and Policies · Edit                             |
+| Account | Access: Service Tokens · Edit                                |
 | Account | Access: Organizations, Identity Providers, and Groups · Edit |
 | Zone    | Zone · Read                                                  |
 | Zone    | DNS · Edit                                                   |
@@ -268,6 +269,26 @@ The second hostname is the point. A published page carries its own inline style,
 
 The feature is off until a deployment names that hostname — `--artifact-hostname` for `npm run setup`, `RECALL_ARTIFACT_HOSTNAME` for a Workers Builds deploy. Without it the deployment is unchanged and no R2 bucket is created, since R2 needs billing switched on even where it costs nothing. Turning it back off is a deliberate act: unsetting the variable makes the OpenTofu plan destroy the bucket, and the deploy refuses any plan that destroys, as it does for the D1 database. Empty the bucket, `tofu state rm cloudflare_r2_bucket.artifacts[0]` and delete it by hand, then deploy.
 
+## Desktop connector
+
+The Claude Code desktop app reaches recall as a custom connector, without the CLI. The endpoint speaks MCP over streamable HTTP at a path of the main hostname:
+
+```
+https://recall.example.com/mcp
+```
+
+Paste that URL into Settings → Connectors → Add custom connector. It serves the tool set `recall mcp` serves on stdio, under the same names: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_send` and `recall_publish`. The stdio lane is untouched; a host with a device token keeps using it.
+
+Two differences follow from there being no working copy at the other end. The connector runs in no repository, so a call that names no tags covers global memories alone, and `recall_save` needs `global` or `tags` for a `project` or `reference` memory. And `recall_publish` takes the page's HTML rather than a path, since the file the model wrote is never on the Worker's disk.
+
+The endpoint sits behind an Access application of its own, admitting two schemes. A browser sign-in works where the app carries an Access session cookie: the Worker reads the email out of the assertion and maps it to the user, and refuses a sign-in relayed from another origin. The scheme that needs no browser is an Access service token, sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers, which the deployment maps to one user by its client id. Every refusal names the scheme it tried and why Access turned it down, so a connector that will not connect says which half is wrong.
+
+It registers as a device of its own kind. The row is not a host: it never appears in `recall devices`, never answers a `recall_send`, carries no sessions and counts no tokens, so the sessions, hosts and usage views stay a record of real machines.
+
+Switching it on is one flag — `--mcp-connector` for `npm run setup`, `RECALL_MCP_CONNECTOR=true` for a Workers Builds deploy, which also takes it as an object in the `recall-builder-secrets` bucket. OpenTofu then creates the Access application, one service token per user, and the non-identity policy that admits them. Leaving it out deploys exactly as before and `/mcp` answers 404. Turning it back off destroys the application and the policy, which the deploy refuses as it does for any destroy; remove them by hand first.
+
+Cloudflare shows a service token's secret once, when it is created, and the deploy never reads or prints it. To get one you can paste into the desktop app, open Zero Trust → Access → Service Auth, find `recall-<user>-connector` and rotate it; the Client ID stays the same, so the deployment's mapping still holds.
+
 ## API
 
 The routes under `/v1/memories`, `/v1/search`, `/v1/devices`, `/v1/messages`, `/v1/sessions` and `/v1/artifacts` need `Authorization: Bearer <device token>`. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
@@ -315,7 +336,7 @@ The build reads the instance from build variables and stops with a message namin
 | `RECALL_HOSTNAME`   | `recall.example.com`                           |
 | `RECALL_USERS`      | `{"alice": {"emails": ["alice@example.com"]}}` |
 
-`RECALL_ARTIFACT_HOSTNAME` is the one optional variable. Setting it to a second hostname in the same zone, such as `artifact.recall.example.com`, turns on [artifacts](#artifacts): OpenTofu then creates the R2 bucket and that hostname's Access application, and the Worker takes the hostname as a second custom domain. Leaving it out deploys exactly as before. The Workers Builds variables API refuses account-owned API tokens, so it can also be set as an object named `RECALL_ARTIFACT_HOSTNAME` in the `recall-builder-secrets` bucket, holding the hostname; the build variable wins when both are present.
+Two variables are optional. `RECALL_MCP_CONNECTOR=true` turns on the [desktop connector](#desktop-connector) at `<hostname>/mcp`. Setting `RECALL_ARTIFACT_HOSTNAME` to a second hostname in the same zone, such as `artifact.recall.example.com`, turns on [artifacts](#artifacts): OpenTofu then creates the R2 bucket and that hostname's Access application, and the Worker takes the hostname as a second custom domain. Leaving either out deploys exactly as before. The Workers Builds variables API refuses account-owned API tokens, so both can also be set as objects of the same name in the `recall-builder-secrets` bucket; the build variable wins when both are present.
 
 The account needs an R2 bucket `recall-tfstate` for the OpenTofu state, and a private R2 bucket `recall-builder-secrets` holding three objects: `CLOUDFLARE_TOFU_TOKEN` (an API token with the permissions above), and `TFSTATE_ACCESS_KEY_ID` and `TFSTATE_SECRET_ACCESS_KEY` (R2 S3 credentials for the state bucket). Each email in `RECALL_USERS` may approve devices and signs in as that user id; adding a person is one entry. Removing a user signs out all their devices.
 

@@ -1,0 +1,1 @@
+ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'host';

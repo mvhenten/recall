@@ -1,5 +1,8 @@
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
-const modes = ["hybrid", "vector", "text"] as const;
+export const modes = ["hybrid", "vector", "text"] as const;
+
+// The tag a memory carries when it belongs to no repository. cli/src/repo.rs names the same string.
+export const GLOBAL_TAG = "global";
 
 export type MemoryType = (typeof memoryTypes)[number];
 export type Mode = (typeof modes)[number];
@@ -336,7 +339,11 @@ export const sessionHandle = (deviceName: string, sessionId: string): string =>
     .replace(/[^a-z0-9]/g, "")
     .slice(0, 4)}`;
 
-export type Verification = { ok: true; email: string } | { ok: false; reason: string };
+// Who an Access assertion names. A browser sign-in carries an email and a service token carries the
+// common name Access derives from its client id, so the two never share one shape with a blank half.
+export type Principal = { kind: "email"; email: string } | { kind: "serviceToken"; commonName: string };
+
+export type Verification = { ok: true; principal: Principal } | { ok: false; reason: string };
 
 export type Verify = (assertion: string) => Promise<Verification>;
 

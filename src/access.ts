@@ -1,4 +1,8 @@
-import type { Verification, Verify } from "./model";
+import type { Principal, Verification, Verify } from "./model";
+
+export const EMAIL_ONLY = "the JWT carries no email; sign in to Access with a one-time PIN";
+
+export const emailOf = (principal: Principal): string | null => (principal.kind === "email" ? principal.email : null);
 
 const KEY_TTL_SECONDS = 3600;
 const REFRESH_FLOOR_MS = 60_000;
@@ -148,9 +152,12 @@ export const accessVerifier =
     if (typeof payload.exp !== "number" || payload.exp + CLOCK_LEEWAY_S <= nowS) return reject("the JWT has expired");
     if (typeof payload.nbf === "number" && payload.nbf - CLOCK_LEEWAY_S > nowS)
       return reject("the JWT is not valid yet");
-    const email = payload.email;
-    if (typeof email !== "string" || !email.includes("@")) {
-      return reject("the JWT carries no email; sign in to Access with a one-time PIN");
+    const { email, common_name: commonName } = payload;
+    if (typeof email === "string" && email.includes("@")) {
+      return { ok: true, principal: { kind: "email", email: email.toLowerCase() } };
     }
-    return { ok: true, email: email.toLowerCase() };
+    if (typeof commonName === "string" && commonName !== "") {
+      return { ok: true, principal: { kind: "serviceToken", commonName } };
+    }
+    return reject("the JWT names neither an email nor a service token");
   };

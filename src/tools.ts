@@ -1,0 +1,448 @@
+import type { Device } from "./device";
+import {
+  GLOBAL_TAG,
+  type Memory,
+  type MemoryType,
+  type Mode,
+  memoryTypes,
+  modes,
+  type Parsed,
+  parseTags,
+  type Session,
+} from "./model";
+
+// The surface cli/src/mcp.rs serves, named and described the same way, so a session reaching recall
+// over the connector and a session reaching it over stdio call one tool set. The connector runs in
+// no repository, so where the stdio server would read a repo tag there is none and the scope falls
+// back to global alone.
+
+export interface SearchArgs {
+  query: string;
+  mode: Mode;
+  tags: string[];
+  any: boolean;
+}
+
+export interface NameArgs {
+  name: string;
+}
+
+export interface ListArgs {
+  tags: string[];
+  since: number;
+  limit: number;
+}
+
+export interface SaveArgs {
+  name: string;
+  description: string;
+  type: MemoryType;
+  body: string;
+  tags: string[];
+}
+
+export interface EditArgs {
+  name: string;
+  description: string | undefined;
+  type: MemoryType | undefined;
+  body: string | undefined;
+  addTags: string[];
+  removeTags: string[];
+}
+
+export interface SendArgs {
+  to: string;
+  message: string;
+}
+
+export interface PublishArgs {
+  name: string;
+  html: string;
+}
+
+export interface ToolSchema {
+  type: "object";
+  properties: Record<string, unknown>;
+  required?: string[];
+  additionalProperties: false;
+}
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: ToolSchema;
+}
+
+export const SEARCH_LIMIT = 5;
+const LIST_LIMIT = 20;
+
+const text = (description: string): Record<string, unknown> => ({ type: "string", description });
+const strings = (description: string): Record<string, unknown> => ({
+  type: "array",
+  items: { type: "string" },
+  description,
+});
+const flag = (description: string): Record<string, unknown> => ({ type: "boolean", description });
+
+const schema = (properties: Record<string, unknown>, required: string[] = []): ToolSchema => ({
+  type: "object",
+  properties,
+  ...(required.length > 0 ? { required } : {}),
+  additionalProperties: false,
+});
+
+const NAME_SCHEMA = schema({ name: text("The memory's kebab-case name.") }, ["name"]);
+
+export const TOOLS: ToolDefinition[] = [
+  {
+    name: "recall_search",
+    description:
+      "Search the user's memories. Covers the current repo and global memories unless tags or any is given. Returns {hits, elsewhere}: hits are full memories with a score; elsewhere lists the best matches outside the searched tags by name, so recall_get them if relevant.",
+    inputSchema: schema(
+      {
+        query: text("What to look for, in plain words or an exact identifier."),
+        mode: {
+          type: "string",
+          enum: [...modes],
+          description:
+            "hybrid (default) ranks by meaning and words; text matches exact identifiers; vector by meaning only.",
+        },
+        tags: strings("Search these tags instead of global."),
+        any: flag("Search every memory, whatever its tags."),
+      },
+      ["query"],
+    ),
+  },
+  {
+    name: "recall_get",
+    description: "Read one memory in full by its name.",
+    inputSchema: NAME_SCHEMA,
+  },
+  {
+    name: "recall_list",
+    description:
+      "List memories, newest created first. Covers global memories unless tags is given. Use recall_search to find memories by topic.",
+    inputSchema: schema({
+      tags: strings("List these tags instead of global."),
+      since: text("Only memories created at or after this ISO 8601 time, date or epoch ms."),
+      limit: {
+        type: "integer",
+        minimum: 1,
+        maximum: 100,
+        description: "At most this many, newest first (default 20).",
+      },
+    }),
+  },
+  {
+    name: "recall_save",
+    description:
+      "Save a new memory. Search first: if a memory on the topic exists, use recall_edit instead of saving a duplicate. user and feedback memories are global by default; project and reference memories need a repo tag, which this connector has none of, so pass global or tags.",
+    inputSchema: schema(
+      {
+        name: text("Unique kebab-case name; saving an existing name replaces that memory."),
+        description: text("One line that says when this memory is relevant."),
+        type: {
+          type: "string",
+          enum: [...memoryTypes],
+          description:
+            "user: who the user is; feedback: how the user wants you to work; project: ongoing work and decisions; reference: where to find things.",
+        },
+        body: text("The memory in markdown."),
+        tags: strings("Extra free-form tags."),
+        global: flag("Tag it global. Defaults to true for user and feedback, false otherwise."),
+      },
+      ["name", "description", "type", "body"],
+    ),
+  },
+  {
+    name: "recall_edit",
+    description:
+      "Change an existing memory. Only the fields you pass change; body replaces the whole body. Renaming is not supported: save under the new name and delete the old one.",
+    inputSchema: schema(
+      {
+        name: text("The memory to change."),
+        description: text("New one-line description."),
+        type: { type: "string", enum: [...memoryTypes], description: "New type." },
+        body: text("New markdown body, replacing the old one."),
+        add_tags: strings("Tags to add."),
+        remove_tags: strings("Tags to remove."),
+      },
+      ["name"],
+    ),
+  },
+  {
+    name: "recall_send",
+    description:
+      "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named as recall devices shows it. The message arrives as a user turn there.",
+    inputSchema: schema(
+      {
+        to: text(
+          "The session to reach, named by the handle recall sessions shows, or a host named as recall devices shows it to reach every session on that host.",
+        ),
+        message: text("The message to deliver there."),
+      },
+      ["to", "message"],
+    ),
+  },
+  {
+    name: "recall_publish",
+    description:
+      "Publish a self-contained HTML page, carrying its own style, script and data: assets, and return the URL the user opens it on. Pass the page's HTML; this connector reads no files. Publishing a name that already exists replaces that page at the same URL.",
+    inputSchema: schema(
+      {
+        name: text("Publish under this kebab-case slug."),
+        html: text("The page's complete HTML."),
+      },
+      ["name", "html"],
+    ),
+  },
+  {
+    name: "recall_delete",
+    description: "Delete a memory that turned out wrong or no longer holds.",
+    inputSchema: NAME_SCHEMA,
+  },
+];
+
+const fail = <T>(error: string): Parsed<T> => ({ ok: false, error });
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const unknownFields = (args: Record<string, unknown>, known: string[]): string[] =>
+  Object.keys(args).filter((field) => !known.includes(field));
+
+export const toolArguments = (definition: ToolDefinition, params: unknown): Parsed<Record<string, unknown>> => {
+  if (params === undefined) return { ok: true, value: {} };
+  if (!isRecord(params)) return fail(`${definition.name} takes its arguments as a JSON object`);
+  const unknown = unknownFields(params, Object.keys(definition.inputSchema.properties));
+  if (unknown.length > 0) return fail(`${definition.name} takes no argument ${unknown.join(", ")}`);
+  for (const field of definition.inputSchema.required ?? []) {
+    if (params[field] === undefined) return fail(`${definition.name} needs ${field}`);
+  }
+  return { ok: true, value: params };
+};
+
+const optionalText = (value: unknown, field: string, max: number): Parsed<string | undefined> => {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (typeof value !== "string" || value.length < 1 || value.length > max) {
+    return fail(`${field} must hold 1 to ${max} characters`);
+  }
+  return { ok: true, value };
+};
+
+const requiredText = (value: unknown, field: string, max: number): Parsed<string> => {
+  const parsed = optionalText(value, field, max);
+  if (!parsed.ok) return parsed;
+  return parsed.value === undefined
+    ? fail(`${field} must hold 1 to ${max} characters`)
+    : { ok: true, value: parsed.value };
+};
+
+const optionalType = (value: unknown, field: string): Parsed<MemoryType | undefined> => {
+  if (value === undefined) return { ok: true, value: undefined };
+  const found = memoryTypes.find((type) => type === value);
+  return found === undefined ? fail(`${field} must be one of ${memoryTypes.join(", ")}`) : { ok: true, value: found };
+};
+
+const optionalFlag = (value: unknown, field: string): Parsed<boolean | undefined> => {
+  if (value === undefined) return { ok: true, value: undefined };
+  return typeof value === "boolean" ? { ok: true, value } : fail(`${field} must be true or false`);
+};
+
+const tagList = (value: unknown, field: string): Parsed<string[]> => {
+  if (value === undefined) return { ok: true, value: [] };
+  const parsed = parseTags(value);
+  return parsed.ok ? parsed : fail(`${field}: ${parsed.error}`);
+};
+
+// The scope a call covers when it names none: global alone, since the connector sits in no
+// repository. tags and any are the same either-or the stdio server refuses to take both of.
+export const scopeTags = (tags: string[], any: boolean): Parsed<string[]> => {
+  if (any && tags.length > 0) return fail("pass tags or any, not both");
+  if (any) return { ok: true, value: [] };
+  return { ok: true, value: tags.length > 0 ? tags : [GLOBAL_TAG] };
+};
+
+export const saveTags = (type: MemoryType, global: boolean | undefined, extra: string[]): Parsed<string[]> => {
+  const scoped = global ?? (type === "user" || type === "feedback");
+  if (!scoped) {
+    return fail(
+      "this connector runs in no repository, so there is no repo tag; pass global: true, or name the repo tag in tags alongside global: true",
+    );
+  }
+  return { ok: true, value: extra.includes(GLOBAL_TAG) ? extra : [...extra, GLOBAL_TAG].sort() };
+};
+
+export const parseSinceArgument = (value: unknown): Parsed<number> => {
+  if (value === undefined) return { ok: true, value: 0 };
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= 0 ? { ok: true, value } : fail("since must be epoch milliseconds");
+  }
+  if (typeof value !== "string") return fail("since must be an ISO 8601 time, date or epoch ms");
+  if (/^\d+$/.test(value)) return { ok: true, value: Number(value) };
+  const parsed = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00Z` : value);
+  return Number.isNaN(parsed) ? fail(`since ${value} is neither epoch ms nor ISO 8601`) : { ok: true, value: parsed };
+};
+
+export const parseSearchArgs = (args: Record<string, unknown>): Parsed<SearchArgs> => {
+  const query = requiredText(args.query, "query", 2_000);
+  if (!query.ok) return query;
+  const tags = tagList(args.tags, "tags");
+  if (!tags.ok) return tags;
+  const any = optionalFlag(args.any, "any");
+  if (!any.ok) return any;
+  const scope = scopeTags(tags.value, any.value ?? false);
+  if (!scope.ok) return scope;
+  const mode = args.mode === undefined ? "hybrid" : modes.find((known) => known === args.mode);
+  if (mode === undefined) return fail(`mode must be one of ${modes.join(", ")}`);
+  return { ok: true, value: { query: query.value, mode, tags: scope.value, any: any.value ?? false } };
+};
+
+export const parseNameArgs = (args: Record<string, unknown>): Parsed<NameArgs> => {
+  const name = requiredText(args.name, "name", 100);
+  return name.ok ? { ok: true, value: { name: name.value } } : name;
+};
+
+export const parseListArgs = (args: Record<string, unknown>): Parsed<ListArgs> => {
+  const tags = tagList(args.tags, "tags");
+  if (!tags.ok) return tags;
+  const scope = scopeTags(tags.value, false);
+  if (!scope.ok) return scope;
+  const since = parseSinceArgument(args.since);
+  if (!since.ok) return since;
+  const limit = args.limit ?? LIST_LIMIT;
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return fail("limit must be a whole number from 1 to 100");
+  }
+  return { ok: true, value: { tags: scope.value, since: since.value, limit } };
+};
+
+export const parseSaveArgs = (args: Record<string, unknown>): Parsed<SaveArgs> => {
+  const name = requiredText(args.name, "name", 100);
+  if (!name.ok) return name;
+  const description = requiredText(args.description, "description", 500);
+  if (!description.ok) return description;
+  const type = optionalType(args.type, "type");
+  if (!type.ok) return type;
+  if (type.value === undefined) return fail(`type must be one of ${memoryTypes.join(", ")}`);
+  const body = requiredText(args.body, "body", 100_000);
+  if (!body.ok) return body;
+  const extra = tagList(args.tags, "tags");
+  if (!extra.ok) return extra;
+  const global = optionalFlag(args.global, "global");
+  if (!global.ok) return global;
+  const tags = saveTags(type.value, global.value, extra.value);
+  if (!tags.ok) return tags;
+  return {
+    ok: true,
+    value: { name: name.value, description: description.value, type: type.value, body: body.value, tags: tags.value },
+  };
+};
+
+export const parseEditArgs = (args: Record<string, unknown>): Parsed<EditArgs> => {
+  const name = requiredText(args.name, "name", 100);
+  if (!name.ok) return name;
+  const description = optionalText(args.description, "description", 500);
+  if (!description.ok) return description;
+  const type = optionalType(args.type, "type");
+  if (!type.ok) return type;
+  const body = optionalText(args.body, "body", 100_000);
+  if (!body.ok) return body;
+  const addTags = tagList(args.add_tags, "add_tags");
+  if (!addTags.ok) return addTags;
+  const removeTags = tagList(args.remove_tags, "remove_tags");
+  if (!removeTags.ok) return removeTags;
+  if (
+    description.value === undefined &&
+    type.value === undefined &&
+    body.value === undefined &&
+    args.add_tags === undefined &&
+    args.remove_tags === undefined
+  ) {
+    return fail("nothing to change; pass description, type, body, add_tags or remove_tags");
+  }
+  return {
+    ok: true,
+    value: {
+      name: name.value,
+      description: description.value,
+      type: type.value,
+      body: body.value,
+      addTags: addTags.value,
+      removeTags: removeTags.value,
+    },
+  };
+};
+
+export const parseSendArgs = (args: Record<string, unknown>): Parsed<SendArgs> => {
+  const to = requiredText(args.to, "to", 500);
+  if (!to.ok) return to;
+  const message = requiredText(args.message, "message", 32_768);
+  if (!message.ok) return message;
+  return { ok: true, value: { to: to.value, message: message.value } };
+};
+
+export const parsePublishArgs = (args: Record<string, unknown>): Parsed<PublishArgs> => {
+  const name = requiredText(args.name, "name", 100);
+  if (!name.ok) return name;
+  const html = requiredText(args.html, "html", 16 * 1024 * 1024);
+  if (!html.ok) return html;
+  return { ok: true, value: { name: name.value, html: html.value } };
+};
+
+export interface SendTarget {
+  toDeviceId: string;
+  toSessionId: string;
+}
+
+// A host name or id reaches every session on that host; a session handle or id reaches the one
+// session. api::resolve_target in the CLI reads the same two listings in the same order.
+export const resolveTarget = (devices: Device[], sessions: Session[], to: string): Parsed<SendTarget> => {
+  const host = devices.find((device) => device.deviceId === to) ?? devices.find((device) => device.name === to);
+  if (host !== undefined) return { ok: true, value: { toDeviceId: host.deviceId, toSessionId: "" } };
+  const addressed = sessions.filter((session) => session.name === to || session.sessionId === to);
+  const [only] = addressed;
+  if (addressed.length === 1 && only !== undefined) {
+    return { ok: true, value: { toDeviceId: only.deviceId, toSessionId: only.sessionId } };
+  }
+  if (addressed.length === 0) {
+    return fail(
+      `no host or session named ${to}; recall devices lists the hosts signed in as you and recall sessions the handle of each live session`,
+    );
+  }
+  return fail(
+    `ambiguous target ${to}: ${addressed.length} sessions answer to it; pass one of these session ids instead: ${addressed
+      .map((session) => session.sessionId)
+      .join(", ")}`,
+  );
+};
+
+export const editedMemory = (memory: Memory, args: EditArgs): SaveArgs => {
+  const tags = memory.tags.filter((tag) => !args.removeTags.includes(tag));
+  for (const tag of args.addTags) if (!tags.includes(tag)) tags.push(tag);
+  return {
+    name: memory.name,
+    description: args.description ?? memory.description,
+    type: args.type ?? memory.type,
+    body: args.body ?? memory.body,
+    tags,
+  };
+};
+
+const iso = (ms: number): string => (ms === 0 ? "never" : `${new Date(ms).toISOString().slice(0, 19)}Z`);
+
+// The front matter cli/src/markdown.rs renders, so one memory reads the same whichever lane asked.
+export const renderMemory = (memory: Memory): string =>
+  [
+    "---",
+    `name: ${memory.name}`,
+    `description: ${memory.description}`,
+    `type: ${memory.type}`,
+    `tags: [${memory.tags.join(", ")}]`,
+    `created: ${iso(memory.createdAt)}`,
+    `updated: ${iso(memory.updatedAt)}`,
+    `recalled: ${memory.recallCount} times, last ${iso(memory.lastRecalledAt)}`,
+    "---",
+    "",
+    `${memory.body.trimEnd()}\n`,
+  ].join("\n");

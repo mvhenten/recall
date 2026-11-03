@@ -5,6 +5,11 @@ const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ";
 const USER_CODE_LENGTH = 8;
 const LAST_USED_RESOLUTION_MS = 3_600_000;
 
+// A host signs in with a device token and runs sessions; a connector is the MCP endpoint answering
+// for one Access identity. Only hosts are listed, addressed by a message or revoked, so a connector
+// never reads as a machine the user owns.
+export const CONNECTOR_NAME = "desktop connector";
+
 export interface DeviceCodeLimits {
   perClient: number;
   total: number;
@@ -168,7 +173,7 @@ const suffixed = (name: string, suffix: number): string => `${name}-${suffix}`;
 
 const freeDeviceName = async (db: D1Database, userId: string, wanted: string): Promise<string> => {
   const { results } = await db
-    .prepare("SELECT name FROM devices WHERE user_id = ?")
+    .prepare("SELECT name FROM devices WHERE user_id = ? AND kind = 'host'")
     .bind(userId)
     .all<{ name: string }>();
   const taken = new Set(results.map((row) => row.name));
@@ -216,11 +221,12 @@ export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: nu
   const [issued] = await db.batch([
     db
       .prepare(
-        `INSERT INTO devices (device_id, token_sha256, user_id, name, created_at, last_used_at)
-         SELECT ?1, ?2, user_id, ?3, ?4, ?4 FROM device_codes
+        `INSERT INTO devices (device_id, token_sha256, user_id, name, kind, created_at, last_used_at)
+         SELECT ?1, ?2, user_id, ?3, 'host', ?4, ?4 FROM device_codes
          WHERE device_code_sha256 = ?5 AND status = 'approved'
            AND NOT EXISTS (
-             SELECT 1 FROM devices WHERE devices.user_id = device_codes.user_id AND devices.name = ?3
+             SELECT 1 FROM devices
+             WHERE devices.user_id = device_codes.user_id AND devices.name = ?3 AND devices.kind = 'host'
            )`,
       )
       .bind(crypto.randomUUID(), await sha256Hex(accessToken), name, now, codeHash),
@@ -240,7 +246,7 @@ export const userForEmail = async (db: D1Database, email: string): Promise<strin
 
 export const deviceForToken = async (db: D1Database, token: string, now: number): Promise<Caller | null> => {
   const row = await db
-    .prepare("SELECT device_id, user_id, last_used_at FROM devices WHERE token_sha256 = ?")
+    .prepare("SELECT device_id, user_id, last_used_at FROM devices WHERE token_sha256 = ? AND kind = 'host'")
     .bind(await sha256Hex(token))
     .first<{ device_id: string; user_id: string; last_used_at: number }>();
   if (!row) return null;
@@ -253,7 +259,8 @@ export const deviceForToken = async (db: D1Database, token: string, now: number)
 export const listDevices = async (db: D1Database, userId: string): Promise<Device[]> => {
   const { results } = await db
     .prepare(
-      "SELECT device_id, name, created_at, last_used_at FROM devices WHERE user_id = ? ORDER BY created_at, device_id",
+      `SELECT device_id, name, created_at, last_used_at FROM devices
+       WHERE user_id = ? AND kind = 'host' ORDER BY created_at, device_id`,
     )
     .bind(userId)
     .all<{ device_id: string; name: string; created_at: number; last_used_at: number }>();
@@ -267,7 +274,7 @@ export const listDevices = async (db: D1Database, userId: string): Promise<Devic
 
 export const hasDevice = async (db: D1Database, userId: string, deviceId: string): Promise<boolean> => {
   const row = await db
-    .prepare("SELECT device_id FROM devices WHERE user_id = ? AND device_id = ?")
+    .prepare("SELECT device_id FROM devices WHERE user_id = ? AND device_id = ? AND kind = 'host'")
     .bind(userId, deviceId)
     .first<{ device_id: string }>();
   return row !== null;
@@ -275,8 +282,24 @@ export const hasDevice = async (db: D1Database, userId: string, deviceId: string
 
 export const revokeDevice = async (db: D1Database, userId: string, deviceId: string): Promise<boolean> => {
   const result = await db
-    .prepare("DELETE FROM devices WHERE user_id = ? AND device_id = ?")
+    .prepare("DELETE FROM devices WHERE user_id = ? AND device_id = ? AND kind = 'host'")
     .bind(userId, deviceId)
     .run();
   return result.meta.changes === 1;
+};
+
+// The row the MCP endpoint acts as. Its token column holds the digest of a string no issued token
+// can hash to, so the connector is reachable through Access alone and never through a bearer token.
+export const connectorDevice = async (db: D1Database, userId: string, now: number): Promise<Caller> => {
+  const row = await db
+    .prepare(
+      `INSERT INTO devices (device_id, token_sha256, user_id, name, kind, created_at, last_used_at)
+       VALUES (?1, ?2, ?3, ?4, 'connector', ?5, ?5)
+       ON CONFLICT (token_sha256) DO UPDATE SET last_used_at = excluded.last_used_at
+       RETURNING device_id`,
+    )
+    .bind(crypto.randomUUID(), await sha256Hex(`connector:${userId}`), userId, CONNECTOR_NAME, now)
+    .first<{ device_id: string }>();
+  if (row === null) throw new Error(`no connector device for ${userId}`);
+  return { userId, deviceId: row.device_id };
 };

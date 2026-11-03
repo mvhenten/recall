@@ -3,6 +3,7 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { accessVerifier, type KeySource, localKeys } from "../src/access";
 import { createApp } from "../src/app";
 import { DEVICE_CODE_LIMITS, type DeviceCodeLimits } from "../src/device";
+import { MCP_PATH } from "../src/mcp";
 import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
 
@@ -11,6 +12,8 @@ const AUDIENCE = "recall-test-aud";
 const ORIGIN = "https://recall.test";
 export const ARTIFACT_HOSTNAME = "artifact.recall.test";
 export const ARTIFACT_AUDIENCE = "recall-test-artifact-aud";
+export const MCP_AUDIENCE = "recall-test-mcp-aud";
+export const MCP_PROTOCOL_VERSION = "2025-11-25";
 
 export interface DeviceStart {
   device_code: string;
@@ -85,7 +88,11 @@ const USAGE_DELTA: Record<string, unknown> = {
   at: 1_700_000_060_000,
 };
 
-export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS) => {
+export const harness = async (
+  keys: "up" | "down" = "up",
+  deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS,
+  mcpConnector: "on" | "off" = "on",
+) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
   const { n, e } = await exportJWK(publicKey);
   if (!n || !e) throw new Error("the generated key has no RSA modulus");
@@ -95,6 +102,7 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
   };
   let clock = 1_700_000_000_000;
   const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
+  const serviceClients = new Map<string, string>();
   const app = createApp({
     verify: accessVerifier(source, ISSUER, AUDIENCE),
     artifactHost: {
@@ -102,19 +110,26 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
       verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
       bucket: env.ARTIFACTS,
     },
+    mcpHost: mcpConnector === "off" ? null : { verify: accessVerifier(source, ISSUER, MCP_AUDIENCE), serviceClients },
     embedder: wordEmbedder,
     deviceCodeLimits,
     now: () => clock,
   });
 
-  const assertionFor = (email: string, audience = AUDIENCE, expiresAt: string | number = "5m"): Promise<string> =>
-    new SignJWT({ email, type: "app" })
+  const signed = (claims: Record<string, unknown>, audience: string, expiresAt: string | number): Promise<string> =>
+    new SignJWT({ ...claims, type: "app" })
       .setProtectedHeader({ alg: "RS256", kid: "test" })
       .setIssuer(ISSUER)
       .setAudience([audience])
       .setIssuedAt()
       .setExpirationTime(expiresAt)
       .sign(privateKey);
+
+  const assertionFor = (email: string, audience = AUDIENCE, expiresAt: string | number = "5m"): Promise<string> =>
+    signed({ email }, audience, expiresAt);
+
+  const serviceAssertionFor = (commonName: string, audience = MCP_AUDIENCE): Promise<string> =>
+    signed({ common_name: commonName }, audience, "5m");
 
   const send = (path: string, init: RequestInit = {}): Promise<Response> =>
     app.fetch(new Request(`${ORIGIN}${path}`, init), env);
@@ -264,12 +279,49 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
   const user = async (label: string): Promise<Client> =>
     clientWithToken(await login(await invite(`${label}-${crypto.randomUUID()}@example.com`)));
 
+  // One JSON-RPC message over the connector endpoint, with whichever Access credential the caller
+  // wants the Worker to see.
+  const rpc = (message: Record<string, unknown>, headers: Record<string, string> = {}): Promise<Response> =>
+    send(MCP_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({ jsonrpc: "2.0", ...message }),
+    });
+
+  const connector = async (email: string) => {
+    const headers = { "cf-access-jwt-assertion": await assertionFor(email, MCP_AUDIENCE) };
+    let id = 0;
+    const call = async (method: string, params?: unknown): Promise<Record<string, unknown>> => {
+      id += 1;
+      const response = await rpc({ id, method, ...(params === undefined ? {} : { params }) }, headers);
+      if (response.status !== 200) throw new Error(`${method}: ${response.status} ${await response.text()}`);
+      return response.json();
+    };
+    const tool = async (name: string, args: Record<string, unknown> = {}): Promise<string> => {
+      const answered = await call("tools/call", { name, arguments: args });
+      const result = answered.result as { content: Array<{ text: string }>; isError?: boolean };
+      const [block] = result.content;
+      if (result.isError === true) throw new Error(block?.text ?? "the tool failed with no text");
+      return block?.text ?? "";
+    };
+    return {
+      headers,
+      call,
+      tool,
+      json: async (name: string, args?: Record<string, unknown>) => JSON.parse(await tool(name, args)),
+    };
+  };
+
   return {
     user,
     invite,
     requestDevice,
     send,
     sendToArtifactHost,
+    rpc,
+    connector,
+    serviceAssertionFor,
+    serviceClients,
     login,
     startDevice,
     poll,
