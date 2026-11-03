@@ -41,10 +41,16 @@ const STOPWORDS = new Set(
   while who whom why will with would you your yours`.split(/\s+/),
 );
 
+export const contentWords = (text: string): Set<string> =>
+  new Set(
+    text
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((term) => term !== "" && !STOPWORDS.has(term)),
+  );
+
 export const ftsQuery = (query: string): string | null => {
-  const terms = [...new Set(query.toLowerCase().split(/[^\p{L}\p{N}]+/u))]
-    .filter((term) => term !== "" && !STOPWORDS.has(term))
-    .sort();
+  const terms = [...contentWords(query)].sort();
   if (terms.length === 0) return null;
   return terms.map((term) => `"${term}"`).join(" OR ");
 };

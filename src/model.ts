@@ -58,8 +58,10 @@ export const FRESH_WINDOW_MS = FRESH_WINDOW_DAYS * 86_400_000;
 export const DEFAULT_MIN_SCORE = 0.55;
 const MAX_QUERY_CHARS = 2_000;
 
+// Embedding is batched because indexing a session asks for a hundred vectors at once and one call
+// per chunk would be a hundred round trips. A memory asks for one and takes the first back.
 export interface Embedder {
-  embed(text: string): Promise<Float32Array>;
+  embed(texts: string[]): Promise<Float32Array[]>;
 }
 
 export const sessionModes = ["interactive", "headless", ""] as const;
@@ -97,6 +99,7 @@ export interface SessionInput {
 export interface Session extends SessionInput {
   sessionId: string;
   name: string;
+  agentName: string;
   deviceId: string;
 }
 
@@ -110,7 +113,9 @@ export interface Live {
 export interface PastSession {
   sessionId: string;
   name: string;
+  agentName: string;
   host: string;
+  cwd: string;
   repo: string;
   branch: string;
   startedAt: number;
@@ -118,6 +123,20 @@ export interface PastSession {
   prompts: number;
   focus: Focus;
   running: boolean;
+}
+
+// One session a search found, and the stretch of it that answered. The excerpt is a chunk of the
+// transcript verbatim rather than a summary: it says why the session was returned, and nothing in
+// recall ever writes prose a session did not.
+export interface SessionHit {
+  session: PastSession;
+  score: number;
+  excerpt: { speaker: string; text: string; at: number };
+}
+
+export interface SessionSearch {
+  query: string;
+  limit: number;
 }
 
 export interface HistoryFilters {
@@ -466,16 +485,25 @@ export const parseLabels = (form: URLSearchParams): Parsed<Label[]> => {
   return { ok: true, value: labels };
 };
 
-export const sessionScopes = ["live", "history"] as const;
+export const sessionScopes = ["live", "history", "search"] as const;
 export type SessionScope = (typeof sessionScopes)[number];
 
-// Which sessions a listing covers: the ones running now, or every one the account has on record. A
-// scope this service does not know is refused rather than read as the default, so a client asking
-// for a listing it cannot give never takes the live sessions for the whole span.
+// Which sessions a listing covers: the ones running now, every one the account has on record, or
+// the ones a query finds by meaning. A scope this service does not know is refused rather than
+// read as the default, so a client asking for a listing it cannot give never takes the live
+// sessions for the whole span.
 export const parseSessionScope = (value: string | null): Parsed<SessionScope> => {
   if (value === null || value === "") return { ok: true, value: "live" };
   if (!isOneOf(sessionScopes, value)) return fail(`scope must be one of ${sessionScopes.join(", ")}`);
   return { ok: true, value };
+};
+
+export const parseSessionSearch = (params: URLSearchParams): Parsed<SessionSearch> => {
+  const query = params.get("q") ?? "";
+  if (query.length < 1 || query.length > MAX_QUERY_CHARS) return fail(`q must hold 1 to ${MAX_QUERY_CHARS} characters`);
+  const limit = Number(params.get("limit") ?? 10);
+  if (!isInteger(limit, 1, 50)) return fail("limit must be a whole number from 1 to 50");
+  return { ok: true, value: { query, limit } };
 };
 
 const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/;

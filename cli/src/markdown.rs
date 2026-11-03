@@ -1,4 +1,4 @@
-use crate::api::{Elsewhere, Hit, Memory, Session};
+use crate::api::{Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit};
 use crate::sessions;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -210,6 +210,63 @@ pub fn render_sessions(sessions: &[Session], now: i64) -> String {
         .collect()
 }
 
+/// The name a session answers to: the one Claude Code gave it where there is one, and the handle
+/// `recall send` takes otherwise.
+fn session_name(session: &PastSession) -> &str {
+    if session.agent_name.is_empty() {
+        &session.name
+    } else {
+        &session.agent_name
+    }
+}
+
+/// One stored session: what it is called, where and when it ran, what it was about, and what the
+/// archive holds of it.
+pub fn render_session(session: &PastSession, files: &[HeldFile]) -> String {
+    let held: String = files
+        .iter()
+        .map(|file| format!("- {} ({} bytes)\n", file.file, file.bytes))
+        .collect();
+    format!(
+        "---\nname: {}\nhandle: {}\nsession: {}\nhost: {}\ncwd: {}\nwhere: {}\nstarted: {}\nlast active: {}\nprompts: {}\nstate: {}\n---\n\n{}\n\nTranscript:\n\n{}",
+        session_name(session),
+        session.name,
+        session.session_id,
+        host_column(&session.host_label, &session.host),
+        session.cwd,
+        repo_at_branch(&session.repo, &session.branch),
+        iso(session.started_at),
+        iso(session.last_activity_at),
+        session.prompts,
+        if session.running { "running" } else { "over" },
+        sessions::focus_line(&session.focus),
+        if held.is_empty() {
+            "- nothing archived\n".to_string()
+        } else {
+            held
+        }
+    )
+}
+
+/// One block per session a search found, newest match first within the ranking the service gave:
+/// the session's name and where it ran, then the stretch of its transcript that answered.
+pub fn render_session_hits(hits: &[SessionHit]) -> String {
+    hits.iter()
+        .map(|hit| {
+            format!(
+                "## {} ({}, score {:.3})\n\n_{} · {} · {}_\n\n> {}\n\n",
+                session_name(&hit.session),
+                hit.session.session_id,
+                hit.score,
+                host_column(&hit.session.host_label, &hit.session.host),
+                repo_at_branch(&hit.session.repo, &hit.session.branch),
+                iso(hit.session.last_activity_at),
+                hit.excerpt.text.trim().replace('\n', "\n> ")
+            )
+        })
+        .collect()
+}
+
 pub fn render_elsewhere(entries: &[Elsewhere]) -> String {
     if entries.is_empty() {
         return String::new();
@@ -256,6 +313,7 @@ mod tests {
         let session = |host: &str, repo: &str, branch: &str, started: i64, active: i64, focus: [&str; 2]| Session {
             session_id: format!("s-{host}"),
             name: format!("{host}-2"),
+            agent_name: String::new(),
             device_id: format!("d-{host}"),
             host: host.to_string(),
             host_label: String::new(),
