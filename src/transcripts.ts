@@ -42,10 +42,11 @@ const sessionPrefix = (userId: string, sessionId: string): string => `${userId}/
 
 const OFFSET_SEGMENT = new RegExp(`^[0-9]{${OFFSET_DIGITS}}$`);
 
-// The stretch one key names. A key the archive did not write — a listing that caught something
-// else, an event for an object this service knows nothing about — is no stretch and is passed
-// over rather than guessed at.
-export const parseChunkKey = (key: string, size: number): Chunk | null => {
+// The stretch one key names, read off whatever named it: an object a listing caught, or the key
+// and size a storage event carries. A key the archive did not write, and an event for anything
+// but a write, is no stretch and is passed over rather than guessed at.
+export const parseChunkKey = (key: unknown, size: unknown): Chunk | null => {
+  if (typeof key !== "string" || typeof size !== "number") return null;
   const [userId, sessionId, file, offset, ...rest] = key.split("/");
   if (userId === undefined || sessionId === undefined || file === undefined || offset === undefined) return null;
   if (rest.length > 0 || userId === "" || sessionId === "" || file === "") return null;
@@ -161,9 +162,14 @@ export const readStretch = async (
   return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
 };
 
-// The one write an append makes. Where the stretch starts is the caller's to say and the key
-// carries it, so nothing is read first and nothing is claimed; a stretch written twice overwrites
-// itself. Where the file ends afterwards is arithmetic, so the answer costs no read either.
+// The one write an append makes, and it lands only where nothing is yet. Where the stretch starts
+// is the caller's to say and the key carries it, so nothing is read first and nothing is claimed.
+// The put is conditional because two writers reaching one offset hold stretches of different
+// lengths — a listener's beat and a session ending read the same file at different instants — and
+// letting the second write over the first would leave the longer writer's tail in no object at
+// all while that writer carries on past it. The first to land wins; the loser is answered `null`
+// and told where the file reaches. Where it reaches after a write is arithmetic, so that answer
+// costs no read either.
 export const putChunk = async (
   bucket: R2Bucket,
   userId: string,
@@ -171,12 +177,13 @@ export const putChunk = async (
   file: string,
   offset: number,
   body: ArrayBuffer,
-): Promise<number> => {
+): Promise<number | null> => {
   if (body.byteLength === 0) return offset;
-  await bucket.put(chunkKey(userId, sessionId, file, offset), body, {
+  const written = await bucket.put(chunkKey(userId, sessionId, file, offset), body, {
     httpMetadata: { contentType: "application/x-ndjson" },
+    onlyIf: { etagDoesNotMatch: "*" },
   });
-  return offset + body.byteLength;
+  return written === null ? null : offset + body.byteLength;
 };
 
 // The one thing worth keeping off the objects: how far a session's own transcript runs. The
@@ -192,27 +199,19 @@ export const cacheChunk = (db: D1Database, chunk: Chunk): D1PreparedStatement[] 
     ? [
         db
           .prepare(
-            `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)
+            `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks, indexed_at) VALUES (?1, ?2, ?3, 0, 0, 0)
              ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
           )
           .bind(chunk.userId, chunk.sessionId, chunk.end),
       ]
     : [];
 
-// How far into each of a session's files the archive runs, counted off the objects. Every caller
-// that acts on the answer reads it here — a host working out where to send the rest of a file, a
-// restore writing them back to disk — because a count a second behind would have one of them
-// write over a stretch or stop short of one.
-//
-// It is also what puts the indexer's mark back where it belongs when the two disagree: a listing
-// is the archive itself, so it may lower the mark as well as raise it, and a mark left ahead of
-// the objects by a write that was announced and then lost is exactly the drift this undoes.
-export const archivedFiles = async (
-  bucket: R2Bucket,
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-): Promise<TranscriptFile[]> => {
+// How far into each of a session's files the archive runs, counted off the objects and nothing
+// else. Every caller that acts on the answer reads it here — a host working out where to send the
+// rest of a file, a restore writing them back to disk, a writer told where it was beaten to an
+// offset — because a count a second behind would have one of them write over a stretch or stop
+// short of one.
+export const archivedFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
   const prefix = sessionPrefix(userId, sessionId);
   const ends = new Map<string, number>();
   let cursor: string | undefined;
@@ -225,16 +224,6 @@ export const archivedFiles = async (
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor !== undefined);
-  const archived = ends.get(MAIN_FILE);
-  if (archived !== undefined) {
-    await db
-      .prepare(
-        `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)
-         ON CONFLICT (user_id, session_id) DO UPDATE SET archived = excluded.archived`,
-      )
-      .bind(userId, sessionId, archived)
-      .run();
-  }
   return [...ends]
     .map(([file, bytes]): TranscriptFile => ({ file, bytes }))
     .sort((left, right) => (left.file < right.file ? -1 : 1));

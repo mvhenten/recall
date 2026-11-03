@@ -148,8 +148,9 @@ describe("indexing off the storage event", () => {
   // The failure that would otherwise take the index down for every account at once. One delivery
   // carries the stretches of several sessions, so a transcript the indexer cannot get through
   // would fail the delivery and hold back everything in it; each session is caught on its own
-  // instead, and keeps its own mark where it was.
-  it("catches a session it cannot get through, and indexes the rest of the delivery", async () => {
+  // instead, keeps its own mark where it was, and sends its own messages back for redelivery.
+  // Nothing else asks what is behind, so a session that acked a failure would never be indexed.
+  it("sends back the messages of a session it cannot get through, and indexes the rest", async () => {
     const h = await harness();
     const userId = `wounded-${crypto.randomUUID()}`;
     const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
@@ -165,7 +166,7 @@ describe("indexing off the storage event", () => {
     const poisoned = await h.indexMark(userId, "s-aaa-poisoned");
     expect(poisoned?.bytes).toBe(0);
     expect(poisoned?.archived).toBeGreaterThan(0);
-    // The mark is still behind the archive, so the next stretch of that session tries again.
+    expect(h.retried()).toBe(1);
     await h.deliver();
     expect(await h.chunks(userId, "s-zzz-healthy")).not.toEqual([]);
     expect(await h.chunks(userId, "s-aaa-poisoned")).toEqual([]);

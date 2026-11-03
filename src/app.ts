@@ -61,6 +61,7 @@ import {
   dayWindow,
   type Embedder,
   FRESH_WINDOW_MS,
+  isRecord,
   type Live,
   type MemoryHit,
   type MemoryType,
@@ -69,7 +70,6 @@ import {
   parseLabels,
   parseList,
   parseName,
-  parseObjectEvent,
   parseSave,
   parseSearch,
   parseSession,
@@ -161,9 +161,17 @@ export interface AppEnv {
   TRANSCRIPTS: R2Bucket;
 }
 
+// One storage event as the queue hands it over. Only the body and the two ways of answering for
+// it are read, so the consumer can be driven by anything that carries a stretch.
+export interface Delivered {
+  body: unknown;
+  ack(): void;
+  retry(): void;
+}
+
 export interface App {
   fetch(request: Request, env: AppEnv): Promise<Response>;
-  consume(env: AppEnv, events: unknown[]): Promise<number>;
+  consume(env: AppEnv, delivered: readonly Delivered[]): Promise<number>;
 }
 
 type Refusal = (status: number, title: string, text: string) => Response;
@@ -361,7 +369,7 @@ export const createApp = (deps: Deps): App => {
     const found = await findSession(db, caller.userId, target, deps.now());
     if (!found) return error(404, `no session named ${target}`);
     const [files, labels] = await Promise.all([
-      archivedFiles(env.TRANSCRIPTS, db, caller.userId, found.session.sessionId),
+      archivedFiles(env.TRANSCRIPTS, caller.userId, found.session.sessionId),
       readLabels(db, caller.userId),
     ]);
     return json({
@@ -493,7 +501,9 @@ export const createApp = (deps: Deps): App => {
   // The listing is counted off the objects, since a host deciding where to write next cannot be
   // a second behind the archive. An append writes the object and nothing else: it claims no
   // offset, so there is no second write to disagree with the first and nothing to give back when
-  // one fails, and where the file reaches afterwards is arithmetic rather than a read.
+  // one fails, and where the file reaches afterwards is arithmetic rather than a read. The one
+  // append that costs a listing is the one beaten to its offset, which is told where the file
+  // reaches so it can carry on from there.
   const transcript = async (
     request: Request,
     url: URL,
@@ -506,7 +516,7 @@ export const createApp = (deps: Deps): App => {
     const wanted = url.searchParams.get("file");
     if (request.method === "GET" && wanted === null) {
       const [files, counted] = await Promise.all([
-        archivedFiles(env.TRANSCRIPTS, env.DB, caller.userId, sessionId),
+        archivedFiles(env.TRANSCRIPTS, caller.userId, sessionId),
         countedFiles(env.DB, caller.userId, sessionId),
       ]);
       return json({ files, counted });
@@ -527,7 +537,13 @@ export const createApp = (deps: Deps): App => {
     const body = await request.arrayBuffer();
     if (body.byteLength > MAX_CHUNK_BYTES) return tooLarge;
     const end = await putChunk(env.TRANSCRIPTS, caller.userId, sessionId, file.value, offset.value, body);
-    return json({ file: file.value, offset: end });
+    if (end !== null) return json({ file: file.value, offset: end });
+    const held = await archivedFiles(env.TRANSCRIPTS, caller.userId, sessionId);
+    const reaches = held.find((archived) => archived.file === file.value)?.bytes ?? offset.value;
+    return json(
+      { error: `${file.value} holds ${reaches} bytes; send the stretch starting there`, offset: reaches },
+      409,
+    );
   };
 
   const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
@@ -999,40 +1015,47 @@ export const createApp = (deps: Deps): App => {
     // event delivered twice writes the same rows and indexes nothing a second time.
     //
     // The cache goes down for the whole delivery in one batch; a D1 failure there fails the
-    // delivery and the retry writes the same rows again. Indexing is caught per session: a
+    // delivery and the retry writes the same rows again. Indexing is caught per session, and the
+    // messages that brought a session here are sent back for redelivery when it fails: a
     // transcript the indexer cannot get through — a hole in the archive, an embedding call the
-    // model refuses — leaves its own mark where it was and holds up no other session. The next
-    // stretch of it brings the next attempt, which is the only thing that ever does.
-    async consume(env: AppEnv, events: unknown[]): Promise<number> {
+    // model refuses — is tried again on its own while every other session's message acks.
+    async consume(env: AppEnv, delivered: readonly Delivered[]): Promise<number> {
       const landed: Chunk[] = [];
-      for (const event of events) {
-        const parsed = parseObjectEvent(event);
-        const chunk = parsed.ok ? parseChunkKey(parsed.value.key, parsed.value.size) : null;
+      const sessions = new Map<string, { chunk: Chunk; messages: Delivered[] }>();
+      for (const message of delivered) {
+        const event = isRecord(message.body) && isRecord(message.body.object) ? message.body.object : {};
+        const chunk = parseChunkKey(event.key, event.size);
         if (chunk === null) {
-          console.error(JSON.stringify({ error: "no transcript stretch in this storage event", event }));
+          console.error(JSON.stringify({ error: "no transcript stretch in this storage event", event: message.body }));
+          message.ack();
           continue;
         }
         landed.push(chunk);
+        if (chunk.file !== MAIN_FILE) continue;
+        const session = sessions.get(`${chunk.userId}/${chunk.sessionId}`);
+        if (session === undefined) sessions.set(`${chunk.userId}/${chunk.sessionId}`, { chunk, messages: [message] });
+        else session.messages.push(message);
       }
       if (landed.length === 0) return 0;
-      await env.DB.batch(landed.flatMap((chunk) => cacheChunk(env.DB, chunk)));
-      const sessions = new Map(
-        landed
-          .filter((chunk) => chunk.file === MAIN_FILE)
-          .map((chunk) => [`${chunk.userId}/${chunk.sessionId}`, chunk]),
-      );
+      const cached = landed.flatMap((chunk) => cacheChunk(env.DB, chunk));
+      if (cached.length > 0) await env.DB.batch(cached);
       let indexed = 0;
-      for (const { userId, sessionId } of sessions.values()) {
-        indexed += await indexSession(env, userId, sessionId).catch((failure: unknown) => {
+      for (const { chunk, messages } of sessions.values()) {
+        const read = await indexSession(env, chunk.userId, chunk.sessionId).catch((failure: unknown) => {
           console.error(
             JSON.stringify({
               error: failure instanceof Error ? failure.message : String(failure),
-              indexing: sessionId,
+              indexing: chunk.sessionId,
               stack: failure instanceof Error ? failure.stack : "",
             }),
           );
-          return 0;
+          return null;
         });
+        if (read === null) {
+          for (const message of messages) message.retry();
+          continue;
+        }
+        indexed += read;
       }
       return indexed;
     },

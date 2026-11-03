@@ -271,12 +271,7 @@ const run = (args) => {
   if (result.status !== 0) die(`wrangler ${args.join(" ")} exited with ${result.status}`);
 };
 
-const base = JSON.parse(
-  readFileSync(join(ROOT, "wrangler.jsonc"), "utf8")
-    .split("\n")
-    .filter((line) => !line.trim().startsWith("//"))
-    .join("\n"),
-);
+const base = JSON.parse(readFileSync(join(ROOT, "wrangler.jsonc"), "utf8"));
 const config = {
   ...base,
   $schema: undefined,

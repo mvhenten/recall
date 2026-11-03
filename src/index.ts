@@ -67,11 +67,10 @@ export default {
   },
   // Every stretch written to the archive arrives here as an R2 event notification, and everything
   // the service derives from a transcript is derived off it. There is no beat and nothing asks
-  // what is due: the write that made the work is what schedules it.
+  // what is due: the write that made the work is what schedules it. A session the consumer cannot
+  // get through sends its own messages back for redelivery, so a transient failure costs a retry
+  // rather than a transcript that is never indexed.
   async queue(batch, env) {
-    await appFor(env).consume(
-      env,
-      batch.messages.map((message) => message.body),
-    );
+    await appFor(env).consume(env, batch.messages);
   },
 } satisfies ExportedHandler<Env, unknown>;

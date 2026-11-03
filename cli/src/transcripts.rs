@@ -244,9 +244,9 @@ mod tests {
     }
 
     /// The service as a host can see it: one object per stretch, keyed by where the stretch
-    /// starts, which is what the store really holds. A stretch offered where one already sits
-    /// overwrites it rather than landing beside it, and how far a file reaches is counted off
-    /// those objects, the way a listing counts it.
+    /// starts, which is what the store really holds. A stretch offered where one already sits is
+    /// refused with where the file reaches rather than written over it, and how far a file reaches
+    /// is counted off those objects, the way a listing counts it.
     #[derive(Debug, Default)]
     struct Fake {
         objects: RefCell<HashMap<(String, i64), Vec<u8>>>,
@@ -283,6 +283,9 @@ mod tests {
         }
 
         fn append(&self, _session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<i64> {
+            if self.objects.borrow().contains_key(&(file.to_string(), offset)) {
+                return Ok(self.ends().get(file).copied().unwrap_or(offset));
+            }
             self.objects
                 .borrow_mut()
                 .insert((file.to_string(), offset), bytes.to_vec());
@@ -368,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stretch_sent_again_lands_on_itself_rather_than_beside_itself() {
+    fn a_stretch_sent_again_is_refused_with_where_the_file_reaches() {
         let sandbox = Sandbox::new("replayed");
         let transcript = sandbox.transcript("s-1", "one\ntwo\n");
         let service = Fake::default();
@@ -379,9 +382,9 @@ mod tests {
             Reached { end: 8, bytes: 8 },
             "the file reaches where the stretch ends, which the append answers without a read"
         );
-        // A host that lost its place and read the file from nothing again, which is the whole of
-        // what a replay looks like now that no offset is claimed.
-        send_file(&service, "s-1", &source, 0).unwrap();
+        // A host that lost its place and read the file from nothing again. The stretch is refused
+        // with where the file reaches, which is where this pass ends up without writing anything.
+        assert_eq!(send_file(&service, "s-1", &source, 0).unwrap().end, 8);
 
         assert_eq!(service.body("main"), "one\ntwo\n", "no line is written twice");
     }

@@ -799,18 +799,24 @@ impl Client {
     }
 
     /// Appends one stretch to one of a session's transcript files and answers where the file
-    /// reaches once it is in. The stretch is stored under the offset it was sent at and nothing
-    /// else is written, so the same stretch sent twice lands on itself.
+    /// reaches once it is in. A stretch is stored under the offset it was sent at and only where
+    /// nothing is yet, so one already there — a retry, or another writer that reached the offset
+    /// first — is refused with where the file now reaches. That is the same answer: it is where
+    /// the next stretch goes.
     pub fn append_transcript(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<i64> {
         let path = format!(
             "{}/transcript?file={}&offset={offset}",
             Self::session_path(session_id),
             encode(file)
         );
-        let response = self
+        let mut response = self
             .authed(self.agent.put(self.url(&path)))
             .header("content-type", "application/x-ndjson")
             .send(bytes)?;
+        if response.status().as_u16() == 409 {
+            let extent: Extent = response.body_mut().read_json()?;
+            return Ok(extent.offset);
+        }
         let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
             .body_mut()
             .read_json()?;
