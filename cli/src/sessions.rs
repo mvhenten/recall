@@ -126,10 +126,15 @@ pub struct Status {
 pub struct Registered {
     pub session_id: String,
     pub path: PathBuf,
+    pub started_at: i64,
     pub inbox: Inbox,
 }
 
 pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a host-addressed message stays deliverable to a session that was not yet running when
+/// it was sent, so telling a host to do something keeps working while it sits between sessions.
+pub const HOST_GRACE: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Fanout {
@@ -332,6 +337,7 @@ fn registered(dir: &Path) -> Vec<Registered> {
             State::Registered(inbox) => Some(Registered {
                 session_id: status.session_id,
                 path,
+                started_at: status.record.started_at,
                 inbox,
             }),
             _ => None,
@@ -405,13 +411,34 @@ fn addressable(dir: &Path) -> Vec<Registered> {
         .collect()
 }
 
-/// Delivers a message body to every live session, once per inbox socket.
-pub async fn fanout(dir: &Path, body: &str) -> Fanout {
+async fn write_all(registrations: Vec<Registered>, body: &str) -> Fanout {
     let mut fanout = Fanout::default();
-    for registered in addressable(dir) {
+    for registered in registrations {
         write_or_prune(&registered, body, &mut fanout).await;
     }
     fanout
+}
+
+/// Delivers a host-addressed message to the sessions that were already running when it was sent,
+/// once per inbox socket: a session that started afterwards has no idea what a queued message
+/// refers to. When none of those is left the message goes to whoever is registered now, so a host
+/// momentarily between sessions still takes it; past `HOST_GRACE` it is retired unread, which is
+/// what `None` says.
+pub async fn to_host(dir: &Path, body: &str, created_at: i64, now: i64) -> Option<Fanout> {
+    let registrations = addressable(dir);
+    let running: Vec<Registered> = registrations
+        .iter()
+        .filter(|registered| registered.started_at <= created_at)
+        .cloned()
+        .collect();
+    if !running.is_empty() {
+        return Some(write_all(running, body).await);
+    }
+    let grace = i64::try_from(HOST_GRACE.as_millis()).unwrap_or(i64::MAX);
+    if now.saturating_sub(created_at) > grace {
+        return None;
+    }
+    Some(write_all(registrations, body).await)
 }
 
 /// Delivers a message body to the one session named, so a handle reaches that session and nothing
@@ -462,6 +489,8 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
+    const STARTED_AT: i64 = 1_762_000_000_000;
+
     struct Sandbox {
         dir: PathBuf,
     }
@@ -479,6 +508,10 @@ mod tests {
         }
 
         fn record(&self, session_id: &str, pid: i32, state: State) {
+            self.record_started(session_id, pid, STARTED_AT, state);
+        }
+
+        fn record_started(&self, session_id: &str, pid: i32, started_at: i64, state: State) {
             let record = Record {
                 cwd: self.dir.clone(),
                 pid,
@@ -487,7 +520,7 @@ mod tests {
                 repo: "repo:github.com/mvhenten/recall".to_string(),
                 branch: "work".to_string(),
                 commit: "feat(sessions): list every host's sessions".to_string(),
-                started_at: 1_762_000_000_000,
+                started_at,
                 last_activity_at: 1_762_000_060_000,
                 prompts: 2,
                 focus: Focus {
@@ -508,9 +541,14 @@ mod tests {
         }
 
         fn register(&self, session_id: &str, socket: &Path, pid: i32) {
-            self.record(
+            self.register_started(session_id, socket, pid, STARTED_AT);
+        }
+
+        fn register_started(&self, session_id: &str, socket: &Path, pid: i32, started_at: i64) {
+            self.record_started(
                 session_id,
                 pid,
+                started_at,
                 State::Registered(Inbox {
                     socket: socket.to_path_buf(),
                     token: Token("t-inbox".to_string()),
@@ -542,7 +580,9 @@ mod tests {
         sandbox.register("s-child", &socket, mine);
 
         let delivery = tokio::spawn(async move { read_frames(&listener).await });
-        let fanout = fanout(&sandbox.sessions(), "ship it").await;
+        let fanout = to_host(&sandbox.sessions(), "ship it", STARTED_AT, STARTED_AT)
+            .await
+            .unwrap();
 
         assert_eq!(
             fanout,
@@ -646,7 +686,9 @@ mod tests {
         sandbox.register("s-there", &there, mine);
 
         let delivery = tokio::spawn(async move { (read_frames(&left).await, read_frames(&right).await) });
-        let fanout = fanout(&sandbox.sessions(), "all of you").await;
+        let fanout = to_host(&sandbox.sessions(), "all of you", STARTED_AT, STARTED_AT)
+            .await
+            .unwrap();
 
         assert_eq!(
             fanout,
@@ -662,6 +704,85 @@ mod tests {
                 serde_json::json!({ "role": "user", "content": "all of you" })
             );
         }
+    }
+
+    fn grace_ms() -> i64 {
+        i64::try_from(HOST_GRACE.as_millis()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_session_that_started_after_the_send_takes_nothing_once_the_grace_has_passed() {
+        let sandbox = Sandbox::new("stale-host");
+        let socket = sandbox.dir.join("inbox.sock");
+        let listening = UnixListener::bind(&socket).unwrap();
+        let sent = STARTED_AT - 1;
+        sandbox.register_started("s-later", &socket, std::process::id() as i32, STARTED_AT);
+
+        assert_eq!(
+            to_host(&sandbox.sessions(), "rerun the migration", sent, sent + grace_ms() + 1).await,
+            None,
+            "a message queued before this session existed is retired, not delivered"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listening.accept())
+                .await
+                .is_err(),
+            "a session that had no part in a queued message must not be written to at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_running_when_the_message_was_sent_takes_it_however_old_it_is() {
+        let sandbox = Sandbox::new("live-at-send");
+        let socket = sandbox.dir.join("inbox.sock");
+        let listening = UnixListener::bind(&socket).unwrap();
+        sandbox.register_started("s-live", &socket, std::process::id() as i32, STARTED_AT);
+        let sent = STARTED_AT + 60_000;
+
+        let delivery = tokio::spawn(async move { read_frames(&listening).await });
+        let fanout = to_host(&sandbox.sessions(), "ship it", sent, sent + grace_ms() * 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fanout,
+            Fanout {
+                delivered: 1,
+                pruned: 0
+            }
+        );
+        let frames = delivery.await.unwrap();
+        assert_eq!(
+            frames[1]["message"],
+            serde_json::json!({ "role": "user", "content": "ship it" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_starting_inside_the_grace_takes_a_message_the_host_had_nobody_for() {
+        let sandbox = Sandbox::new("grace-host");
+        let socket = sandbox.dir.join("inbox.sock");
+        let listening = UnixListener::bind(&socket).unwrap();
+        sandbox.register_started("s-next", &socket, std::process::id() as i32, STARTED_AT);
+        let sent = STARTED_AT - 60_000;
+
+        let delivery = tokio::spawn(async move { read_frames(&listening).await });
+        let fanout = to_host(&sandbox.sessions(), "pull main", sent, STARTED_AT + 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fanout,
+            Fanout {
+                delivered: 1,
+                pruned: 0
+            }
+        );
+        let frames = delivery.await.unwrap();
+        assert_eq!(
+            frames[1]["message"],
+            serde_json::json!({ "role": "user", "content": "pull main" })
+        );
     }
 
     #[test]
