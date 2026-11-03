@@ -635,14 +635,28 @@ fn backfill_sessions() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Says which session a name settled on when it named more than one. The service answers with the
+/// most recently active, which is the one a caller typing a name from memory means, but a caller
+/// about to write a transcript to disk is told there was a choice and how to make it themselves.
+fn report_matches(stored: &api::StoredSession, target: &str) {
+    if stored.matches <= 1 {
+        return;
+    }
+    eprintln!(
+        "recall: {target} names {} sessions; took the most recently active, {}. Pass a session id for another.",
+        stored.matches, stored.session.session_id
+    );
+}
+
 /// One session the account has on record, wherever it ran, by any of the names that reach it.
 fn find_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
     let Some(stored) = client.session(target)? else {
         eprintln!("recall: no session named {target}");
         return Ok(ExitCode::from(1));
     };
+    report_matches(&stored, target);
     if json {
-        print_json(&stored.session)?;
+        print_json(&stored)?;
     } else {
         print!("{}", markdown::render_session(&stored.session, &stored.files));
     }
@@ -671,24 +685,30 @@ fn restore_session(client: &Client, target: &str, cwd: Option<&str>, json: bool)
         eprintln!("recall: no session named {target}");
         return Ok(ExitCode::from(1));
     };
+    report_matches(&stored, target);
     let projects = config::claude_dir()
         .context("neither CLAUDE_CONFIG_DIR nor HOME is set, so there is nowhere to restore a session")?
         .join("projects");
-    let written = restore::restore(client, &projects, &stored.session, &stored.files, cwd)?;
+    let done = restore::restore(client, &projects, &stored.session, &stored.files, cwd)?;
     let under = cwd.unwrap_or(&stored.session.cwd);
+    let name = |path: &PathBuf| path.to_string_lossy().into_owned();
     if json {
         print_json(&serde_json::json!({
             "sessionId": stored.session.session_id,
             "cwd": under,
-            "files": written.iter().map(|file| file.path.to_string_lossy()).collect::<Vec<_>>(),
+            "written": done.written.iter().map(|file| name(&file.path)).collect::<Vec<_>>(),
+            "kept": done.kept.iter().map(name).collect::<Vec<_>>(),
         }))?;
         return Ok(ExitCode::SUCCESS);
     }
-    for file in &written {
+    for file in &done.written {
         println!("restored {} ({} bytes)", file.path.display(), file.bytes);
     }
-    if written.is_empty() {
-        println!("this host already holds every file of {}", stored.session.session_id);
+    for path in &done.kept {
+        println!(
+            "kept {} (this host holds at least what the archive does)",
+            path.display()
+        );
     }
     println!(
         "resume it with: cd {under} && claude --resume {}",

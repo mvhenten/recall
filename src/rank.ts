@@ -24,14 +24,6 @@ export const quantize = (vector: Float32Array): Uint8Array => {
   return bytes;
 };
 
-export const unquantize = (stored: Uint8Array): Float32Array => {
-  const scale = new DataView(stored.buffer, stored.byteOffset, 4).getFloat32(0, true);
-  const values = new Int8Array(stored.buffer, stored.byteOffset + 4, stored.length - 4);
-  const out = new Float32Array(values.length);
-  for (let i = 0; i < values.length; i++) out[i] = (values[i] ?? 0) * scale;
-  return out;
-};
-
 export const dot = (query: Float32Array, stored: Uint8Array): number => {
   if (stored.length !== query.length + 4) throw new Error(`stored embedding holds ${stored.length} bytes`);
   const scale = new DataView(stored.buffer, stored.byteOffset, 4).getFloat32(0, true);

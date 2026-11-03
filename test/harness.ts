@@ -21,11 +21,16 @@ export interface DeviceStart {
   interval: number;
 }
 
+// A word this embedder refuses, which is how a test stands a model call that keeps failing — a
+// Workers AI 5xx, a text it will not take — in front of the indexer.
+export const UNEMBEDDABLE = "zzsickzz";
+
 // Embeds plain words only: tokens holding a digit are invisible to it, the way
 // rare identifiers barely register with a real embedding model.
 const wordEmbedder: Embedder = {
   async embed(texts: string[]): Promise<Float32Array[]> {
     return texts.map((text) => {
+      if (text.includes(UNEMBEDDABLE)) throw new Error("the embedder refused this text");
       const vector = new Array<number>(DIMENSIONS).fill(0);
       for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
         if (/[0-9]/.test(word)) continue;
@@ -294,6 +299,12 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
     clientWithHeaders,
     assertionFor,
     index: () => app.index(env),
+    indexMark: async (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
+      env.DB.prepare(
+        "SELECT archived, bytes, chunks, indexed_at FROM session_index WHERE user_id = ? AND session_id = ?",
+      )
+        .bind(userId, sessionId)
+        .first<Record<string, number>>(),
     chunks: async (userId: string, sessionId: string): Promise<string[]> => {
       const { results } = await env.DB.prepare(
         "SELECT text FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",

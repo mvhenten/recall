@@ -77,31 +77,49 @@ export const readTranscript = async (
   });
 };
 
-// The bytes of one file from `from`, at most `limit` of them and cut back to the last complete
-// line. The indexer reads a transcript this way so that one pass over a long session costs a
-// bounded amount of memory and the next pass carries on where this one stopped.
+export interface Bite {
+  text: string;
+  /// Where in the file this bite ends, as a position in the file and never a count of bytes read.
+  /// The two part company over a hole, and a mark that could mean either would have a reader
+  /// index prose it already held or skip prose it never did.
+  through: number;
+}
+
+// One bite of a file, from `from` and at most `limit` bytes, for a reader that will come back for
+// the rest. `through` always moves: a reader that takes it as its mark cannot be handed the same
+// bite twice, whatever the archive holds.
+//
+// A hole is a stretch whose end was claimed and whose object never landed, which is what an
+// isolate killed between the two leaves behind. Those bytes exist nowhere and never will, so the
+// read steps over the hole to the next stretch rather than reading across it as though the file
+// ran on; a reader stopping short of it instead would find the session due for good.
 export const readStretch = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
   from: number,
+  to: number,
   limit: number,
-): Promise<{ text: string; bytes: number; read: number }> => {
-  const parts = (await stretches(bucket, userId, sessionId, file))
-    .filter((part) => part.from + part.bytes > from && part.from < from + limit)
-    .sort((left, right) => left.from - right.from);
+): Promise<Bite> => {
+  const parts = (await stretches(bucket, userId, sessionId, file)).sort((left, right) => left.from - right.from);
   const read: Uint8Array[] = [];
+  let at = from;
   let held = 0;
-  for (const part of parts) {
-    const offset = Math.max(0, from - part.from);
-    const length = Math.min(part.bytes - offset, limit - held);
+  while (at < to && held < limit) {
+    const covering = parts.find((part) => part.from <= at && part.from + part.bytes > at);
+    const part = covering ?? parts.find((part) => part.from > at);
+    if (part === undefined) break;
+    at = Math.max(at, part.from);
+    const offset = at - part.from;
+    const length = Math.min(part.bytes - offset, limit - held, to - at);
     if (length <= 0) break;
     const object = await bucket.get(part.key, { range: { offset, length } });
     if (object === null) throw new Error(`the archive lost ${part.key}`);
     const body = new Uint8Array(await object.arrayBuffer());
     read.push(body);
     held += body.byteLength;
+    at += body.byteLength;
   }
   const bytes = new Uint8Array(held);
   let written = 0;
@@ -109,9 +127,28 @@ export const readStretch = async (
     bytes.set(body, written);
     written += body.byteLength;
   }
-  const end = bytes.lastIndexOf(10) + 1;
-  return { text: new TextDecoder().decode(bytes.subarray(0, end)), bytes: end, read: held };
+  const line = bytes.lastIndexOf(10) + 1;
+  // Level with the archive, so there is no later stretch to finish a line that ends short; the
+  // mark takes the whole bite. Stopped early, so the last line may yet be completed by bytes that
+  // have not arrived, and the mark holds back to the last one that is whole — unless the bite
+  // holds no line end at all, which is one entry longer than a bite and never worth waiting for.
+  const through = at >= to ? to : from + (line > 0 ? line : held);
+  return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
 };
+
+// How far the archive holds a session's own transcript, which is what puts the session in the
+// indexer's queue. It is moved by the append that wrote those bytes, so the queue costs the
+// indexer no scan of its own, and it never moves backwards: a stretch refused for landing
+// anywhere but the end of the file says nothing about where the file ends.
+const markArchived = (db: D1Database, userId: string, sessionId: string, end: number): Promise<unknown> =>
+  db
+    .prepare(
+      `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks, indexed_at)
+       VALUES (?1, ?2, ?3, 0, 0, 0)
+       ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
+    )
+    .bind(userId, sessionId, end)
+    .run();
 
 // How far into each of a session's transcript files this service has been written, which is where
 // the host that holds them picks up. A file nothing was ever written for is simply absent.
@@ -200,5 +237,6 @@ export const appendChunk = async (
       await claim(db, userId, sessionId, file, end, offset);
       throw failure;
     });
+  if (file === MAIN_FILE) await markArchived(db, userId, sessionId, end);
   return { ok: true, offset: end };
 };

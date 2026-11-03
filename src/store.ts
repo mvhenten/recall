@@ -35,7 +35,6 @@ import {
   usageDay,
   usageDayStart,
 } from "./model";
-import { DIMENSIONS, normalize, quantize, unquantize } from "./rank";
 
 interface MemoryRow {
   memory_id: string;
@@ -470,40 +469,56 @@ export const listSessionHistoryIds = async (
   };
 };
 
+// How many sessions a name answered for, beside the one returned. A name recurs — the harness
+// hands the same word to a session resumed weeks later — and the most recently active wins, which
+// is the one a caller typing a name from memory means. The count rides along because `--restore`
+// writes to disk off that pick, and a caller choosing between two sessions should be told there
+// were two.
+export interface FoundSession {
+  session: PastSession;
+  matches: number;
+}
+
+// How many of a device's sessions the handle branch reads before giving up. A handle is a
+// function of the session id that SQL cannot compute — `sessionHandle` strips the id of
+// everything but letters and digits before taking its head — so the rows are narrowed to the one
+// device and the handle is checked here. Newest first, since a handle is something a caller just
+// read off a listing.
+const HANDLE_SCAN = 500;
+
 // One session, by any of the three things that name it: its Claude Code session id, the name the
-// harness gave it, or the handle `recall send` addresses it by. A name recurs — the harness hands
-// the same word to a session resumed weeks later — so the most recently active wins, which is the
-// one a caller typing a name from memory means.
+// harness gave it, or the handle `recall send` addresses it by.
 export const findSession = async (
   db: D1Database,
   userId: string,
   target: string,
   now: number,
-): Promise<PastSession | null> => {
+): Promise<FoundSession | null> => {
   const gone = now - SESSION_TTL_MS;
   const named = await db
     .prepare(
-      `${pastSessions(3)}
-       WHERE h.user_id = ?1 AND (h.session_id = ?2 OR h.agent_name = ?2)
-       ORDER BY h.last_activity_at DESC, h.session_id DESC LIMIT 1`,
+      `SELECT found.*, COUNT(*) OVER () AS matches FROM (${pastSessions(3)}
+         WHERE h.user_id = ?1 AND (h.session_id = ?2 OR h.agent_name = ?2)) AS found
+       ORDER BY found.last_activity_at DESC, found.session_id DESC LIMIT 1`,
     )
     .bind(userId, target, gone)
-    .first<PastSessionRow>();
-  if (named !== null) return toPastSession(named);
+    .first<PastSessionRow & { matches: number }>();
+  if (named !== null) return { session: toPastSession(named), matches: named.matches };
   // A handle is a device name, a dash and the head of a session id, and the device name may hold
   // dashes of its own; the last dash is the one that splits them.
   const dash = target.lastIndexOf("-");
   if (dash <= 0) return null;
   const { results } = await db
     .prepare(
-      `${pastSessions(4)}
-       WHERE h.user_id = ?1 AND h.device_name = ?2 AND lower(h.session_id) LIKE ?3
-       ORDER BY h.last_activity_at DESC, h.session_id DESC LIMIT 50`,
+      `${pastSessions(3)}
+       WHERE h.user_id = ?1 AND h.device_name = ?2
+       ORDER BY h.last_activity_at DESC, h.session_id DESC LIMIT ${HANDLE_SCAN}`,
     )
-    .bind(userId, target.slice(0, dash), `${target.slice(dash + 1).toLowerCase()}%`, gone)
+    .bind(userId, target.slice(0, dash), gone)
     .all<PastSessionRow>();
-  const row = results.find((found) => sessionHandle(found.device_name, found.session_id) === target);
-  return row ? toPastSession(row) : null;
+  const matched = results.filter((found) => sessionHandle(found.device_name, found.session_id) === target);
+  const row = matched[0];
+  return row ? { session: toPastSession(row), matches: matched.length } : null;
 };
 
 export const describeSessions = async (
@@ -972,7 +987,11 @@ export const recordUsage = async (
 // they read.
 // One session whose archive has grown past what the index has read. A session prompted in the
 // last few minutes is left alone: it will be quiet soon enough, and indexing it on every pass
-// would read the same stretch over and over for as long as it runs.
+// would cut a chunk at every pass boundary for as long as it runs.
+//
+// The queue is `session_index` and nothing else. `session_index_due` indexes the sessions behind
+// their archive by the pass that last took them on, so a tick with nothing due reads no row, and
+// one with work reads the few rows it takes on.
 export interface DueSession {
   user_id: string;
   session_id: string;
@@ -984,19 +1003,28 @@ export interface DueSession {
 export const dueSessions = async (db: D1Database, now: number, limit: number): Promise<DueSession[]> => {
   const { results } = await db
     .prepare(
-      `SELECT t.user_id, t.session_id, t.bytes AS archived, COALESCE(i.bytes, 0) AS indexed,
-         COALESCE(i.chunks, 0) AS chunks
-       FROM transcript_files t
-       LEFT JOIN session_index i ON i.user_id = t.user_id AND i.session_id = t.session_id
-       LEFT JOIN sessions s ON s.user_id = t.user_id AND s.session_id = t.session_id
-       WHERE t.file = 'main' AND t.bytes > COALESCE(i.bytes, 0)
-         AND (s.session_id IS NULL OR s.last_activity_at <= ?1)
-       ORDER BY COALESCE(i.indexed_at, 0), t.user_id, t.session_id
+      `SELECT i.user_id, i.session_id, i.archived, i.bytes AS indexed, i.chunks
+       FROM session_index i
+       LEFT JOIN sessions s ON s.user_id = i.user_id AND s.session_id = i.session_id
+       WHERE i.bytes < i.archived AND (s.session_id IS NULL OR s.last_activity_at <= ?1)
+       ORDER BY i.indexed_at
        LIMIT ?2`,
     )
     .bind(now - IDLE_AFTER_MS, limit)
     .all<DueSession>();
   return results;
+};
+
+// Marks a session as taken on, before the pass that takes it on does any work. A session the
+// indexer cannot get through — a stretch the archive lost, an embedding call that keeps failing —
+// would otherwise keep its old mark, sort to the front of the queue again on the next tick and
+// hold every session behind it there for good. Stamped first, it costs one wasted pass per cycle
+// and nothing else waits on it.
+export const takingOn = async (db: D1Database, userId: string, sessionId: string, now: number): Promise<void> => {
+  await db
+    .prepare("UPDATE session_index SET indexed_at = ?3 WHERE user_id = ?1 AND session_id = ?2")
+    .bind(userId, sessionId, now)
+    .run();
 };
 
 export interface IndexedChunk {
@@ -1033,50 +1061,11 @@ export const writeChunks = async (
   }
   await db
     .prepare(
-      `INSERT INTO session_index (user_id, session_id, bytes, chunks, embedding, indexed_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-       ON CONFLICT (user_id, session_id) DO UPDATE SET
-         bytes = excluded.bytes, chunks = excluded.chunks, embedding = excluded.embedding,
-         indexed_at = excluded.indexed_at`,
+      `UPDATE session_index SET bytes = ?3, chunks = ?4, indexed_at = ?5
+       WHERE user_id = ?1 AND session_id = ?2`,
     )
-    .bind(userId, sessionId, reached, from + chunks.length, await sessionVector(db, userId, sessionId, chunks), now)
+    .bind(userId, sessionId, reached, from + chunks.length, now)
     .run();
-};
-
-// The session's place in the first pass of a search: the mean of its chunk vectors, read back
-// whole rather than carried forward, so a pass that added chunks cannot drift from what the
-// session now holds.
-const sessionVector = async (
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-  added: IndexedChunk[],
-): Promise<Uint8Array> => {
-  const rows = await db
-    .prepare("SELECT embedding FROM session_chunks WHERE user_id = ? AND session_id = ?")
-    .bind(userId, sessionId)
-    .raw<[unknown]>();
-  const stored = rows.map(([embedding]) => toBytes(embedding));
-  const held = stored.length > 0 ? stored : added.map((chunk) => chunk.embedding);
-  const mean = new Float32Array(DIMENSIONS);
-  for (const embedding of held) {
-    const vector = unquantize(embedding);
-    for (let i = 0; i < DIMENSIONS; i++) mean[i] = (mean[i] ?? 0) + (vector[i] ?? 0);
-  }
-  return quantize(normalize(mean));
-};
-
-export interface SessionVector {
-  sessionId: string;
-  embedding: Uint8Array;
-}
-
-export const sessionVectors = async (db: D1Database, userId: string): Promise<SessionVector[]> => {
-  const rows = await db
-    .prepare("SELECT session_id, embedding FROM session_index WHERE user_id = ?")
-    .bind(userId)
-    .raw<[string, unknown]>();
-  return rows.map(([sessionId, embedding]) => ({ sessionId, embedding: toBytes(embedding) }));
 };
 
 export interface ChunkCandidate {
@@ -1086,16 +1075,14 @@ export interface ChunkCandidate {
   embedding: Uint8Array;
 }
 
-// Every chunk of the sessions the first pass shortlisted, without their text: a shortlist of two
-// dozen sessions is a couple of thousand chunks, and their vectors alone are a tenth of what
-// carrying the prose with them would cost. The prose is read back only for the chunks that win.
-export const chunkVectors = async (db: D1Database, userId: string, sessionIds: string[]): Promise<ChunkCandidate[]> => {
+// Every chunk this account holds, without its text. A search scores all of them: a vector is 388
+// bytes, so a few thousand chunks is under a megabyte and a few thousand dot products of 384
+// dimensions, which is the same shape the memory search has always had. The prose is read back
+// only for the chunks that win, since carrying it here would be ten times the bytes.
+export const chunkVectors = async (db: D1Database, userId: string): Promise<ChunkCandidate[]> => {
   const rows = await db
-    .prepare(
-      `SELECT chunk_seq, session_id, speaker, embedding FROM session_chunks
-       WHERE user_id = ? AND session_id IN (SELECT value FROM json_each(?))`,
-    )
-    .bind(userId, JSON.stringify(sessionIds))
+    .prepare("SELECT chunk_seq, session_id, speaker, embedding FROM session_chunks WHERE user_id = ?")
+    .bind(userId)
     .raw<[number, string, string, unknown]>();
   return rows.map(([chunkSeq, sessionId, speaker, embedding]) => ({
     chunkSeq,

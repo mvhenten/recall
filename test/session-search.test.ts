@@ -1,6 +1,7 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { IDLE_AFTER_MS, type PastSession, type SessionHit } from "../src/model";
-import { harness } from "./harness";
+import { harness, UNEMBEDDABLE } from "./harness";
 
 const line = (entry: Record<string, unknown>): string => `${JSON.stringify(entry)}\n`;
 
@@ -40,7 +41,9 @@ describe("finding a stored session", () => {
     const client = await h.user("finder");
     const id = "11112222-3333-4444-5555-666677778888";
     await client.sync(id);
-    await client.archive(id, "main", 0, named("kisuvpalas") + prompt("rotate the signing key"));
+    await client.archive(id, "main", 0, named("kisuvpalas") + about("the signing key"));
+    h.tick(QUIET);
+    await h.index();
 
     const session = await sessionOf(await client.session("kisuvpalas"));
 
@@ -52,22 +55,26 @@ describe("finding a stored session", () => {
     expect((await client.session("nobody-here")).status).toBe(404);
   });
 
-  // A transcript whose name entry lands past the first stretch, which is every session archived
-  // before the append path learned to read one. The indexing pass reads the head again and names
-  // it, so nothing has to be sent twice.
-  it("names a session the archive never named, on its first indexing pass", async () => {
+  // The harness hands the same word to a session resumed weeks later, so a name is not a key. The
+  // most recent is the one a caller typing a name from memory means, and `--restore` writes a
+  // transcript to disk off that pick, so the count rides along rather than the choice being made
+  // silently.
+  it("takes the most recent of the sessions a name answers for, and says how many there were", async () => {
     const h = await harness();
-    const client = await h.user("latecomer");
-    const head = prompt("a first stretch with no name in it");
-    await client.sync("s-unnamed");
-    await client.archive("s-unnamed", "main", 0, head);
-    await client.archive("s-unnamed", "main", bytes(head), named("dubikrimaz") + about("the offset table"));
-    expect((await sessionOf(await client.session("s-unnamed"))).agentName).toBe("");
-
+    const client = await h.user("twin");
+    await client.sync("s-older", { lastActivityAt: h.now() + 1_000 });
+    await client.archive("s-older", "main", 0, named("lobivdigob") + about("the first run"));
+    await client.sync("s-newer", { lastActivityAt: h.now() + 90_000 });
+    await client.archive("s-newer", "main", 0, named("lobivdigob") + about("the second run"));
     h.tick(QUIET);
     await h.index();
 
-    expect((await sessionOf(await client.session("dubikrimaz"))).sessionId).toBe("s-unnamed");
+    const found = (await (await client.session("lobivdigob")).json()) as { session: PastSession; matches: number };
+
+    expect(found.session.sessionId).toBe("s-newer");
+    expect(found.matches).toBe(2);
+    const single = (await (await client.session("s-older")).json()) as { matches: number };
+    expect(single.matches).toBe(1);
   });
 
   it("answers no caller the session does not belong to", async () => {
@@ -75,7 +82,9 @@ describe("finding a stored session", () => {
     const owner = await h.user("keeper");
     const stranger = await h.user("passerby");
     await owner.sync("s-private");
-    await owner.archive("s-private", "main", 0, named("vatoglojaf") + prompt("nothing to see"));
+    await owner.archive("s-private", "main", 0, named("vatoglojaf") + about("nothing to see"));
+    h.tick(QUIET);
+    await h.index();
 
     expect((await stranger.session("vatoglojaf")).status).toBe(404);
     expect((await stranger.session("s-private")).status).toBe(404);
@@ -111,13 +120,14 @@ describe("searching sessions by meaning", () => {
     await theirs.archive("s-theirs", "main", 0, named("minuksijaj") + about("the signing key rotation"));
     h.tick(QUIET);
     await h.index();
-    await h.index();
 
     const found = await hitsOf(await mine.searchSessions("signing key rotation"));
 
     expect(found.map((hit) => hit.session.sessionId)).toEqual(["s-mine"]);
   });
+});
 
+describe("the indexing pass", () => {
   // Indexing runs on a beat of its own and picks a session up where it left it, so a session that
   // goes on writing is caught up a stretch at a time rather than read from the start again.
   it("indexes what has arrived since the last pass, and nothing twice", async () => {
@@ -142,6 +152,60 @@ describe("searching sessions by meaning", () => {
     await h.index();
     expect(await h.chunks(userId, "s-long")).toEqual(grown);
     expect((await hitsOf(await client.searchSessions("the labels tab")))[0]?.session.sessionId).toBe("s-long");
+  });
+
+  // The failure that would otherwise take the index down for every account at once. A session the
+  // pass cannot get through keeps its place at the front of a queue ordered by when each session
+  // was last taken on, and everything behind it waits for good — so a session is marked as taken
+  // on before the work starts, and each one is caught on its own.
+  it("leaves a session it cannot get through behind it, rather than in front of everything else", async () => {
+    const h = await harness();
+    const userId = `wounded-${crypto.randomUUID()}`;
+    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
+    await client.sync("s-aaa-poisoned");
+    await client.archive("s-aaa-poisoned", "main", 0, named("rogiffavof") + about(`${UNEMBEDDABLE} wreckage`));
+    await client.sync("s-zzz-healthy");
+    await client.archive("s-zzz-healthy", "main", 0, named("minuksijaj") + about("the labels tab"));
+    h.tick(QUIET);
+
+    await h.index();
+
+    expect(await h.chunks(userId, "s-zzz-healthy")).not.toEqual([]);
+    expect(await h.chunks(userId, "s-aaa-poisoned")).toEqual([]);
+    const poisoned = await h.indexMark(userId, "s-aaa-poisoned");
+    expect(poisoned?.indexed_at).toBe(h.now());
+    expect(poisoned?.bytes).toBe(0);
+    // Still due, so it is retried — but behind every session taken on since, not ahead of them.
+    h.tick(QUIET);
+    await h.index();
+    expect(await h.chunks(userId, "s-zzz-healthy")).not.toEqual([]);
+  });
+
+  // A stretch whose end was claimed and whose object never landed, which is what an isolate killed
+  // between the two leaves behind. Those bytes exist nowhere and never will.
+  it("steps over a stretch the archive lost rather than stalling on it", async () => {
+    const h = await harness();
+    const userId = `holed-${crypto.randomUUID()}`;
+    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
+    await client.sync("s-holed");
+    const head = named("nufogruzup") + about("the offset table");
+    const lost = about("a stretch that never landed");
+    await client.archive("s-holed", "main", 0, head);
+    await client.archive("s-holed", "main", bytes(head), lost);
+    await client.archive("s-holed", "main", bytes(head) + bytes(lost), about("the labels tab"));
+    const keys = await env.TRANSCRIPTS.list({ prefix: `${userId}/s-holed/main/` });
+    await env.TRANSCRIPTS.delete(keys.objects[1]?.key ?? "");
+    h.tick(QUIET);
+
+    await h.index();
+
+    const mark = await h.indexMark(userId, "s-holed");
+    expect(mark?.bytes).toBe(mark?.archived);
+    const indexed = await h.chunks(userId, "s-holed");
+    expect(indexed.some((text) => text.includes("the offset table"))).toBe(true);
+    expect(indexed.some((text) => text.includes("the labels tab"))).toBe(true);
+    expect(indexed.some((text) => text.includes("never landed"))).toBe(false);
+    expect((await hitsOf(await client.searchSessions("the labels tab")))[0]?.session.sessionId).toBe("s-holed");
   });
 });
 

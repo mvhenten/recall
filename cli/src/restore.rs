@@ -41,6 +41,14 @@ pub struct Written {
     pub bytes: u64,
 }
 
+/// What a restore did: the files it wrote, and the ones it left where they were because this host
+/// already holds at least as much of them as the archive does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restored {
+    pub written: Vec<Written>,
+    pub kept: Vec<PathBuf>,
+}
+
 /// Whether a file already on disk may be written over. A transcript this host holds more of than
 /// the archive does is the live one, or one archived from a run that has not finished going up,
 /// and overwriting it would throw lines away; one it holds less of is a part the archive has the
@@ -53,6 +61,23 @@ fn stale(path: &Path, archived: i64) -> Result<bool> {
     }
 }
 
+/// One file, downloaded beside where it belongs and moved into place once it is whole. A download
+/// that fails part way would otherwise leave a truncated transcript under the name Claude Code
+/// resumes from, which reads as a session that lost its second half rather than as a failure.
+fn download(client: &Client, session_id: &str, file: &str, path: &Path) -> Result<u64> {
+    let dir = path.parent().context("a transcript path has no directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let partial = path.with_extension("jsonl.part");
+    let bytes = {
+        let mut into = std::fs::File::create(&partial).with_context(|| format!("writing {}", partial.display()))?;
+        client.read_transcript(session_id, file, &mut into).inspect_err(|_| {
+            let _ = std::fs::remove_file(&partial);
+        })?
+    };
+    std::fs::rename(&partial, path).with_context(|| format!("moving {} into place", partial.display()))?;
+    Ok(bytes)
+}
+
 /// Writes one session's transcript files where Claude Code looks for them. A file this host
 /// already holds the whole of is left alone rather than fetched again, so restoring a session
 /// twice costs nothing and a restore onto the host that ran it never truncates what is there.
@@ -62,7 +87,7 @@ pub fn restore(
     session: &PastSession,
     files: &[HeldFile],
     cwd: Option<&str>,
-) -> Result<Vec<Written>> {
+) -> Result<Restored> {
     let cwd = cwd.unwrap_or(&session.cwd);
     if cwd.is_empty() {
         bail!(
@@ -76,19 +101,17 @@ pub fn restore(
             session.session_id
         );
     }
-    let mut written = Vec::new();
+    let mut done = Restored::default();
     for held in files {
         let path = file_path(projects, cwd, &session.session_id, &held.file);
         if !stale(&path, held.bytes)? {
+            done.kept.push(path);
             continue;
         }
-        let dir = path.parent().context("a transcript path has no directory")?;
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let mut file = std::fs::File::create(&path).with_context(|| format!("writing {}", path.display()))?;
-        let bytes = client.read_transcript(&session.session_id, &held.file, &mut file)?;
-        written.push(Written { path, bytes });
+        let bytes = download(client, &session.session_id, &held.file, &path)?;
+        done.written.push(Written { path, bytes });
     }
-    Ok(written)
+    Ok(done)
 }
 
 #[cfg(test)]

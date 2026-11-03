@@ -344,11 +344,20 @@ pub struct Excerpt {
 
 /// One session and the transcript files the archive holds of it, which is everything a host needs
 /// to put the session back on disk.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredSession {
     pub session: PastSession,
     pub files: Vec<HeldFile>,
+    /// How many sessions the name answered for. A name recurs, so more than one is ordinary and
+    /// the most recently active is what came back; a caller writing to disk off that pick is told
+    /// there was a choice.
+    #[serde(default = "one")]
+    pub matches: i64,
+}
+
+fn one() -> i64 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -402,7 +411,7 @@ struct HistoryIds {
 
 /// How far into one of a session's transcript files the service has been written. It is the only
 /// mark an archive resumes from, so nothing a host keeps locally can put the two out of step.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HeldFile {
     pub file: String,
     pub bytes: i64,
