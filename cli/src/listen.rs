@@ -177,7 +177,13 @@ async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
         return;
     }
     let (target, fanout) = if message.to_session_id.is_empty() {
-        ("host".to_string(), sessions::fanout(sessions_dir, &message.body).await)
+        let now = Timestamp::now().as_millisecond();
+        let Some(fanout) = sessions::to_host(sessions_dir, &message.body, message.created_at, now).await else {
+            seen.record(&message.message_id);
+            log(&format!("message:retired:{}", message.message_id), started.elapsed());
+            return;
+        };
+        ("host".to_string(), fanout)
     } else {
         (
             format!("session:{}", message.to_session_id),
