@@ -220,8 +220,7 @@ pub enum Poll {
 pub struct Device {
     pub device_id: String,
     pub name: String,
-    /// The machine this login was made from. Signing in twice from one machine takes two names,
-    /// core-box and core-box-2, under the one host core-box.
+    /// The machine this login was made from.
     #[serde(default)]
     pub host: String,
     /// The name the user gave this host on the dashboard's labels tab, empty when it carries none.
@@ -233,8 +232,6 @@ pub struct Device {
 }
 
 impl Device {
-    /// The machine a login belongs to, which a service too old to name one answers for with the
-    /// login's own name.
     fn machine(&self) -> &str {
         if self.host.is_empty() { &self.name } else { &self.host }
     }
@@ -376,10 +373,12 @@ pub struct Target {
 /// first, so `sessions` is called only for a target no device claims and an ordinary host send
 /// costs no listing.
 ///
-/// A machine signing in more than once holds a login per sign-in, all under the one host, and only
-/// the newest of them has a daemon reading its queue — so they collapse to that one rather than
-/// reading as a crowd. Two distinct hosts answering to one name or label is the real ambiguity:
-/// that names them both rather than picking one, and only the device id settles it on its own.
+/// A machine signing in more than once holds a login per sign-in, all under the one host, so they
+/// collapse to the most recently used rather than reading as a crowd. That is a last-seen mark and
+/// not a liveness signal — a token baked into a container goes on moving it without a daemon
+/// behind it — but it is the best of them the service holds. Two distinct hosts answering to one
+/// name or label is the real ambiguity: that names them all rather than picking one, and only the
+/// device id settles it on its own.
 pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<Session>>, to: &str) -> Result<Target> {
     let host = |device_id: &str| {
         Ok(Target {
@@ -414,7 +413,7 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
                 .map(|device| format!("{} ({})", device.name, device.device_id))
                 .collect();
             bail!(
-                "ambiguous target {to}: {} hosts answer to it; pass one of these device ids instead: {}",
+                "ambiguous target {to}: it names {} hosts; pass one of these device ids instead: {}",
                 machines.len(),
                 candidates.join(", ")
             )
@@ -784,7 +783,6 @@ mod tests {
         }
     }
 
-    /// One further sign-in from a machine already signed in: its own name, the same host.
     fn relogin(device_id: &str, name: &str, host: &str, last_used_at: i64, label: &str) -> Device {
         Device {
             host: host.to_string(),

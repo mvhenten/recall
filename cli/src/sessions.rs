@@ -972,7 +972,6 @@ mod tests {
         let socket = sandbox.dir.join("inbox.sock");
         sandbox.register("s-here", &socket, mine);
         sandbox.register("s-elsewhere", &sandbox.dir.join("other.sock"), mine);
-        sandbox.record("s-unregistered", mine, State::Off);
 
         assert_eq!(sending_session(&dir, &socket), Some("s-here".to_string()));
         assert_eq!(sending_session(&dir, &sandbox.dir.join("unknown.sock")), None);

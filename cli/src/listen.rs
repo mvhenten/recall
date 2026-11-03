@@ -174,17 +174,23 @@ pub fn log(outcome: &str, took: Duration) {
 /// turn with nothing saying where it came from, and Claude Code's own cross-session tools reach
 /// only sessions on the same machine, so the route back has to be spelled out. The handle answers
 /// the one session that asked; a sender that named none is answered on its device id, which is
-/// unique and unchanging, where its label is neither and only ever reads as prose.
+/// unique and unchanging, where its label is neither and only ever reads as prose. A message
+/// queued before a send named its sender has no host to read as, and says the device id instead.
 pub fn header(message: &Message) -> String {
+    let from = if message.from_host.is_empty() {
+        &message.from_device_id
+    } else {
+        &message.from_host
+    };
     if message.from_name.is_empty() {
         return format!(
-            "[recall from {}; reply with recall_send to \"{}\"]",
-            message.from_host, message.from_device_id
+            "[recall from {from}; reply with recall_send to \"{}\"]",
+            message.from_device_id
         );
     }
     format!(
-        "[recall from {}/{}; reply with recall_send to \"{}\"]",
-        message.from_host, message.from_name, message.from_name
+        "[recall from {from}/{}; reply with recall_send to \"{}\"]",
+        message.from_name, message.from_name
     )
 }
 
@@ -754,6 +760,10 @@ mod tests {
         assert_eq!(
             header(&message("core", "")),
             "[recall from core; reply with recall_send to \"d-1\"]"
+        );
+        assert_eq!(
+            header(&message("", "")),
+            "[recall from d-1; reply with recall_send to \"d-1\"]"
         );
         assert_eq!(delivered_body(&message("core", "")).lines().last().unwrap(), "ship it");
     }
