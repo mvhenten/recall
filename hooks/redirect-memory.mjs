@@ -1,6 +1,7 @@
 import path from "node:path";
 import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
 import { GLOBAL_TYPES, isMemoryFile, isMemoryIndex, memoryType, resolveReal } from "./memory-files.mjs";
+import { memoryName } from "./memory-name.mjs";
 
 const TIMEOUT_MS = 5000;
 const INDEX_REASON = "recall needs no index; memories are found by search.";
@@ -39,7 +40,7 @@ async function run(input) {
   }
   if (!isMemoryFile(file)) return "skipped";
 
-  const name = path.basename(file, ".md");
+  const name = memoryName(file);
   if (input.tool_name !== "Write") {
     decide(
       "deny",
@@ -51,8 +52,8 @@ async function run(input) {
   const saved = await save(name, String(input.tool_input.content ?? ""), input);
   if (!saved.ok) {
     const error = firstLine(saved.error);
-    decide("allow", `recall save failed; writing ${name} locally instead.`, {
-      systemMessage: `recall: saving memory ${name} failed, so it was kept locally: ${error}`,
+    decide("allow", `recall save failed; writing ${path.basename(file)} locally instead.`, {
+      systemMessage: `recall: saving memory ${path.basename(file)} failed, so it was kept locally: ${error}`,
     });
     return `redirect:fallback:${error}`;
   }
