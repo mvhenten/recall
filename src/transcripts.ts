@@ -76,24 +76,6 @@ const stretches = async (bucket: R2Bucket, userId: string, sessionId: string, fi
   return found.sort((left, right) => left.from - right.from);
 };
 
-// One file's stretches and how far it runs, listed once. A reader that walks a file reads several
-// windows out of the same listing, and listing the prefix again per window is what made a page
-// view cost a listing per click.
-export interface Archive {
-  parts: Stretch[];
-  bytes: number;
-}
-
-export const archiveOf = async (
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-): Promise<Archive> => {
-  const parts = await stretches(bucket, userId, sessionId, file);
-  return { parts, bytes: parts.reduce((end, part) => Math.max(end, part.from + part.bytes), 0) };
-};
-
 // One of a session's transcript files, read back whole as the concatenation of its stretches. The
 // body is streamed rather than gathered: a long session's transcript runs to megabytes, and a
 // reader restoring one writes it out as it arrives.
@@ -123,149 +105,19 @@ export const readTranscript = async (
 
 export interface Bite {
   text: string;
-  /// Where in the file this bite begins and ends, as positions in the file and never counts of
-  /// bytes read. The two part company over a hole, and a mark that could mean either would have a
-  /// reader index prose it already held or skip prose it never did.
-  from: number;
+  /// Where in the file this bite ends, as a position in the file and never a count of bytes read.
+  /// The two part company over a hole, and a mark that could mean either would have a reader
+  /// index prose it already held or skip prose it never did.
   through: number;
 }
 
-// A run of bytes read out of one stretch, carrying the file position it starts at. Two pieces are
-// adjacent in the buffer and apart in the file whenever the read stepped over a hole, so a cut is
-// only ever made by holding both numbers.
-interface Piece {
-  at: number;
-  body: Uint8Array;
-}
-
-interface Gathered {
-  pieces: Piece[];
-  at: number;
-  /// Nothing further to read before `to`: either the read reached it, or the stretches ran out.
-  level: boolean;
-}
-
+// One bite of a file, from `from` and at most `limit` bytes, for a reader that will come back for
+// the rest. `through` always moves while stretches are left: a reader that takes it as its mark
+// cannot be handed the same bite twice, whatever the archive holds.
+//
 // A hole is a run of bytes no object covers, which is what a stretch sent past the end of the
 // file leaves behind. Those bytes exist nowhere, so the read steps over the hole to the next
 // stretch rather than reading across it as though the file ran on.
-const gather = async (
-  bucket: R2Bucket,
-  parts: Stretch[],
-  from: number,
-  to: number,
-  limit: number,
-): Promise<Gathered> => {
-  const pieces: Piece[] = [];
-  let at = from;
-  let held = 0;
-  for (;;) {
-    if (at >= to) return { pieces, at, level: true };
-    if (held >= limit) return { pieces, at, level: false };
-    const covering = parts.find((part) => part.from <= at && part.from + part.bytes > at);
-    const part = covering ?? parts.find((part) => part.from > at);
-    if (part === undefined) return { pieces, at, level: true };
-    at = Math.max(at, part.from);
-    const offset = at - part.from;
-    const length = Math.min(part.bytes - offset, limit - held, to - at);
-    const object = await bucket.get(part.key, { range: { offset, length } });
-    if (object === null) throw new Error(`the archive lost ${part.key}`);
-    const body = new Uint8Array(await object.arrayBuffer());
-    pieces.push({ at, body });
-    held += body.byteLength;
-    at += body.byteLength;
-  }
-};
-
-const extent = (pieces: Piece[]): number => pieces.reduce((all, piece) => all + piece.body.byteLength, 0);
-
-const decode = (pieces: Piece[], start: number, end: number): string => {
-  const bytes = new Uint8Array(extent(pieces));
-  let written = 0;
-  for (const piece of pieces) {
-    bytes.set(piece.body, written);
-    written += piece.body.byteLength;
-  }
-  return new TextDecoder().decode(bytes.subarray(start, end));
-};
-
-// Where a line ends, as both the file position just past the newline and the index just past it in
-// the gathered buffer. The two are the same only when the read crossed no hole.
-interface Cut {
-  at: number;
-  index: number;
-}
-
-const lastCut = (pieces: Piece[]): Cut | null => {
-  let before = extent(pieces);
-  for (let index = pieces.length - 1; index >= 0; index -= 1) {
-    const piece = pieces[index];
-    if (piece === undefined) continue;
-    before -= piece.body.byteLength;
-    const found = piece.body.lastIndexOf(10);
-    if (found < 0) continue;
-    return { at: piece.at + found + 1, index: before + found + 1 };
-  }
-  return null;
-};
-
-// The first line end inside the gathered bytes, ignoring one that falls on the very last byte: a
-// window read backwards ends on a line already, and cutting its head there would leave it empty.
-const firstCut = (pieces: Piece[]): Cut | null => {
-  let before = 0;
-  const stop = extent(pieces) - 1;
-  for (const piece of pieces) {
-    const found = piece.body.indexOf(10);
-    if (found >= 0 && before + found < stop) return { at: piece.at + found + 1, index: before + found + 1 };
-    before += piece.body.byteLength;
-  }
-  return null;
-};
-
-// One bite of a file, from `from` and at most `limit` bytes, for a reader that will come back for
-// the rest. Both ends fall on an entry boundary, so the next bite read from `through` holds the
-// entry this one stopped before and never half of it.
-//
-// An entry longer than the window is read whole rather than cut: a window of raw mid-entry bytes
-// parses as nothing and would render as an empty stretch, which is the one thing a reader cannot
-// tell from a session that said nothing.
-export const readFrom = async (
-  bucket: R2Bucket,
-  archive: Archive,
-  from: number,
-  to: number,
-  limit: number,
-): Promise<Bite> => {
-  const pieces: Piece[] = [];
-  let at = from;
-  for (;;) {
-    const got = await gather(bucket, archive.parts, at, to, limit);
-    pieces.push(...got.pieces);
-    at = got.at;
-    // Level with the archive, so there is no later stretch to finish a line that ends short and
-    // the bite takes what is there.
-    if (got.level) return { text: decode(pieces, 0, extent(pieces)), from, through: at };
-    const cut = lastCut(pieces);
-    if (cut !== null) return { text: decode(pieces, 0, cut.index), from, through: cut.at };
-  }
-};
-
-// The window of at most `limit` bytes that ends at `to`, which is where the window after it
-// begins. The head is cut forward to the first whole entry, so the two abut exactly and the entry
-// they meet on is read by the later of them alone.
-export const readBefore = async (bucket: R2Bucket, archive: Archive, to: number, limit: number): Promise<Bite> => {
-  const pieces: Piece[] = [];
-  let end = to;
-  for (;;) {
-    const start = Math.max(0, end - limit);
-    const got = await gather(bucket, archive.parts, start, end, limit);
-    pieces.unshift(...got.pieces);
-    const cut = firstCut(pieces);
-    if (cut !== null) return { text: decode(pieces, cut.index, extent(pieces)), from: cut.at, through: to };
-    if (start === 0) return { text: decode(pieces, 0, extent(pieces)), from: 0, through: to };
-    end = start;
-  }
-};
-
 export const readStretch = async (
   bucket: R2Bucket,
   userId: string,
@@ -274,7 +126,127 @@ export const readStretch = async (
   from: number,
   to: number,
   limit: number,
-): Promise<Bite> => readFrom(bucket, await archiveOf(bucket, userId, sessionId, file), from, to, limit);
+): Promise<Bite> => {
+  const parts = await stretches(bucket, userId, sessionId, file);
+  const read: Uint8Array[] = [];
+  let at = from;
+  let held = 0;
+  while (at < to && held < limit) {
+    const covering = parts.find((part) => part.from <= at && part.from + part.bytes > at);
+    const part = covering ?? parts.find((part) => part.from > at);
+    if (part === undefined) break;
+    at = Math.max(at, part.from);
+    const offset = at - part.from;
+    const length = Math.min(part.bytes - offset, limit - held, to - at);
+    if (length <= 0) break;
+    const object = await bucket.get(part.key, { range: { offset, length } });
+    if (object === null) throw new Error(`the archive lost ${part.key}`);
+    const body = new Uint8Array(await object.arrayBuffer());
+    read.push(body);
+    held += body.byteLength;
+    at += body.byteLength;
+  }
+  const bytes = new Uint8Array(held);
+  let written = 0;
+  for (const body of read) {
+    bytes.set(body, written);
+    written += body.byteLength;
+  }
+  const line = bytes.lastIndexOf(10) + 1;
+  // Level with the archive, so there is no later stretch to finish a line that ends short; the
+  // mark takes the whole bite. Stopped early, so the last line may yet be completed by bytes that
+  // have not arrived, and the mark holds back to the last one that is whole — unless the bite
+  // holds no line end at all, which is one entry longer than a bite and never worth waiting for.
+  const through = at >= to ? to : from + (line > 0 ? line : held);
+  return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
+};
+
+// One ranged read of one stretch: which object to open, how much of its head to pass over, and
+// how many bytes to take. `skip` is zero for every stretch an archive wrote in order; it is other
+// than zero only where a stretch overlaps the one before it, and then it is what keeps the bytes
+// they share out of the file twice.
+export interface Read {
+  offset: number;
+  skip: number;
+  bytes: number;
+}
+
+// One span of a file every byte of which sits in some object. Two stretches that meet exactly are
+// one run; a stretch that lands past the end of the one before it opens another, since the bytes
+// between them are in no object and the lines either side of the gap do not join up.
+export interface Run {
+  from: number;
+  to: number;
+  reads: Read[];
+}
+
+export interface ArchivedFile {
+  file: string;
+  bytes: number;
+  runs: Run[];
+}
+
+const runsOf = (parts: Chunk[]): Run[] => {
+  const runs: Run[] = [];
+  for (const part of parts) {
+    const run = runs[runs.length - 1];
+    if (run !== undefined && part.offset <= run.to) {
+      if (part.end <= run.to) continue;
+      run.reads.push({ offset: part.offset, skip: run.to - part.offset, bytes: part.end - run.to });
+      run.to = part.end;
+      continue;
+    }
+    if (part.end === part.offset) continue;
+    runs.push({
+      from: part.offset,
+      to: part.end,
+      reads: [{ offset: part.offset, skip: 0, bytes: part.end - part.offset }],
+    });
+  }
+  return runs;
+};
+
+// Every file a session archived and how each is laid out across objects, off one listing of the
+// session's prefix and nothing else. It opens no object: a reader hands this to the browser, which
+// fetches the bytes it wants against it.
+export const archivedTranscript = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+): Promise<ArchivedFile[]> => {
+  const prefix = sessionPrefix(userId, sessionId);
+  const byFile = new Map<string, Chunk[]>();
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor });
+    for (const object of page.objects) {
+      const chunk = parseChunkKey(object.key, object.size);
+      if (chunk === null) continue;
+      const held = byFile.get(chunk.file);
+      if (held === undefined) byFile.set(chunk.file, [chunk]);
+      else held.push(chunk);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor !== undefined);
+  return [...byFile]
+    .map(([file, parts]): ArchivedFile => {
+      const runs = runsOf(parts.sort((left, right) => left.offset - right.offset));
+      return { file, bytes: runs[runs.length - 1]?.to ?? 0, runs };
+    })
+    .sort((left, right) => (left.file < right.file ? -1 : 1));
+};
+
+// One stretch, opened by the key its offset names and ranged by what the caller asked for. Nothing
+// is listed and nothing is parsed: a manifest already said which stretches a file holds, and this
+// hands back the bytes of one of them.
+export const readChunk = (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  offset: number,
+  range: R2Range,
+): Promise<R2ObjectBody | null> => bucket.get(chunkKey(userId, sessionId, file, offset), { range });
 
 // The one write an append makes, and it lands only where nothing is yet. Where the stretch starts
 // is the caller's to say and the key carries it, so nothing is read first and nothing is claimed.
@@ -325,39 +297,5 @@ export const cacheChunk = (db: D1Database, chunk: Chunk): D1PreparedStatement[] 
 // rest of a file, a restore writing them back to disk, a writer told where it was beaten to an
 // offset — because a count a second behind would have one of them write over a stretch or stop
 // short of one.
-// Which files a session archived, and nothing about how long they are. A delimited listing comes
-// back one entry per file where the undelimited one comes back one per stretch, and a session
-// archiving on a ten second beat holds thousands of those — a reader that only has to name the
-// files must not pay to page through them.
-export const archivedFileNames = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<string[]> => {
-  const prefix = sessionPrefix(userId, sessionId);
-  const names: string[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, delimiter: "/", cursor });
-    for (const found of page.delimitedPrefixes) {
-      const name = found.slice(prefix.length, -1);
-      if (name !== "") names.push(name);
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
-  return names.sort();
-};
-
-export const archivedFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
-  const prefix = sessionPrefix(userId, sessionId);
-  const ends = new Map<string, number>();
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, cursor });
-    for (const object of page.objects) {
-      const chunk = parseChunkKey(object.key, object.size);
-      if (chunk === null) continue;
-      ends.set(chunk.file, Math.max(ends.get(chunk.file) ?? 0, chunk.end));
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
-  return [...ends]
-    .map(([file, bytes]): TranscriptFile => ({ file, bytes }))
-    .sort((left, right) => (left.file < right.file ? -1 : 1));
-};
+export const archivedFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> =>
+  (await archivedTranscript(bucket, userId, sessionId)).map(({ file, bytes }): TranscriptFile => ({ file, bytes }));

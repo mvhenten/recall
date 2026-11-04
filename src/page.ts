@@ -17,6 +17,13 @@ const DEVICE_STYLE = `body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;ma
 code{font-size:1.6rem;letter-spacing:.15em}button,input{font:inherit;padding:.5rem 1rem;margin:.25rem .5rem .25rem 0}
 @media (prefers-color-scheme:dark){body{color:#eee;background:#161616}}`;
 
+const BASE_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+// What a page that runs script sends instead. The script is named by nonce rather than opening the
+// policy to every inline script, and the only host the page may fetch from is this one.
+export const scriptedCsp = (nonce: string): string => `${BASE_CSP}; script-src 'nonce-${nonce}'; connect-src 'self'`;
+
 // A page sets more than one cookie when it both holds a form token and clears a one-shot notice,
 // and `set-cookie` is the one header that cannot be folded into a second value, so a list of
 // values is appended rather than overwriting.
@@ -30,8 +37,7 @@ export const htmlPage = (
   const built = new Headers({
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
-    "content-security-policy":
-      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    "content-security-policy": BASE_CSP,
     "x-frame-options": "DENY",
     "referrer-policy": "same-origin",
   });

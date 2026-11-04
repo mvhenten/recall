@@ -29,8 +29,8 @@ import {
   sessionPath,
   sessionsPage,
   statsPage,
-  TRANSCRIPT_WINDOW_BYTES,
-  type TranscriptWindow,
+  TRANSCRIPT_SEGMENT,
+  type TranscriptPlan,
   tabForPath,
 } from "./dashboard";
 import {
@@ -72,6 +72,7 @@ import {
   type Live,
   type MemoryHit,
   type MemoryType,
+  parseByteRange,
   parseChunkOffset,
   parseHistory,
   parseLabels,
@@ -139,17 +140,15 @@ import {
   writeLabels,
 } from "./store";
 import {
-  archivedFileNames,
   archivedFiles,
-  archiveOf,
+  archivedTranscript,
   type Chunk,
   cacheChunk,
   MAIN_FILE,
   MAX_CHUNK_BYTES,
   parseChunkKey,
   putChunk,
-  readBefore,
-  readFrom,
+  readChunk,
   readStretch,
   readTranscript,
 } from "./transcripts";
@@ -666,7 +665,14 @@ export const createApp = (deps: Deps): App => {
     const live = await liveTally(db, userId, now);
     if (tab === null) {
       if (url.pathname.startsWith(sessionPrefix)) {
-        return sessionDetail(request, url, env, userId, email, live, url.pathname.slice(sessionPrefix.length), lost);
+        const [rawSessionId, ...rest] = url.pathname.slice(sessionPrefix.length).split("/");
+        if (rest.length === 0) {
+          return sessionDetail(request, url, env, userId, email, live, rawSessionId ?? "", lost);
+        }
+        if (rest.length > 1 || rest[0] !== TRANSCRIPT_SEGMENT) {
+          return lost(404, "No such page", "The dashboard has no page at this address.");
+        }
+        return transcriptBytes(request, url, env, userId, rawSessionId ?? "");
       }
       const prefix = `${MEMORY_TAB.path}/`;
       if (!url.pathname.startsWith(prefix)) {
@@ -727,60 +733,63 @@ export const createApp = (deps: Deps): App => {
     return new Response(null, { status: 303, headers: { location: LABELS_TAB.path } });
   };
 
-  // One window of a session's transcript, read off the archive. The window is bounded in bytes of
-  // the file and both its ends fall on an entry boundary: `at` takes the window that begins where
-  // the one before it stopped, `before` the window that ends where the one after it begins, and
-  // neither is arithmetic on a byte count no entry ends at. The page opens on the tail, which is
-  // the last window of the file.
-  //
-  // The archive is listed twice and no more: once for the names the chips offer, which costs one
-  // entry per file rather than one per stretch, and once for the chosen file, whose stretches the
-  // ranged reads need anyway.
-  const transcriptWindow = async (
+  // What the page tells the browser about a session's transcript: which files it holds, and where
+  // every stretch of the chosen one sits. It is one listing and no reads — the browser fetches the
+  // bytes it wants itself, off the stretches named here.
+  const transcriptPlan = async (
     env: AppEnv,
     userId: string,
     sessionId: string,
     url: URL,
-  ): Promise<TranscriptWindow | Response> => {
-    const refuse = (title: string, text: string): Response =>
-      dashboardNotice(400, title, text, "Back to the dashboard");
+  ): Promise<TranscriptPlan | Response> => {
     const wanted = url.searchParams.get("file");
     const chosen = wanted === null ? { ok: true as const, value: MAIN_FILE } : parseTranscriptFile(wanted);
-    if (!chosen.ok) return refuse("File refused", `${chosen.error}.`);
+    if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
     const file = chosen.value;
-    const rawBefore = url.searchParams.get("before");
-    const rawAt = url.searchParams.get("at");
-    const cursor = parseChunkOffset(rawBefore ?? rawAt ?? "0");
-    if (!cursor.ok) return refuse("Page link refused", `${cursor.error}.`);
-    const files = await archivedFileNames(env.TRANSCRIPTS, userId, sessionId);
-    if (files.length === 0) return { kind: "none" };
-    if (!files.includes(file)) return { kind: "missing", file, files };
-    const archive = await archiveOf(env.TRANSCRIPTS, userId, sessionId, file);
-    if (archive.bytes === 0) return { kind: "missing", file, files };
-    if (cursor.value > archive.bytes) {
-      return refuse(
-        "Page link refused",
-        `This link starts past the end of ${file}, which holds ${archive.bytes} bytes.`,
-      );
+    const held = await archivedTranscript(env.TRANSCRIPTS, userId, sessionId);
+    if (held.length === 0) return { kind: "none" };
+    const files = held.map((archived) => archived.file);
+    const archive = held.find((archived) => archived.file === file);
+    if (archive === undefined || archive.bytes === 0) return { kind: "missing", file, files };
+    return { kind: "read", file, files, bytes: archive.bytes, runs: archive.runs };
+  };
+
+  // The bytes of one stretch, streamed as they come off the archive. The key is built from the
+  // user the Access assertion resolved to, so a caller reaches nothing outside its own prefix, and
+  // the range is the browser's to choose: this reads no listing, joins no stretches and parses
+  // nothing, which is the whole of why the window the reader sees is the browser's own business.
+  const transcriptBytes = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    userId: string,
+    rawSessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!session.ok) return error(404, session.error);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    const at = parseChunkOffset(url.searchParams.get("at"));
+    if (!at.ok) return error(400, at.error);
+    const asked = parseByteRange(request.headers.get("range"));
+    if (!asked.ok) return error(416, asked.error);
+    const { offset, length } = asked.value;
+    const object = await readChunk(env.TRANSCRIPTS, userId, session.value, file.value, at.value, { offset, length });
+    if (object === null) {
+      return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
     }
-    const bite =
-      rawBefore === null && rawAt !== null
-        ? await readFrom(env.TRANSCRIPTS, archive, cursor.value, archive.bytes, TRANSCRIPT_WINDOW_BYTES)
-        : await readBefore(
-            env.TRANSCRIPTS,
-            archive,
-            rawBefore === null ? archive.bytes : cursor.value,
-            TRANSCRIPT_WINDOW_BYTES,
-          );
-    return {
-      kind: "read",
-      file,
-      files,
-      from: bite.from,
-      through: bite.through,
-      bytes: archive.bytes,
-      turns: readTurns(bite.text),
-    };
+    if (offset + length > object.size) {
+      return error(416, `the stretch at ${at.value} holds ${object.size} bytes`);
+    }
+    return new Response(object.body, {
+      status: 206,
+      headers: {
+        "content-type": "application/x-ndjson",
+        "cache-control": "no-store",
+        "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
+      },
+    });
   };
 
   // One session the dashboard can read and talk to. The page is reached by clicking a row of the
@@ -808,7 +817,7 @@ export const createApp = (deps: Deps): App => {
     ]);
     const csrf = pageToken(request);
     const render = async (flash: Flash | null, draft: string, status: number): Promise<Response> => {
-      const transcript = await transcriptWindow(env, userId, session.sessionId, url);
+      const transcript = await transcriptPlan(env, userId, session.sessionId, url);
       if (transcript instanceof Response) return transcript;
       const view: SessionView = { session, deviceId, spend, transcript, send: { csrf, draft, flash } };
       return sessionPage(email, live, view, labels, now, status);

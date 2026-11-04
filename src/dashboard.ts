@@ -1,5 +1,4 @@
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
-import type { Turn } from "./chunks";
 import {
   DAY_MS,
   type DayWindow,
@@ -39,7 +38,9 @@ import {
   usageDay,
   usageMonth,
 } from "./model";
-import { CSRF_COOKIE, escapeHtml, htmlPage, SENT_COOKIE } from "./page";
+import { CSRF_COOKIE, escapeHtml, htmlPage, SENT_COOKIE, scriptedCsp } from "./page";
+import { TRANSCRIPT_SCRIPT } from "./transcript-view";
+import type { Run } from "./transcripts";
 
 export interface Tab {
   path: string;
@@ -228,8 +229,14 @@ svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .turn.user .who{color:var(--accent)}
 .say{margin:0;padding:.7rem .85rem;border-radius:6px;background:var(--surface2);font:400 .82rem/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
 .turn.model .say{padding:.1rem 0;background:none}
-.walk{display:flex;justify-content:space-between;gap:1rem;margin:0;font-size:.85rem}
-.walk span{color:var(--faint)}
+.scroller{max-height:34rem;overflow-y:auto;overscroll-behavior:contain;padding:.85rem .9rem;border:1px solid var(--line2);border-radius:8px;background:var(--surface)}
+.scroller:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.txtop{margin:0 0 .9rem;text-align:center}
+.txtop button{font:600 .78rem/1 var(--sans);padding:.4rem .9rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface2);color:var(--ink);cursor:pointer}
+.txtop button[disabled]{opacity:.5;cursor:default}
+.txnote{margin:.55rem 0 0;font-size:.8rem;color:var(--faint)}
+.txnote.bad{color:var(--bad)}
+.txnote a{margin-left:.3rem}
 .send{display:grid;gap:.6rem;margin:0}
 .send textarea{width:100%;min-height:6.5rem;resize:vertical;font:inherit;font-size:.9rem;padding:.6rem .75rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--ink)}
 .send textarea::placeholder{color:var(--faint)}
@@ -1273,19 +1280,19 @@ ${insightCard("Cache drift", "hit rate by month · every month on record", cache
   );
 };
 
-// How much of a transcript one page reads out of the archive. The bound is bytes of the file and
-// never turns: a window of prose is cheap to render, but the machinery it is buried in — tool
-// calls, results, file snapshots — is most of what the archive holds, and only a byte budget
-// bounds what the page pulls out of R2.
-export const TRANSCRIPT_WINDOW_BYTES = 131_072;
+// How many bytes of the file the browser pulls down at a time: once on opening the page, and once
+// more each time the reader scrolls back past the top of the box. The bound is bytes and never
+// turns, because the machinery a transcript is mostly made of — tool calls, results, file
+// snapshots — is what the fetch pays for and the prose is what survives it.
+export const TRANSCRIPT_STEP_BYTES = 65_536;
 
-// What one page read of one transcript file. A session with nothing archived and a session asked
-// for a file it never wrote are different answers, and the page says which rather than reading
-// both as a window of no bytes.
-export type TranscriptWindow =
+// What the page knows about one transcript file. A session with nothing archived and a session
+// asked for a file it never wrote are different answers, and the page says which rather than
+// handing the browser a manifest of no stretches.
+export type TranscriptPlan =
   | { kind: "none" }
   | { kind: "missing"; file: string; files: string[] }
-  | { kind: "read"; file: string; files: string[]; from: number; through: number; bytes: number; turns: Turn[] };
+  | { kind: "read"; file: string; files: string[]; bytes: number; runs: Run[] };
 
 // What the send box has to say for itself after a post, and nothing when it has nothing.
 export type Flash = { tone: "sent" } | { tone: "refused"; text: string };
@@ -1301,7 +1308,7 @@ export interface SessionView {
   /// The device the session is live on, and null once its host has let the session go.
   deviceId: string | null;
   spend: SessionSpend[];
-  transcript: TranscriptWindow;
+  transcript: TranscriptPlan;
   send: SessionSend;
 }
 
@@ -1378,12 +1385,6 @@ const sendCard = (view: SessionView): string => {
   );
 };
 
-const turnHtml = (turn: Turn): string => {
-  const who = turn.speaker === "user" ? "you" : "claude";
-  const at = turn.at === 0 ? "" : ` · ${moment(turn.at)}`;
-  return `<li class="turn ${turn.speaker}"><p class="who">${who}${escapeHtml(at)}</p><pre class="say">${escapeHtml(turn.text)}</pre></li>`;
-};
-
 const fileChips = (sessionId: string, files: string[], file: string): string => {
   if (files.length < 2) return "";
   return `<nav class="chips" aria-label="Transcript files">${files
@@ -1394,27 +1395,26 @@ const fileChips = (sessionId: string, files: string[], file: string): string => 
     .join("")}</nav>`;
 };
 
-// Where the window sits in the file, and the two links that move it. The transcript is read from
-// the end, since the last thing a session said is what a reader came for. Both links name a
-// boundary this window already found — earlier ends where this one begins, later begins where
-// this one ended — so the two windows abut and no arithmetic guesses at an entry's edge.
-const walk = (sessionId: string, window: Extract<TranscriptWindow, { kind: "read" }>): string => {
-  const { from, through, bytes, file } = window;
-  const earlier =
-    from === 0
-      ? "<span>the start of the transcript</span>"
-      : `<a href="${sessionLink(sessionId, { file, before: String(from) })}">← Earlier</a>`;
-  const later =
-    through >= bytes
-      ? "<span>the end of the transcript</span>"
-      : `<a href="${sessionLink(sessionId, { file, at: String(through) })}">Later →</a>`;
-  return `<p class="walk">${earlier}${later}</p>`;
+export const TRANSCRIPT_SEGMENT = "transcript";
+
+// A `</script` anywhere in the manifest would close the element early; escaping the one character
+// that can open it keeps the JSON valid and the element whole.
+const planJson = (plan: unknown): string => JSON.stringify(plan).replaceAll("<", "\\u003c");
+
+// A hole is a run of bytes the archive never got, which is what a stretch written past the end of
+// the file leaves behind. The entry that straddles one cannot be read, and saying so is what keeps
+// a reader from taking the entries either side of it for the whole conversation.
+const holeNote = (runs: Run[]): string => {
+  const missing = runs.reduce((all, run, index) => all + run.from - (runs[index - 1]?.to ?? run.from), 0);
+  if (missing === 0) return "";
+  const places = runs.length - 1;
+  return `<p class="callout">The archive never got ${missing} bytes of this file, in ${places} ${places === 1 ? "place" : "places"}. Whatever entry each gap falls inside is not shown.</p>`;
 };
 
-const transcriptCard = (view: SessionView): string => {
-  const window = view.transcript;
+const transcriptCard = (view: SessionView, nonce: string): string => {
+  const held = view.transcript;
   const id = view.session.sessionId;
-  if (window.kind === "none") {
+  if (held.kind === "none") {
     return insightCard(
       "Transcript",
       "nothing archived",
@@ -1424,24 +1424,31 @@ const transcriptCard = (view: SessionView): string => {
       ),
     );
   }
-  if (window.kind === "missing") {
+  if (held.kind === "missing") {
     return insightCard(
       "Transcript",
-      `${window.files.length} ${window.files.length === 1 ? "file" : "files"}`,
-      `${fileChips(id, window.files, window.file)}${emptyState(`This session has no ${window.file} on record.`, "Pick one of the files it did archive.")}`,
+      `${held.files.length} ${held.files.length === 1 ? "file" : "files"}`,
+      `${fileChips(id, held.files, held.file)}${emptyState(`This session has no ${held.file} on record.`, "Pick one of the files it did archive.")}`,
     );
   }
-  const body =
-    window.turns.length === 0
-      ? emptyState(
-          "This stretch holds no prose.",
-          "The window covers tool calls and their results alone. Walk back for the prompts and answers around them.",
-        )
-      : `<ol class="turns" role="list">${window.turns.map(turnHtml).join("")}</ol>`;
+  const plan = {
+    path: `${sessionPath(id)}/${TRANSCRIPT_SEGMENT}`,
+    file: held.file,
+    bytes: held.bytes,
+    step: TRANSCRIPT_STEP_BYTES,
+    runs: held.runs,
+  };
   return insightCard(
     "Transcript",
-    `${window.file} · ${kb(window.from)}–${kb(window.through)} of ${kb(window.bytes)}`,
-    `${fileChips(id, window.files, window.file)}${walk(id, window)}${body}`,
+    `${held.file} · ${kb(held.bytes)}`,
+    `${fileChips(id, held.files, held.file)}${holeNote(held.runs)}
+<div class="scroller" id="tx" tabindex="0" aria-label="Transcript">
+<p class="txtop"><button type="button" id="txmore">Load earlier</button></p>
+<ol class="turns" id="txlist" role="list"></ol></div>
+<p class="txnote" id="txnote">Reading ${escapeHtml(held.file)}…</p>
+<noscript><p class="callout">The transcript is read by the browser straight off the archive, so this box stays empty while scripts are off.</p></noscript>
+<script type="application/json" id="txplan">${planJson(plan)}</script>
+<script nonce="${escapeHtml(nonce)}">${TRANSCRIPT_SCRIPT}</script>`,
   );
 };
 
@@ -1454,6 +1461,7 @@ export const sessionPage = (
   status = 200,
 ): Response => {
   const { session } = view;
+  const nonce = crypto.randomUUID();
   const cookies = [`${CSRF_COOKIE}=${view.send.csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict`];
   if (view.send.flash?.tone === "sent") {
     cookies.push(`${SENT_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict`);
@@ -1466,9 +1474,9 @@ export const sessionPage = (
     `${labelled(labels.hosts, session.host)} · ${sessionState(session, now)}`,
     `<p class="lede">${focusHtml(session.focus)}</p>
 <div class="charts duo">${factsCard(view, labels, now)}${sendCard(view)}</div>
-${transcriptCard(view)}
+${transcriptCard(view, nonce)}
 <p class="more"><a href="${SESSIONS_TAB.path}">Back to the sessions</a></p>`,
-    { "set-cookie": cookies },
+    { "set-cookie": cookies, "content-security-policy": scriptedCsp(nonce) },
     status,
   );
 };

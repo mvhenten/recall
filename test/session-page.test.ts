@@ -1,8 +1,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { TRANSCRIPT_WINDOW_BYTES } from "../src/dashboard";
+import { TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Mailbox, type Message } from "../src/mailbox";
+import type { Read, Run } from "../src/transcripts";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -52,17 +53,19 @@ const entry = (index: number, pad = 1_200 + ((index * 137) % 1_600)): string =>
 const transcriptOf = (entries: number): string =>
   `${Array.from({ length: entries }, (_, index) => entry(index)).join("\n")}\n`;
 
-const laterLink = (html: string): string | null => {
-  const found = /<a href="([^"]+)">Later →<\/a>/.exec(html)?.[1];
-  return found === undefined ? null : found.replaceAll("&amp;", "&");
-};
+interface Plan {
+  path: string;
+  file: string;
+  bytes: number;
+  step: number;
+  runs: Run[];
+}
 
-const earlierLink = (html: string): string | null => {
-  const found = /<a href="([^"]+)">← Earlier<\/a>/.exec(html)?.[1];
-  return found === undefined ? null : found.replaceAll("&amp;", "&");
+const planOf = (html: string): Plan => {
+  const found = /<script type="application\/json" id="txplan">([^<]*)<\/script>/.exec(html)?.[1];
+  if (found === undefined) throw new Error("the session page carries no transcript manifest");
+  return JSON.parse(found);
 };
-
-const occurrences = (text: string, needle: string): number => text.split(needle).length - 1;
 
 const archivedBody = async (h: Harness, client: Client, sessionId: string, body: string, at = 0): Promise<number> => {
   const now = h.now();
@@ -72,33 +75,29 @@ const archivedBody = async (h: Harness, client: Client, sessionId: string, body:
   return at + bytes.byteLength;
 };
 
-const archived = (h: Harness, client: Client, sessionId: string, entries: number): Promise<number> =>
-  archivedBody(h, client, sessionId, transcriptOf(entries));
+// One stretch, fetched the way the browser fetches it: the manifest names the object and the span
+// of it to take, and the range header is what asks for that span.
+const bytesOf = (h: Harness, plan: Plan, read: Read, assertion: string, span?: string): Promise<Response> =>
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.offset}`, {
+    headers: {
+      "cf-access-jwt-assertion": assertion,
+      range: span ?? `bytes=${read.skip}-${read.skip + read.bytes - 1}`,
+    },
+  });
 
-// Every window the walk visits, following one link until it runs out.
-const walked = async (
-  h: Harness,
-  you: Owner,
-  first: string,
-  link: (html: string) => string | null,
-): Promise<string[]> => {
-  const windows: string[] = [];
-  let html = await read(h, first, you.assertion);
-  for (let step = 0; step < 40; step += 1) {
-    windows.push(html);
-    const next = link(html);
-    if (next === null) return windows;
-    html = await read(h, next, you.assertion);
+// The whole of a file, reassembled out of the manifest alone, with a marker where the manifest
+// says a hole sits. Whatever this reads is what a browser reading against the same manifest sees.
+const reassembled = async (h: Harness, plan: Plan, assertion: string): Promise<string> => {
+  const parts: string[] = [];
+  for (const run of plan.runs) {
+    if (parts.length > 0) parts.push("|hole|");
+    for (const read of run.reads) {
+      const response = await bytesOf(h, plan, read, assertion);
+      expect(response.status).toBe(206);
+      parts.push(await response.text());
+    }
   }
-  throw new Error(`the walk from ${first} never reached an end`);
-};
-
-const eachEntryOnce = (windows: string[], entries: number): void => {
-  for (let index = 0; index < entries; index += 1) {
-    const prompt = `prompt ${String(index).padStart(3, "0")} `;
-    const seen = windows.reduce((count, window) => count + occurrences(window, prompt), 0);
-    expect({ prompt, seen }).toEqual({ prompt, seen: 1 });
-  }
+  return parts.join("");
 };
 
 const form = async (h: Harness, path: string, assertion: string): Promise<{ csrf: string; cookie: string }> => {
@@ -170,12 +169,21 @@ describe("a session page", () => {
     const ledger = await read(h, "/dashboard", you.assertion);
     expect(ledger).toContain('<a href="/dashboard/sessions/9f8a1b2c">laptop-9f8a</a>');
 
-    const html = await read(h, "/dashboard/sessions/9f8a1b2c", you.assertion);
+    const response = await open(h, "/dashboard/sessions/9f8a1b2c", you.assertion);
+    expect(response.status).toBe(200);
+    const html = await response.text();
     expect(html).toContain("laptop-9f8a");
     expect(html).toContain("repo:github.com/mvhenten/recall@feat/dashboard-sessions");
     expect(html).toContain('<span class="in">Account</span><span class="iv">work</span>');
-    expect(html).toContain("prompt 001");
-    expect(html).toContain("the end of the transcript");
+
+    const plan = planOf(html);
+    expect(plan).toMatchObject({ file: "main", bytes: `${entry(1)}\n`.length });
+    expect(await reassembled(h, plan, you.assertion)).toBe(`${entry(1)}\n`);
+
+    // The box is filled by the page's own script, so a policy that refuses it leaves a dead box.
+    const nonce = /<script nonce="([^"]+)">/.exec(html)?.[1];
+    expect(nonce).toBeDefined();
+    expect(response.headers.get("content-security-policy")).toContain(`script-src 'nonce-${nonce}'`);
   });
 
   it("says so when a session has no transcript archived, rather than reading as an empty one", async () => {
@@ -199,81 +207,97 @@ describe("a session page", () => {
   });
 });
 
-describe("the transcript window", () => {
-  it("walks a long transcript in either direction and reads every entry exactly once", async () => {
+describe("the transcript manifest", () => {
+  // Every byte of the file is named by exactly one read, so a browser that fetches the manifest
+  // in order holds the file and nothing doubled: the four defects this replaced were all a window
+  // that overlapped its neighbour or skipped the entry they met on.
+  it("names every stretch of a long transcript, covering the file once and exactly", async () => {
     const h = await harness();
     const you = await owner(h);
-    const entries = 200;
-    const bytes = await archived(h, you.laptop, "cafe0001", entries);
-    expect(bytes).toBeGreaterThan(TRANSCRIPT_WINDOW_BYTES * 2);
-    const path = "/dashboard/sessions/cafe0001";
+    const body = transcriptOf(200);
+    const stretch = 40_000;
+    for (let at = 0; at < body.length; at += stretch) {
+      await archivedBody(h, you.laptop, "cafe0001", body.slice(at, at + stretch), at);
+    }
+    expect(body.length).toBeGreaterThan(TRANSCRIPT_STEP_BYTES * 2);
 
-    const tail = await read(h, path, you.assertion);
-    expect(tail).toContain(`prompt ${String(entries - 1).padStart(3, "0")} `);
-    expect(tail).not.toContain("prompt 000 ");
-    expect(tail).not.toContain('"origin"');
-    expect(tail.length).toBeLessThan(TRANSCRIPT_WINDOW_BYTES * 2);
-    expect(tail).toContain("the end of the transcript");
-
-    const forwards = await walked(h, you, `${path}?at=0`, laterLink);
-    expect(forwards[0]).toContain("the start of the transcript");
-    expect(forwards.length).toBeGreaterThan(2);
-    eachEntryOnce(forwards, entries);
-
-    const backwards = await walked(h, you, path, earlierLink);
-    expect(backwards[backwards.length - 1]).toContain("the start of the transcript");
-    expect(backwards.length).toBeGreaterThan(2);
-    eachEntryOnce(backwards, entries);
+    const plan = planOf(await read(h, "/dashboard/sessions/cafe0001", you.assertion));
+    expect(plan.bytes).toBe(body.length);
+    expect(plan.runs).toHaveLength(1);
+    expect(plan.runs[0]).toMatchObject({ from: 0, to: body.length });
+    expect(plan.runs[0]?.reads.every((read) => read.skip === 0)).toBe(true);
+    expect(await reassembled(h, plan, you.assertion)).toBe(body);
   });
 
-  // The window is a byte budget, and an entry past it is still an entry: rendering the raw bytes
-  // in the middle of one reads as a stretch that holds nothing, which is what a session that said
-  // nothing looks like too.
-  it("reads an entry longer than the window whole, rather than as a run of empty stretches", async () => {
+  // A file whose first stretch landed past zero leaves a run of bytes that sit in no object. The
+  // manifest says where the hole is rather than pretending the bytes either side of it join up,
+  // which is what had an earlier reader print the entries around it twice.
+  it("breaks a file with a hole in it into runs, so nothing is read across the hole", async () => {
     const h = await harness();
     const you = await owner(h);
-    const huge = `prompt 001 ${"y".repeat(TRANSCRIPT_WINDOW_BYTES * 2)}`;
-    const body = `${entry(0)}\n${JSON.stringify({
-      type: "user",
-      origin: { kind: "human" },
-      timestamp: new Date(1_700_000_001_000).toISOString(),
-      message: { content: huge },
-    })}\n${entry(2)}\n`;
-    await archivedBody(h, you.laptop, "cafe0003", body);
-    const path = "/dashboard/sessions/cafe0003";
+    const head = transcriptOf(4);
+    const tail = transcriptOf(6);
+    await archivedBody(h, you.laptop, "cafe0004", head, 0);
+    await archivedBody(h, you.laptop, "cafe0004", tail, 50_000);
 
-    const windows = await walked(h, you, `${path}?at=0`, laterLink);
-
-    expect(windows.some((window) => window.includes(huge))).toBe(true);
-    eachEntryOnce(windows, 3);
-    expect(windows.every((window) => !window.includes("This stretch holds no prose."))).toBe(true);
+    const html = await read(h, "/dashboard/sessions/cafe0004", you.assertion);
+    expect(html).toContain(`The archive never got ${50_000 - head.length} bytes of this file, in 1 place.`);
+    const plan = planOf(html);
+    expect(plan.bytes).toBe(50_000 + tail.length);
+    expect(plan.runs.map((run) => ({ from: run.from, to: run.to }))).toEqual([
+      { from: 0, to: head.length },
+      { from: 50_000, to: 50_000 + tail.length },
+    ]);
+    expect(await reassembled(h, plan, you.assertion)).toBe(`${head}|hole|${tail}`);
   });
 
-  // A file whose first stretch landed past zero leaves a run of bytes no object covers. The read
-  // steps over it, so where the read reached in the file and how much it read part company, and a
-  // mark that confused the two re-read the entries either side of the hole.
-  it("walks a file that starts past zero without reading an entry twice", async () => {
+  it("says which files a session archived, and says so when it never archived the one asked for", async () => {
     const h = await harness();
     const you = await owner(h);
-    const entries = 60;
-    const bytes = await archivedBody(h, you.laptop, "cafe0004", transcriptOf(entries), 50_000);
-    expect(bytes).toBeGreaterThan(TRANSCRIPT_WINDOW_BYTES);
-    const path = "/dashboard/sessions/cafe0004";
-
-    eachEntryOnce(await walked(h, you, `${path}?at=0`, laterLink), entries);
-    eachEntryOnce(await walked(h, you, path, earlierLink), entries);
-  });
-
-  it("refuses a window the file cannot hold rather than reading an empty one", async () => {
-    const h = await harness();
-    const you = await owner(h);
-    const bytes = await archived(h, you.laptop, "cafe0002", 4);
+    await archivedBody(h, you.laptop, "cafe0002", transcriptOf(2));
+    expect((await you.laptop.archive("cafe0002", "task-7", 0, transcriptOf(1))).status).toBe(200);
     const path = "/dashboard/sessions/cafe0002";
 
-    expect((await open(h, `${path}?at=${bytes + 1}`, you.assertion)).status).toBe(400);
-    expect((await open(h, `${path}?at=-1`, you.assertion)).status).toBe(400);
-    expect((await open(h, `${path}?file=../main`, you.assertion)).status).toBe(400);
+    expect(planOf(await read(h, path, you.assertion)).file).toBe("main");
+    expect(planOf(await read(h, `${path}?file=task-7`, you.assertion)).file).toBe("task-7");
     expect(await read(h, `${path}?file=task-1`, you.assertion)).toContain("has no task-1 on record");
+    expect((await open(h, `${path}?file=../main`, you.assertion)).status).toBe(400);
+  });
+});
+
+describe("the transcript bytes", () => {
+  it("answers the range the browser asked for and nothing around it", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const body = transcriptOf(3);
+    await archivedBody(h, you.laptop, "beef0001", body);
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0001", you.assertion));
+    const read0 = plan.runs[0]?.reads[0];
+    if (read0 === undefined) throw new Error("the manifest names no stretch");
+
+    const response = await bytesOf(h, plan, read0, you.assertion, "bytes=10-29");
+    expect(response.status).toBe(206);
+    expect(response.headers.get("content-range")).toBe(`bytes 10-29/${body.length}`);
+    expect(await response.text()).toBe(body.slice(10, 30));
+  });
+
+  // A dead scrollbox is the one answer the reader cannot tell from a session that said nothing,
+  // so every way of asking for bytes that cannot be had says which way it was.
+  it("refuses a range, a stretch and a caller it cannot answer, rather than answering empty", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const body = transcriptOf(3);
+    await archivedBody(h, you.laptop, "beef0002", body);
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0002", you.assertion));
+    const here = plan.runs[0]?.reads[0];
+    if (here === undefined) throw new Error("the manifest names no stretch");
+    const gone: Read = { offset: 90_000, skip: 0, bytes: 10 };
+
+    expect((await bytesOf(h, plan, here, you.assertion, "bytes=0-")).status).toBe(416);
+    expect((await bytesOf(h, plan, here, you.assertion, `bytes=0-${body.length}`)).status).toBe(416);
+    expect((await bytesOf(h, plan, gone, you.assertion)).status).toBe(404);
+    expect((await bytesOf(h, plan, here, await h.assertionFor("stranger@example.com"))).status).toBe(403);
+    expect((await h.send(`${plan.path}?file=main&at=0`, { headers: { range: "bytes=0-9" } })).status).toBe(401);
   });
 });
 

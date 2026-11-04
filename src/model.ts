@@ -1,3 +1,5 @@
+import { MAX_CHUNK_BYTES } from "./transcripts";
+
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
 const modes = ["hybrid", "vector", "text"] as const;
 
@@ -553,6 +555,27 @@ export const parseChunkOffset = (value: string | null): Parsed<number> => {
   return value !== null && value !== "" && isInteger(offset, 0, Number.MAX_SAFE_INTEGER)
     ? { ok: true, value: offset }
     : fail("offset must be a whole number of bytes into the file");
+};
+
+const BYTE_RANGE = /^bytes=([0-9]{1,16})-([0-9]{1,16})$/;
+
+export interface ByteRange {
+  offset: number;
+  length: number;
+}
+
+// The one range shape a reader of the archive asks for: both ends named, and neither open. A
+// suffix range or an open end would have the answer's length depend on how long the stretch turned
+// out to be, and the reader already knows that from the manifest it is reading against.
+export const parseByteRange = (header: string | null): Parsed<ByteRange> => {
+  const found = BYTE_RANGE.exec(header ?? "");
+  const first = Number(found?.[1]);
+  const last = Number(found?.[2]);
+  return found !== null &&
+    isInteger(first, 0, Number.MAX_SAFE_INTEGER) &&
+    isInteger(last, first, first + MAX_CHUNK_BYTES - 1)
+    ? { ok: true, value: { offset: first, length: last - first + 1 } }
+    : fail(`range must be bytes=<first>-<last>, spanning at most ${MAX_CHUNK_BYTES} bytes`);
 };
 
 const parseFocus = (value: unknown): Parsed<Focus> => {
