@@ -9,6 +9,8 @@
 // derived from that key by the consumer the storage event wakes, and nothing derived is ever
 // asked a question the objects can answer, so a row that disagrees with them is wrong by
 // definition and is written over by the listing that found it out.
+import type { Run } from "./transcript-plan";
+
 const OFFSET_DIGITS = 16;
 
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
@@ -160,25 +162,6 @@ export const readStretch = async (
   const through = at >= to ? to : from + (line > 0 ? line : held);
   return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
 };
-
-// One ranged read of one stretch: which object to open, how much of its head to pass over, and
-// how many bytes to take. `skip` is zero for every stretch an archive wrote in order; it is other
-// than zero only where a stretch overlaps the one before it, and then it is what keeps the bytes
-// they share out of the file twice.
-export interface Read {
-  offset: number;
-  skip: number;
-  bytes: number;
-}
-
-// One span of a file every byte of which sits in some object. Two stretches that meet exactly are
-// one run; a stretch that lands past the end of the one before it opens another, since the bytes
-// between them are in no object and the lines either side of the gap do not join up.
-export interface Run {
-  from: number;
-  to: number;
-  reads: Read[];
-}
 
 export interface ArchivedFile {
   file: string;

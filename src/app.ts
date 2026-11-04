@@ -8,7 +8,7 @@ import {
   readArtifact,
   type Stored,
 } from "./artifacts";
-import { agentName, chunkTurns, readTurns } from "./chunks";
+import { chunkTurns } from "./chunks";
 import {
   dashboardNotice,
   type Flash,
@@ -29,9 +29,11 @@ import {
   sessionPath,
   sessionsPage,
   statsPage,
+  TRANSCRIPT_SCRIPT_PATH,
   TRANSCRIPT_SEGMENT,
   type TranscriptPlan,
   tabForPath,
+  transcriptScript,
 } from "./dashboard";
 import {
   type Caller,
@@ -152,6 +154,7 @@ import {
   readStretch,
   readTranscript,
 } from "./transcripts";
+import { agentName, readTurns } from "./turns";
 
 export interface ArtifactHost {
   hostname: string;
@@ -647,8 +650,11 @@ export const createApp = (deps: Deps): App => {
       dashboardNotice(status, title, text, "Sign in again");
     const tab = tabForPath(url.pathname);
     const sessionPrefix = `${SESSIONS_PATH}/`;
+    const segments = url.pathname.startsWith(sessionPrefix) ? url.pathname.slice(sessionPrefix.length).split("/") : [];
+    const rawSessionId = segments[0] ?? "";
+    const bytes = segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT;
     const saving = request.method === "POST" && tab?.path === LABELS_TAB.path;
-    const sending = request.method === "POST" && url.pathname.startsWith(sessionPrefix);
+    const sending = request.method === "POST" && segments.length === 1;
     if (request.method !== "GET" && !saving && !sending) {
       return lost(
         405,
@@ -661,21 +667,19 @@ export const createApp = (deps: Deps): App => {
     const userId = await invited(db, email, signIn);
     if (userId instanceof Response) return userId;
     if (saving) return saveLabels(request, url, db, userId, lost);
+    // Neither of these renders a page, so neither pays for the tally a page carries in its
+    // header: a scroll back through a long transcript is thousands of ranged reads, and a D1
+    // write batch apiece would be the whole cost of reading one.
+    if (url.pathname === TRANSCRIPT_SCRIPT_PATH) return transcriptScript();
+    if (bytes) return transcriptBytes(request, url, env, userId, rawSessionId);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (tab === null) {
-      if (url.pathname.startsWith(sessionPrefix)) {
-        const [rawSessionId, ...rest] = url.pathname.slice(sessionPrefix.length).split("/");
-        if (rest.length === 0) {
-          return sessionDetail(request, url, env, userId, email, live, rawSessionId ?? "", lost);
-        }
-        if (rest.length > 1 || rest[0] !== TRANSCRIPT_SEGMENT) {
-          return lost(404, "No such page", "The dashboard has no page at this address.");
-        }
-        return transcriptBytes(request, url, env, userId, rawSessionId ?? "");
+      if (segments.length === 1) {
+        return sessionDetail(request, url, env, userId, email, live, rawSessionId, lost);
       }
       const prefix = `${MEMORY_TAB.path}/`;
-      if (!url.pathname.startsWith(prefix)) {
+      if (segments.length > 0 || !url.pathname.startsWith(prefix)) {
         return lost(404, "No such page", "The dashboard has no page at this address.");
       }
       return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
@@ -765,9 +769,8 @@ export const createApp = (deps: Deps): App => {
     userId: string,
     rawSessionId: string,
   ): Promise<Response> => {
-    if (request.method !== "GET") return error(405, "method not allowed");
     const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!session.ok) return error(404, session.error);
+    if (!session.ok) return error(400, session.error);
     const file = parseTranscriptFile(url.searchParams.get("file"));
     if (!file.ok) return error(400, file.error);
     const at = parseChunkOffset(url.searchParams.get("at"));

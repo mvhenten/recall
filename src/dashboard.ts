@@ -38,9 +38,9 @@ import {
   usageDay,
   usageMonth,
 } from "./model";
-import { CSRF_COOKIE, escapeHtml, htmlPage, SENT_COOKIE, scriptedCsp } from "./page";
-import { TRANSCRIPT_SCRIPT } from "./transcript-view";
-import type { Run } from "./transcripts";
+import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE } from "./page";
+import { gapsIn, type Listing, listedRuns, type Run } from "./transcript-plan";
+import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
 
 export interface Tab {
   path: string;
@@ -464,7 +464,7 @@ const sessionLink = (sessionId: string, changes: Record<string, string>): string
 };
 
 const handleLink = (sessionId: string, name: string): string =>
-  `<b><a href="${sessionLink(sessionId, {})}">${escapeHtml(name)}</a></b>`;
+  `<b><a href="${escapeHtml(sessionPath(sessionId))}">${escapeHtml(name)}</a></b>`;
 
 const sessionRow = (session: Session, labels: Labels, now: number): string => {
   const busy = isBusy(session, now);
@@ -1378,7 +1378,7 @@ const sendCard = (view: SessionView): string => {
   return insightCard(
     "Send a message",
     SEND_WINDOW,
-    `${flash}<form class="send" method="post" action="${sessionLink(session.sessionId, {})}">
+    `${flash}<form class="send" method="post" action="${escapeHtml(sessionPath(session.sessionId))}">
 <input type="hidden" name="csrf" value="${escapeHtml(view.send.csrf)}">
 <textarea name="body" rows="4" required placeholder="What should this session read next?" aria-label="Message to this session">${escapeHtml(view.send.draft)}</textarea>
 <button type="submit">Send</button></form>`,
@@ -1397,21 +1397,43 @@ const fileChips = (sessionId: string, files: string[], file: string): string => 
 
 export const TRANSCRIPT_SEGMENT = "transcript";
 
+// The script the box runs. It is the same file for every reader, so the page names it instead of
+// carrying it, and the policy can name an origin rather than an inline script.
+export const TRANSCRIPT_SCRIPT_PATH = `${SESSIONS_TAB.path}/transcript.js`;
+
+export const transcriptScript = (): Response =>
+  new Response(TRANSCRIPT_SCRIPT, {
+    headers: {
+      "content-type": "text/javascript; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'",
+      "x-content-type-options": "nosniff",
+    },
+  });
+
 // A `</script` anywhere in the manifest would close the element early; escaping the one character
 // that can open it keeps the JSON valid and the element whole.
 const planJson = (plan: unknown): string => JSON.stringify(plan).replaceAll("<", "\\u003c");
 
 // A hole is a run of bytes the archive never got, which is what a stretch written past the end of
-// the file leaves behind. The entry that straddles one cannot be read, and saying so is what keeps
-// a reader from taking the entries either side of it for the whole conversation.
-const holeNote = (runs: Run[]): string => {
-  const missing = runs.reduce((all, run, index) => all + run.from - (runs[index - 1]?.to ?? run.from), 0);
-  if (missing === 0) return "";
-  const places = runs.length - 1;
-  return `<p class="callout">The archive never got ${missing} bytes of this file, in ${places} ${places === 1 ? "place" : "places"}. Whatever entry each gap falls inside is not shown.</p>`;
+// the file leaves behind — including one in front of the first stretch, where a file whose
+// archiving began late has no beginning at all. The entry that straddles a hole cannot be read,
+// and saying so is what keeps a reader from taking the entries either side of it for the whole
+// conversation.
+const holeNote = (listing: Listing): string => {
+  const { bytes, places } = gapsIn(listing);
+  if (bytes === 0) return "";
+  return `<p class="callout">The archive never got ${bytes} bytes of this file, in ${places} ${places === 1 ? "place" : "places"}. Whatever entry each gap falls inside is not shown.</p>`;
 };
 
-const transcriptCard = (view: SessionView, nonce: string): string => {
+// What a manifest held back says for itself. The reader is told the box stops short of the start
+// of the file rather than being left to read the oldest turn it shows as the first one there was.
+const trimNote = (listing: Listing, bytes: number): string =>
+  listing.from === 0
+    ? ""
+    : `<p class="callout">This file runs to ${kb(bytes)}. The last ${kb(bytes - listing.from)} of it is listed here; the stretches before that are not, so the box stops short of the start of the session.</p>`;
+
+const transcriptCard = (view: SessionView): string => {
   const held = view.transcript;
   const id = view.session.sessionId;
   if (held.kind === "none") {
@@ -1431,24 +1453,25 @@ const transcriptCard = (view: SessionView, nonce: string): string => {
       `${fileChips(id, held.files, held.file)}${emptyState(`This session has no ${held.file} on record.`, "Pick one of the files it did archive.")}`,
     );
   }
+  const listing = listedRuns(held.runs);
   const plan = {
     path: `${sessionPath(id)}/${TRANSCRIPT_SEGMENT}`,
     file: held.file,
-    bytes: held.bytes,
+    bytes: listing.bytes,
     step: TRANSCRIPT_STEP_BYTES,
-    runs: held.runs,
+    runs: listing.runs,
   };
   return insightCard(
     "Transcript",
     `${held.file} · ${kb(held.bytes)}`,
-    `${fileChips(id, held.files, held.file)}${holeNote(held.runs)}
+    `${fileChips(id, held.files, held.file)}${trimNote(listing, held.bytes)}${holeNote(listing)}
 <div class="scroller" id="tx" tabindex="0" aria-label="Transcript">
 <p class="txtop"><button type="button" id="txmore">Load earlier</button></p>
 <ol class="turns" id="txlist" role="list"></ol></div>
 <p class="txnote" id="txnote">Reading ${escapeHtml(held.file)}…</p>
 <noscript><p class="callout">The transcript is read by the browser straight off the archive, so this box stays empty while scripts are off.</p></noscript>
 <script type="application/json" id="txplan">${planJson(plan)}</script>
-<script nonce="${escapeHtml(nonce)}">${TRANSCRIPT_SCRIPT}</script>`,
+<script src="${TRANSCRIPT_SCRIPT_PATH}" defer></script>`,
   );
 };
 
@@ -1461,7 +1484,6 @@ export const sessionPage = (
   status = 200,
 ): Response => {
   const { session } = view;
-  const nonce = crypto.randomUUID();
   const cookies = [`${CSRF_COOKIE}=${view.send.csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict`];
   if (view.send.flash?.tone === "sent") {
     cookies.push(`${SENT_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict`);
@@ -1474,9 +1496,9 @@ export const sessionPage = (
     `${labelled(labels.hosts, session.host)} · ${sessionState(session, now)}`,
     `<p class="lede">${focusHtml(session.focus)}</p>
 <div class="charts duo">${factsCard(view, labels, now)}${sendCard(view)}</div>
-${transcriptCard(view, nonce)}
+${transcriptCard(view)}
 <p class="more"><a href="${SESSIONS_TAB.path}">Back to the sessions</a></p>`,
-    { "set-cookie": cookies, "content-security-policy": scriptedCsp(nonce) },
+    { "set-cookie": cookies, "content-security-policy": SCRIPT_CSP },
     status,
   );
 };

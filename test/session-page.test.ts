@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Mailbox, type Message } from "../src/mailbox";
-import type { Read, Run } from "../src/transcripts";
+import type { Read, Run } from "../src/transcript-plan";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -39,9 +39,6 @@ const read = async (h: Harness, path: string, assertion: string): Promise<string
   return response.text();
 };
 
-// A transcript of prompts, each long enough that a hundred of them run past two windows and no
-// two of them the same length, so no window boundary can land on an entry edge by arithmetic. The
-// index is in the prose, so a window says which stretch of the file it was read from.
 const entry = (index: number, pad = 1_200 + ((index * 137) % 1_600)): string =>
   JSON.stringify({
     type: "user",
@@ -180,10 +177,18 @@ describe("a session page", () => {
     expect(plan).toMatchObject({ file: "main", bytes: `${entry(1)}\n`.length });
     expect(await reassembled(h, plan, you.assertion)).toBe(`${entry(1)}\n`);
 
-    // The box is filled by the page's own script, so a policy that refuses it leaves a dead box.
-    const nonce = /<script nonce="([^"]+)">/.exec(html)?.[1];
-    expect(nonce).toBeDefined();
-    expect(response.headers.get("content-security-policy")).toContain(`script-src 'nonce-${nonce}'`);
+    // The box is filled by a script this Worker serves, off bytes it fetches back from this Worker,
+    // so a policy that refuses either leaves a dead box.
+    expect(html).toContain(`<script src="/dashboard/transcript.js" defer></script>`);
+    const policy = response.headers.get("content-security-policy") ?? "";
+    expect(policy).toContain("script-src 'self'");
+    expect(policy).toContain("connect-src 'self'");
+
+    const script = await open(h, "/dashboard/transcript.js", you.assertion);
+    expect(script.status).toBe(200);
+    expect(script.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+    expect(await script.text()).toContain("txplan");
+    expect((await open(h, "/dashboard/transcript.js", null)).status).toBe(401);
   });
 
   it("says so when a session has no transcript archived, rather than reading as an empty one", async () => {
@@ -209,8 +214,7 @@ describe("a session page", () => {
 
 describe("the transcript manifest", () => {
   // Every byte of the file is named by exactly one read, so a browser that fetches the manifest
-  // in order holds the file and nothing doubled: the four defects this replaced were all a window
-  // that overlapped its neighbour or skipped the entry they met on.
+  // in order holds the file and nothing doubled.
   it("names every stretch of a long transcript, covering the file once and exactly", async () => {
     const h = await harness();
     const you = await owner(h);
@@ -243,12 +247,28 @@ describe("the transcript manifest", () => {
     const html = await read(h, "/dashboard/sessions/cafe0004", you.assertion);
     expect(html).toContain(`The archive never got ${50_000 - head.length} bytes of this file, in 1 place.`);
     const plan = planOf(html);
-    expect(plan.bytes).toBe(50_000 + tail.length);
+    // What the page counts down is what can be read, so the progress line reaches the end of a
+    // holed file rather than stopping short of it by the size of the hole for ever.
+    expect(plan.bytes).toBe(head.length + tail.length);
     expect(plan.runs.map((run) => ({ from: run.from, to: run.to }))).toEqual([
       { from: 0, to: head.length },
       { from: 50_000, to: 50_000 + tail.length },
     ]);
     expect(await reassembled(h, plan, you.assertion)).toBe(`${head}|hole|${tail}`);
+  });
+
+  // A file the archive only ever caught the end of has a hole in front of everything it holds,
+  // and nothing in the manifest says where the file starts, so counting from its first run would
+  // report a whole file with no gap in it.
+  it("counts the bytes in front of the first stretch as the hole they are", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const tail = transcriptOf(3);
+    await archivedBody(h, you.laptop, "cafe0005", tail, 9_000);
+
+    const html = await read(h, "/dashboard/sessions/cafe0005", you.assertion);
+    expect(html).toContain("The archive never got 9000 bytes of this file, in 1 place.");
+    expect(planOf(html).bytes).toBe(tail.length);
   });
 
   it("says which files a session archived, and says so when it never archived the one asked for", async () => {
@@ -298,6 +318,17 @@ describe("the transcript bytes", () => {
     expect((await bytesOf(h, plan, gone, you.assertion)).status).toBe(404);
     expect((await bytesOf(h, plan, here, await h.assertionFor("stranger@example.com"))).status).toBe(403);
     expect((await h.send(`${plan.path}?file=main&at=0`, { headers: { range: "bytes=0-9" } })).status).toBe(401);
+
+    // The key is built from the user the assertion resolved to and the file is a single segment,
+    // so a name that tries to climb out of the prefix is refused rather than joined into a key.
+    const climb = await bytesOf(h, { ...plan, file: "../main" }, here, you.assertion);
+    expect(climb.status).toBe(400);
+    expect((await bytesOf(h, { ...plan, file: ".hidden" }, here, you.assertion)).status).toBe(400);
+    // A malformed address is a malformed address, whichever part of it is malformed.
+    const named = `/dashboard/sessions/two%20words/transcript?file=main&at=0`;
+    expect(
+      (await h.send(named, { headers: { "cf-access-jwt-assertion": you.assertion, range: "bytes=0-9" } })).status,
+    ).toBe(400);
   });
 });
 

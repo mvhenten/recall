@@ -20,9 +20,10 @@ code{font-size:1.6rem;letter-spacing:.15em}button,input{font:inherit;padding:.5r
 const BASE_CSP =
   "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
-// What a page that runs script sends instead. The script is named by nonce rather than opening the
-// policy to every inline script, and the only host the page may fetch from is this one.
-export const scriptedCsp = (nonce: string): string => `${BASE_CSP}; script-src 'nonce-${nonce}'; connect-src 'self'`;
+// What a page that runs script sends instead. The script is served by this Worker rather than
+// written into the page, so the policy names the origin and no inline script runs at all; and the
+// only host the page may fetch from is this one, which is where the transcript comes from.
+export const SCRIPT_CSP = `${BASE_CSP}; script-src 'self'; connect-src 'self'`;
 
 // A page sets more than one cookie when it both holds a form token and clears a one-shot notice,
 // and `set-cookie` is the one header that cannot be folded into a second value, so a list of
