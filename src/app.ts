@@ -667,10 +667,9 @@ export const createApp = (deps: Deps): App => {
     const userId = await invited(db, email, signIn);
     if (userId instanceof Response) return userId;
     if (saving) return saveLabels(request, url, db, userId, lost);
-    // Neither of these renders a page, so neither pays for the tally a page carries in its
-    // header: a scroll back through a long transcript is thousands of ranged reads, and a D1
-    // write batch apiece would be the whole cost of reading one.
-    if (url.pathname === TRANSCRIPT_SCRIPT_PATH) return transcriptScript();
+    // A ranged read renders no page, so it does not pay for the tally a page carries in its
+    // header: a scroll back through a long transcript is thousands of them, and a D1 write batch
+    // apiece would be the whole cost of reading one.
     if (bytes) return transcriptBytes(request, url, env, userId, rawSessionId);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
@@ -1150,6 +1149,7 @@ export const createApp = (deps: Deps): App => {
     const host = deps.artifactHost;
     if (host !== null && url.hostname === host.hostname) return artifactSite(request, url, env.DB, host);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
+    if (url.pathname === TRANSCRIPT_SCRIPT_PATH) return transcriptScript();
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
       return dashboard(request, url, env);
     }

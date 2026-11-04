@@ -16,6 +16,7 @@
     "test": "vitest run && node --test --test-timeout=10000 hooks/*.test.mjs",
     "predeploy": "npm run build:browser",
     "deploy": "node npm-scripts/deploy.mjs",
+    "presetup": "npm run build:browser",
     "setup": "node npm-scripts/setup.mjs",
     "release": "node npm-scripts/release.mjs"
   },

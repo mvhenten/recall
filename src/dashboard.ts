@@ -1398,8 +1398,12 @@ const fileChips = (sessionId: string, files: string[], file: string): string => 
 export const TRANSCRIPT_SEGMENT = "transcript";
 
 // The script the box runs. It is the same file for every reader, so the page names it instead of
-// carrying it, and the policy can name an origin rather than an inline script.
-export const TRANSCRIPT_SCRIPT_PATH = `${SESSIONS_TAB.path}/transcript.js`;
+// carrying it, and the policy can name an origin rather than an inline script. It sits outside
+// `/dashboard` because the Access application that gates the browser pages is scoped to that path
+// and `/device`: a tab woken from bfcache after the sign-in ran out would get a login redirect for
+// the script, and `script-src 'self'` leaves the page no way to notice. The script carries code
+// and no user data, so the hostname-wide bypass is the right gate for it.
+export const TRANSCRIPT_SCRIPT_PATH = "/transcript.js";
 
 export const transcriptScript = (): Response =>
   new Response(TRANSCRIPT_SCRIPT, {

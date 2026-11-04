@@ -169,10 +169,9 @@ export const joinedTexts = (groups: Group[], runs: Run[], remnant: string): Join
   let held = remnant;
   for (const group of [...groups].reverse()) {
     const run = runs[group.run];
-    if (run === undefined) throw new Error(`the manifest names no run ${group.run}`);
     let text = group.text + held;
     held = "";
-    if (group.at > run.from) {
+    if (run !== undefined && group.at > run.from) {
       const cut = text.indexOf("\n");
       held = cut < 0 ? text : text.slice(0, cut + 1);
       text = cut < 0 ? "" : text.slice(cut + 1);

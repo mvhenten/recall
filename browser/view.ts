@@ -5,7 +5,7 @@
 //
 // The arithmetic of the walk lives in transcript-plan, and what counts as a turn lives in turns,
 // which is the reader the index itself runs. This file is the document and the network around
-// them. npm-scripts/build-browser.mjs bundles it to the script served at /dashboard/transcript.js.
+// them. npm-scripts/build-browser.mjs bundles it to the script served at /transcript.js.
 
 import type { Run } from "../src/transcript-plan";
 import { type Fetched, groupedReads, joinedTexts, type PlannedRead, plannedBatch } from "../src/transcript-plan";
@@ -61,6 +61,7 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
   let remnant = "";
   let loaded = 0;
   let blanks = 0;
+  let blankBytes = 0;
   let busy = false;
   let broken = false;
 
@@ -161,7 +162,9 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
     }
     edge = planned.edge;
     pending = planned.pending;
-    for (const read of planned.batch) loaded += read.bytes;
+    let walked = 0;
+    for (const read of planned.batch) walked += read.bytes;
+    loaded += walked;
 
     const joined = joinedTexts(groupedReads(fetched), plan.runs, remnant);
     remnant = joined.remnant;
@@ -172,13 +175,17 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
     box.scrollTop = box.scrollHeight - held;
 
     busy = false;
-    blanks = list.childElementCount === before ? blanks + 1 : 0;
+    const blank = list.childElementCount === before;
+    blanks = blank ? blanks + 1 : 0;
+    blankBytes = blank ? blankBytes + walked : 0;
     if (edge === 0) return done();
     more.removeAttribute("disabled");
     if (blanks >= BLANK_STEPS) {
+      const dry = blankBytes;
       blanks = 0;
+      blankBytes = 0;
       say(
-        `${kb(loaded)} of ${kb(plan.bytes)} read, and the last ${kb(BLANK_STEPS * plan.step)} of it holds no prose at all. Load earlier to keep reading.`,
+        `${kb(loaded)} of ${kb(plan.bytes)} read, and the last ${kb(dry)} of it holds no prose at all. Load earlier to keep reading.`,
       );
       return;
     }

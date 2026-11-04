@@ -179,16 +179,25 @@ describe("a session page", () => {
 
     // The box is filled by a script this Worker serves, off bytes it fetches back from this Worker,
     // so a policy that refuses either leaves a dead box.
-    expect(html).toContain(`<script src="/dashboard/transcript.js" defer></script>`);
+    expect(html).toContain(`<script src="/transcript.js" defer></script>`);
     const policy = response.headers.get("content-security-policy") ?? "";
     expect(policy).toContain("script-src 'self'");
     expect(policy).toContain("connect-src 'self'");
 
-    const script = await open(h, "/dashboard/transcript.js", you.assertion);
+    const script = await open(h, "/transcript.js", you.assertion);
     expect(script.status).toBe(200);
     expect(script.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
     expect(await script.text()).toContain("txplan");
-    expect((await open(h, "/dashboard/transcript.js", null)).status).toBe(401);
+  });
+
+  // The script sits outside /dashboard so that it is outside the Access application gating it: a
+  // tab restored from bfcache after the sign-in ran out would be redirected to a login page for
+  // the script, and the policy the page runs under forbids the inline handler that would notice.
+  it("serves the transcript script to a reader with no dashboard sign-in", async () => {
+    const h = await harness();
+    const script = await open(h, "/transcript.js", null);
+    expect(script.status).toBe(200);
+    expect(await script.text()).toContain("txplan");
   });
 
   it("says so when a session has no transcript archived, rather than reading as an empty one", async () => {
