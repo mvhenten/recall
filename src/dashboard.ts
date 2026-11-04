@@ -26,6 +26,7 @@ import {
   type PastSession,
   type RepoHours,
   type Session,
+  type SessionSpend,
   STALE_AFTER_DAYS,
   type Stats,
   type TokenCounts,
@@ -37,7 +38,9 @@ import {
   usageDay,
   usageMonth,
 } from "./model";
-import { CSRF_COOKIE, escapeHtml, htmlPage } from "./page";
+import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE } from "./page";
+import { gapsIn, type Listing, listedRuns, type Run } from "./transcript-plan";
+import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
 
 export interface Tab {
   path: string;
@@ -220,6 +223,27 @@ svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .lrows input:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 .lsave{margin:0}
 .lsave button{font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
+.turns{list-style:none;margin:0;padding:0;display:grid;gap:.9rem}
+.turn{display:grid;gap:.25rem}
+.who{margin:0;font:600 .62rem/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;color:var(--faint)}
+.turn.user .who{color:var(--accent)}
+.say{margin:0;padding:.7rem .85rem;border-radius:6px;background:var(--surface2);font:400 .82rem/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.turn.model .say{padding:.1rem 0;background:none}
+.scroller{max-height:34rem;overflow-y:auto;overscroll-behavior:contain;padding:.85rem .9rem;border:1px solid var(--line2);border-radius:8px;background:var(--surface)}
+.scroller:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.txtop{margin:0 0 .9rem;text-align:center}
+.txtop button{font:600 .78rem/1 var(--sans);padding:.4rem .9rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface2);color:var(--ink);cursor:pointer}
+.txtop button[disabled]{opacity:.5;cursor:default}
+.txnote{margin:.55rem 0 0;font-size:.8rem;color:var(--faint)}
+.txnote.bad{color:var(--bad)}
+.txnote a{margin-left:.3rem}
+.send{display:grid;gap:.6rem;margin:0}
+.send textarea{width:100%;min-height:6.5rem;resize:vertical;font:inherit;font-size:.9rem;padding:.6rem .75rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--ink)}
+.send textarea::placeholder{color:var(--faint)}
+.send textarea:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.send button{justify-self:start;font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
+.flash{margin:0;padding:.6rem .8rem;border:1px solid var(--line2);border-left:3px solid var(--good);border-radius:6px;background:var(--surface2);font-size:.85rem}
+.flash.bad{border-left-color:var(--bad)}
 .noticewrap{max-width:34rem;margin:0 auto;padding:3rem 1.25rem;display:grid;gap:1.1rem}
 .notice{display:grid;gap:.45rem;padding:1rem 1.1rem;background:var(--surface);border:1px solid var(--line2);border-left:3px solid var(--warn);border-radius:8px}
 .notice h1,.notice b{margin:0;font-size:.92rem}
@@ -276,6 +300,7 @@ main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
 .charts{gap:1rem}
 .statrow{grid-template-columns:1fr 1fr 24rem}
 .trio{grid-template-columns:repeat(3,1fr)}
+.duo{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 .rhythm{grid-template-columns:2fr 1fr}
 .lrows li{grid-template-columns:16rem minmax(0,1fr);align-items:center;gap:.9rem}
 }`;
@@ -314,7 +339,8 @@ const focusHtml = (focus: Focus): string => {
   return `${escapeHtml(shorten(focus.first, FOCUS_FIRST_CHARS))}<span class="then"> → </span>${escapeHtml(focus.latest)}`;
 };
 
-const isBusy = (session: Session, now: number): boolean => now - session.lastActivityAt < IDLE_AFTER_MS;
+const isBusy = (session: { lastActivityAt: number }, now: number): boolean =>
+  now - session.lastActivityAt < IDLE_AFTER_MS;
 
 const emptyState = (headline: string, hint: string): string =>
   `<div class="empty"><b>${escapeHtml(headline)}</b><p>${escapeHtml(hint)}</p></div>`;
@@ -405,10 +431,11 @@ const shell = (
   heading: string,
   meta: string,
   main: string,
-  headers: Record<string, string> = {},
+  headers: Record<string, string | string[]> = {},
+  status = 200,
 ): Response =>
   htmlPage(
-    200,
+    status,
     `recall ${heading.toLowerCase()}`,
     STYLE,
     `<div class="app"><header class="side"><p class="brand"><i></i>recall</p>
@@ -423,11 +450,27 @@ ${summary(live)}
 // only what the reader sees changes.
 const labelled = (labels: Map<string, string>, value: string): string => labels.get(value) ?? value;
 
+export const SESSIONS_PATH = "/dashboard/sessions";
+
+export const sessionPath = (sessionId: string): string => `${SESSIONS_PATH}/${encodeURIComponent(sessionId)}`;
+
+const sessionLink = (sessionId: string, changes: Record<string, string>): string => {
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries(changes)) {
+    if (value !== "") params.set(name, value);
+  }
+  const query = params.toString();
+  return escapeHtml(query === "" ? sessionPath(sessionId) : `${sessionPath(sessionId)}?${query}`);
+};
+
+const handleLink = (sessionId: string, name: string): string =>
+  `<b><a href="${escapeHtml(sessionPath(sessionId))}">${escapeHtml(name)}</a></b>`;
+
 const sessionRow = (session: Session, labels: Labels, now: number): string => {
   const busy = isBusy(session, now);
   const state = busy ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
   const focus = focusHtml(session.focus);
-  return `<li class="srow${busy ? "" : " idle"}"><p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span></p>
+  return `<li class="srow${busy ? "" : " idle"}"><p class="h">${handleLink(session.sessionId, session.name)} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span></p>
 <p class="${busy ? "state busy" : "state"}"><span class="dot"></span>${state}</p>
 <p class="fc">${focus}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${age(session.startedAt, now)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
@@ -450,7 +493,7 @@ const hostsCard = (sessions: Session[], labels: Labels, now: number): string => 
   const lines = [...hosts]
     .map(
       ([host, tally]) =>
-        `<p><strong>${escapeHtml(labelled(labels.hosts, host))}</strong> · ${tally.live} ${tally.live === 1 ? "session" : "sessions"} · ${tally.busy} busy</p>`,
+        `<p><strong><a href="${escapeHtml(`${HISTORY_TAB.path}?host=${encodeURIComponent(host)}`)}">${escapeHtml(labelled(labels.hosts, host))}</a></strong> · ${tally.live} ${tally.live === 1 ? "session" : "sessions"} · ${tally.busy} busy</p>`,
     )
     .join("");
   return `<div class="rk"><b>Hosts</b>${lines}</div>`;
@@ -505,7 +548,7 @@ const dayHead = (group: DayGroup): string =>
 
 const historyRow = (session: PastSession, labels: Labels): string =>
   `<li class="srow hrow"><p class="tm">${clock(session.startedAt)}–${clock(session.lastActivityAt)}</p>
-<p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
+<p class="h">${handleLink(session.sessionId, session.name)} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
 <p class="fc">${focusHtml(session.focus)}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${span(session.lastActivityAt - session.startedAt)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
 
@@ -1234,6 +1277,233 @@ ${insightCard("Month by month", "cost by model · every month on record", monthl
 ${insightCard("Busiest repos", "session time · every session on record", busiestRepos(insights.allTime))}
 ${insightCard("Cache drift", "hit rate by month · every month on record", cacheDrift(horizon))}
 </div>`,
+  );
+};
+
+// How many bytes of the file the browser pulls down at a time: once on opening the page, and once
+// more each time the reader scrolls back past the top of the box. The bound is bytes and never
+// turns, because the machinery a transcript is mostly made of — tool calls, results, file
+// snapshots — is what the fetch pays for and the prose is what survives it.
+export const TRANSCRIPT_STEP_BYTES = 65_536;
+
+// What the page knows about one transcript file. A session with nothing archived and a session
+// asked for a file it never wrote are different answers, and the page says which rather than
+// handing the browser a manifest of no stretches.
+export type TranscriptPlan =
+  | { kind: "none" }
+  | { kind: "missing"; file: string; files: string[] }
+  | { kind: "read"; file: string; files: string[]; bytes: number; runs: Run[] };
+
+// What the send box has to say for itself after a post, and nothing when it has nothing.
+export type Flash = { tone: "sent" } | { tone: "refused"; text: string };
+
+export interface SessionSend {
+  csrf: string;
+  draft: string;
+  flash: Flash | null;
+}
+
+export interface SessionView {
+  session: PastSession;
+  /// The device the session is live on, and null once its host has let the session go.
+  deviceId: string | null;
+  spend: SessionSpend[];
+  transcript: TranscriptPlan;
+  send: SessionSend;
+}
+
+const kb = (bytes: number): string => (bytes < 1_024 ? `${bytes} B` : `${Math.round(bytes / 1_024)} kB`);
+
+const moment = (at: number): string => new Date(at).toISOString().slice(0, 16).replace("T", " ");
+
+const sessionState = (session: PastSession, now: number): string => {
+  if (!session.running) return `ended · last activity ${age(session.lastActivityAt, now)} ago`;
+  return isBusy(session, now) ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
+};
+
+const factsCard = (view: SessionView, labels: Labels, now: number): string => {
+  const { session } = view;
+  const accounts = [...new Set(view.spend.map((row) => row.account))].filter((account) => account !== "");
+  const counted = view.spend.reduce((sum, row) => sum + countedTokens(row), 0);
+  const facts = [
+    { name: "State", value: sessionState(session, now), warn: !session.running },
+    { name: "Host", value: labelled(labels.hosts, session.host), warn: false },
+    { name: "Scope", value: repoAtBranch(session.repo, session.branch), warn: false },
+    { name: "Directory", value: session.cwd, warn: false },
+    { name: "Started", value: `${moment(session.startedAt)} · ${age(session.startedAt, now)} ago`, warn: false },
+    { name: "Prompts", value: String(session.prompts), warn: false },
+    { name: "Session id", value: session.sessionId, warn: false },
+  ];
+  if (session.agentName !== "") facts.splice(1, 0, { name: "Named", value: session.agentName, warn: false });
+  if (accounts.length > 0) {
+    facts.push({
+      name: accounts.length === 1 ? "Account" : "Accounts",
+      value: accounts.map((account) => labelled(labels.accounts, account)).join(", "),
+      warn: false,
+    });
+  }
+  if (view.spend.length > 0) {
+    facts.push({ name: "Tokens", value: tokens(counted), warn: false });
+    facts.push({ name: "Cost", value: totalCost(view.spend), warn: false });
+  }
+  const unmetered =
+    view.spend.length > 0
+      ? ""
+      : '<p class="callout">No usage is on record for this session. A raw reading is kept for two weeks after the server took it, and longer only where it was read back out of the transcript.</p>';
+  return insightCard(session.name, repoAtBranch(session.repo, session.branch), `${insightList(facts)}${unmetered}`);
+};
+
+// The bus reaches a session for as long as its host holds it, which is a day after its last
+// prompt and not the five minutes that separate busy from idle. A session idle for hours is still
+// addressable, and the copy says what delivery actually depends on rather than promising a turn
+// the host may never take.
+const SEND_WINDOW = "the bus reaches a session its host still holds";
+
+const flashHtml = (flash: Flash | null, name: string): string => {
+  if (flash === null) return "";
+  if (flash.tone === "refused") return `<p class="flash bad">${escapeHtml(flash.text)}</p>`;
+  return `<p class="flash">Queued for <strong>${escapeHtml(name)}</strong>. Its host hands it to the session as the next turn, unless the host has already let the session go.</p>`;
+};
+
+const sendCard = (view: SessionView): string => {
+  const { session } = view;
+  const flash = flashHtml(view.send.flash, session.name);
+  if (view.deviceId === null) {
+    return insightCard(
+      "Send a message",
+      SEND_WINDOW,
+      `${flash}<p class="callout">No host is running this session any more, so the bus has nowhere to deliver. A message reaches a session until a day after its last prompt, while its host still holds it.</p>`,
+    );
+  }
+  return insightCard(
+    "Send a message",
+    SEND_WINDOW,
+    `${flash}<form class="send" method="post" action="${escapeHtml(sessionPath(session.sessionId))}">
+<input type="hidden" name="csrf" value="${escapeHtml(view.send.csrf)}">
+<textarea name="body" rows="4" required placeholder="What should this session read next?" aria-label="Message to this session">${escapeHtml(view.send.draft)}</textarea>
+<button type="submit">Send</button></form>`,
+  );
+};
+
+const fileChips = (sessionId: string, files: string[], file: string): string => {
+  if (files.length < 2) return "";
+  return `<nav class="chips" aria-label="Transcript files">${files
+    .map(
+      (held) =>
+        `<a href="${sessionLink(sessionId, { file: held })}"${held === file ? ' aria-current="page"' : ""}>${escapeHtml(held)}</a>`,
+    )
+    .join("")}</nav>`;
+};
+
+export const TRANSCRIPT_SEGMENT = "transcript";
+
+// The script the box runs. It is the same file for every reader, so the page names it instead of
+// carrying it, and the policy can name an origin rather than an inline script. It sits outside
+// `/dashboard` because the Access application that gates the browser pages is scoped to that path
+// and `/device`: a tab woken from bfcache after the sign-in ran out would get a login redirect for
+// the script, and `script-src 'self'` leaves the page no way to notice. The script carries code
+// and no user data, so the hostname-wide bypass is the right gate for it.
+export const TRANSCRIPT_SCRIPT_PATH = "/transcript.js";
+
+export const transcriptScript = (): Response =>
+  new Response(TRANSCRIPT_SCRIPT, {
+    headers: {
+      "content-type": "text/javascript; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'",
+      "x-content-type-options": "nosniff",
+    },
+  });
+
+// A `</script` anywhere in the manifest would close the element early; escaping the one character
+// that can open it keeps the JSON valid and the element whole.
+const planJson = (plan: unknown): string => JSON.stringify(plan).replaceAll("<", "\\u003c");
+
+// A hole is a run of bytes the archive never got, which is what a stretch written past the end of
+// the file leaves behind — including one in front of the first stretch, where a file whose
+// archiving began late has no beginning at all. The entry that straddles a hole cannot be read,
+// and saying so is what keeps a reader from taking the entries either side of it for the whole
+// conversation.
+const holeNote = (listing: Listing): string => {
+  const { bytes, places } = gapsIn(listing);
+  if (bytes === 0) return "";
+  return `<p class="callout">The archive never got ${bytes} bytes of this file, in ${places} ${places === 1 ? "place" : "places"}. Whatever entry each gap falls inside is not shown.</p>`;
+};
+
+// What a manifest held back says for itself. The reader is told the box stops short of the start
+// of the file rather than being left to read the oldest turn it shows as the first one there was.
+const trimNote = (listing: Listing, bytes: number): string =>
+  listing.from === 0
+    ? ""
+    : `<p class="callout">This file runs to ${kb(bytes)}. The last ${kb(bytes - listing.from)} of it is listed here; the stretches before that are not, so the box stops short of the start of the session.</p>`;
+
+const transcriptCard = (view: SessionView): string => {
+  const held = view.transcript;
+  const id = view.session.sessionId;
+  if (held.kind === "none") {
+    return insightCard(
+      "Transcript",
+      "nothing archived",
+      emptyState(
+        "No transcript is archived for this session.",
+        "A host archives a session's transcript as it runs, and the stretches land here within a minute of the prose.",
+      ),
+    );
+  }
+  if (held.kind === "missing") {
+    return insightCard(
+      "Transcript",
+      `${held.files.length} ${held.files.length === 1 ? "file" : "files"}`,
+      `${fileChips(id, held.files, held.file)}${emptyState(`This session has no ${held.file} on record.`, "Pick one of the files it did archive.")}`,
+    );
+  }
+  const listing = listedRuns(held.runs);
+  const plan = {
+    path: `${sessionPath(id)}/${TRANSCRIPT_SEGMENT}`,
+    file: held.file,
+    bytes: listing.bytes,
+    step: TRANSCRIPT_STEP_BYTES,
+    runs: listing.runs,
+  };
+  return insightCard(
+    "Transcript",
+    `${held.file} · ${kb(held.bytes)}`,
+    `${fileChips(id, held.files, held.file)}${trimNote(listing, held.bytes)}${holeNote(listing)}
+<div class="scroller" id="tx" tabindex="0" aria-label="Transcript">
+<p class="txtop"><button type="button" id="txmore">Load earlier</button></p>
+<ol class="turns" id="txlist" role="list"></ol></div>
+<p class="txnote" id="txnote">Reading ${escapeHtml(held.file)}…</p>
+<noscript><p class="callout">The transcript is read by the browser straight off the archive, so this box stays empty while scripts are off.</p></noscript>
+<script type="application/json" id="txplan">${planJson(plan)}</script>
+<script src="${TRANSCRIPT_SCRIPT_PATH}" defer></script>`,
+  );
+};
+
+export const sessionPage = (
+  email: string,
+  live: Live,
+  view: SessionView,
+  labels: Labels,
+  now: number,
+  status = 200,
+): Response => {
+  const { session } = view;
+  const cookies = [`${CSRF_COOKIE}=${view.send.csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict`];
+  if (view.send.flash?.tone === "sent") {
+    cookies.push(`${SENT_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict`);
+  }
+  return shell(
+    email,
+    SESSIONS_TAB,
+    live,
+    session.name,
+    `${labelled(labels.hosts, session.host)} · ${sessionState(session, now)}`,
+    `<p class="lede">${focusHtml(session.focus)}</p>
+<div class="charts duo">${factsCard(view, labels, now)}${sendCard(view)}</div>
+${transcriptCard(view)}
+<p class="more"><a href="${SESSIONS_TAB.path}">Back to the sessions</a></p>`,
+    { "set-cookie": cookies, "content-security-policy": SCRIPT_CSP },
+    status,
   );
 };
 

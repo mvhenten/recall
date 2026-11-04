@@ -23,6 +23,7 @@ import {
   type Session,
   type SessionInput,
   type SessionMode,
+  type SessionSpend,
   STALE_AFTER_DAYS,
   type Stats,
   type StatsWindows,
@@ -878,21 +879,44 @@ export const readInsights = async (
   };
 };
 
+// The device one session is live on, which is the only address a message to it can carry. A
+// session the account no longer has running has none, and saying so is what stops the dashboard
+// queueing a message no host will ever read.
+export const liveSessionDevice = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  now: number,
+): Promise<string | null> => {
+  const row = await db
+    .prepare("SELECT device_id FROM sessions WHERE user_id = ? AND session_id = ? AND last_activity_at > ?")
+    .bind(userId, sessionId, now - SESSION_TTL_MS)
+    .first<{ device_id: string }>();
+  return row === null ? null : row.device_id;
+};
+
 export const sessionOnDevice = async (
   db: D1Database,
   userId: string,
   sessionId: string,
   deviceId: string,
   now: number,
-): Promise<boolean> => {
-  const row = await db
+): Promise<boolean> => (await liveSessionDevice(db, userId, sessionId, now)) === deviceId;
+
+// What one session spent, and on whose account. The rollup cannot answer either: it is keyed by
+// day, host, repo and account and never by session, so the raw events are the only reading that
+// holds a session together. They are swept at two weeks unless the reading was taken from the
+// transcript, and the page says that rather than printing an old session's spend as nothing.
+export const sessionSpend = async (db: D1Database, userId: string, sessionId: string): Promise<SessionSpend[]> => {
+  const { results } = await db
     .prepare(
-      `SELECT session_id FROM sessions
-       WHERE user_id = ? AND session_id = ? AND device_id = ? AND last_activity_at > ?`,
+      `SELECT account, provider, model, ${COUNT_SUMS} FROM usage_events
+       WHERE user_id = ?1 AND session_id = ?2
+       GROUP BY account, provider, model ORDER BY account, provider, model`,
     )
-    .bind(userId, sessionId, deviceId, now - SESSION_TTL_MS)
-    .first<{ session_id: string }>();
-  return row !== null;
+    .bind(userId, sessionId)
+    .all<ModelRow & { account: string }>();
+  return results.map((row) => ({ account: row.account, ...toModelTotals(row) }));
 };
 
 // Whether this account has the session at all, running or long over. A transcript outlives the

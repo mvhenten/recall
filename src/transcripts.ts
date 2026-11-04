@@ -9,6 +9,8 @@
 // derived from that key by the consumer the storage event wakes, and nothing derived is ever
 // asked a question the objects can answer, so a row that disagrees with them is wrong by
 // definition and is written over by the listing that found it out.
+import type { Run } from "./transcript-plan";
+
 const OFFSET_DIGITS = 16;
 
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
@@ -73,7 +75,7 @@ const stretches = async (bucket: R2Bucket, userId: string, sessionId: string, fi
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor !== undefined);
-  return found;
+  return found.sort((left, right) => left.from - right.from);
 };
 
 // One of a session's transcript files, read back whole as the concatenation of its stretches. The
@@ -127,7 +129,7 @@ export const readStretch = async (
   to: number,
   limit: number,
 ): Promise<Bite> => {
-  const parts = (await stretches(bucket, userId, sessionId, file)).sort((left, right) => left.from - right.from);
+  const parts = await stretches(bucket, userId, sessionId, file);
   const read: Uint8Array[] = [];
   let at = from;
   let held = 0;
@@ -160,6 +162,74 @@ export const readStretch = async (
   const through = at >= to ? to : from + (line > 0 ? line : held);
   return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
 };
+
+export interface ArchivedFile {
+  file: string;
+  bytes: number;
+  runs: Run[];
+}
+
+const runsOf = (parts: Chunk[]): Run[] => {
+  const runs: Run[] = [];
+  for (const part of parts) {
+    const run = runs[runs.length - 1];
+    if (run !== undefined && part.offset <= run.to) {
+      if (part.end <= run.to) continue;
+      run.reads.push({ offset: part.offset, skip: run.to - part.offset, bytes: part.end - run.to });
+      run.to = part.end;
+      continue;
+    }
+    if (part.end === part.offset) continue;
+    runs.push({
+      from: part.offset,
+      to: part.end,
+      reads: [{ offset: part.offset, skip: 0, bytes: part.end - part.offset }],
+    });
+  }
+  return runs;
+};
+
+// Every file a session archived and how each is laid out across objects, off one listing of the
+// session's prefix and nothing else. It opens no object: a reader hands this to the browser, which
+// fetches the bytes it wants against it.
+export const archivedTranscript = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+): Promise<ArchivedFile[]> => {
+  const prefix = sessionPrefix(userId, sessionId);
+  const byFile = new Map<string, Chunk[]>();
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor });
+    for (const object of page.objects) {
+      const chunk = parseChunkKey(object.key, object.size);
+      if (chunk === null) continue;
+      const held = byFile.get(chunk.file);
+      if (held === undefined) byFile.set(chunk.file, [chunk]);
+      else held.push(chunk);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor !== undefined);
+  return [...byFile]
+    .map(([file, parts]): ArchivedFile => {
+      const runs = runsOf(parts.sort((left, right) => left.offset - right.offset));
+      return { file, bytes: runs[runs.length - 1]?.to ?? 0, runs };
+    })
+    .sort((left, right) => (left.file < right.file ? -1 : 1));
+};
+
+// One stretch, opened by the key its offset names and ranged by what the caller asked for. Nothing
+// is listed and nothing is parsed: a manifest already said which stretches a file holds, and this
+// hands back the bytes of one of them.
+export const readChunk = (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  offset: number,
+  range: R2Range,
+): Promise<R2ObjectBody | null> => bucket.get(chunkKey(userId, sessionId, file, offset), { range });
 
 // The one write an append makes, and it lands only where nothing is yet. Where the stretch starts
 // is the caller's to say and the key carries it, so nothing is read first and nothing is claimed.
@@ -210,20 +280,5 @@ export const cacheChunk = (db: D1Database, chunk: Chunk): D1PreparedStatement[] 
 // rest of a file, a restore writing them back to disk, a writer told where it was beaten to an
 // offset — because a count a second behind would have one of them write over a stretch or stop
 // short of one.
-export const archivedFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
-  const prefix = sessionPrefix(userId, sessionId);
-  const ends = new Map<string, number>();
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, cursor });
-    for (const object of page.objects) {
-      const chunk = parseChunkKey(object.key, object.size);
-      if (chunk === null) continue;
-      ends.set(chunk.file, Math.max(ends.get(chunk.file) ?? 0, chunk.end));
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
-  return [...ends]
-    .map(([file, bytes]): TranscriptFile => ({ file, bytes }))
-    .sort((left, right) => (left.file < right.file ? -1 : 1));
-};
+export const archivedFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> =>
+  (await archivedTranscript(bucket, userId, sessionId)).map(({ file, bytes }): TranscriptFile => ({ file, bytes }));

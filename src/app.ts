@@ -8,9 +8,10 @@ import {
   readArtifact,
   type Stored,
 } from "./artifacts";
-import { agentName, chunkTurns, readTurns } from "./chunks";
+import { chunkTurns } from "./chunks";
 import {
   dashboardNotice,
+  type Flash,
   HISTORY_TAB,
   historyPage,
   INSIGHTS_TAB,
@@ -21,10 +22,18 @@ import {
   memoriesPage,
   memoryBodyPage,
   memorySearchPage,
+  SESSIONS_PATH,
+  type SessionView,
   STATS_TAB,
+  sessionPage,
+  sessionPath,
   sessionsPage,
   statsPage,
+  TRANSCRIPT_SCRIPT_PATH,
+  TRANSCRIPT_SEGMENT,
+  type TranscriptPlan,
   tabForPath,
+  transcriptScript,
 } from "./dashboard";
 import {
   type Caller,
@@ -65,6 +74,7 @@ import {
   type Live,
   type MemoryHit,
   type MemoryType,
+  parseByteRange,
   parseChunkOffset,
   parseHistory,
   parseLabels,
@@ -87,7 +97,7 @@ import {
   USAGE_WEEK_DAYS,
   type Verify,
 } from "./model";
-import { artifactPage, CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie } from "./page";
+import { artifactPage, CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie, SENT_COOKIE } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
 import {
   type ChunkCandidate,
@@ -111,6 +121,7 @@ import {
   listSessionHistory,
   listSessionHistoryIds,
   listSessions,
+  liveSessionDevice,
   liveTally,
   memoryCounts,
   nameSession,
@@ -124,6 +135,7 @@ import {
   sessionHistoryFilters,
   sessionOnDevice,
   sessionOnRecord,
+  sessionSpend,
   textCandidates,
   vectorCandidates,
   writeChunks,
@@ -131,15 +143,18 @@ import {
 } from "./store";
 import {
   archivedFiles,
+  archivedTranscript,
   type Chunk,
   cacheChunk,
   MAIN_FILE,
   MAX_CHUNK_BYTES,
   parseChunkKey,
   putChunk,
+  readChunk,
   readStretch,
   readTranscript,
 } from "./transcripts";
+import { agentName, readTurns } from "./turns";
 
 export interface ArtifactHost {
   hostname: string;
@@ -188,6 +203,12 @@ const GRANT_ERRORS = {
 } as const;
 
 const ELSEWHERE_LIMIT = 3;
+
+// A message typed into the dashboard comes from a person at a browser and from no device at all,
+// so it says so rather than borrowing one: its host and its device id both read `dashboard`, and
+// the name it carries is the Access email that signed in. Device ids are UUIDs, so no device of
+// the account can be mistaken for the sender of something it did not send.
+const DASHBOARD_DEVICE = "dashboard";
 
 // How much of one file an indexing pass reads. A stretch is at most a megabyte, so a session
 // keeping up with its own events is caught up in one pass per event; a session far behind — one
@@ -621,26 +642,43 @@ export const createApp = (deps: Deps): App => {
     return object === null ? lost() : artifactPage(object.body);
   };
 
-  const dashboard = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
+  const dashboard = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
+    const db = env.DB;
     const lost = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Back to the dashboard");
     const signIn = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Sign in again");
     const tab = tabForPath(url.pathname);
+    const sessionPrefix = `${SESSIONS_PATH}/`;
+    const segments = url.pathname.startsWith(sessionPrefix) ? url.pathname.slice(sessionPrefix.length).split("/") : [];
+    const rawSessionId = segments[0] ?? "";
+    const bytes = segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT;
     const saving = request.method === "POST" && tab?.path === LABELS_TAB.path;
-    if (request.method !== "GET" && !saving) {
-      return lost(405, "Not allowed", "The dashboard only answers a GET, and the Labels tab its own POST.");
+    const sending = request.method === "POST" && segments.length === 1;
+    if (request.method !== "GET" && !saving && !sending) {
+      return lost(
+        405,
+        "Not allowed",
+        "The dashboard only answers a GET, the Labels tab its own POST, and a session page the message it sends.",
+      );
     }
     const email = await approver(request, deps.verify, signIn);
     if (email instanceof Response) return email;
     const userId = await invited(db, email, signIn);
     if (userId instanceof Response) return userId;
     if (saving) return saveLabels(request, url, db, userId, lost);
+    // A ranged read renders no page, so it does not pay for the tally a page carries in its
+    // header: a scroll back through a long transcript is thousands of them, and a D1 write batch
+    // apiece would be the whole cost of reading one.
+    if (bytes) return transcriptBytes(request, url, env, userId, rawSessionId);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (tab === null) {
+      if (segments.length === 1) {
+        return sessionDetail(request, url, env, userId, email, live, rawSessionId, lost);
+      }
       const prefix = `${MEMORY_TAB.path}/`;
-      if (!url.pathname.startsWith(prefix)) {
+      if (segments.length > 0 || !url.pathname.startsWith(prefix)) {
         return lost(404, "No such page", "The dashboard has no page at this address.");
       }
       return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
@@ -649,14 +687,36 @@ export const createApp = (deps: Deps): App => {
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
     if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
     if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
-    if (tab.path === LABELS_TAB.path) return labelsTab(db, userId, email, live);
+    if (tab.path === LABELS_TAB.path) return labelsTab(request, db, userId, email, live);
     const [sessions, labels] = await Promise.all([listSessions(db, userId, now), readLabels(db, userId)]);
     return sessionsPage(email, live, sessions, labels, now);
   };
 
-  const labelsTab = async (db: D1Database, userId: string, email: string, live: Live): Promise<Response> => {
+  // The token every dashboard form posts back. A browser holds one cookie for the whole site, so
+  // a page that minted a fresh one on each view would invalidate the form of every page already
+  // open; the cookie it arrived with is the token it keeps.
+  const pageToken = (request: Request): string =>
+    readCookie(request.headers.get("cookie"), CSRF_COOKIE) ?? randomToken();
+
+  // What a dashboard form post is worth: the fields it carries, and whether it came from a page
+  // of this site holding the cookie's token. The caller decides how to answer an untrusted one.
+  const formPost = async (request: Request, url: URL): Promise<{ form: URLSearchParams; trusted: boolean }> => {
+    const form = new URLSearchParams(await request.text());
+    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
+    const trusted =
+      request.headers.get("origin") === url.origin && cookie !== null && sameSecret(cookie, form.get("csrf") ?? "");
+    return { form, trusted };
+  };
+
+  const labelsTab = async (
+    request: Request,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+  ): Promise<Response> => {
     const [targets, labels] = await Promise.all([labelTargets(db, userId), readLabels(db, userId)]);
-    return labelsPage(email, live, targets, labels, randomToken());
+    return labelsPage(email, live, targets, labels, pageToken(request));
   };
 
   const saveLabels = async (
@@ -666,16 +726,157 @@ export const createApp = (deps: Deps): App => {
     userId: string,
     lost: Refusal,
   ): Promise<Response> => {
-    const form = new URLSearchParams(await request.text());
-    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
-    const csrf = form.get("csrf") ?? "";
-    if (request.headers.get("origin") !== url.origin || cookie === null || !sameSecret(cookie, csrf)) {
+    const posted = await formPost(request, url);
+    if (!posted.trusted) {
       return lost(403, "Request refused", "The form did not come from this page. Reload it and try again.");
     }
-    const labels = parseLabels(form);
+    const labels = parseLabels(posted.form);
     if (!labels.ok) return lost(400, "Labels refused", `${labels.error}.`);
     await writeLabels(db, userId, labels.value);
     return new Response(null, { status: 303, headers: { location: LABELS_TAB.path } });
+  };
+
+  // What the page tells the browser about a session's transcript: which files it holds, and where
+  // every stretch of the chosen one sits. It is one listing and no reads — the browser fetches the
+  // bytes it wants itself, off the stretches named here.
+  const transcriptPlan = async (
+    env: AppEnv,
+    userId: string,
+    sessionId: string,
+    url: URL,
+  ): Promise<TranscriptPlan | Response> => {
+    const wanted = url.searchParams.get("file");
+    const chosen = wanted === null ? { ok: true as const, value: MAIN_FILE } : parseTranscriptFile(wanted);
+    if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
+    const file = chosen.value;
+    const held = await archivedTranscript(env.TRANSCRIPTS, userId, sessionId);
+    if (held.length === 0) return { kind: "none" };
+    const files = held.map((archived) => archived.file);
+    const archive = held.find((archived) => archived.file === file);
+    if (archive === undefined || archive.bytes === 0) return { kind: "missing", file, files };
+    return { kind: "read", file, files, bytes: archive.bytes, runs: archive.runs };
+  };
+
+  // The bytes of one stretch, streamed as they come off the archive. The key is built from the
+  // user the Access assertion resolved to, so a caller reaches nothing outside its own prefix, and
+  // the range is the browser's to choose: this reads no listing, joins no stretches and parses
+  // nothing, which is the whole of why the window the reader sees is the browser's own business.
+  const transcriptBytes = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    userId: string,
+    rawSessionId: string,
+  ): Promise<Response> => {
+    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!session.ok) return error(400, session.error);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    const at = parseChunkOffset(url.searchParams.get("at"));
+    if (!at.ok) return error(400, at.error);
+    const asked = parseByteRange(request.headers.get("range"));
+    if (!asked.ok) return error(416, asked.error);
+    const { offset, length } = asked.value;
+    const object = await readChunk(env.TRANSCRIPTS, userId, session.value, file.value, at.value, { offset, length });
+    if (object === null) {
+      return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
+    }
+    if (offset + length > object.size) {
+      return error(416, `the stretch at ${at.value} holds ${object.size} bytes`);
+    }
+    return new Response(object.body, {
+      status: 206,
+      headers: {
+        "content-type": "application/x-ndjson",
+        "cache-control": "no-store",
+        "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
+      },
+    });
+  };
+
+  // One session the dashboard can read and talk to. The page is reached by clicking a row of the
+  // ledger or the history, and both carry sessions this account has on record, live or long over.
+  const sessionDetail = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    userId: string,
+    email: string,
+    live: Live,
+    rawSessionId: string,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const parsed = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!parsed.ok) return lost(404, "No such session", "The dashboard has no page at this address.");
+    const now = deps.now();
+    const found = await findSession(env.DB, userId, parsed.value, now);
+    if (!found) return lost(404, "No such session", `This recall holds no session ${parsed.value}.`);
+    const { session } = found;
+    const [deviceId, spend, labels] = await Promise.all([
+      liveSessionDevice(env.DB, userId, session.sessionId, now),
+      sessionSpend(env.DB, userId, session.sessionId),
+      readLabels(env.DB, userId),
+    ]);
+    const csrf = pageToken(request);
+    const render = async (flash: Flash | null, draft: string, status: number): Promise<Response> => {
+      const transcript = await transcriptPlan(env, userId, session.sessionId, url);
+      if (transcript instanceof Response) return transcript;
+      const view: SessionView = { session, deviceId, spend, transcript, send: { csrf, draft, flash } };
+      return sessionPage(email, live, view, labels, now, status);
+    };
+    if (request.method === "GET") {
+      const sent = readCookie(request.headers.get("cookie"), SENT_COOKIE) === session.sessionId;
+      return render(sent ? { tone: "sent" } : null, "", 200);
+    }
+    return sendToSession(request, url, env, userId, email, session.sessionId, deviceId, render);
+  };
+
+  // The dashboard's own send, which is the Labels tab's post shape pointed at the message bus: an
+  // origin and CSRF check, then the same enqueue `POST /v1/messages` makes. A browser carries no
+  // device token, so it cannot reach that endpoint; what it shares with it is the mailbox.
+  //
+  // Every refusal, the refused origin and token among them, re-renders the page with the typing
+  // still in the box and says what went wrong, since a send box that clears itself and shows
+  // nothing is indistinguishable from one that worked.
+  const sendToSession = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    userId: string,
+    email: string,
+    sessionId: string,
+    deviceId: string | null,
+    render: (flash: Flash | null, draft: string, status: number) => Promise<Response>,
+  ): Promise<Response> => {
+    const posted = await formPost(request, url);
+    const body = posted.form.get("body") ?? "";
+    const refuse = (text: string, status: number): Promise<Response> => render({ tone: "refused", text }, body, status);
+    if (!posted.trusted) {
+      return refuse("The form did not come from this page, so nothing was sent. Send it again from here.", 403);
+    }
+    if (body.trim() === "") return refuse("The message was empty, so nothing was sent.", 400);
+    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
+      return refuse(`A message holds at most ${MAX_BODY_BYTES} bytes, and this one is longer. Nothing was sent.`, 400);
+    }
+    if (deviceId === null) {
+      return refuse("No host is running this session any more, so the bus has nowhere to deliver it.", 400);
+    }
+    if (!(await hasDevice(env.DB, userId, deviceId))) {
+      return refuse("The host that ran this session is signed out, so the bus has nowhere to deliver it.", 400);
+    }
+    const sender: Sender = { deviceId: DASHBOARD_DEVICE, host: DASHBOARD_DEVICE, name: email };
+    const input = { toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
+    const message = await mailboxFor(env, userId).enqueue(input, sender, deps.now());
+    if (message === null) {
+      return refuse(`This account already holds ${MAX_QUEUED_MESSAGES} queued messages, so the bus took nothing.`, 400);
+    }
+    return new Response(null, {
+      status: 303,
+      headers: {
+        location: sessionPath(sessionId),
+        "set-cookie": `${SENT_COOKIE}=${sessionId}; Path=/; Max-Age=30; Secure; HttpOnly; SameSite=Strict`,
+      },
+    });
   };
 
   const statsTab = async (
@@ -948,8 +1149,9 @@ export const createApp = (deps: Deps): App => {
     const host = deps.artifactHost;
     if (host !== null && url.hostname === host.hostname) return artifactSite(request, url, env.DB, host);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
+    if (url.pathname === TRANSCRIPT_SCRIPT_PATH) return transcriptScript();
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
-      return dashboard(request, url, env.DB);
+      return dashboard(request, url, env);
     }
     if (url.pathname === "/") {
       if ((request.headers.get("accept") ?? "").includes("text/html")) {

@@ -6,5 +6,6 @@
 .wrangler/
 dist/
 node_modules/
+src/*.generated.ts
 target/
 wrangler.deploy.json

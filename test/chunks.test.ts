@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { agentName, chunkTurns, MAX_CHUNK_CHARS, readTurns } from "../src/chunks";
+import { chunkTurns, MAX_CHUNK_CHARS } from "../src/chunks";
+import { agentName, readTurns } from "../src/turns";
 
 const line = (entry: Record<string, unknown>): string => JSON.stringify(entry);
 
