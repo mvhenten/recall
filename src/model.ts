@@ -281,6 +281,11 @@ export interface UsageSplit extends ModelTotals {
   value: string;
 }
 
+// What one session spent on one model, under the account that paid for it.
+export interface SessionSpend extends ModelTotals {
+  account: string;
+}
+
 export interface DaySessions {
   day: string;
   sessions: number;

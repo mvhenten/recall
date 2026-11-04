@@ -21,9 +21,16 @@ import {
   memoriesPage,
   memoryBodyPage,
   memorySearchPage,
+  SESSIONS_PATH,
+  type SessionSend,
+  type SessionView,
   STATS_TAB,
+  sessionPage,
+  sessionPath,
   sessionsPage,
   statsPage,
+  TRANSCRIPT_WINDOW_BYTES,
+  type TranscriptWindow,
   tabForPath,
 } from "./dashboard";
 import {
@@ -111,6 +118,7 @@ import {
   listSessionHistory,
   listSessionHistoryIds,
   listSessions,
+  liveSessionDevice,
   liveTally,
   memoryCounts,
   nameSession,
@@ -124,6 +132,7 @@ import {
   sessionHistoryFilters,
   sessionOnDevice,
   sessionOnRecord,
+  sessionSpend,
   textCandidates,
   vectorCandidates,
   writeChunks,
@@ -188,6 +197,12 @@ const GRANT_ERRORS = {
 } as const;
 
 const ELSEWHERE_LIMIT = 3;
+
+// A message typed into the dashboard comes from a person at a browser and from no device at all,
+// so it says so rather than borrowing one: its host and its device id both read `dashboard`, and
+// the name it carries is the Access email that signed in. Device ids are UUIDs, so no device of
+// the account can be mistaken for the sender of something it did not send.
+const DASHBOARD_DEVICE = "dashboard";
 
 // How much of one file an indexing pass reads. A stretch is at most a megabyte, so a session
 // keeping up with its own events is caught up in one pass per event; a session far behind — one
@@ -621,15 +636,22 @@ export const createApp = (deps: Deps): App => {
     return object === null ? lost() : artifactPage(object.body);
   };
 
-  const dashboard = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
+  const dashboard = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
+    const db = env.DB;
     const lost = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Back to the dashboard");
     const signIn = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Sign in again");
     const tab = tabForPath(url.pathname);
+    const sessionPrefix = `${SESSIONS_PATH}/`;
     const saving = request.method === "POST" && tab?.path === LABELS_TAB.path;
-    if (request.method !== "GET" && !saving) {
-      return lost(405, "Not allowed", "The dashboard only answers a GET, and the Labels tab its own POST.");
+    const sending = request.method === "POST" && url.pathname.startsWith(sessionPrefix);
+    if (request.method !== "GET" && !saving && !sending) {
+      return lost(
+        405,
+        "Not allowed",
+        "The dashboard only answers a GET, the Labels tab its own POST, and a session page the message it sends.",
+      );
     }
     const email = await approver(request, deps.verify, signIn);
     if (email instanceof Response) return email;
@@ -639,6 +661,9 @@ export const createApp = (deps: Deps): App => {
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (tab === null) {
+      if (url.pathname.startsWith(sessionPrefix)) {
+        return sessionDetail(request, url, env, userId, email, live, url.pathname.slice(sessionPrefix.length), lost);
+      }
       const prefix = `${MEMORY_TAB.path}/`;
       if (!url.pathname.startsWith(prefix)) {
         return lost(404, "No such page", "The dashboard has no page at this address.");
@@ -676,6 +701,134 @@ export const createApp = (deps: Deps): App => {
     if (!labels.ok) return lost(400, "Labels refused", `${labels.error}.`);
     await writeLabels(db, userId, labels.value);
     return new Response(null, { status: 303, headers: { location: LABELS_TAB.path } });
+  };
+
+  // One window of a session's transcript, read off the archive. The window is bounded in bytes of
+  // the file, walks back from the end, and is cut on line ends by the reader, so a stretch that
+  // begins mid-entry loses that entry rather than rendering half of it.
+  const transcriptWindow = async (
+    env: AppEnv,
+    userId: string,
+    sessionId: string,
+    url: URL,
+  ): Promise<TranscriptWindow | Response> => {
+    const files = await archivedFiles(env.TRANSCRIPTS, userId, sessionId);
+    const wanted = url.searchParams.get("file");
+    const chosen = wanted === null ? { ok: true as const, value: MAIN_FILE } : parseTranscriptFile(wanted);
+    if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
+    const file = chosen.value;
+    const bytes = files.find((held) => held.file === file)?.bytes ?? 0;
+    const raw = url.searchParams.get("at");
+    const start =
+      raw === null ? { ok: true as const, value: Math.max(0, bytes - TRANSCRIPT_WINDOW_BYTES) } : parseChunkOffset(raw);
+    if (!start.ok) return dashboardNotice(400, "Page link refused", `${start.error}.`, "Back to the dashboard");
+    if (start.value > bytes) {
+      return dashboardNotice(
+        400,
+        "Page link refused",
+        `This link starts past the end of ${file}, which holds ${bytes} bytes.`,
+        "Back to the dashboard",
+      );
+    }
+    if (bytes === 0) return { file, files, at: 0, through: 0, bytes: 0, turns: [] };
+    const bite = await readStretch(
+      env.TRANSCRIPTS,
+      userId,
+      sessionId,
+      file,
+      start.value,
+      bytes,
+      TRANSCRIPT_WINDOW_BYTES,
+    );
+    return { file, files, at: start.value, through: bite.through, bytes, turns: readTurns(bite.text) };
+  };
+
+  // One session the dashboard can read and talk to. The page is reached by clicking a row of the
+  // ledger or the history, and both carry sessions this account has on record, live or long over.
+  const sessionDetail = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    userId: string,
+    email: string,
+    live: Live,
+    rawSessionId: string,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const parsed = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!parsed.ok) return lost(404, "No such session", "The dashboard has no page at this address.");
+    const now = deps.now();
+    const found = await findSession(env.DB, userId, parsed.value, now);
+    if (!found) return lost(404, "No such session", `This recall holds no session ${parsed.value}.`);
+    const { session } = found;
+    const [device, spend, labels] = await Promise.all([
+      liveSessionDevice(env.DB, userId, session.sessionId, now),
+      sessionSpend(env.DB, userId, session.sessionId),
+      readLabels(env.DB, userId),
+    ]);
+    const deviceId = device ?? "";
+    const render = async (send: SessionSend, status: number): Promise<Response> => {
+      const transcript = await transcriptWindow(env, userId, session.sessionId, url);
+      if (transcript instanceof Response) return transcript;
+      const view: SessionView = { session, deviceId, spend, transcript, send };
+      return sessionPage(email, live, view, labels, now, status);
+    };
+    if (request.method === "GET") {
+      const send: SessionSend = {
+        csrf: randomToken(),
+        draft: "",
+        sent: url.searchParams.get("sent") !== null,
+        failed: "",
+      };
+      return render(send, 200);
+    }
+    return sendToSession(request, url, env, userId, email, session.sessionId, deviceId, render, lost);
+  };
+
+  // The dashboard's own send, which is the Labels tab's post shape pointed at the message bus: an
+  // origin and CSRF check, then the same enqueue `POST /v1/messages` makes. A browser carries no
+  // device token, so it cannot reach that endpoint; what it shares with it is the mailbox.
+  //
+  // Every refusal re-renders the page with the typing still in the box and says what went wrong,
+  // since a send box that clears itself and shows nothing is indistinguishable from one that
+  // worked.
+  const sendToSession = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    userId: string,
+    email: string,
+    sessionId: string,
+    deviceId: string,
+    render: (send: SessionSend, status: number) => Promise<Response>,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const form = new URLSearchParams(await request.text());
+    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
+    const csrf = form.get("csrf") ?? "";
+    if (request.headers.get("origin") !== url.origin || cookie === null || !sameSecret(cookie, csrf)) {
+      return lost(403, "Request refused", "The form did not come from this page. Reload it and try again.");
+    }
+    const body = form.get("body") ?? "";
+    const refuse = (reason: string): Promise<Response> =>
+      render({ csrf: randomToken(), draft: body, sent: false, failed: reason }, 400);
+    if (body.trim() === "") return refuse("The message was empty, so nothing was sent.");
+    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
+      return refuse(`A message holds at most ${MAX_BODY_BYTES} bytes, and this one is longer. Nothing was sent.`);
+    }
+    if (deviceId === "") {
+      return refuse("This session is no longer running on any host, so the bus has nowhere to deliver it.");
+    }
+    if (!(await hasDevice(env.DB, userId, deviceId))) {
+      return refuse("The host that ran this session is signed out, so the bus has nowhere to deliver it.");
+    }
+    const sender: Sender = { deviceId: DASHBOARD_DEVICE, host: DASHBOARD_DEVICE, name: email };
+    const input = { toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
+    const message = await mailboxFor(env, userId).enqueue(input, sender, deps.now());
+    if (message === null) {
+      return refuse(`This account already holds ${MAX_QUEUED_MESSAGES} queued messages, so the bus took nothing.`);
+    }
+    return new Response(null, { status: 303, headers: { location: `${sessionPath(sessionId)}?sent=1` } });
   };
 
   const statsTab = async (
@@ -949,7 +1102,7 @@ export const createApp = (deps: Deps): App => {
     if (host !== null && url.hostname === host.hostname) return artifactSite(request, url, env.DB, host);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
-      return dashboard(request, url, env.DB);
+      return dashboard(request, url, env);
     }
     if (url.pathname === "/") {
       if ((request.headers.get("accept") ?? "").includes("text/html")) {

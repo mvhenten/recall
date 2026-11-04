@@ -1,4 +1,6 @@
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
+import type { Turn } from "./chunks";
+import { MAX_BODY_BYTES } from "./mailbox";
 import {
   DAY_MS,
   type DayWindow,
@@ -26,6 +28,7 @@ import {
   type PastSession,
   type RepoHours,
   type Session,
+  type SessionSpend,
   STALE_AFTER_DAYS,
   type Stats,
   type TokenCounts,
@@ -38,6 +41,7 @@ import {
   usageMonth,
 } from "./model";
 import { CSRF_COOKIE, escapeHtml, htmlPage } from "./page";
+import type { TranscriptFile } from "./transcripts";
 
 export interface Tab {
   path: string;
@@ -220,6 +224,21 @@ svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .lrows input:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 .lsave{margin:0}
 .lsave button{font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
+.turns{list-style:none;margin:0;padding:0;display:grid;gap:.9rem}
+.turn{display:grid;gap:.25rem}
+.who{margin:0;font:600 .62rem/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;color:var(--faint)}
+.turn.user .who{color:var(--accent)}
+.say{margin:0;padding:.7rem .85rem;border-radius:6px;background:var(--surface2);font:400 .82rem/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.turn.model .say{padding:.1rem 0;background:none}
+.walk{display:flex;justify-content:space-between;gap:1rem;margin:0;font-size:.85rem}
+.walk span{color:var(--faint)}
+.send{display:grid;gap:.6rem;margin:0}
+.send textarea{width:100%;min-height:6.5rem;resize:vertical;font:inherit;font-size:.9rem;padding:.6rem .75rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--ink)}
+.send textarea::placeholder{color:var(--faint)}
+.send textarea:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.send button{justify-self:start;font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
+.flash{margin:0;padding:.6rem .8rem;border:1px solid var(--line2);border-left:3px solid var(--good);border-radius:6px;background:var(--surface2);font-size:.85rem}
+.flash.bad{border-left-color:var(--bad)}
 .noticewrap{max-width:34rem;margin:0 auto;padding:3rem 1.25rem;display:grid;gap:1.1rem}
 .notice{display:grid;gap:.45rem;padding:1rem 1.1rem;background:var(--surface);border:1px solid var(--line2);border-left:3px solid var(--warn);border-radius:8px}
 .notice h1,.notice b{margin:0;font-size:.92rem}
@@ -276,6 +295,7 @@ main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
 .charts{gap:1rem}
 .statrow{grid-template-columns:1fr 1fr 24rem}
 .trio{grid-template-columns:repeat(3,1fr)}
+.duo{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 .rhythm{grid-template-columns:2fr 1fr}
 .lrows li{grid-template-columns:16rem minmax(0,1fr);align-items:center;gap:.9rem}
 }`;
@@ -406,9 +426,10 @@ const shell = (
   meta: string,
   main: string,
   headers: Record<string, string> = {},
+  status = 200,
 ): Response =>
   htmlPage(
-    200,
+    status,
     `recall ${heading.toLowerCase()}`,
     STYLE,
     `<div class="app"><header class="side"><p class="brand"><i></i>recall</p>
@@ -423,11 +444,27 @@ ${summary(live)}
 // only what the reader sees changes.
 const labelled = (labels: Map<string, string>, value: string): string => labels.get(value) ?? value;
 
+export const SESSIONS_PATH = "/dashboard/sessions";
+
+export const sessionPath = (sessionId: string): string => `${SESSIONS_PATH}/${encodeURIComponent(sessionId)}`;
+
+const sessionLink = (sessionId: string, changes: Record<string, string>): string => {
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries(changes)) {
+    if (value !== "") params.set(name, value);
+  }
+  const query = params.toString();
+  return escapeHtml(query === "" ? sessionPath(sessionId) : `${sessionPath(sessionId)}?${query}`);
+};
+
+const handleLink = (sessionId: string, name: string): string =>
+  `<b><a href="${sessionLink(sessionId, {})}">${escapeHtml(name)}</a></b>`;
+
 const sessionRow = (session: Session, labels: Labels, now: number): string => {
   const busy = isBusy(session, now);
   const state = busy ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
   const focus = focusHtml(session.focus);
-  return `<li class="srow${busy ? "" : " idle"}"><p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span></p>
+  return `<li class="srow${busy ? "" : " idle"}"><p class="h">${handleLink(session.sessionId, session.name)} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span></p>
 <p class="${busy ? "state busy" : "state"}"><span class="dot"></span>${state}</p>
 <p class="fc">${focus}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${age(session.startedAt, now)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
@@ -450,7 +487,7 @@ const hostsCard = (sessions: Session[], labels: Labels, now: number): string => 
   const lines = [...hosts]
     .map(
       ([host, tally]) =>
-        `<p><strong>${escapeHtml(labelled(labels.hosts, host))}</strong> · ${tally.live} ${tally.live === 1 ? "session" : "sessions"} · ${tally.busy} busy</p>`,
+        `<p><strong><a href="${escapeHtml(`${HISTORY_TAB.path}?host=${encodeURIComponent(host)}`)}">${escapeHtml(labelled(labels.hosts, host))}</a></strong> · ${tally.live} ${tally.live === 1 ? "session" : "sessions"} · ${tally.busy} busy</p>`,
     )
     .join("");
   return `<div class="rk"><b>Hosts</b>${lines}</div>`;
@@ -505,7 +542,7 @@ const dayHead = (group: DayGroup): string =>
 
 const historyRow = (session: PastSession, labels: Labels): string =>
   `<li class="srow hrow"><p class="tm">${clock(session.startedAt)}–${clock(session.lastActivityAt)}</p>
-<p class="h"><b>${escapeHtml(session.name)}</b> <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
+<p class="h">${handleLink(session.sessionId, session.name)} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
 <p class="fc">${focusHtml(session.focus)}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${span(session.lastActivityAt - session.startedAt)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
 
@@ -1234,6 +1271,197 @@ ${insightCard("Month by month", "cost by model · every month on record", monthl
 ${insightCard("Busiest repos", "session time · every session on record", busiestRepos(insights.allTime))}
 ${insightCard("Cache drift", "hit rate by month · every month on record", cacheDrift(horizon))}
 </div>`,
+  );
+};
+
+// How much of a transcript one page reads out of the archive. The bound is bytes of the file and
+// never turns: a window of prose is cheap to render, but the machinery it is buried in — tool
+// calls, results, file snapshots — is most of what the archive holds, and only a byte budget
+// bounds what the page pulls out of R2.
+export const TRANSCRIPT_WINDOW_BYTES = 131_072;
+
+// One window of one transcript file: where it starts, where the read reached, and how far the
+// archive runs. A session's transcript runs to megabytes, so a page reads a window of it and walks
+// rather than rendering the file.
+export interface TranscriptWindow {
+  file: string;
+  files: TranscriptFile[];
+  at: number;
+  through: number;
+  bytes: number;
+  turns: Turn[];
+}
+
+// What the send box carries back after a post: the token the next post must repeat, the message
+// that was refused so the typing is not lost, and which of the two states to show.
+export interface SessionSend {
+  csrf: string;
+  draft: string;
+  sent: boolean;
+  failed: string;
+}
+
+export interface SessionView {
+  session: PastSession;
+  deviceId: string;
+  spend: SessionSpend[];
+  transcript: TranscriptWindow;
+  send: SessionSend;
+}
+
+const kb = (bytes: number): string => (bytes < 1_024 ? `${bytes} B` : `${Math.round(bytes / 1_024)} kB`);
+
+const moment = (at: number): string => new Date(at).toISOString().slice(0, 16).replace("T", " ");
+
+const sessionState = (session: PastSession, now: number): string => {
+  if (!session.running) return `ended · last activity ${age(session.lastActivityAt, now)} ago`;
+  return now - session.lastActivityAt < IDLE_AFTER_MS ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
+};
+
+const factsCard = (view: SessionView, labels: Labels, now: number): string => {
+  const { session } = view;
+  const accounts = [...new Set(view.spend.map((row) => row.account))].filter((account) => account !== "");
+  const counted = view.spend.reduce((sum, row) => sum + countedTokens(row), 0);
+  const facts = [
+    { name: "State", value: sessionState(session, now), warn: !session.running },
+    { name: "Host", value: labelled(labels.hosts, session.host), warn: false },
+    { name: "Scope", value: repoAtBranch(session.repo, session.branch), warn: false },
+    { name: "Directory", value: session.cwd, warn: false },
+    { name: "Started", value: `${moment(session.startedAt)} · ${age(session.startedAt, now)} ago`, warn: false },
+    { name: "Prompts", value: String(session.prompts), warn: false },
+    { name: "Session id", value: session.sessionId, warn: false },
+  ];
+  if (session.agentName !== "") facts.splice(1, 0, { name: "Named", value: session.agentName, warn: false });
+  if (accounts.length > 0) {
+    facts.push({
+      name: accounts.length === 1 ? "Account" : "Accounts",
+      value: accounts.map((account) => labelled(labels.accounts, account)).join(", "),
+      warn: false,
+    });
+  }
+  if (view.spend.length > 0) {
+    facts.push({ name: "Tokens", value: tokens(counted), warn: false });
+    facts.push({ name: "Cost", value: totalCost(view.spend), warn: false });
+  }
+  const unmetered =
+    view.spend.length > 0
+      ? ""
+      : '<p class="callout">No usage is on record for this session. A raw reading is swept two weeks after the server took it, unless it was read back out of the transcript.</p>';
+  return insightCard(session.name, repoAtBranch(session.repo, session.branch), `${insightList(facts)}${unmetered}`);
+};
+
+const sendCard = (view: SessionView): string => {
+  const { session } = view;
+  if (view.deviceId === "") {
+    return insightCard(
+      "Send a message",
+      "the bus reaches a live session",
+      `<p class="callout">This session is not running on any host, so the bus has nowhere to deliver. Messages reach a session while its host holds it.</p>`,
+    );
+  }
+  const flash = view.send.sent
+    ? `<p class="flash">Queued for <strong>${escapeHtml(session.name)}</strong>. It arrives as the session's next turn, and the answer lands in the transcript below.</p>`
+    : view.send.failed === ""
+      ? ""
+      : `<p class="flash bad">${escapeHtml(view.send.failed)}</p>`;
+  return insightCard(
+    "Send a message",
+    `to ${session.name} over the message bus`,
+    `${flash}<form class="send" method="post" action="${sessionLink(session.sessionId, {})}">
+<input type="hidden" name="csrf" value="${escapeHtml(view.send.csrf)}">
+<textarea name="body" rows="4" required maxlength="${MAX_BODY_BYTES}" placeholder="What should this session read next?" aria-label="Message to this session">${escapeHtml(view.send.draft)}</textarea>
+<button type="submit">Send</button></form>`,
+  );
+};
+
+const turnHtml = (turn: Turn): string => {
+  const who = turn.speaker === "user" ? "you" : "claude";
+  const at = turn.at === 0 ? "" : ` · ${moment(turn.at)}`;
+  return `<li class="turn ${turn.speaker}"><p class="who">${who}${escapeHtml(at)}</p><pre class="say">${escapeHtml(turn.text)}</pre></li>`;
+};
+
+const fileChips = (view: SessionView): string => {
+  const { files, file } = view.transcript;
+  if (files.length < 2) return "";
+  return `<nav class="chips" aria-label="Transcript files">${files
+    .map(
+      (held) =>
+        `<a href="${sessionLink(view.session.sessionId, { file: held.file })}"${held.file === file ? ' aria-current="page"' : ""}>${escapeHtml(held.file)} ${escapeHtml(kb(held.bytes))}</a>`,
+    )
+    .join("")}</nav>`;
+};
+
+// Where the window sits in the file, and the two links that move it. The transcript is read from
+// the end, since the last thing a session said is what a reader came for; earlier walks back one
+// window at a time, and later takes the read from where this one stopped.
+const walk = (view: SessionView): string => {
+  const { at, through, bytes, file } = view.transcript;
+  const id = view.session.sessionId;
+  const earlier =
+    at === 0
+      ? "<span>the start of the transcript</span>"
+      : `<a href="${sessionLink(id, { file, at: String(Math.max(0, at - TRANSCRIPT_WINDOW_BYTES)) })}">← Earlier</a>`;
+  const later =
+    through >= bytes
+      ? "<span>the end of the transcript</span>"
+      : `<a href="${sessionLink(id, { file, at: String(through) })}">Later →</a>`;
+  return `<p class="walk">${earlier}${later}</p>`;
+};
+
+const transcriptCard = (view: SessionView): string => {
+  const { files, file, at, through, bytes, turns } = view.transcript;
+  if (files.length === 0) {
+    return insightCard(
+      "Transcript",
+      "nothing archived",
+      emptyState(
+        "No transcript is archived for this session.",
+        "A host archives a session's transcript as it runs, and the stretches land here within a minute of the prose.",
+      ),
+    );
+  }
+  if (bytes === 0) {
+    return insightCard(
+      "Transcript",
+      `${files.length} ${files.length === 1 ? "file" : "files"}`,
+      `${fileChips(view)}${emptyState(`This session has no ${file} on record.`, "Pick one of the files it did archive.")}`,
+    );
+  }
+  const body =
+    turns.length === 0
+      ? emptyState(
+          "This stretch holds no prose.",
+          "The window covers tool calls and their results alone. Walk back for the prompts and answers around them.",
+        )
+      : `<ol class="turns" role="list">${turns.map(turnHtml).join("")}</ol>`;
+  return insightCard(
+    "Transcript",
+    `${file} · ${kb(at)}–${kb(through)} of ${kb(bytes)}`,
+    `${fileChips(view)}${walk(view)}${body}`,
+  );
+};
+
+export const sessionPage = (
+  email: string,
+  live: Live,
+  view: SessionView,
+  labels: Labels,
+  now: number,
+  status = 200,
+): Response => {
+  const { session } = view;
+  return shell(
+    email,
+    SESSIONS_TAB,
+    live,
+    session.name,
+    `${labelled(labels.hosts, session.host)} · ${sessionState(session, now)}`,
+    `<p class="lede">${focusHtml(session.focus)}</p>
+<div class="charts duo">${factsCard(view, labels, now)}${sendCard(view)}</div>
+${transcriptCard(view)}
+<p class="more"><a href="${SESSIONS_TAB.path}">Back to the sessions</a></p>`,
+    { "set-cookie": `${CSRF_COOKIE}=${view.send.csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict` },
+    status,
   );
 };
 
