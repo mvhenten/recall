@@ -1,6 +1,5 @@
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
 import type { Turn } from "./chunks";
-import { MAX_BODY_BYTES } from "./mailbox";
 import {
   DAY_MS,
   type DayWindow,
@@ -40,8 +39,7 @@ import {
   usageDay,
   usageMonth,
 } from "./model";
-import { CSRF_COOKIE, escapeHtml, htmlPage } from "./page";
-import type { TranscriptFile } from "./transcripts";
+import { CSRF_COOKIE, escapeHtml, htmlPage, SENT_COOKIE } from "./page";
 
 export interface Tab {
   path: string;
@@ -334,7 +332,8 @@ const focusHtml = (focus: Focus): string => {
   return `${escapeHtml(shorten(focus.first, FOCUS_FIRST_CHARS))}<span class="then"> → </span>${escapeHtml(focus.latest)}`;
 };
 
-const isBusy = (session: Session, now: number): boolean => now - session.lastActivityAt < IDLE_AFTER_MS;
+const isBusy = (session: { lastActivityAt: number }, now: number): boolean =>
+  now - session.lastActivityAt < IDLE_AFTER_MS;
 
 const emptyState = (headline: string, hint: string): string =>
   `<div class="empty"><b>${escapeHtml(headline)}</b><p>${escapeHtml(hint)}</p></div>`;
@@ -425,7 +424,7 @@ const shell = (
   heading: string,
   meta: string,
   main: string,
-  headers: Record<string, string> = {},
+  headers: Record<string, string | string[]> = {},
   status = 200,
 ): Response =>
   htmlPage(
@@ -1280,30 +1279,27 @@ ${insightCard("Cache drift", "hit rate by month · every month on record", cache
 // bounds what the page pulls out of R2.
 export const TRANSCRIPT_WINDOW_BYTES = 131_072;
 
-// One window of one transcript file: where it starts, where the read reached, and how far the
-// archive runs. A session's transcript runs to megabytes, so a page reads a window of it and walks
-// rather than rendering the file.
-export interface TranscriptWindow {
-  file: string;
-  files: TranscriptFile[];
-  at: number;
-  through: number;
-  bytes: number;
-  turns: Turn[];
-}
+// What one page read of one transcript file. A session with nothing archived and a session asked
+// for a file it never wrote are different answers, and the page says which rather than reading
+// both as a window of no bytes.
+export type TranscriptWindow =
+  | { kind: "none" }
+  | { kind: "missing"; file: string; files: string[] }
+  | { kind: "read"; file: string; files: string[]; from: number; through: number; bytes: number; turns: Turn[] };
 
-// What the send box carries back after a post: the token the next post must repeat, the message
-// that was refused so the typing is not lost, and which of the two states to show.
+// What the send box has to say for itself after a post, and nothing when it has nothing.
+export type Flash = { tone: "sent" } | { tone: "refused"; text: string };
+
 export interface SessionSend {
   csrf: string;
   draft: string;
-  sent: boolean;
-  failed: string;
+  flash: Flash | null;
 }
 
 export interface SessionView {
   session: PastSession;
-  deviceId: string;
+  /// The device the session is live on, and null once its host has let the session go.
+  deviceId: string | null;
   spend: SessionSpend[];
   transcript: TranscriptWindow;
   send: SessionSend;
@@ -1315,7 +1311,7 @@ const moment = (at: number): string => new Date(at).toISOString().slice(0, 16).r
 
 const sessionState = (session: PastSession, now: number): string => {
   if (!session.running) return `ended · last activity ${age(session.lastActivityAt, now)} ago`;
-  return now - session.lastActivityAt < IDLE_AFTER_MS ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
+  return isBusy(session, now) ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
 };
 
 const factsCard = (view: SessionView, labels: Labels, now: number): string => {
@@ -1346,30 +1342,38 @@ const factsCard = (view: SessionView, labels: Labels, now: number): string => {
   const unmetered =
     view.spend.length > 0
       ? ""
-      : '<p class="callout">No usage is on record for this session. A raw reading is swept two weeks after the server took it, unless it was read back out of the transcript.</p>';
+      : '<p class="callout">No usage is on record for this session. A raw reading is kept for two weeks after the server took it, and longer only where it was read back out of the transcript.</p>';
   return insightCard(session.name, repoAtBranch(session.repo, session.branch), `${insightList(facts)}${unmetered}`);
+};
+
+// The bus reaches a session for as long as its host holds it, which is a day after its last
+// prompt and not the five minutes that separate busy from idle. A session idle for hours is still
+// addressable, and the copy says what delivery actually depends on rather than promising a turn
+// the host may never take.
+const SEND_WINDOW = "the bus reaches a session its host still holds";
+
+const flashHtml = (flash: Flash | null, name: string): string => {
+  if (flash === null) return "";
+  if (flash.tone === "refused") return `<p class="flash bad">${escapeHtml(flash.text)}</p>`;
+  return `<p class="flash">Queued for <strong>${escapeHtml(name)}</strong>. Its host hands it to the session as the next turn, unless the host has already let the session go.</p>`;
 };
 
 const sendCard = (view: SessionView): string => {
   const { session } = view;
-  if (view.deviceId === "") {
+  const flash = flashHtml(view.send.flash, session.name);
+  if (view.deviceId === null) {
     return insightCard(
       "Send a message",
-      "the bus reaches a live session",
-      `<p class="callout">This session is not running on any host, so the bus has nowhere to deliver. Messages reach a session while its host holds it.</p>`,
+      SEND_WINDOW,
+      `${flash}<p class="callout">No host is running this session any more, so the bus has nowhere to deliver. A message reaches a session until a day after its last prompt, while its host still holds it.</p>`,
     );
   }
-  const flash = view.send.sent
-    ? `<p class="flash">Queued for <strong>${escapeHtml(session.name)}</strong>. It arrives as the session's next turn, and the answer lands in the transcript below.</p>`
-    : view.send.failed === ""
-      ? ""
-      : `<p class="flash bad">${escapeHtml(view.send.failed)}</p>`;
   return insightCard(
     "Send a message",
-    `to ${session.name} over the message bus`,
+    SEND_WINDOW,
     `${flash}<form class="send" method="post" action="${sessionLink(session.sessionId, {})}">
 <input type="hidden" name="csrf" value="${escapeHtml(view.send.csrf)}">
-<textarea name="body" rows="4" required maxlength="${MAX_BODY_BYTES}" placeholder="What should this session read next?" aria-label="Message to this session">${escapeHtml(view.send.draft)}</textarea>
+<textarea name="body" rows="4" required placeholder="What should this session read next?" aria-label="Message to this session">${escapeHtml(view.send.draft)}</textarea>
 <button type="submit">Send</button></form>`,
   );
 };
@@ -1380,37 +1384,37 @@ const turnHtml = (turn: Turn): string => {
   return `<li class="turn ${turn.speaker}"><p class="who">${who}${escapeHtml(at)}</p><pre class="say">${escapeHtml(turn.text)}</pre></li>`;
 };
 
-const fileChips = (view: SessionView): string => {
-  const { files, file } = view.transcript;
+const fileChips = (sessionId: string, files: string[], file: string): string => {
   if (files.length < 2) return "";
   return `<nav class="chips" aria-label="Transcript files">${files
     .map(
       (held) =>
-        `<a href="${sessionLink(view.session.sessionId, { file: held.file })}"${held.file === file ? ' aria-current="page"' : ""}>${escapeHtml(held.file)} ${escapeHtml(kb(held.bytes))}</a>`,
+        `<a href="${sessionLink(sessionId, { file: held })}"${held === file ? ' aria-current="page"' : ""}>${escapeHtml(held)}</a>`,
     )
     .join("")}</nav>`;
 };
 
 // Where the window sits in the file, and the two links that move it. The transcript is read from
-// the end, since the last thing a session said is what a reader came for; earlier walks back one
-// window at a time, and later takes the read from where this one stopped.
-const walk = (view: SessionView): string => {
-  const { at, through, bytes, file } = view.transcript;
-  const id = view.session.sessionId;
+// the end, since the last thing a session said is what a reader came for. Both links name a
+// boundary this window already found — earlier ends where this one begins, later begins where
+// this one ended — so the two windows abut and no arithmetic guesses at an entry's edge.
+const walk = (sessionId: string, window: Extract<TranscriptWindow, { kind: "read" }>): string => {
+  const { from, through, bytes, file } = window;
   const earlier =
-    at === 0
+    from === 0
       ? "<span>the start of the transcript</span>"
-      : `<a href="${sessionLink(id, { file, at: String(Math.max(0, at - TRANSCRIPT_WINDOW_BYTES)) })}">← Earlier</a>`;
+      : `<a href="${sessionLink(sessionId, { file, before: String(from) })}">← Earlier</a>`;
   const later =
     through >= bytes
       ? "<span>the end of the transcript</span>"
-      : `<a href="${sessionLink(id, { file, at: String(through) })}">Later →</a>`;
+      : `<a href="${sessionLink(sessionId, { file, at: String(through) })}">Later →</a>`;
   return `<p class="walk">${earlier}${later}</p>`;
 };
 
 const transcriptCard = (view: SessionView): string => {
-  const { files, file, at, through, bytes, turns } = view.transcript;
-  if (files.length === 0) {
+  const window = view.transcript;
+  const id = view.session.sessionId;
+  if (window.kind === "none") {
     return insightCard(
       "Transcript",
       "nothing archived",
@@ -1420,24 +1424,24 @@ const transcriptCard = (view: SessionView): string => {
       ),
     );
   }
-  if (bytes === 0) {
+  if (window.kind === "missing") {
     return insightCard(
       "Transcript",
-      `${files.length} ${files.length === 1 ? "file" : "files"}`,
-      `${fileChips(view)}${emptyState(`This session has no ${file} on record.`, "Pick one of the files it did archive.")}`,
+      `${window.files.length} ${window.files.length === 1 ? "file" : "files"}`,
+      `${fileChips(id, window.files, window.file)}${emptyState(`This session has no ${window.file} on record.`, "Pick one of the files it did archive.")}`,
     );
   }
   const body =
-    turns.length === 0
+    window.turns.length === 0
       ? emptyState(
           "This stretch holds no prose.",
           "The window covers tool calls and their results alone. Walk back for the prompts and answers around them.",
         )
-      : `<ol class="turns" role="list">${turns.map(turnHtml).join("")}</ol>`;
+      : `<ol class="turns" role="list">${window.turns.map(turnHtml).join("")}</ol>`;
   return insightCard(
     "Transcript",
-    `${file} · ${kb(at)}–${kb(through)} of ${kb(bytes)}`,
-    `${fileChips(view)}${walk(view)}${body}`,
+    `${window.file} · ${kb(window.from)}–${kb(window.through)} of ${kb(window.bytes)}`,
+    `${fileChips(id, window.files, window.file)}${walk(id, window)}${body}`,
   );
 };
 
@@ -1450,6 +1454,10 @@ export const sessionPage = (
   status = 200,
 ): Response => {
   const { session } = view;
+  const cookies = [`${CSRF_COOKIE}=${view.send.csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict`];
+  if (view.send.flash?.tone === "sent") {
+    cookies.push(`${SENT_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict`);
+  }
   return shell(
     email,
     SESSIONS_TAB,
@@ -1460,7 +1468,7 @@ export const sessionPage = (
 <div class="charts duo">${factsCard(view, labels, now)}${sendCard(view)}</div>
 ${transcriptCard(view)}
 <p class="more"><a href="${SESSIONS_TAB.path}">Back to the sessions</a></p>`,
-    { "set-cookie": `${CSRF_COOKIE}=${view.send.csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict` },
+    { "set-cookie": cookies },
     status,
   );
 };

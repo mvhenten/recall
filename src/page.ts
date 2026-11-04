@@ -2,6 +2,11 @@ import { ARTIFACT_CONTENT_TYPE } from "./artifacts";
 
 export const CSRF_COOKIE = "__Host-recall_csrf";
 
+// What a send that worked leaves behind, so the page it redirects to can say so once. The notice
+// belongs to that one navigation and not to the address, which a reader bookmarks, reloads and
+// walks back to; carrying it in the URL would reprint it every time.
+export const SENT_COOKIE = "__Host-recall_sent";
+
 export const escapeHtml = (text: string): string =>
   text.replace(
     /[&<>"']/g,
@@ -12,28 +17,36 @@ const DEVICE_STYLE = `body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;ma
 code{font-size:1.6rem;letter-spacing:.15em}button,input{font:inherit;padding:.5rem 1rem;margin:.25rem .5rem .25rem 0}
 @media (prefers-color-scheme:dark){body{color:#eee;background:#161616}}`;
 
+// A page sets more than one cookie when it both holds a form token and clears a one-shot notice,
+// and `set-cookie` is the one header that cannot be folded into a second value, so a list of
+// values is appended rather than overwriting.
 export const htmlPage = (
   status: number,
   title: string,
   style: string,
   body: string,
-  headers: Record<string, string> = {},
-): Response =>
-  new Response(
+  headers: Record<string, string | string[]> = {},
+): Response => {
+  const built = new Headers({
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "content-security-policy":
+      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    "x-frame-options": "DENY",
+    "referrer-policy": "same-origin",
+  });
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value === "string") {
+      built.set(name, value);
+      continue;
+    }
+    for (const one of value) built.append(name, one);
+  }
+  return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>${style}</style></head><body>${body}</body></html>`,
-    {
-      status,
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-        "content-security-policy":
-          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-        "x-frame-options": "DENY",
-        "referrer-policy": "same-origin",
-        ...headers,
-      },
-    },
+    { status, headers: built },
   );
+};
 
 // Every user's pages share this hostname, so each one loads into an opaque origin: inline style
 // and script run, and a page reaches neither another host nor the storage, cookies and pages of

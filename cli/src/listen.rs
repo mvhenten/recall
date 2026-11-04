@@ -170,13 +170,31 @@ pub fn log(outcome: &str, took: Duration) {
         .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
+/// The device id a message typed into the dashboard carries, mirroring DASHBOARD_DEVICE in
+/// src/app.ts, which is the original. Every real device id is a UUID the service minted, so no
+/// device can claim this one; a host's label can read as anything and is never tested here.
+const DASHBOARD_DEVICE: &str = "dashboard";
+
 /// The line a delivered message arrives under. A session reading one otherwise sees a bare user
 /// turn with nothing saying where it came from, and Claude Code's own cross-session tools reach
 /// only sessions on the same machine, so the route back has to be spelled out. The handle answers
 /// the one session that asked; a sender that named none is answered on its device id, which is
 /// unique and unchanging, where its label is neither and only ever reads as prose. A message
 /// queued before a send named its sender has no host to read as, and says the device id instead.
+///
+/// Nobody typed a dashboard message at a session, so `recall_send` has nothing to answer: the
+/// address would be the signed-in email, which resolves to no device, name, label or handle. The
+/// line says where it came from and stops, rather than printing a reply route that always fails.
 pub fn header(message: &Message) -> String {
+    if message.from_device_id == DASHBOARD_DEVICE {
+        if message.from_name.is_empty() {
+            return "[recall from the dashboard; it has no reply address, so answer in this session]".to_string();
+        }
+        return format!(
+            "[recall from the dashboard, signed in as {}; it has no reply address, so answer in this session]",
+            message.from_name
+        );
+    }
     let from = if message.from_host.is_empty() {
         &message.from_device_id
     } else {
@@ -741,17 +759,18 @@ mod tests {
 
     #[test]
     fn the_header_answers_on_the_handle_and_falls_back_to_the_device_id() {
-        let message = |from_host: &str, from_name: &str| Message {
+        let sent = |from_device_id: &str, from_host: &str, from_name: &str| Message {
             message_id: "m-1".to_string(),
             to_device_id: "d-2".to_string(),
             to_session_id: String::new(),
-            from_device_id: "d-1".to_string(),
+            from_device_id: from_device_id.to_string(),
             from_host: from_host.to_string(),
             from_name: from_name.to_string(),
             body: "ship it".to_string(),
             created_at: 1_762_000_000_000,
             expires_at: 1_762_259_200_000,
         };
+        let message = |from_host: &str, from_name: &str| sent("d-1", from_host, from_name);
 
         assert_eq!(
             header(&message("core", "ip-10-0-7-31-9f8a")),
@@ -766,6 +785,39 @@ mod tests {
             "[recall from d-1; reply with recall_send to \"d-1\"]"
         );
         assert_eq!(delivered_body(&message("core", "")).lines().last().unwrap(), "ship it");
+    }
+
+    /// A browser types into the dashboard and no device sends it, so the one thing the line must
+    /// not do is print an address `recall_send` cannot resolve. A host labelled with the owner's
+    /// own email changes nothing: the dashboard is told apart by the device id the service sets,
+    /// which no device can hold.
+    #[test]
+    fn the_header_gives_a_dashboard_message_no_reply_address() {
+        let sent = |from_device_id: &str, from_host: &str| Message {
+            message_id: "m-2".to_string(),
+            to_device_id: "d-2".to_string(),
+            to_session_id: "s-9".to_string(),
+            from_device_id: from_device_id.to_string(),
+            from_host: from_host.to_string(),
+            from_name: "owner@example.com".to_string(),
+            body: "ship it".to_string(),
+            created_at: 1_762_000_000_000,
+            expires_at: 1_762_259_200_000,
+        };
+
+        let line = header(&sent("dashboard", "dashboard"));
+
+        assert_eq!(
+            line,
+            "[recall from the dashboard, signed in as owner@example.com; it has no reply address, so answer in this session]"
+        );
+        assert!(!line.contains("recall_send"), "{line}");
+        // A host labelled with the owner's own email is still a device, and still gets the reply
+        // route its handle resolves on.
+        assert_eq!(
+            header(&sent("9f8a1b2c-0d1e-4f20-8a3b-5c6d7e8f9a0b", "owner@example.com")),
+            "[recall from owner@example.com/owner@example.com; reply with recall_send to \"owner@example.com\"]"
+        );
     }
 
     #[test]

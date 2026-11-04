@@ -879,23 +879,6 @@ export const readInsights = async (
   };
 };
 
-export const sessionOnDevice = async (
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-  deviceId: string,
-  now: number,
-): Promise<boolean> => {
-  const row = await db
-    .prepare(
-      `SELECT session_id FROM sessions
-       WHERE user_id = ? AND session_id = ? AND device_id = ? AND last_activity_at > ?`,
-    )
-    .bind(userId, sessionId, deviceId, now - SESSION_TTL_MS)
-    .first<{ session_id: string }>();
-  return row !== null;
-};
-
 // The device one session is live on, which is the only address a message to it can carry. A
 // session the account no longer has running has none, and saying so is what stops the dashboard
 // queueing a message no host will ever read.
@@ -911,6 +894,14 @@ export const liveSessionDevice = async (
     .first<{ device_id: string }>();
   return row === null ? null : row.device_id;
 };
+
+export const sessionOnDevice = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  deviceId: string,
+  now: number,
+): Promise<boolean> => (await liveSessionDevice(db, userId, sessionId, now)) === deviceId;
 
 // What one session spent, and on whose account. The rollup cannot answer either: it is keyed by
 // day, host, repo and account and never by session, so the raw events are the only reading that
