@@ -61,7 +61,6 @@ interface Plan {
 }
 
 interface Reach {
-  bytes: number;
   running: boolean;
   runs: Run[];
 }
@@ -349,10 +348,11 @@ describe("the transcript bytes", () => {
   });
 });
 
-// One beat of a box following a session still being written: how far the file reaches now, and
-// the stretches past where the reader has got to.
-const reachOf = (h: Harness, plan: Plan, from: number, assertion: string): Promise<Response> =>
-  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${from}`, {
+// One beat of a box following a session still being written. It carries both of the box's
+// cursors: `from` is how far it has read the file to, and `after` is where the last stretch it
+// took begins, which is what the listing is keyed by.
+const beatOf = (h: Harness, plan: Plan, from: number, after: number, assertion: string): Promise<Response> =>
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${from}&after=${after}`, {
     headers: { "cf-access-jwt-assertion": assertion },
   });
 
@@ -368,34 +368,54 @@ describe("following a transcript as it is written", () => {
     expect(plan.follow).toEqual({ from: head.length, every: TRANSCRIPT_FOLLOW_MS });
 
     // Nothing has landed since the page was drawn, so the beat names no stretch at all.
-    const quiet: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
-    expect(quiet).toEqual({ bytes: head.length, running: true, runs: [] });
+    const first = await beatOf(h, plan, at, 0, you.assertion);
+    expect(first.headers.get("cache-control")).toBe("no-store");
+    expect(await first.json()).toEqual({ running: true, runs: [] });
 
     await archivedBody(h, you.laptop, "beef0010", grew, at);
     await h.deliver();
-    const moved: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
+    const moved: Reach = await (await beatOf(h, plan, at, 0, you.assertion)).json();
 
-    expect(moved.bytes).toBe(head.length + grew.length);
     expect(moved.running).toBe(true);
     expect(await reassembled(h, { ...plan, runs: moved.runs }, you.assertion)).toBe(grew);
   });
 
   // The whole point of the cursor: the stretches already in the reader's hands are never named
   // again, so nothing the box has shown can be rendered a second time.
-  it("names nothing it has already handed over, however many stretches the file holds", async () => {
+  it("names nothing it has already taken, however many stretches the file holds", async () => {
     const h = await harness();
     const you = await owner(h);
+    const starts: number[] = [];
     let at = 0;
-    for (let beat = 0; beat < 4; beat += 1) at = await archivedBody(h, you.laptop, "beef0011", transcriptOf(2), at);
+    for (let beat = 0; beat < 4; beat += 1) {
+      starts.push(at);
+      at = await archivedBody(h, you.laptop, "beef0011", transcriptOf(2), at);
+    }
     await h.deliver();
     const plan = planOf(await read(h, "/dashboard/sessions/beef0011", you.assertion));
 
-    const whole: Reach = await (await reachOf(h, plan, 0, you.assertion)).json();
-    const since: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
+    const behind: Reach = await (await beatOf(h, plan, starts[1] ?? 0, starts[0] ?? 0, you.assertion)).json();
+    const caught: Reach = await (await beatOf(h, plan, at, starts[3] ?? 0, you.assertion)).json();
 
-    expect(whole.runs.flatMap((run) => run.reads)).toHaveLength(4);
-    expect(whole.bytes).toBe(at);
-    expect(since.runs).toEqual([]);
+    expect(behind.runs.flatMap((run) => run.reads)).toHaveLength(3);
+    expect(caught.runs).toEqual([]);
+  });
+
+  // The extent the beat reads is a cache the storage event keeps, and a session no event has ever
+  // landed for keeps no row at all. That never corrects itself, so the objects are listed
+  // regardless rather than answering "nothing new" for as long as the tab is open.
+  it("lists the objects for a session no storage event has cached", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const grew = transcriptOf(2);
+    const at = await archivedBody(h, you.laptop, "beef0014", transcriptOf(2));
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0014", you.assertion));
+    await archivedBody(h, you.laptop, "beef0014", grew, at);
+
+    const beat: Reach = await (await beatOf(h, plan, at, 0, you.assertion)).json();
+
+    expect(await h.indexMark(you.userId, "beef0014")).toBeNull();
+    expect(await reassembled(h, { ...plan, runs: beat.runs }, you.assertion)).toBe(grew);
   });
 
   it("says a session nobody is running is no longer worth following", async () => {
@@ -406,7 +426,7 @@ describe("following a transcript as it is written", () => {
     const plan = planOf(await read(h, "/dashboard/sessions/beef0012", you.assertion));
     h.tick(SESSION_TTL_MS + 1);
 
-    const cold: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
+    const cold: Reach = await (await beatOf(h, plan, at, 0, you.assertion)).json();
     expect(cold.running).toBe(false);
     expect(planOf(await read(h, "/dashboard/sessions/beef0012", you.assertion)).follow).toBeNull();
   });
@@ -421,14 +441,21 @@ describe("following a transcript as it is written", () => {
     expect((await you.laptop.archive("beef0013", "task-7", 0, transcriptOf(2))).status).toBe(200);
     await h.deliver();
     const plan = planOf(await read(h, "/dashboard/sessions/beef0013?file=task-7", you.assertion));
+    const main = { ...plan, file: "main" };
 
     expect(plan.follow).toBeNull();
-    expect((await reachOf(h, plan, 0, you.assertion)).status).toBe(400);
-    expect((await reachOf(h, { ...plan, file: "../main" }, 0, you.assertion)).status).toBe(400);
-    expect((await reachOf(h, { ...plan, file: "main" }, -1, you.assertion)).status).toBe(400);
-    expect((await reachOf(h, { ...plan, file: "main" }, 0, await h.assertionFor("stranger@example.com"))).status).toBe(
-      403,
-    );
+    expect((await beatOf(h, plan, 0, 0, you.assertion)).status).toBe(400);
+    expect((await beatOf(h, { ...plan, file: "../main" }, 0, 0, you.assertion)).status).toBe(400);
+    expect((await beatOf(h, main, -1, 0, you.assertion)).status).toBe(400);
+    expect((await beatOf(h, main, 0, -1, you.assertion)).status).toBe(400);
+    expect(
+      (
+        await h.send(`${plan.path}?file=main&from=0`, {
+          headers: { "cf-access-jwt-assertion": you.assertion },
+        })
+      ).status,
+    ).toBe(400);
+    expect((await beatOf(h, main, 0, 0, await h.assertionFor("stranger@example.com"))).status).toBe(403);
   });
 });
 

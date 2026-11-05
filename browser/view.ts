@@ -20,6 +20,7 @@ import {
   joinedTexts,
   type PlannedRead,
   plannedBatch,
+  tailNote,
   walkNote,
 } from "../src/transcript-plan";
 import { readTurns, type Turn } from "../src/turns";
@@ -39,23 +40,12 @@ interface Plan {
   follow: Follow | null;
 }
 
-// What the server says of a file still being written: how far it reaches, whether anyone is still
-// running the session, and the stretches past the offset the box asked about.
+// What the server says of a file still being written: whether anyone is still running the
+// session, and the stretches past the one the box last took.
 interface Reach {
-  bytes: number;
   running: boolean;
   runs: Run[];
 }
-
-const isReach = (value: unknown): value is Reach =>
-  typeof value === "object" &&
-  value !== null &&
-  "bytes" in value &&
-  typeof value.bytes === "number" &&
-  "running" in value &&
-  typeof value.running === "boolean" &&
-  "runs" in value &&
-  Array.isArray(value.runs);
 
 // How many batches in a row may come back with no prose in them before the reader stops and says
 // so. A transcript is mostly machinery — tool calls, results, file snapshots — and a stretch of
@@ -66,6 +56,12 @@ const BLANK_STEPS = 4;
 // written to while it is read, so one refused beat means nothing; a run of them means the box is
 // no longer showing what the session is saying, and a reader must not have to guess that.
 const FOLLOW_TRIES = 3;
+
+// The slowest the box beats. A session saying nothing says nothing for minutes at a time, and a
+// tab left open on one would otherwise ask thousands of times a day; each beat that brings no
+// bytes doubles the wait up to this, and the first that brings some puts it back to the pace the
+// page chose. A session being written to is followed at that pace throughout.
+const FOLLOW_SLOWEST_MS = 300_000;
 
 // How near the foot of the box counts as being at the foot. A reader watching the bottom is
 // carried along; a reader who has scrolled back is left exactly where they are.
@@ -93,7 +89,15 @@ const rendered = (turns: Turn[]): DocumentFragment => {
 
 type Got = { ok: true; text: string } | { ok: false; why: string; signedOut: boolean };
 
-const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTMLElement, plan: Plan): void => {
+interface Parts {
+  box: HTMLElement;
+  list: HTMLElement;
+  note: HTMLElement;
+  tail: HTMLElement;
+  more: HTMLElement;
+}
+
+const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
   const reads: PlannedRead[] = [];
   plan.runs.forEach((run, index) => {
     for (const read of run.reads) {
@@ -110,18 +114,25 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
   let busy = false;
   let broken = false;
 
-  // The forward cursor and what hangs off it. `at` starts at the end of the manifest the page was
-  // handed, which is the first byte the backward walk will never read, so following can only ever
-  // add turns the box has not shown. `reaches` grows with the file, so the note counts against
-  // what the archive holds now rather than what it held when the page was drawn.
+  // The two forward cursors and what hangs off them. `at` is how far the file has been read to:
+  // it starts at the end of the manifest the page was handed, which is the first byte the
+  // backward walk will never read, so following can only ever add turns the box has not shown.
+  // `after` is where the last stretch taken begins, which is what a listing is keyed by, and it
+  // starts at the newest stretch the manifest names. `reaches` grows with the file, so the note
+  // counts against what the archive holds now rather than what it held when the page was drawn.
   const following = plan.follow;
+  const pace = following === null ? 0 : following.every;
   let at = following === null ? 0 : following.from;
+  let after = reads[reads.length - 1]?.offset ?? 0;
   let reaches = plan.bytes;
   let trailing = "";
   let newer = 0;
   let ended = false;
   let misses = 0;
   let beating = 0;
+  let every = pace;
+  let chasing = false;
+  let adrift = false;
 
   // A failure holds the box: it stays on screen until the reader asks again, so the next thing the
   // page has to say cannot quietly take its place and leave a reader short of the file with
@@ -174,22 +185,21 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
     );
 
   const noteFor = (dry: number): string =>
-    walkNote({
-      file: plan.file,
-      bytes: reaches,
-      loaded,
-      shown: list.childElementCount,
-      dry,
-      through: edge === 0,
-      newer,
-      ended,
-    });
+    walkNote({ file: plan.file, bytes: reaches, loaded, shown: list.childElementCount, dry, through: edge === 0 });
+
+  // What following has to say, on its own line. A beat that has given up holds that line the way
+  // a failed walk holds the walk's, so the live news cannot quietly take the failure's place.
+  const sayTail = (): void => {
+    if (adrift) return;
+    tail.className = "txnote";
+    tail.textContent = tailNote({ newer, ended });
+  };
 
   const atFoot = (): boolean => box.scrollHeight - box.scrollTop - box.clientHeight < FOOT_SLACK;
 
   const stopFollowing = (): void => {
     if (beating === 0) return;
-    clearInterval(beating);
+    clearTimeout(beating);
     beating = 0;
   };
 
@@ -198,37 +208,57 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
     say(noteFor(0));
   };
 
-  // A read that cannot be had says which read and why, and offers the one control that gets past
-  // it: another go at a transport failure, and a reload for a sign-in that has run out, since only
-  // a fresh navigation goes back through Access. Following stops with it, so a box that has given
-  // up says so under a control that starts it again rather than beating on behind a dead note.
-  const fail = (why: string, signedOut: boolean, retry: () => void): void => {
-    broken = true;
-    stopFollowing();
-    note.className = "txnote bad";
-    note.textContent = `${why} `;
-    more.setAttribute("disabled", "");
+  // The one control that gets past a read that cannot be had: another go at a transport failure,
+  // and a reload for a sign-in that has run out, since only a fresh navigation goes back through
+  // Access.
+  const control = (signedOut: boolean, retry: () => void): HTMLElement => {
     if (signedOut) {
-      const again = document.createElement("a");
-      again.href = location.pathname + location.search;
-      again.textContent = "Reload this page";
-      note.appendChild(again);
-      return;
+      const back = document.createElement("a");
+      back.href = location.pathname + location.search;
+      back.textContent = "Reload this page";
+      return back;
     }
     const again = document.createElement("button");
     again.type = "button";
     again.textContent = "Try again";
-    again.addEventListener("click", () => {
-      broken = false;
-      more.removeAttribute("disabled");
-      retry();
-    });
-    note.appendChild(again);
+    again.addEventListener("click", retry);
+    return again;
   };
 
-  const retryLoad = (): void => {
-    startFollowing();
-    void load();
+  // A read the walk cannot have says which read and why, and holds the box: the note stays on
+  // screen until the reader asks again, so the next thing the page has to say cannot leave a
+  // reader short of the file with nothing to say so. Following is left running, since it reads
+  // other objects and a walk that cannot go back says nothing about what is landing now.
+  const fail = (why: string, signedOut: boolean): void => {
+    broken = true;
+    note.className = "txnote bad";
+    note.textContent = `${why} `;
+    more.setAttribute("disabled", "");
+    note.appendChild(
+      control(signedOut, () => {
+        broken = false;
+        more.removeAttribute("disabled");
+        void load();
+      }),
+    );
+  };
+
+  // Following has given up, and says so on its own line under its own control. The walk's
+  // controls are left alone: "Load earlier" reads stretches this has never touched.
+  const lost = (why: string, signedOut: boolean): void => {
+    adrift = true;
+    stopFollowing();
+    tail.className = "txnote bad";
+    tail.textContent = `${why} `;
+    tail.appendChild(
+      control(signedOut, () => {
+        adrift = false;
+        misses = 0;
+        every = pace;
+        sayTail();
+        startFollowing();
+      }),
+    );
   };
 
   const load = async (): Promise<void> => {
@@ -244,7 +274,7 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
       const got = await grab(read);
       if (!got.ok) {
         busy = false;
-        fail(got.why, got.signedOut, retryLoad);
+        fail(got.why, got.signedOut);
         return;
       }
       fetched.push({ ...read, text: got.text });
@@ -283,38 +313,29 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
   const missed = (why: string, signedOut: boolean): void => {
     misses += 1;
     if (misses < FOLLOW_TRIES) return;
-    fail(why, signedOut, () => {
-      misses = 0;
-      startFollowing();
-      beat();
-    });
+    lost(why, signedOut);
   };
 
-  // One beat. It asks how far the file now reaches, and reads forward only over what it has not
-  // read: nothing already on screen is fetched again, and the cursor moves only by the bytes that
-  // came back. A batch is capped at the same step the backward walk takes, so a tab left hidden
-  // for an hour catches up over several beats rather than in one enormous read.
+  // One beat. It asks what has landed since the stretch it last took, and reads forward only over
+  // what it has not read: nothing already on screen is fetched again, and the cursors move only
+  // by the bytes that came back. A batch is capped at the same step the backward walk takes, so a
+  // tab left hidden for an hour catches up over several beats rather than in one enormous read.
   const follow = async (): Promise<void> => {
-    if (following === null || busy || broken) return;
-    busy = true;
-    const got = await asked(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}`, {}, at);
+    if (following === null || chasing || adrift) return;
+    chasing = true;
+    const got = await asked(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}&after=${after}`, {}, at);
     if (!got.ok) {
-      busy = false;
+      chasing = false;
       missed(got.why, got.signedOut);
       return;
     }
-    const reach: unknown = JSON.parse(got.text);
-    if (!isReach(reach)) {
-      busy = false;
-      missed(`Following ${plan.file} got an answer this page cannot read.`, false);
-      return;
-    }
+    const reach = JSON.parse(got.text) as Reach;
     const planned = followedBatch(reach.runs, at, plan.step);
     const fetched: Fetched[] = [];
     for (const read of planned.batch) {
       const one = await grab(read);
       if (!one.ok) {
-        busy = false;
+        chasing = false;
         missed(one.why, one.signedOut);
         return;
       }
@@ -329,8 +350,10 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
     let walked = 0;
     for (const read of planned.batch) walked += read.bytes;
     at = planned.at;
+    after = planned.batch[planned.batch.length - 1]?.offset ?? after;
     reaches += walked;
     loaded += walked;
+    every = walked > 0 ? pace : Math.min(every * 2, FOLLOW_SLOWEST_MS);
 
     const joined = followedTexts(groupedReads(fetched), trailing);
     trailing = joined.remnant;
@@ -344,27 +367,39 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
     } else {
       newer += added;
     }
-    busy = false;
+    chasing = false;
 
     if (!reach.running) {
       ended = true;
       stopFollowing();
     }
-    if (added > 0 || ended) say(noteFor(0));
+    if (walked > 0) say(noteFor(0));
+    sayTail();
   };
 
   const beat = (): void => {
-    void follow().catch((error: unknown) => {
-      busy = false;
-      missed(`Following ${plan.file} failed: ${error instanceof Error ? error.message : String(error)}.`, false);
-    });
+    void follow()
+      .catch((error: unknown) => {
+        chasing = false;
+        missed(`Following ${plan.file} failed: ${error instanceof Error ? error.message : String(error)}.`, false);
+      })
+      .then(rest);
   };
 
-  // Nothing beats at a session nobody is running, at a box that has given up, at a file already
-  // done, or at a tab nobody is looking at.
+  // When the next beat falls due. Nothing is waiting at a session that has ended, at a box that
+  // has given up following, or at a tab nobody is looking at.
+  const rest = (): void => {
+    if (following === null || adrift || ended || document.hidden) return;
+    beating = setTimeout(() => {
+      beating = 0;
+      beat();
+    }, every);
+  };
+
+  // Following starts on the beat it fires here, and starting it twice beats once.
   const startFollowing = (): void => {
-    if (following === null || beating !== 0 || broken || ended || document.hidden) return;
-    beating = setInterval(beat, following.every);
+    if (following === null || beating !== 0 || chasing || adrift || ended || document.hidden) return;
+    beat();
   };
 
   more.addEventListener("click", () => {
@@ -374,7 +409,7 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
     if (box.scrollTop < 240) void load();
     if (newer > 0 && atFoot()) {
       newer = 0;
-      say(noteFor(0));
+      sayTail();
     }
   });
 
@@ -385,7 +420,6 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
         return;
       }
       startFollowing();
-      beat();
     });
     window.addEventListener("pagehide", stopFollowing);
   }
@@ -399,9 +433,10 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
 const box = document.getElementById("tx");
 const list = document.getElementById("txlist");
 const note = document.getElementById("txnote");
+const tail = document.getElementById("txtail");
 const more = document.getElementById("txmore");
 const source = document.getElementById("txplan");
-if (box === null || list === null || note === null || more === null || source === null) {
+if (box === null || list === null || note === null || tail === null || more === null || source === null) {
   throw new Error("the session page carries no transcript box");
 }
-boot(box, list, note, more, JSON.parse(source.textContent ?? "") as Plan);
+boot({ box, list, note, tail, more }, JSON.parse(source.textContent ?? "") as Plan);

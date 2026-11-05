@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { DAY_MS, USAGE_RETENTION_MS } from "../src/model";
-import { MAX_CHUNK_BYTES } from "../src/transcripts";
+import { followedBatch } from "../src/transcript-plan";
+import { archivedSince, MAX_CHUNK_BYTES } from "../src/transcripts";
 import { harness } from "./harness";
 
 const held = async (response: Response): Promise<Record<string, number>> => {
@@ -149,6 +150,26 @@ describe("transcript archive", () => {
     expect(also?.offset).toBe(told?.offset);
     expect((await client.archive("s-race", "main", told?.offset ?? 0, "!")).status).toBe(200);
     expect((await held(await client.transcript("s-race"))).main).toBe((told?.offset ?? 0) + 1);
+  });
+
+  // The one case a byte cursor cannot express. A stretch keyed before where the reader has read
+  // to, and ending past it, holds its unread tail in no other object: a listing keyed off bytes
+  // leaves it out, and the bytes between the two cursors are never shown and never mentioned.
+  // The cursor is the key of the last stretch taken, so the straddler comes back and the reader
+  // reads forward across it from its own place in the file.
+  it("names the stretch that begins before the reader has read to and ends past it", async () => {
+    const userId = `straddler-${crypto.randomUUID()}`;
+    const key = (offset: number): string => `${userId}/s-tail/main/${String(offset).padStart(16, "0")}`;
+    await env.TRANSCRIPTS.put(key(0), "a".repeat(100));
+    await env.TRANSCRIPTS.put(key(50), "b".repeat(150));
+
+    const runs = await archivedSince(env.TRANSCRIPTS, userId, "s-tail", "main", 0);
+
+    expect(runs).toEqual([{ from: 50, to: 200, reads: [{ offset: 50, skip: 0, bytes: 150 }] }]);
+    expect(followedBatch(runs, 100, 65_536)).toEqual({
+      batch: [{ run: 0, offset: 50, skip: 50, bytes: 100 }],
+      at: 200,
+    });
   });
 
   it("keeps a session's files once its row has moved to the history", async () => {

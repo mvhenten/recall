@@ -236,6 +236,7 @@ svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .txtop button{font:600 .78rem/1 var(--sans);padding:.4rem .9rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface2);color:var(--ink);cursor:pointer}
 .txtop button[disabled]{opacity:.5;cursor:default}
 .txnote{margin:.55rem 0 0;font-size:.8rem;color:var(--faint)}
+.txnote:empty{display:none}
 .txnote.bad{color:var(--bad)}
 .txnote a{margin-left:.3rem}
 .send{display:grid;gap:.6rem;margin:0}
@@ -1287,9 +1288,10 @@ ${insightCard("Cache drift", "hit rate by month · every month on record", cache
 // snapshots — is what the fetch pays for and the prose is what survives it.
 export const TRANSCRIPT_STEP_BYTES = 65_536;
 
-// How often the box asks a session still being written how far its file now reaches. It matches
-// the beat a host archives on, so a turn shows about as soon as the archive holds it, and a beat
-// that finds nothing new costs one indexed row read and opens no object.
+// The quickest the box asks a session still being written how far its file now reaches. It
+// matches the beat a host archives on, so a turn shows about as soon as the archive holds it, and
+// a beat that finds nothing new costs one indexed row read and opens no object. The box slows
+// itself down from here while nothing arrives and comes back to this pace the moment some does.
 export const TRANSCRIPT_FOLLOW_MS = 10_000;
 
 // What the page knows about one transcript file. A session with nothing archived and a session
@@ -1445,10 +1447,12 @@ const trimNote = (listing: Listing, bytes: number): string =>
 
 // What the box follows, and nothing when there is nothing to follow. `from` is the end of the
 // manifest, which is the first byte the box has not been handed, so following starts where the
-// page stops and no byte is read twice. A session nobody is running writes nothing more, and only
-// its own file keeps an extent cheap enough to beat against.
+// page stops and no byte is read twice. A session no host is holding writes nothing more, and
+// whether one is holding it is the fact the beat itself answers with, so the page that starts
+// following and the beat that ends it cannot disagree about what live means. Only the session's
+// own file keeps an extent cheap enough to beat against.
 const followOf = (view: SessionView, file: string, bytes: number): { from: number; every: number } | null =>
-  view.session.running && file === MAIN_FILE ? { from: bytes, every: TRANSCRIPT_FOLLOW_MS } : null;
+  view.deviceId !== null && file === MAIN_FILE ? { from: bytes, every: TRANSCRIPT_FOLLOW_MS } : null;
 
 const transcriptCard = (view: SessionView): string => {
   const held = view.transcript;
@@ -1487,6 +1491,7 @@ const transcriptCard = (view: SessionView): string => {
 <p class="txtop"><button type="button" id="txmore">Load earlier</button></p>
 <ol class="turns" id="txlist" role="list"></ol></div>
 <p class="txnote" id="txnote">Reading ${escapeHtml(held.file)}…</p>
+<p class="txnote" id="txtail"></p>
 <noscript><p class="callout">The transcript is read by the browser straight off the archive, so this box stays empty while scripts are off.</p></noscript>
 <script type="application/json" id="txplan">${planJson(plan)}</script>
 <script src="${TRANSCRIPT_SCRIPT_PATH}" defer></script>`,

@@ -11,6 +11,7 @@ import {
   MAX_PLANNED_READS,
   type PlannedRead,
   plannedBatch,
+  tailNote,
   type Walk,
   walkNote,
 } from "../src/transcript-plan";
@@ -119,8 +120,6 @@ describe("saying how the walk went", () => {
     shown: 4,
     dry: 0,
     through: true,
-    newer: 0,
-    ended: false,
     ...over,
   });
 
@@ -153,25 +152,25 @@ describe("saying how the walk went", () => {
     );
     expect(walkNote(walk({ loaded: 40_960, through: false }))).toBe("40 kB of 74 kB read. Scroll up for more.");
   });
+});
 
-  // A reader who has scrolled back is not carried to the foot of the box, so the note is the only
+describe("saying what following has to say", () => {
+  // A reader who has scrolled back is not carried to the foot of the box, so the line is the only
   // thing that can tell them the session has said something since.
   it("counts the turns that landed below a reader who has scrolled back", () => {
-    expect(walkNote(walk({ newer: 1 }))).toBe(
-      "The whole of agent-7f21 is here, 74 kB of it. 1 newer turn has arrived below.",
-    );
-    expect(walkNote(walk({ newer: 3, loaded: 40_960, through: false }))).toBe(
-      "40 kB of 74 kB read. Scroll up for more. 3 newer turns have arrived below.",
-    );
+    expect(tailNote({ newer: 1, ended: false })).toBe("1 newer turn has arrived below.");
+    expect(tailNote({ newer: 3, ended: false })).toBe("3 newer turns have arrived below.");
   });
 
   it("says a followed session has ended, so a box that stops moving is not read as a broken one", () => {
-    expect(walkNote(walk({ ended: true }))).toBe(
-      "The whole of agent-7f21 is here, 74 kB of it. This session has ended, so nothing more will arrive.",
-    );
-    expect(walkNote(walk({ ended: true, newer: 2 }))).toBe(
-      "The whole of agent-7f21 is here, 74 kB of it. 2 newer turns have arrived below.",
-    );
+    expect(tailNote({ newer: 0, ended: true })).toBe("This session has ended, so nothing more will arrive.");
+    expect(tailNote({ newer: 2, ended: true })).toBe("2 newer turns have arrived below.");
+  });
+
+  // Nothing to say is said with nothing, so the line under the box is not there at all while a
+  // reader at the foot is watching turns arrive.
+  it("says nothing of a box at the foot of a session still writing", () => {
+    expect(tailNote({ newer: 0, ended: false })).toBe("");
   });
 });
 

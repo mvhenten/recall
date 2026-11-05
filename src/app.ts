@@ -186,7 +186,7 @@ export interface App {
 
 type Refusal = (status: number, title: string, text: string) => Response;
 
-const json = (body: unknown, status = 200): Response => Response.json(body, { status });
+const json = (body: unknown, status = 200, headers?: HeadersInit): Response => Response.json(body, { status, headers });
 const error = (status: number, message: string): Response => json({ error: message }, status);
 
 const readJson = (request: Request): Promise<unknown> => request.json().catch(() => null);
@@ -801,11 +801,21 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
-  // How far a file reaches now, whether anyone is still running the session, and the stretches
-  // past where the reader has got to. A box following a live session beats against this, so it
-  // answers off the cheapest readings there are: the extent is the cache the storage event keeps,
-  // so a beat that finds nothing new opens no object and lists nothing at all, and the listing it
-  // does run once the file has grown starts at the offset the reader names.
+  // Whether anyone is still running the session, and the stretches of its file past the one the
+  // reader last took. A box following a live session beats against this, so it answers off the
+  // cheapest readings there are: the extent the storage event caches says whether the file has
+  // grown past where the reader has read, and a beat that finds it has not opens no object and
+  // lists nothing at all.
+  //
+  // That extent is a cache and lags the objects for as long as the event behind it is in flight,
+  // so it is trusted to say a file has grown and never to say it has not. A session no event has
+  // ever landed for keeps no row at all, and that one never corrects itself; with no row the
+  // objects are listed regardless, so a reader is never left watching a box that beats on in
+  // silence about a session writing away.
+  //
+  // `from` is how far the reader has read and `after` the stretch it last took, because a
+  // listing is keyed by where a stretch starts and the two part company over one that straddles
+  // the reader's place in the file.
   //
   // Only the session's own file is followed. Every other file is a delegated turn, which derives
   // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
@@ -817,14 +827,15 @@ export const createApp = (deps: Deps): App => {
     if (file.value !== MAIN_FILE) return error(400, `only ${MAIN_FILE} is followed as it is written`);
     const from = parseChunkOffset(url.searchParams.get("from"));
     if (!from.ok) return error(400, from.error);
+    const after = parseChunkOffset(url.searchParams.get("after"));
+    if (!after.ok) return error(400, after.error);
     const [mark, device] = await Promise.all([
       indexMark(env.DB, userId, session.value),
       liveSessionDevice(env.DB, userId, session.value, deps.now()),
     ]);
-    const bytes = mark === null ? 0 : mark.archived;
-    const runs =
-      bytes > from.value ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value) : [];
-    return json({ bytes, running: device !== null, runs });
+    const grown = mark === null || mark.archived > from.value;
+    const runs = grown ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, after.value) : [];
+    return json({ running: device !== null, runs }, 200, { "cache-control": "no-store" });
   };
 
   // One session the dashboard can read and talk to. The page is reached by clicking a row of the

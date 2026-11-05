@@ -9,7 +9,7 @@
 // derived from that key by the consumer the storage event wakes, and nothing derived is ever
 // asked a question the objects can answer, so a row that disagrees with them is wrong by
 // definition and is written over by the listing that found it out.
-import type { Run } from "./transcript-plan";
+import { MAX_PLANNED_READS, type Run } from "./transcript-plan";
 
 const OFFSET_DIGITS = 16;
 
@@ -219,31 +219,38 @@ export const archivedTranscript = async (
     .sort((left, right) => (left.file < right.file ? -1 : 1));
 };
 
-// How one file lays out past an offset, for a reader following a session still writing it. The
-// listing starts at the key that offset names rather than at the head of the prefix, so a beat
-// costs a page of whatever has landed since the reader last asked and never grows with the length
-// of the session. A stretch that starts before the offset is already in the reader's hands and is
-// left out, so nothing it holds is read a second time.
+// How one file lays out past the stretch a reader has taken, for a box following a session still
+// writing it. The listing starts at the key after that stretch rather than at the head of the
+// prefix, so a beat costs a page of whatever has landed since the reader last asked and never
+// grows with the length of the session.
+//
+// The cursor is the key of the last stretch taken and never how far into the file the reader has
+// read. The two part company over a stretch that begins before the reader's byte cursor and ends
+// past it: its unread tail is in no other object, and a listing keyed off bytes leaves it out and
+// steps over bytes that exist nowhere else. The caller reads forward from its own byte cursor
+// across whatever comes back, so a stretch it has already read part of costs it nothing.
+//
+// One page of keys and no more. A truncated listing is already the right answer: the reader takes
+// what its own step allows and comes straight back for the rest, so a tab that woke to a day of
+// writing catches up over several beats rather than being handed thousands of reads it has no
+// budget to fetch.
 export const archivedSince = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
-  from: number,
+  after: number,
 ): Promise<Run[]> => {
-  const prefix = filePrefix(userId, sessionId, file);
+  const page = await bucket.list({
+    prefix: filePrefix(userId, sessionId, file),
+    startAfter: chunkKey(userId, sessionId, file, after),
+    limit: MAX_PLANNED_READS,
+  });
   const found: Chunk[] = [];
-  let startAfter = from > 0 ? chunkKey(userId, sessionId, file, from - 1) : undefined;
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, cursor, startAfter });
-    startAfter = undefined;
-    for (const object of page.objects) {
-      const chunk = parseChunkKey(object.key, object.size);
-      if (chunk !== null) found.push(chunk);
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
+  for (const object of page.objects) {
+    const chunk = parseChunkKey(object.key, object.size);
+    if (chunk !== null) found.push(chunk);
+  }
   return runsOf(found.sort((left, right) => left.offset - right.offset));
 };
 

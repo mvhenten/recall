@@ -224,6 +224,13 @@ export interface Walk {
   dry: number;
   /// Whether the walk has reached the start of the listing.
   through: boolean;
+}
+
+// What a box following a session still being written has to say for itself. It is a line of its
+// own under the box and never part of the walk's: the two read different objects and fail apart
+// from each other, so a tail nobody can read says nothing about how far back the reader can walk,
+// and a walk that has given up must not take the live news down with it.
+export interface Tail {
   /// Turns that landed at the foot of the box while the reader was reading further up, and zero
   /// while the reader is at the foot and watching them arrive.
   newer: number;
@@ -233,17 +240,18 @@ export interface Walk {
 
 const kb = (bytes: number): string => (bytes < 1_024 ? `${bytes} B` : `${Math.round(bytes / 1_024)} kB`);
 
-// What a box following a session still being written adds to the note. A reader who has scrolled
-// back is told what arrived rather than being carried to it, and a session that has ended is said
-// to have ended rather than leaving a box that simply stops moving.
-const followNote = (walk: Walk): string => {
-  if (walk.newer > 0) {
-    return ` ${walk.newer} newer ${walk.newer === 1 ? "turn has" : "turns have"} arrived below.`;
+// A reader who has scrolled back is told what arrived rather than being carried to it, and a
+// session that has ended is said to have ended rather than leaving a box that simply stops moving.
+export const tailNote = (tail: Tail): string => {
+  if (tail.newer > 0) {
+    return `${tail.newer} newer ${tail.newer === 1 ? "turn has" : "turns have"} arrived below.`;
   }
-  return walk.ended ? " This session has ended, so nothing more will arrive." : "";
+  return tail.ended ? "This session has ended, so nothing more will arrive." : "";
 };
 
-const readNote = (walk: Walk): string => {
+// What the walk has to say for itself, so what the reader is told and what the reader can see
+// cannot disagree.
+export const walkNote = (walk: Walk): string => {
   const whole = `The whole of ${walk.file} is here, ${kb(walk.bytes)} of it`;
   if (walk.through) {
     if (walk.shown > 0) return `${whole}.`;
@@ -258,10 +266,6 @@ const readNote = (walk: Walk): string => {
   }
   return `${read} read. Scroll up for more.`;
 };
-
-// What the box has to say for itself, so what the reader is told and what the reader can see
-// cannot disagree.
-export const walkNote = (walk: Walk): string => `${readNote(walk)}${followNote(walk)}`;
 
 // The groups turned into text that parses, reading backwards, newest group first. A batch starts
 // wherever its budget ran out and not on a line end, so the head of a group is a part line: it is
