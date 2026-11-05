@@ -263,6 +263,9 @@ describe("the artifact hostname", () => {
     expect(file.status).toBe(200);
     expect(file.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
     expect(file.headers.get("x-content-type-options")).toBe("nosniff");
+    const fileCsp = file.headers.get("content-security-policy") ?? "";
+    expect(fileCsp).toContain("sandbox allow-scripts allow-downloads");
+    expect(fileCsp).toContain("default-src 'none'");
     expect(await file.text()).toBe("# Notes\n");
   });
 

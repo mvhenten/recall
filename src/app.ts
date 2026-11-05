@@ -123,6 +123,7 @@ import {
 } from "./model";
 import { boundaryOf, readMultipart } from "./multipart";
 import {
+  ARTIFACT_CSP,
   artifactPage,
   CSRF_COOKIE,
   confirmPage,
@@ -726,6 +727,11 @@ export const createApp = (deps: Deps): App => {
   // One file of one artifact, streamed. The request's own headers are handed to R2, so the slice is
   // R2's to compute and a seek in a long track never waits for the bytes before it. The manifest
   // names the content type, and a path the manifest does not name is a 404 whoever asks.
+  // A file carries the policy a site's page does, because a document may hold HTML or SVG of its
+  // publisher's and an address under a name is navigated to as readily as the name itself.
+  // `sandbox` binds the document a navigation makes, and a subresource the player or a rendered
+  // document asks for is fetched under the asking page's policy, so a track still plays and a
+  // range still answers.
   const artifactFile = async (
     request: Request,
     bucket: R2Bucket,
@@ -745,7 +751,10 @@ export const createApp = (deps: Deps): App => {
     const headers: Record<string, string> = {
       "content-type": entry.contentType,
       "cache-control": "private, no-cache",
+      "content-security-policy": ARTIFACT_CSP,
       "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
       "accept-ranges": "bytes",
     };
     if (!("body" in object)) return new Response(null, { status: 304, headers });

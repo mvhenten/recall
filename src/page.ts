@@ -100,10 +100,10 @@ export const htmlPage = (
   );
 };
 
-// Every user's pages share this hostname, so each one loads into an opaque origin: inline style
-// and script run, and a page reaches neither another host nor the storage, cookies and pages of
-// whoever else publishes here.
-const ARTIFACT_CSP =
+// Every user's pages and files share this hostname, so each one loads into an opaque origin:
+// inline style and script run, and a page reaches neither another host nor the storage, cookies
+// and pages of whoever else publishes here.
+export const ARTIFACT_CSP =
   "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'unsafe-inline'; " +
   "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data:; " +
   "form-action 'none'; frame-ancestors 'none'; base-uri 'none'";

@@ -484,7 +484,7 @@ impl Recall {
                 replace: params.replace.unwrap_or(false),
                 files: paths,
             })?;
-            to_json(&published)
+            to_json(&published.artifact)
         })
         .await
     }

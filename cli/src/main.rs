@@ -1109,7 +1109,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 files,
             })?;
             if cli.json {
-                print_json(&published)?;
+                print_json(&published.artifact)?;
             } else {
                 if published.owned_by_another {
                     eprintln!(
