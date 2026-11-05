@@ -28,7 +28,7 @@ describe("reading a transcript", () => {
       "{ this line does not parse",
     ].join("\n");
 
-    const turns = readTurns(transcript);
+    const turns = readTurns(transcript, "main");
 
     expect(turns).toEqual([
       { speaker: "user", text: "port the offset table to D1", at: Date.parse("2026-11-01T10:00:00.000Z") },
@@ -38,6 +38,51 @@ describe("reading a transcript", () => {
         at: Date.parse("2026-11-01T10:00:01.000Z"),
       },
     ]);
+  });
+
+  // A subagent's file is nothing but delegated turns, and the harness marks every entry of it a
+  // sidechain — the brief it was given, the prose it answered with, the lot. Read as the session's
+  // own file it comes back with no turn in it at all, which is what left the box empty under a
+  // note saying the whole file was there.
+  it("reads the prose of a delegated file, which is a sidechain from its first entry to its last", () => {
+    const delegated = [
+      line({
+        type: "user",
+        isSidechain: true,
+        timestamp: "2026-11-01T11:00:00.000Z",
+        message: { content: "find why the window stays empty" },
+      }),
+      line({ type: "attachment", isSidechain: true, attachment: { type: "file", path: "/src/turns.ts" } }),
+      line({
+        type: "assistant",
+        isSidechain: true,
+        timestamp: "2026-11-01T11:00:02.000Z",
+        message: {
+          content: [
+            { type: "thinking", thinking: "every entry carries the mark" },
+            { type: "text", text: "Every entry of this file is a sidechain." },
+            { type: "tool_use", name: "Read", input: { file_path: "/src/turns.ts" } },
+          ],
+        },
+      }),
+      line({
+        type: "user",
+        isSidechain: true,
+        toolUseResult: { stdout: "export const readTurns" },
+        message: { content: [{ type: "tool_result", content: "export const readTurns" }] },
+      }),
+      line({ type: "user", isSidechain: true, isMeta: true, message: { content: "the harness wrote this" } }),
+    ].join("\n");
+
+    expect(readTurns(delegated, "agent-7f21")).toEqual([
+      { speaker: "user", text: "find why the window stays empty", at: Date.parse("2026-11-01T11:00:00.000Z") },
+      {
+        speaker: "model",
+        text: "Every entry of this file is a sidechain.",
+        at: Date.parse("2026-11-01T11:00:02.000Z"),
+      },
+    ]);
+    expect(readTurns(delegated, "main")).toEqual([]);
   });
 
   it("reads the name the harness gave the session, however it was written", () => {

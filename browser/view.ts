@@ -8,7 +8,14 @@
 // them. npm-scripts/build-browser.mjs bundles it to the script served at /transcript.js.
 
 import type { Run } from "../src/transcript-plan";
-import { type Fetched, groupedReads, joinedTexts, type PlannedRead, plannedBatch } from "../src/transcript-plan";
+import {
+  type Fetched,
+  groupedReads,
+  joinedTexts,
+  type PlannedRead,
+  plannedBatch,
+  walkNote,
+} from "../src/transcript-plan";
 import { readTurns, type Turn } from "../src/turns";
 
 interface Plan {
@@ -23,8 +30,6 @@ interface Plan {
 // so. A transcript is mostly machinery — tool calls, results, file snapshots — and a stretch of
 // nothing else would otherwise be walked to the head of the file one fetch at a time on page open.
 const BLANK_STEPS = 4;
-
-const kb = (bytes: number): string => (bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} kB`);
 
 const moment = (at: number): string => new Date(at).toISOString().slice(0, 16).replace("T", " ");
 
@@ -111,9 +116,19 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
       }));
   };
 
+  const noteFor = (dry: number): string =>
+    walkNote({
+      file: plan.file,
+      bytes: plan.bytes,
+      loaded,
+      shown: list.childElementCount,
+      dry,
+      through: edge === 0,
+    });
+
   const done = (): void => {
     more.remove();
-    say(`The whole of ${plan.file} is here, ${kb(plan.bytes)} of it.`);
+    say(noteFor(0));
   };
 
   // A read that cannot be had says which read and why, and offers the one control that gets past
@@ -171,7 +186,7 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
 
     const held = box.scrollHeight - box.scrollTop;
     const before = list.childElementCount;
-    for (const text of joined.texts) list.insertBefore(rendered(readTurns(text)), list.firstChild);
+    for (const text of joined.texts) list.insertBefore(rendered(readTurns(text, plan.file)), list.firstChild);
     box.scrollTop = box.scrollHeight - held;
 
     busy = false;
@@ -184,13 +199,11 @@ const boot = (box: HTMLElement, list: HTMLElement, note: HTMLElement, more: HTML
       const dry = blankBytes;
       blanks = 0;
       blankBytes = 0;
-      say(
-        `${kb(loaded)} of ${kb(plan.bytes)} read, and the last ${kb(dry)} of it holds no prose at all. Load earlier to keep reading.`,
-      );
+      say(noteFor(dry));
       return;
     }
-    say(`${kb(loaded)} of ${kb(plan.bytes)} read. Scroll up for more.`);
-    if (list.childElementCount === before) return load();
+    say(noteFor(0));
+    if (blank) return load();
   };
 
   more.addEventListener("click", () => {

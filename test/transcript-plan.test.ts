@@ -9,6 +9,8 @@ import {
   MAX_PLANNED_READS,
   type PlannedRead,
   plannedBatch,
+  type Walk,
+  walkNote,
 } from "../src/transcript-plan";
 
 const read = (run: number, offset: number, skip: number, bytes: number): PlannedRead => ({ run, offset, skip, bytes });
@@ -104,6 +106,48 @@ describe("planning a batch", () => {
     expect(whole.batch).toEqual([read(0, 0, 0, 10)]);
     expect(whole).toMatchObject({ edge: 0, pending: 0 });
     expect(plannedBatch(reads, 0, 0, 1_000)).toEqual({ batch: [], edge: 0, pending: 0 });
+  });
+});
+
+describe("saying how the walk went", () => {
+  const walk = (over: Partial<Walk>): Walk => ({
+    file: "agent-7f21",
+    bytes: 75_776,
+    loaded: 75_776,
+    shown: 4,
+    dry: 0,
+    through: true,
+    ...over,
+  });
+
+  it("says the file was read whole, and what was in it, when something rendered", () => {
+    expect(walkNote(walk({}))).toBe("The whole of agent-7f21 is here, 74 kB of it.");
+  });
+
+  // The bug this is here for: a file read end to end that rendered no turn was reported as the
+  // whole file being there, under a box with nothing in it.
+  it("never reports a walk that rendered nothing as the whole file being here", () => {
+    const note = walkNote(walk({ shown: 0 }));
+
+    expect(note).toContain("agent-7f21");
+    expect(note).toContain("74 kB");
+    expect(note).toContain("none of it is prose this reader knows how to show");
+    expect(note).toContain("the box above is empty");
+  });
+
+  it("says the same of a walk still short of the start of the file", () => {
+    const note = walkNote(walk({ loaded: 20_480, shown: 0, dry: 20_480, through: false }));
+
+    expect(note).toBe(
+      "20 kB of 74 kB of agent-7f21 read, and none of it is prose this reader knows how to show, so the box above is still empty. Load earlier to keep reading.",
+    );
+  });
+
+  it("names the dry stretch only once something is on screen to read", () => {
+    expect(walkNote(walk({ loaded: 40_960, dry: 20_480, through: false }))).toBe(
+      "40 kB of 74 kB read, and the last 20 kB of it holds no prose at all. Load earlier to keep reading.",
+    );
+    expect(walkNote(walk({ loaded: 40_960, through: false }))).toBe("40 kB of 74 kB read. Scroll up for more.");
   });
 });
 
