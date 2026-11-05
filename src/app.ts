@@ -143,6 +143,7 @@ import {
 } from "./store";
 import {
   archivedFiles,
+  archivedSince,
   archivedTranscript,
   type Chunk,
   cacheChunk,
@@ -669,8 +670,14 @@ export const createApp = (deps: Deps): App => {
     if (saving) return saveLabels(request, url, db, userId, lost);
     // A ranged read renders no page, so it does not pay for the tally a page carries in its
     // header: a scroll back through a long transcript is thousands of them, and a D1 write batch
-    // apiece would be the whole cost of reading one.
-    if (bytes) return transcriptBytes(request, url, env, userId, rawSessionId);
+    // apiece would be the whole cost of reading one. A box following a live session beats against
+    // the same route, and `from` is what tells the two apart: it asks how far the file now reaches
+    // rather than for the bytes of one stretch named in the manifest.
+    if (bytes) {
+      return url.searchParams.has("from")
+        ? transcriptTail(url, env, userId, rawSessionId)
+        : transcriptBytes(request, url, env, userId, rawSessionId);
+    }
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (tab === null) {
@@ -792,6 +799,32 @@ export const createApp = (deps: Deps): App => {
         "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
       },
     });
+  };
+
+  // How far a file reaches now, whether anyone is still running the session, and the stretches
+  // past where the reader has got to. A box following a live session beats against this, so it
+  // answers off the cheapest readings there are: the extent is the cache the storage event keeps,
+  // so a beat that finds nothing new opens no object and lists nothing at all, and the listing it
+  // does run once the file has grown starts at the offset the reader names.
+  //
+  // Only the session's own file is followed. Every other file is a delegated turn, which derives
+  // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
+  const transcriptTail = async (url: URL, env: AppEnv, userId: string, rawSessionId: string): Promise<Response> => {
+    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!session.ok) return error(400, session.error);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    if (file.value !== MAIN_FILE) return error(400, `only ${MAIN_FILE} is followed as it is written`);
+    const from = parseChunkOffset(url.searchParams.get("from"));
+    if (!from.ok) return error(400, from.error);
+    const [mark, device] = await Promise.all([
+      indexMark(env.DB, userId, session.value),
+      liveSessionDevice(env.DB, userId, session.value, deps.now()),
+    ]);
+    const bytes = mark === null ? 0 : mark.archived;
+    const runs =
+      bytes > from.value ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value) : [];
+    return json({ bytes, running: device !== null, runs });
   };
 
   // One session the dashboard can read and talk to. The page is reached by clicking a row of the

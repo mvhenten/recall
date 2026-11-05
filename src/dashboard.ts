@@ -41,6 +41,7 @@ import {
 import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE } from "./page";
 import { gapsIn, type Listing, listedRuns, type Run } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
+import { MAIN_FILE } from "./transcripts";
 
 export interface Tab {
   path: string;
@@ -1286,6 +1287,11 @@ ${insightCard("Cache drift", "hit rate by month · every month on record", cache
 // snapshots — is what the fetch pays for and the prose is what survives it.
 export const TRANSCRIPT_STEP_BYTES = 65_536;
 
+// How often the box asks a session still being written how far its file now reaches. It matches
+// the beat a host archives on, so a turn shows about as soon as the archive holds it, and a beat
+// that finds nothing new costs one indexed row read and opens no object.
+export const TRANSCRIPT_FOLLOW_MS = 10_000;
+
 // What the page knows about one transcript file. A session with nothing archived and a session
 // asked for a file it never wrote are different answers, and the page says which rather than
 // handing the browser a manifest of no stretches.
@@ -1437,6 +1443,13 @@ const trimNote = (listing: Listing, bytes: number): string =>
     ? ""
     : `<p class="callout">This file runs to ${kb(bytes)}. The last ${kb(bytes - listing.from)} of it is listed here; the stretches before that are not, so the box stops short of the start of the session.</p>`;
 
+// What the box follows, and nothing when there is nothing to follow. `from` is the end of the
+// manifest, which is the first byte the box has not been handed, so following starts where the
+// page stops and no byte is read twice. A session nobody is running writes nothing more, and only
+// its own file keeps an extent cheap enough to beat against.
+const followOf = (view: SessionView, file: string, bytes: number): { from: number; every: number } | null =>
+  view.session.running && file === MAIN_FILE ? { from: bytes, every: TRANSCRIPT_FOLLOW_MS } : null;
+
 const transcriptCard = (view: SessionView): string => {
   const held = view.transcript;
   const id = view.session.sessionId;
@@ -1464,6 +1477,7 @@ const transcriptCard = (view: SessionView): string => {
     bytes: listing.bytes,
     step: TRANSCRIPT_STEP_BYTES,
     runs: listing.runs,
+    follow: followOf(view, held.file, held.bytes),
   };
   return insightCard(
     "Transcript",

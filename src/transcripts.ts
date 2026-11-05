@@ -219,6 +219,34 @@ export const archivedTranscript = async (
     .sort((left, right) => (left.file < right.file ? -1 : 1));
 };
 
+// How one file lays out past an offset, for a reader following a session still writing it. The
+// listing starts at the key that offset names rather than at the head of the prefix, so a beat
+// costs a page of whatever has landed since the reader last asked and never grows with the length
+// of the session. A stretch that starts before the offset is already in the reader's hands and is
+// left out, so nothing it holds is read a second time.
+export const archivedSince = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  from: number,
+): Promise<Run[]> => {
+  const prefix = filePrefix(userId, sessionId, file);
+  const found: Chunk[] = [];
+  let startAfter = from > 0 ? chunkKey(userId, sessionId, file, from - 1) : undefined;
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor, startAfter });
+    startAfter = undefined;
+    for (const object of page.objects) {
+      const chunk = parseChunkKey(object.key, object.size);
+      if (chunk !== null) found.push(chunk);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor !== undefined);
+  return runsOf(found.sort((left, right) => left.offset - right.offset));
+};
+
 // One stretch, opened by the key its offset names and ranged by what the caller asked for. Nothing
 // is listed and nothing is parsed: a manifest already said which stretches a file holds, and this
 // hands back the bytes of one of them.

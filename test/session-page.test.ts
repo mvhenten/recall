@@ -1,8 +1,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
+import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Mailbox, type Message } from "../src/mailbox";
+import { SESSION_TTL_MS } from "../src/model";
 import type { Read, Run } from "../src/transcript-plan";
 import { type Client, harness } from "./harness";
 
@@ -55,6 +56,13 @@ interface Plan {
   file: string;
   bytes: number;
   step: number;
+  runs: Run[];
+  follow: { from: number; every: number } | null;
+}
+
+interface Reach {
+  bytes: number;
+  running: boolean;
   runs: Run[];
 }
 
@@ -338,6 +346,89 @@ describe("the transcript bytes", () => {
     expect(
       (await h.send(named, { headers: { "cf-access-jwt-assertion": you.assertion, range: "bytes=0-9" } })).status,
     ).toBe(400);
+  });
+});
+
+// One beat of a box following a session still being written: how far the file reaches now, and
+// the stretches past where the reader has got to.
+const reachOf = (h: Harness, plan: Plan, from: number, assertion: string): Promise<Response> =>
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${from}`, {
+    headers: { "cf-access-jwt-assertion": assertion },
+  });
+
+describe("following a transcript as it is written", () => {
+  it("hands a beat only what landed since, and reading it forward gives the appended bytes once", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const head = transcriptOf(3);
+    const grew = transcriptOf(2);
+    const at = await archivedBody(h, you.laptop, "beef0010", head);
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0010", you.assertion));
+    expect(plan.follow).toEqual({ from: head.length, every: TRANSCRIPT_FOLLOW_MS });
+
+    // Nothing has landed since the page was drawn, so the beat names no stretch at all.
+    const quiet: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
+    expect(quiet).toEqual({ bytes: head.length, running: true, runs: [] });
+
+    await archivedBody(h, you.laptop, "beef0010", grew, at);
+    await h.deliver();
+    const moved: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
+
+    expect(moved.bytes).toBe(head.length + grew.length);
+    expect(moved.running).toBe(true);
+    expect(await reassembled(h, { ...plan, runs: moved.runs }, you.assertion)).toBe(grew);
+  });
+
+  // The whole point of the cursor: the stretches already in the reader's hands are never named
+  // again, so nothing the box has shown can be rendered a second time.
+  it("names nothing it has already handed over, however many stretches the file holds", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    let at = 0;
+    for (let beat = 0; beat < 4; beat += 1) at = await archivedBody(h, you.laptop, "beef0011", transcriptOf(2), at);
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0011", you.assertion));
+
+    const whole: Reach = await (await reachOf(h, plan, 0, you.assertion)).json();
+    const since: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
+
+    expect(whole.runs.flatMap((run) => run.reads)).toHaveLength(4);
+    expect(whole.bytes).toBe(at);
+    expect(since.runs).toEqual([]);
+  });
+
+  it("says a session nobody is running is no longer worth following", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const at = await archivedBody(h, you.laptop, "beef0012", transcriptOf(3));
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0012", you.assertion));
+    h.tick(SESSION_TTL_MS + 1);
+
+    const cold: Reach = await (await reachOf(h, plan, at, you.assertion)).json();
+    expect(cold.running).toBe(false);
+    expect(planOf(await read(h, "/dashboard/sessions/beef0012", you.assertion)).follow).toBeNull();
+  });
+
+  // A delegated turn's file derives nothing and so keeps no extent off the objects. Following one
+  // would cost a listing of the whole prefix a beat, so the page does not offer it and the route
+  // refuses it rather than quietly paying for it.
+  it("follows the session's own file and no other", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    await archivedBody(h, you.laptop, "beef0013", transcriptOf(3));
+    expect((await you.laptop.archive("beef0013", "task-7", 0, transcriptOf(2))).status).toBe(200);
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0013?file=task-7", you.assertion));
+
+    expect(plan.follow).toBeNull();
+    expect((await reachOf(h, plan, 0, you.assertion)).status).toBe(400);
+    expect((await reachOf(h, { ...plan, file: "../main" }, 0, you.assertion)).status).toBe(400);
+    expect((await reachOf(h, { ...plan, file: "main" }, -1, you.assertion)).status).toBe(400);
+    expect((await reachOf(h, { ...plan, file: "main" }, 0, await h.assertionFor("stranger@example.com"))).status).toBe(
+      403,
+    );
   });
 });
 
