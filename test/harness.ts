@@ -394,6 +394,11 @@ export const harness = async (
     writeLegacyArtifact: async (userId: string, name: string, body: string): Promise<void> => {
       await env.ARTIFACTS.put(`${userId}/${name}`, body);
     },
+    // A file the manifest names and storage has lost. No route writes this state, so a test of
+    // what the player draws for it has to make it.
+    dropArtifactFile: async (userId: string, name: string, rev: number, path: string): Promise<void> => {
+      await env.ARTIFACTS.delete(`${userId}/${name}/${rev}/${path}`);
+    },
     indexMark: async (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
       env.DB.prepare("SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?")
         .bind(userId, sessionId)

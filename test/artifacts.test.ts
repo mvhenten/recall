@@ -253,6 +253,68 @@ describe("the artifact hostname", () => {
     expect(await part.text()).toBe("first");
   });
 
+  it("answers the raw view for a document too long to render, and says why", async () => {
+    const { h, alice, assertion } = await publisher();
+    const long = `# Long\n\n${"x".repeat(2 * 1024 * 1024)}`;
+    await alice.publishArtifact("long-doc", {
+      type: "document",
+      files: [{ path: "long.md", body: long }],
+    });
+
+    const bare = await h.sendToArtifactHost("/long-doc", assertion);
+    expect(bare.status).toBe(302);
+    expect(bare.headers.get("location")).toBe("/long-doc?view=raw");
+
+    const raw = await h.sendToArtifactHost("/long-doc?view=raw", assertion);
+    expect(raw.status).toBe(200);
+    const html = await raw.text();
+    expect(html).toContain("too long to render");
+    expect(html).toContain("2.0 MB");
+  });
+
+  it("says when a document holds no text, and keeps both views", async () => {
+    const { h, alice, assertion } = await publisher();
+    await alice.publishArtifact("empty-doc", { type: "document", files: [{ path: "empty.md", body: "" }] });
+    const html = await (await h.sendToArtifactHost("/empty-doc", assertion)).text();
+    expect(html).toContain("empty-doc holds no text.");
+    expect(html).toContain("?view=raw");
+    expect(html).toContain(">Rendered<");
+  });
+
+  it("marks a track whose file storage no longer holds", async () => {
+    const { h, email, alice, assertion } = await publisher();
+    await alice.publishArtifact("gone-episode", {
+      type: "audio",
+      files: [
+        { path: "track-01.mp3", body: "first" },
+        { path: "track-02.mp3", body: "second" },
+      ],
+    });
+    await h.dropArtifactFile(await h.userIdFor(email), "gone-episode", 1, "track-02.mp3");
+
+    const html = await (await h.sendToArtifactHost("/gone-episode", assertion)).text();
+    expect(html).toContain("UNAVAILABLE");
+    expect(html).toContain("track-02.mp3. Storage holds no file at this path");
+    expect((await h.sendToArtifactHost("/gone-episode/track-02.mp3", assertion)).status).toBe(404);
+  });
+
+  it("carries one link to the dashboard on the 404 and none on the 401", async () => {
+    const { h } = await publisher();
+    const owner = `alice-${crypto.randomUUID()}@example.com`;
+    await h.invite(owner);
+    const missing = await h.sendToArtifactHost("/no-such-thing", await h.assertionFor(owner, ARTIFACT_AUDIENCE));
+    expect(missing.status).toBe(404);
+    const page = await missing.text();
+    expect(page).toContain("/dashboard");
+    expect(page).toContain('target="_blank"');
+
+    const signedOut = await h.sendToArtifactHost("/no-such-thing", null);
+    expect(signedOut.status).toBe(401);
+    const refused = await signedOut.text();
+    expect(refused).not.toContain("/dashboard");
+    expect(refused).toContain("Reload this page");
+  });
+
   it("serves the player's script at one address no artifact can hold", async () => {
     const { h, assertion } = await publisher();
     const response = await h.sendToArtifactHost("/player.js", assertion);
