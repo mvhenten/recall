@@ -7,10 +7,16 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const CLOSE_REVOKED: u16 = 4001;
+
+/// What this daemon declares on the upgrade: it reads a message's kind, so an order it is handed
+/// goes to one of its sessions. A mailbox hands no order to a socket that declares nothing, since a
+/// daemon too old to read the kind would write the order into every session it has.
+pub const ORDERS_HEADER: &str = "x-recall-orders";
 
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -91,6 +97,9 @@ pub fn listen_request(url: &str, token: &str) -> Result<Request> {
         .parse()
         .context("the device token holds a character an HTTP header cannot carry; run recall login")?;
     request.headers_mut().insert("authorization", authorization);
+    request
+        .headers_mut()
+        .insert(ORDERS_HEADER, HeaderValue::from_static("1"));
     Ok(request)
 }
 
@@ -186,6 +195,12 @@ mod tests {
     fn the_upgrade_carries_the_device_token_the_api_client_sends() {
         let request = listen_request("wss://recall.test/v1/messages/listen", "t-token").unwrap();
         assert_eq!(request.headers().get("authorization").unwrap(), "Bearer t-token");
+    }
+
+    #[test]
+    fn the_upgrade_declares_that_this_daemon_reads_the_kind_of_a_message() {
+        let request = listen_request("wss://recall.test/v1/messages/listen", "t-token").unwrap();
+        assert_eq!(request.headers().get(ORDERS_HEADER).unwrap(), "1");
     }
 
     #[tokio::test]

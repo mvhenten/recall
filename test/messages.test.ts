@@ -117,7 +117,6 @@ describe("messages", () => {
           { kind: "news", toDeviceId: desktopId, toSessionId: "", fromSessionId: "", body: `queued ${index}` },
           { deviceId: desktopId, host: "desktop", name: "" },
           h.now(),
-          0,
         );
       }
     });

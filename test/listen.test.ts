@@ -8,6 +8,10 @@ import {
   MESSAGE_TTL_MS,
   type Message,
   type MessageFrame,
+  ORDERS,
+  ORDERS_HEADER,
+  SWEEP_INTERVAL_MS,
+  SWEPT_AT,
 } from "../src/mailbox";
 import { type Client, harness } from "./harness";
 
@@ -56,7 +60,7 @@ const send = async (client: Client, toDeviceId: string, body: string): Promise<v
 
 const listen = async (h: Harness, token: string): Promise<Listener> => {
   const response = await h.send("/v1/messages/listen", {
-    headers: { authorization: `Bearer ${token}`, upgrade: "websocket" },
+    headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
   expect(response.status).toBe(101);
   const socket = response.webSocket;
@@ -143,25 +147,25 @@ describe("messages listen", () => {
         { kind: "news", toDeviceId: laptopId, toSessionId: "", fromSessionId: "", body: "past the TTL" },
         from,
         now - MESSAGE_TTL_MS - 1,
-        0,
       );
       await mailbox.enqueue(
         { kind: "news", toDeviceId: orphanId, toSessionId: "", fromSessionId: "", body: "nobody holds this device" },
         from,
         now,
-        0,
       );
       return mailbox.enqueue(
         { kind: "news", toDeviceId: laptopId, toSessionId: "", fromSessionId: "", body: "still within the TTL" },
         from,
         now,
-        0,
       );
     });
-    if (!live.queued) throw new Error("the mailbox refused the message it had room for");
+    if (live === null) throw new Error("the mailbox refused the message it had room for");
 
     const desktop = await listen(h, desktopToken);
     expect((await laptop.request("DELETE", `/v1/devices/${desktopId}`)).status).toBe(204);
+    await runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) =>
+      state.storage.put(SWEPT_AT, now - SWEEP_INTERVAL_MS - 1),
+    );
     expect(await runDurableObjectAlarm(mailboxOf(userId))).toBe(true);
 
     expect(await queued(userId, laptopId, now)).toEqual([live.message]);

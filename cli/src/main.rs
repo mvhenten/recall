@@ -524,27 +524,22 @@ fn message_body(words: &[String]) -> Result<String> {
     Ok(text)
 }
 
-/// Why an order reached nobody, in the words the sender reads. A service that fans an order out
-/// has handed it to every session on the host, which is the thing an order exists to avoid; one
-/// that answers with no outcome at all predates orders and did the same.
+/// Why an order reached nobody, in the words the sender reads. A service that answers with a
+/// fanout, or with no outcome at all, predates orders and handed it to every session on the host,
+/// which is the thing an order exists to avoid.
 pub fn order_refusal(sent: &api::Sent, to: &str) -> String {
     let id = &sent.message.message_id;
     match &sent.outcome {
         Some(api::Outcome::Taken { session_id }) => format!("order {id} was taken by {session_id}"),
         Some(api::Outcome::Untaken { reason }) => format!("order {id} reached no session on {to}: {reason}"),
-        Some(api::Outcome::Fanout) => format!(
-            "order {id} was fanned out to every session on {to} instead of being taken by one; that recall cannot lease an order, so update it"
-        ),
-        None => {
-            format!("the recall serving {to} is too old to carry an order, so order {id} went out as news; update it")
-        }
+        _ => format!("the recall serving {to} is too old to carry an order, so order {id} went out as news; update it"),
     }
 }
 
 /// An order is worth nothing to the sender who cannot tell whether anyone picked it up, so one
 /// nobody took ends the command with the reason the service gave rather than a line that reads
-/// like success. Nothing is left behind to run later: a host that is listening and names no
-/// session loses the order, and one that is not listening keeps it only until its grace runs out.
+/// like success. A host that is listening and names no session loses the order; one that is not
+/// listening keeps it for a session that attaches within the ten minutes of the grace.
 fn report_order(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
     let Some(api::Outcome::Taken { session_id }) = &sent.outcome else {
         bail!("{}", order_refusal(sent, to));
