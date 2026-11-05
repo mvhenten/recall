@@ -10,6 +10,9 @@ import {
 } from "./artifacts";
 import { chunkTurns } from "./chunks";
 import {
+  ARTIFACTS_SHOWN,
+  ARTIFACTS_TAB,
+  artifactsPage,
   dashboardNotice,
   type Flash,
   HISTORY_TAB,
@@ -233,6 +236,11 @@ interface Rankings {
   inScope: Ranking;
   elsewhere: Ranking;
 }
+
+const publishedAt = (host: ArtifactHost, stored: Stored): Artifact => ({
+  ...stored,
+  url: `https://${host.hostname}/${stored.name}`,
+});
 
 const decodeSegment = (segment: string): string | null => {
   try {
@@ -684,6 +692,7 @@ export const createApp = (deps: Deps): App => {
       return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
     }
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
+    if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(userId, email, live);
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
     if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
     if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
@@ -936,6 +945,20 @@ export const createApp = (deps: Deps): App => {
     return memoryBodyPage(email, live, memory, deps.now());
   };
 
+  // The pages this account has published, off the one listing `GET /v1/artifacts` reads and
+  // scoped by the user the Access assertion resolved to. The tab browses and nothing else:
+  // publishing, renaming and deleting stay with `recall publish` and the tools.
+  const artifactsTab = async (userId: string, email: string, live: Live): Promise<Response> => {
+    const host = deps.artifactHost;
+    if (host === null) return artifactsPage(email, live, { kind: "off" });
+    const stored = await listArtifacts(host.bucket, userId);
+    return artifactsPage(email, live, {
+      kind: "pages",
+      pages: stored.slice(0, ARTIFACTS_SHOWN).map((one) => publishedAt(host, one)),
+      total: stored.length,
+    });
+  };
+
   const memoryTab = async (
     url: URL,
     db: D1Database,
@@ -1016,11 +1039,12 @@ export const createApp = (deps: Deps): App => {
   };
 
   const artifacts = async (request: Request, userId: string, rawName: string | undefined): Promise<Response> => {
-    if (deps.artifactHost === null) {
+    const host = deps.artifactHost;
+    if (host === null) {
       return error(404, "this recall publishes no pages; its deployment names no artifact hostname");
     }
-    const { bucket, hostname } = deps.artifactHost;
-    const published = (stored: Stored): Artifact => ({ ...stored, url: `https://${hostname}/${stored.name}` });
+    const { bucket } = host;
+    const published = (stored: Stored): Artifact => publishedAt(host, stored);
     if (rawName === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
       return json({ artifacts: (await listArtifacts(bucket, userId)).map(published) });
