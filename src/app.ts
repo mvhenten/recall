@@ -1,17 +1,36 @@
 import {
-  ARTIFACT_CONTENT_TYPE,
-  type Artifact,
-  deleteArtifact,
-  listArtifacts,
+  type ArtifactRefusal,
+  artifactNotice,
+  documentPage,
+  PLAYER_SCRIPT_PATH,
+  playerPage,
+  playerScript,
+  RAW_VIEW,
+  RENDER_CEILING_BYTES,
+  rawDocumentPage,
+} from "./artifact-page";
+import {
+  type ArtifactFile,
+  type ArtifactListInput,
+  type ArtifactRecord,
+  type ArtifactView,
+  contentTypeFor,
+  deleteArtifactFiles,
+  deleteRevision,
+  fileKey,
+  headArtifactFile,
   MAX_ARTIFACT_BYTES,
-  putArtifact,
-  readArtifact,
-  type Stored,
+  MAX_FILE_BYTES,
+  parseArtifactList,
+  parseFilePath,
+  parseManifest,
+  RAW_INLINE_BYTES,
+  readArtifactFile,
 } from "./artifacts";
 import { chunkTurns } from "./chunks";
 import {
-  ARTIFACTS_SHOWN,
   ARTIFACTS_TAB,
+  type ArtifactShelf,
   artifactsPage,
   dashboardNotice,
   type Flash,
@@ -58,6 +77,7 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
+import { ARTIFACT_SORTS, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortInForce } from "./listing";
 import {
   DEVICE_HEADER,
   MAX_BODY_BYTES,
@@ -67,6 +87,7 @@ import {
   parseSend,
   type Sender,
 } from "./mailbox";
+import { render } from "./markdown";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -100,26 +121,48 @@ import {
   USAGE_WEEK_DAYS,
   type Verify,
 } from "./model";
-import { artifactPage, CSRF_COOKIE, confirmPage, enterCodePage, messagePage, readCookie, SENT_COOKIE } from "./page";
+import { boundaryOf, readMultipart } from "./multipart";
+import {
+  ARTIFACT_CSP,
+  artifactPage,
+  CSRF_COOKIE,
+  confirmPage,
+  enterCodePage,
+  messagePage,
+  readCookie,
+  SENT_COOKIE,
+  sizeText,
+} from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
 import {
+  accountReadableElsewhere,
+  adoptArtifacts,
+  artifactCounts,
+  artifactCursorDirection,
   type ChunkCandidate,
   type ChunkMatch,
+  type Cursor,
   chunkExcerpts,
   chunkMatches,
   chunkVectors,
+  claimRevision,
   countedFiles,
+  createArtifact,
   decodeCursor,
+  deleteArtifactRow,
   deleteMemory,
   describeMemories,
   describeSessions,
   endSession,
   findSession,
+  getArtifact,
   getMemory,
+  historyCursorDirection,
   type IndexedChunk,
   type IndexMark,
   indexMark,
   labelTargets,
+  listArtifactPage,
   listMemories,
   listSessionHistory,
   listSessionHistoryIds,
@@ -127,6 +170,7 @@ import {
   liveSessionDevice,
   liveTally,
   memoryCounts,
+  memoryCursorDirection,
   nameSession,
   putSession,
   readInsights,
@@ -134,7 +178,11 @@ import {
   readStats,
   recall,
   recordUsage,
+  replaceArtifact,
+  resolveArtifact,
   saveMemory,
+  searchArtifacts,
+  searchSessionHistory,
   sessionHistoryFilters,
   sessionOnDevice,
   sessionOnRecord,
@@ -165,6 +213,9 @@ export interface ArtifactHost {
   hostname: string;
   verify: Verify;
   bucket: R2Bucket;
+  // Where an artifact page's footer points. The artifact hostname answers artifacts and nothing
+  // else, so the dashboard is a second host and this is the only place its address is known.
+  dashboard: string;
 }
 
 export interface Deps {
@@ -239,10 +290,44 @@ interface Rankings {
   elsewhere: Ranking;
 }
 
-const publishedAt = (host: ArtifactHost, stored: Stored): Artifact => ({
-  ...stored,
-  url: `https://${host.hostname}/${stored.name}`,
+// The largest manifest a publish may send. It carries a title, a description, two permissions and
+// at most fifty paths, so a body past this is not a manifest.
+const MANIFEST_BYTES = 64 * 1024;
+
+const viewOf = (host: ArtifactHost, record: ArtifactRecord): ArtifactView => ({
+  name: record.name,
+  url: `https://${host.hostname}/${encodeURIComponent(record.name)}`,
+  type: record.type,
+  title: record.title,
+  description: record.description,
+  read: record.read,
+  write: record.write,
+  fileCount: record.fileCount,
+  bytes: record.bytes,
+  createdAt: record.createdAt,
+  updatedAt: record.updatedAt,
+  lastWriter: record.lastWriter,
 });
+
+const jsonOrNull = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+};
+
+const momentOf = (at: number): string => `${new Date(at).toISOString().slice(0, 16)}Z`;
+
+// What the file route answers for a ranged read. R2 computed the slice, so the header is read back
+// off the object rather than off the request.
+const contentRangeOf = (range: R2Range | undefined, size: number): string => {
+  if (range === undefined) return `bytes 0-${Math.max(size - 1, 0)}/${size}`;
+  const suffix = "suffix" in range ? range.suffix : 0;
+  const offset = "offset" in range && range.offset !== undefined ? range.offset : size - suffix;
+  const length = "length" in range && range.length !== undefined ? range.length : size - offset;
+  return `bytes ${offset}-${offset + length - 1}/${size}`;
+};
 
 const decodeSegment = (segment: string): string | null => {
   try {
@@ -639,17 +724,138 @@ export const createApp = (deps: Deps): App => {
     return userId ?? refuse(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
   };
 
+  // One file of one artifact, streamed. The request's own headers are handed to R2, so the slice is
+  // R2's to compute and a seek in a long track never waits for the bytes before it. The manifest
+  // names the content type, and a path the manifest does not name is a 404 whoever asks.
+  // A file carries the policy a site's page does, because a document may hold HTML or SVG of its
+  // publisher's and an address under a name is navigated to as readily as the name itself.
+  // `sandbox` binds the document a navigation makes, and a subresource the player or a rendered
+  // document asks for is fetched under the asking page's policy, so a track still plays and a
+  // range still answers.
+  const artifactFile = async (
+    request: Request,
+    bucket: R2Bucket,
+    record: ArtifactRecord,
+    path: string,
+    lost: () => Response,
+  ): Promise<Response> => {
+    const asked = parseFilePath(path);
+    if (!asked.ok) return lost();
+    const entry = record.files.find((file) => file.path === asked.value);
+    if (entry === undefined) return lost();
+    const object = await bucket.get(fileKey(record.ownerUserId, record.name, record.rev, entry.path), {
+      range: request.headers,
+      onlyIf: request.headers,
+    });
+    if (object === null) return lost();
+    const headers: Record<string, string> = {
+      "content-type": entry.contentType,
+      "cache-control": "private, no-cache",
+      "content-security-policy": ARTIFACT_CSP,
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "accept-ranges": "bytes",
+    };
+    if (!("body" in object)) return new Response(null, { status: 304, headers });
+    if (!request.headers.has("range")) return new Response(object.body, { headers });
+    return new Response(object.body, {
+      status: 206,
+      headers: { ...headers, "content-range": contentRangeOf(object.range, object.size) },
+    });
+  };
+
+  const entryBody = async (bucket: R2Bucket, record: ArtifactRecord): Promise<R2ObjectBody> => {
+    const object = await readArtifactFile(bucket, record.ownerUserId, record.name, record.rev, record.entryPath);
+    if (object === null) {
+      throw new Error(`artifact ${record.name} names ${record.entryPath} and storage holds no such file`);
+    }
+    return object;
+  };
+
+  // The start of the entry, and no more. The raw view is the fallback for a document too long to
+  // render, so it is the one view handed a file of up to 32 MB: it reads a bounded range rather
+  // than the whole object, because the page escapes what it prints and concatenates it into one
+  // string. A range can cut a UTF-8 sequence in half, and a decoder left mid-stream holds the
+  // trailing bytes back rather than printing a replacement character for them.
+  const entryHead = async (bucket: R2Bucket, record: ArtifactRecord, bytes: number): Promise<string> => {
+    const object = await bucket.get(fileKey(record.ownerUserId, record.name, record.rev, record.entryPath), {
+      range: { offset: 0, length: bytes },
+    });
+    if (object === null) {
+      throw new Error(`artifact ${record.name} names ${record.entryPath} and storage holds no such file`);
+    }
+    return new TextDecoder().decode(await object.arrayBuffer(), { stream: true });
+  };
+
+  // The rendered view, the raw view, and the redirect that stands in for a render too long to
+  // spend the CPU on. Both views are recall's own HTML off the publisher's markdown, so neither
+  // carries a script and the renderer escapes every character it prints.
+  const documentView = async (url: URL, host: ArtifactHost, record: ArtifactRecord): Promise<Response> => {
+    const entry = record.files[0];
+    if (entry === undefined) throw new Error(`artifact ${record.name} names no file`);
+    if (url.searchParams.get("view") === RAW_VIEW) {
+      const source = await entryHead(host.bucket, record, RAW_INLINE_BYTES);
+      return rawDocumentPage(record, host.dashboard, source, entry.bytes > RAW_INLINE_BYTES);
+    }
+    if (entry.bytes > RENDER_CEILING_BYTES) {
+      return new Response(null, {
+        status: 302,
+        headers: { location: `/${encodeURIComponent(record.name)}?view=${RAW_VIEW}`, "cache-control": "no-store" },
+      });
+    }
+    const source = await (await entryBody(host.bucket, record)).text();
+    return documentPage(record, host.dashboard, render(source, record.name));
+  };
+
+  // The player, with every entry the manifest names checked against storage as the page is drawn:
+  // a track whose file is gone keeps its row and its mark rather than failing silently when a
+  // reader presses play.
+  const playerView = async (host: ArtifactHost, record: ArtifactRecord): Promise<Response> => {
+    const held = await Promise.all(
+      record.files.map((file) => headArtifactFile(host.bucket, record.ownerUserId, record.name, record.rev, file.path)),
+    );
+    const missing = record.files.filter((_file, index) => held[index] === null).map((file) => file.path);
+    return playerPage(record, host.dashboard, missing);
+  };
+
+  // An artifact published before a row carried its type. Its bytes are at the bare key and no row
+  // names them, so the address keeps working and the tab lists it once the operator adopts it.
+  const legacySite = async (host: ArtifactHost, userId: string, name: string): Promise<Response | null> => {
+    const object = await host.bucket.get(fileKey(userId, name, 0, ""));
+    return object === null ? null : artifactPage(object.body);
+  };
+
   const artifactSite = async (request: Request, url: URL, db: D1Database, host: ArtifactHost): Promise<Response> => {
-    const lost = (): Response => messagePage(404, "No such page", "This recall publishes no page at this address.");
-    if (request.method !== "GET") return messagePage(405, "Not allowed", "This host only answers a GET.");
-    const email = await approver(request, host.verify);
-    if (email instanceof Response) return email;
-    const userId = await invited(db, email, messagePage);
-    if (userId instanceof Response) return userId;
-    const name = parseName(decodeSegment(url.pathname.slice(1)) ?? "");
-    if (!name.ok) return lost();
-    const object = await readArtifact(host.bucket, userId, name.value);
-    return object === null ? lost() : artifactPage(object.body);
+    const notice = (refusal: ArtifactRefusal): Response => artifactNotice(refusal, host.dashboard);
+    if (request.method !== "GET") return notice({ kind: "method" });
+    const address = `${url.pathname}${url.search}`;
+    const assertion = request.headers.get("cf-access-jwt-assertion");
+    if (!assertion) {
+      return notice({ kind: "unauthorized", reason: "this host saw no sign-in at all", address });
+    }
+    const verified = await host.verify(assertion);
+    if (!verified.ok) return notice({ kind: "unauthorized", reason: verified.reason, address });
+    const userId = await userForEmail(db, verified.email);
+    if (userId === null) return notice({ kind: "forbidden", email: verified.email });
+    // A name is a kebab-case slug and cannot hold a dot, so the player's script answers here
+    // without standing in front of any artifact's address.
+    if (url.pathname === PLAYER_SCRIPT_PATH) return playerScript();
+    const [rawName, ...rest] = url.pathname.slice(1).split("/");
+    const name = parseName(decodeSegment(rawName ?? "") ?? "");
+    if (!name.ok) return notice({ kind: "lost" });
+    const record = await resolveArtifact(db, userId, name.value);
+    if (record === null) {
+      return rest.length > 0
+        ? notice({ kind: "lost" })
+        : ((await legacySite(host, userId, name.value)) ?? notice({ kind: "lost" }));
+    }
+    if (rest.length > 0) {
+      return artifactFile(request, host.bucket, record, rest.join("/"), () => notice({ kind: "lost" }));
+    }
+    if (record.type === "document") return documentView(url, host, record);
+    if (record.type === "audio") return playerView(host, record);
+    return artifactPage((await entryBody(host.bucket, record)).body);
   };
 
   const dashboard = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
@@ -700,13 +906,13 @@ export const createApp = (deps: Deps): App => {
       return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
     }
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
-    if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(userId, email, live);
+    if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(url, db, userId, email, live, lost);
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
     if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
     if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
     if (tab.path === LABELS_TAB.path) return labelsTab(request, db, userId, email, live);
     const [sessions, labels] = await Promise.all([listSessions(db, userId, now), readLabels(db, userId)]);
-    return sessionsPage(email, live, sessions, labels, now);
+    return sessionsPage(email, live, url, sessions, labels, now);
   };
 
   // The token every dashboard form posts back. A browser holds one cookie for the whole site, so
@@ -958,6 +1164,11 @@ export const createApp = (deps: Deps): App => {
   ): Promise<Response> =>
     insightsPage(email, live, await readInsights(db, userId, dayWindow(now, USAGE_CHART_DAYS), now), now);
 
+  // A page link cut from an order a reader has since left behind, or one a hand edited, reads as
+  // page one rather than as an error: the address still names the list it names.
+  const pageCursor = (cursor: string, direction: "desc" | "asc"): Cursor =>
+    decodeCursor(cursor, direction) ?? decodeCursor("", direction) ?? [Number.MAX_SAFE_INTEGER, ""];
+
   const historyTab = async (
     url: URL,
     db: D1Database,
@@ -966,13 +1177,32 @@ export const createApp = (deps: Deps): App => {
     live: Live,
     lost: Refusal,
   ): Promise<Response> => {
-    const input = parseHistory(url.searchParams);
+    const chosen = sortInForce(url, HISTORY_SORTS);
+    const input = parseHistory(url.searchParams, chosen.sort);
     if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
-    const cursor = decodeCursor(input.value.cursor);
-    if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the History tab.");
-    const page = await listSessionHistory(db, userId, input.value, cursor, deps.now());
+    const filter = input.value;
+    const now = deps.now();
+    const match = filter.query === "" ? null : ftsQuery(filter.query);
+    const page =
+      filter.query === ""
+        ? {
+            ...(await listSessionHistory(
+              db,
+              userId,
+              filter,
+              pageCursor(filter.cursor, historyCursorDirection(filter.sort)),
+              now,
+            )),
+            cut: false,
+          }
+        : {
+            nextCursor: "",
+            ...(match === null
+              ? { sessions: [], cut: false }
+              : await searchSessionHistory(db, userId, filter, match, MAX_SEARCH_MATCHES, now)),
+          };
     const [known, labels] = await Promise.all([sessionHistoryFilters(db, userId), readLabels(db, userId)]);
-    return historyPage(email, live, url, input.value, known, page.sessions, page.nextCursor, labels);
+    return historyPage(email, live, url, filter, known, page.sessions, page.nextCursor, page.cut, labels);
   };
 
   const memoryBody = async (
@@ -989,18 +1219,54 @@ export const createApp = (deps: Deps): App => {
     return memoryBodyPage(email, live, memory, deps.now());
   };
 
-  // The pages this account has published, off the one listing `GET /v1/artifacts` reads and
+  // One page of the shelf: one indexed read of the artifact rows, and one read of the counts the
+  // chips and the heading print. No bytes are read and the bucket is not listed.
+  const shelfFor = async (
+    db: D1Database,
+    host: ArtifactHost,
+    userId: string,
+    input: ArtifactListInput,
+    cursor: Cursor,
+  ): Promise<ArtifactShelf> => {
+    const match = input.query === "" ? null : ftsQuery(input.query);
+    const [counts, page] = await Promise.all([
+      artifactCounts(db, userId),
+      input.query === ""
+        ? listArtifactPage(db, userId, input, cursor).then((read) => ({ ...read, cut: false }))
+        : match === null
+          ? Promise.resolve({ artifacts: [], nextCursor: "", cut: false })
+          : searchArtifacts(db, userId, input.type, match, MAX_SEARCH_MATCHES).then((found) => ({
+              ...found,
+              nextCursor: "",
+            })),
+    ]);
+    return {
+      artifacts: page.artifacts.map((record) => viewOf(host, record)),
+      counts,
+      nextCursor: page.nextCursor,
+      cut: page.cut,
+    };
+  };
+
+  // The artifacts this account has published, off the same listing `GET /v1/artifacts` reads and
   // scoped by the user the Access assertion resolved to. The tab browses and nothing else:
-  // publishing, renaming and deleting stay with `recall publish` and the tools.
-  const artifactsTab = async (userId: string, email: string, live: Live): Promise<Response> => {
+  // publishing and unpublishing stay with `recall publish` and `recall unpublish`.
+  const artifactsTab = async (
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    lost: Refusal,
+  ): Promise<Response> => {
     const host = deps.artifactHost;
-    if (host === null) return artifactsPage(email, live, { kind: "off" });
-    const stored = await listArtifacts(host.bucket, userId);
-    return artifactsPage(email, live, {
-      kind: "pages",
-      pages: stored.slice(0, ARTIFACTS_SHOWN).map((one) => publishedAt(host, one)),
-      total: stored.length,
-    });
+    if (host === null) return artifactsPage(email, live, url, { kind: "off" });
+    const chosen = sortInForce(url, ARTIFACT_SORTS);
+    const input = parseArtifactList(url.searchParams, chosen.sort);
+    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
+    const cursor = pageCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
+    const shelf = await shelfFor(db, host, userId, input.value, cursor);
+    return artifactsPage(email, live, url, { kind: "shelf", shelf });
   };
 
   const memoryTab = async (
@@ -1011,15 +1277,15 @@ export const createApp = (deps: Deps): App => {
     live: Live,
     lost: Refusal,
   ): Promise<Response> => {
-    const input = parseList(url.searchParams);
+    const chosen = sortInForce(url, MEMORY_SORTS);
+    const input = parseList(url.searchParams, chosen.sort);
     if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
     const filter = input.value;
     const now = deps.now();
     const counts = await memoryCounts(db, userId, now - FRESH_WINDOW_MS);
     const query = url.searchParams.get("q") ?? "";
     if (query === "") {
-      const cursor = decodeCursor(filter.cursor);
-      if (!cursor) return lost(400, "Page link refused", "This link is malformed. Start again from the Memory tab.");
+      const cursor = pageCursor(filter.cursor, memoryCursorDirection(filter.sort));
       const page = await listMemories(db, userId, filter, cursor);
       return memoriesPage(email, live, url, filter, counts, page.memories, page.nextCursor, now);
     }
@@ -1082,49 +1348,226 @@ export const createApp = (deps: Deps): App => {
     return json(saved, saved.created ? 201 : 200);
   };
 
-  const artifacts = async (request: Request, userId: string, rawName: string | undefined): Promise<Response> => {
-    const host = deps.artifactHost;
-    if (host === null) {
-      return error(404, "this recall publishes no pages; its deployment names no artifact hostname");
+  // What a publish is refused with when the name is taken: the artifact, its type, its size, when
+  // it was last written and the email that wrote it, in a string the CLI prints verbatim and in
+  // fields a tool reads.
+  const conflict = (record: ArtifactRecord): Response =>
+    json(
+      {
+        error: `${record.name} already holds a ${record.type} artifact of ${sizeText(record.bytes)}, last written ${momentOf(
+          record.updatedAt,
+        )} by ${record.lastWriter === "" ? "a device of this account" : record.lastWriter}; pass --replace to replace it`,
+        artifact: {
+          name: record.name,
+          type: record.type,
+          bytes: record.bytes,
+          updatedAt: record.updatedAt,
+          lastWriter: record.lastWriter,
+        },
+      },
+      409,
+    );
+
+  // What a write would replace. The caller's own row comes first and is the only one a write that
+  // is not replacing anything may find: one account publishing a name for the account to read must
+  // not take that name away from everyone else, who would otherwise be refused their own first
+  // publish under it. A caller who does mean to replace reaches the account-readable one, and the
+  // write permission decides whether they may.
+  const writeTarget = async (
+    db: D1Database,
+    userId: string,
+    name: string,
+    replacing: boolean,
+  ): Promise<ArtifactRecord | Response | null> => {
+    const own = await getArtifact(db, userId, name);
+    if (own !== null) return own;
+    if (!replacing) return null;
+    const shared = await resolveArtifact(db, userId, name);
+    if (shared === null || shared.write === "account") return shared;
+    return error(403, "this artifact's write permission is owner, and only its owner replaces or deletes it");
+  };
+
+  // The revision a failed publish wrote, and the one a publish that worked replaced. Neither is
+  // reachable from any address once the commit has run, so a delete that fails costs a dead
+  // revision an unpublish collects later rather than the answer the caller is owed.
+  const collect = (bucket: R2Bucket, userId: string, name: string, rev: number): Promise<void> =>
+    deleteRevision(bucket, userId, name, rev).catch((failure: unknown) => {
+      console.error(
+        JSON.stringify({
+          error: failure instanceof Error ? failure.message : String(failure),
+          collecting: `${userId}/${name}/${rev}`,
+          stack: failure instanceof Error ? failure.stack : "",
+        }),
+      );
+    });
+
+  // The publish. The manifest, the stored row and the gates come first and write nothing; then the
+  // revision is claimed in D1, so the prefix every file streams into is one no other writer can
+  // reach; then one compare-and-swap moves the row forward, which is the publish. Anything that
+  // fails before that statement leaves the artifact and every one of its files exactly as they
+  // were.
+  const publish = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    host: ArtifactHost,
+    caller: Caller,
+    name: string,
+  ): Promise<Response> => {
+    const tooLarge = (): Response =>
+      error(413, `a file holds at most ${MAX_FILE_BYTES} bytes and an artifact at most ${MAX_ARTIFACT_BYTES}`);
+    const boundary = boundaryOf(request.headers.get("content-type") ?? "");
+    if (boundary === null || request.body === null) {
+      return error(400, "a publish sends multipart/form-data: a manifest part, then one part per file");
     }
-    const { bucket } = host;
-    const published = (stored: Stored): Artifact => publishedAt(host, stored);
-    if (rawName === undefined) {
-      if (request.method !== "GET") return error(405, "method not allowed");
-      return json({ artifacts: (await listArtifacts(bucket, userId)).map(published) });
+    const declared = Number(request.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_ARTIFACT_BYTES) return tooLarge();
+    const parts = readMultipart(request.body, boundary);
+    const head = await parts.nextPart();
+    if (head === null || head.name !== "manifest") return error(400, "the first part must be named manifest");
+    const text = await parts.text(MANIFEST_BYTES);
+    if (text === null) return error(400, `the manifest part holds at most ${MANIFEST_BYTES} bytes`);
+    const manifest = parseManifest(jsonOrNull(text));
+    if (!manifest.ok) return error(400, manifest.error);
+    const declaredFiles = manifest.value.files;
+    const total = declaredFiles.reduce((running, file) => running + file.bytes, 0);
+    if (total > MAX_ARTIFACT_BYTES || declaredFiles.some((file) => file.bytes > MAX_FILE_BYTES)) return tooLarge();
+    const replacing = url.searchParams.get("replace") === "true";
+    const target = await writeTarget(db, caller.userId, name, replacing);
+    if (target instanceof Response) return target;
+    if (target !== null && !replacing) return conflict(target);
+    const owner = target?.ownerUserId ?? caller.userId;
+    if (manifest.value.read === "account" && (await accountReadableElsewhere(db, owner, name))) {
+      return error(409, `another account publishes ${name} for this recall to read; publish it under another name`);
     }
-    const name = parseName(decodeSegment(rawName) ?? "");
-    if (!name.ok) return error(400, name.error);
-    const tooLarge = (): Response => error(413, `the page must hold at most ${MAX_ARTIFACT_BYTES} bytes`);
-    if (request.method === "PUT") {
-      const declared = Number(request.headers.get("content-length"));
-      if (Number.isFinite(declared) && declared > MAX_ARTIFACT_BYTES) return tooLarge();
-      const body = await request.arrayBuffer();
-      if (body.byteLength === 0) return error(400, "the request body must hold the page's HTML");
-      if (body.byteLength > MAX_ARTIFACT_BYTES) return tooLarge();
-      return json({ artifact: published(await putArtifact(bucket, userId, name.value, body)) });
+    const rev = await claimRevision(db, owner, name);
+    const refuse = async (status: number, message: string): Promise<Response> => {
+      await collect(host.bucket, owner, name, rev);
+      return error(status, message);
+    };
+    const files: ArtifactFile[] = [];
+    for (const file of declaredFiles) {
+      const part = await parts.nextPart();
+      if (part === null) {
+        return refuse(400, `the manifest names ${declaredFiles.length} files and the body holds ${files.length}`);
+      }
+      // R2 takes a stream whose length is known, so the length the manifest declared is the length
+      // the object is written at and the part is held to it exactly.
+      const sized = new FixedLengthStream(file.bytes);
+      const stored = host.bucket.put(fileKey(owner, name, rev, file.path), sized.readable);
+      const written = await parts.pipe(sized.writable, file.bytes);
+      if (!written.ok) {
+        await stored.catch(() => undefined);
+        return refuse(400, `${file.path} holds ${written.bytes} bytes and the manifest names ${file.bytes}`);
+      }
+      await stored;
+      files.push({ path: file.path, bytes: file.bytes, contentType: contentTypeFor(file.path) });
     }
-    if (request.method === "DELETE") {
-      await deleteArtifact(bucket, userId, name.value);
+    const commit = {
+      userId: owner,
+      name,
+      rev,
+      type: manifest.value.type,
+      title: manifest.value.title,
+      description: manifest.value.description,
+      read: manifest.value.read,
+      write: manifest.value.write,
+      files,
+      at: deps.now(),
+      writerUserId: caller.userId,
+    };
+    const committed =
+      target === null ? await createArtifact(db, commit) : await replaceArtifact(db, commit, target.rev);
+    if (!committed) {
+      await collect(host.bucket, owner, name, rev);
+      const held = await getArtifact(db, owner, name);
+      return held === null
+        ? error(409, `${name} was written by another request while this one was publishing`)
+        : conflict(held);
+    }
+    const saved = await getArtifact(db, owner, name);
+    if (saved === null) throw new Error(`artifact ${name} vanished right after it was published`);
+    if (target !== null) await collect(host.bucket, owner, name, target.rev);
+    return json({ artifact: viewOf(host, saved), ownedByAnother: owner !== caller.userId });
+  };
+
+  const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
+    const target = await writeTarget(db, caller.userId, name, true);
+    if (target instanceof Response) return target;
+    if (target === null) {
+      // An artifact published before a row carried its type has bytes and no row, and unpublishing
+      // it is still deleting what the address serves.
+      const legacy = await bucket.head(fileKey(caller.userId, name, 0, ""));
+      if (legacy === null) return error(404, `no artifact named ${name}`);
+      await bucket.delete(legacy.key);
       return new Response(null, { status: 204 });
     }
-    if (request.method !== "GET") return error(405, "method not allowed");
-    const object = await readArtifact(bucket, userId, name.value);
-    if (object === null) return error(404, `no page named ${name.value}`);
-    return new Response(object.body, {
-      headers: {
-        "content-type": ARTIFACT_CONTENT_TYPE,
-        "cache-control": "no-store",
-        "content-security-policy": "default-src 'none'; sandbox",
-        "x-content-type-options": "nosniff",
-      },
+    await deleteArtifactRow(db, target.ownerUserId, name);
+    await deleteArtifactFiles(bucket, target.ownerUserId, name);
+    return new Response(null, { status: 204 });
+  };
+
+  const artifactsListing = async (url: URL, db: D1Database, host: ArtifactHost, userId: string): Promise<Response> => {
+    const chosen = sortInForce(url, ARTIFACT_SORTS);
+    const input = parseArtifactList(url.searchParams, chosen.sort);
+    if (!input.ok) return error(400, input.error);
+    const cursor = decodeCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
+    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
+    const shelf = await shelfFor(db, host, userId, input.value, cursor);
+    return json({
+      artifacts: shelf.artifacts,
+      nextCursor: shelf.nextCursor,
+      total: shelf.counts.total,
+      cut: shelf.cut,
     });
   };
 
+  const artifacts = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    caller: Caller,
+    rawName: string | undefined,
+    subpath: string,
+  ): Promise<Response> => {
+    const host = deps.artifactHost;
+    if (host === null) {
+      return error(404, "this recall publishes no artifacts; its deployment names no artifact hostname");
+    }
+    const { bucket } = host;
+    const { userId } = caller;
+    if (rawName === undefined) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      return artifactsListing(url, db, host, userId);
+    }
+    // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
+    // shadowed by an artifact named adopt.
+    if (rawName === "adopt" && subpath === "" && request.method === "POST") {
+      return json({ adopted: await adoptArtifacts(db, bucket, userId) });
+    }
+    const name = parseName(decodeSegment(rawName) ?? "");
+    if (!name.ok) return error(400, name.error);
+    if (subpath !== "") {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      const record = await resolveArtifact(db, userId, name.value);
+      const lost = (): Response => error(404, `no file ${subpath} in artifact ${name.value}`);
+      if (record === null) return lost();
+      return artifactFile(request, bucket, record, subpath, lost);
+    }
+    if (request.method === "PUT") return publish(request, url, db, host, caller, name.value);
+    if (request.method === "DELETE") return unpublish(db, bucket, caller, name.value);
+    if (request.method !== "GET") return error(405, "method not allowed");
+    // The same artifact a read of one of its files names, so a shared artifact never answers its
+    // files over the API while refusing to say anything about itself.
+    const record = await resolveArtifact(db, userId, name.value);
+    if (record === null) return error(404, `no artifact named ${name.value}`);
+    return json({ artifact: viewOf(host, record) });
+  };
+
   const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
-    const input = parseList(url.searchParams);
+    const input = parseList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
-    const cursor = decodeCursor(input.value.cursor);
+    const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
     if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
     return json(await listMemories(db, userId, input.value, cursor));
   };
@@ -1230,9 +1673,13 @@ export const createApp = (deps: Deps): App => {
         { status: 404, headers: { vary: "accept", "cache-control": "no-store" } },
       );
     }
-    const [version, collection, rawName, subresource, ...rest] = url.pathname.split("/").filter((part) => part !== "");
-    if (version !== "v1" || rest.length > 0) return error(404, "not found");
-    if (subresource !== undefined && collection !== "sessions") return error(404, "not found");
+    const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
+    if (version !== "v1") return error(404, "not found");
+    const subresource = rest[0];
+    // An artifact's files are addressed by a path of up to three segments, so the tail below the
+    // name belongs to the collection rather than to the router.
+    if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts") return error(404, "not found");
+    if (rest.length > 1 && collection !== "artifacts") return error(404, "not found");
     if (collection === "device") {
       if (request.method !== "POST") return error(405, "method not allowed");
       if (rawName === "code") return startDevice(request, url, env.DB);
@@ -1255,7 +1702,7 @@ export const createApp = (deps: Deps): App => {
       return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
     }
     const { userId } = caller;
-    if (collection === "artifacts") return artifacts(request, userId, rawName);
+    if (collection === "artifacts") return artifacts(request, url, env.DB, caller, rawName, rest.join("/"));
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");
     }

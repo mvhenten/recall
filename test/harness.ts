@@ -50,10 +50,28 @@ export interface Hit {
   score: number;
 }
 
+export interface PublishFile {
+  path: string;
+  body: string | Uint8Array;
+}
+
+// What a publish sends, with everything the CLI fills in by default already filled in, so a test
+// names only the part it is about.
+export interface PublishInput {
+  type: string;
+  title: string;
+  description: string;
+  read: string;
+  write: string;
+  files: PublishFile[];
+  replace: boolean;
+}
+
 export interface Client {
   request(method: string, path: string, body?: unknown): Promise<Response>;
   save(name: string, fields: Partial<Pick<Memory, "description" | "type" | "body" | "tags">>): Promise<Memory>;
-  publish(name: string, html: BodyInit): Promise<Response>;
+  publish(name: string, html: string | Uint8Array): Promise<Response>;
+  publishArtifact(name: string, input: Partial<PublishInput>): Promise<Response>;
   get(name: string): Promise<Memory>;
   search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
@@ -119,6 +137,7 @@ export const harness = async (
             hostname: ARTIFACT_HOSTNAME,
             verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
             bucket: env.ARTIFACTS,
+            dashboard: `${ORIGIN}/dashboard`,
           },
     embedder: wordEmbedder,
     deviceCodeLimits,
@@ -227,6 +246,27 @@ export const harness = async (
         headers: { ...headers, "content-type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
+    // The wire format a publish really takes: FormData, so the Request sets the boundary itself
+    // and the Worker reads the same body a CLI sends.
+    const publishArtifact = (name: string, input: Partial<PublishInput>): Promise<Response> => {
+      const files = input.files ?? [{ path: "index.html", body: "<p>published</p>" }];
+      const sized = files.map((file) => ({ ...file, blob: new Blob([file.body]) }));
+      const form = new FormData();
+      form.set(
+        "manifest",
+        JSON.stringify({
+          type: input.type ?? "site",
+          title: input.title ?? name,
+          description: input.description ?? "",
+          read: input.read ?? "private",
+          write: input.write ?? "owner",
+          files: sized.map((file) => ({ path: file.path, bytes: file.blob.size })),
+        }),
+      );
+      for (const file of sized) form.append("file", file.blob, file.path);
+      const replace = input.replace === true ? "?replace=true" : "";
+      return send(`/v1/artifacts/${name}${replace}`, { method: "PUT", headers: { ...headers }, body: form });
+    };
     return {
       request,
       async save(name, fields) {
@@ -241,9 +281,8 @@ export const harness = async (
         const saved: { memory: Memory } = await response.json();
         return saved.memory;
       },
-      publish(name, html) {
-        return send(`/v1/artifacts/${name}`, { method: "PUT", headers: { ...headers }, body: html });
-      },
+      publish: (name, html) => publishArtifact(name, { files: [{ path: "index.html", body: html }] }),
+      publishArtifact,
       async get(name) {
         const response = await request("GET", `/v1/memories/${name}`);
         if (response.status !== 200) throw new Error(`get ${name}: ${response.status} ${await response.text()}`);
@@ -343,6 +382,23 @@ export const harness = async (
       await app.consume(env, delivered);
     },
     retried: () => retried,
+    userIdFor: async (email: string): Promise<string> => {
+      const row = await env.DB.prepare("SELECT user_id FROM principals WHERE email = ?")
+        .bind(email)
+        .first<{ user_id: string }>();
+      if (row === null) throw new Error(`${email} is not invited`);
+      return row.user_id;
+    },
+    // What the Worker before artifact types wrote: one object at the bare key, with no row naming
+    // it. Nothing writes this layout any more, so a test of what it reads back has to lay it down.
+    writeLegacyArtifact: async (userId: string, name: string, body: string): Promise<void> => {
+      await env.ARTIFACTS.put(`${userId}/${name}`, body);
+    },
+    // A file the manifest names and storage has lost. No route writes this state, so a test of
+    // what the player draws for it has to make it.
+    dropArtifactFile: async (userId: string, name: string, rev: number, path: string): Promise<void> => {
+      await env.ARTIFACTS.delete(`${userId}/${name}/${rev}/${path}`);
+    },
     indexMark: async (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
       env.DB.prepare("SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?")
         .bind(userId, sessionId)

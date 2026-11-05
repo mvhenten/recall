@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 const SEND_TOOL: &str = "recall_send";
 
-const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. Where the deployment hosts pages, recall_publish puts a self-contained HTML file at a URL the user can open.";
+const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. Where the deployment hosts artifacts, recall_publish puts a site of self-contained HTML, a markdown document or a set of audio files at a URL the user can open.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -131,10 +131,84 @@ pub struct SendParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublishParams {
-    /// Path to the HTML file to publish.
-    pub file_path: String,
+    /// Path to the file to publish. For an artifact of several files, pass file_paths instead.
+    pub file_path: Option<String>,
+    /// Paths to every file of the artifact, in the order they are served. The first is what the
+    /// artifact's own address answers with; for an audio artifact this is the track order.
+    pub file_paths: Option<Vec<String>>,
+    /// What the artifact is: a site of self-contained HTML, a markdown document, or a set of audio
+    /// files that play as one artifact. Defaults to site.
+    #[serde(rename = "type")]
+    pub kind: Option<ArtifactKind>,
+    /// The heading the artifact's page carries. Defaults to the artifact's name.
+    pub title: Option<String>,
+    /// One line under the title.
+    pub description: Option<String>,
+    /// Who may open it: private means its owner alone, account every invited email. Defaults to
+    /// private.
+    pub read: Option<ReadPermission>,
+    /// Who may replace it: owner means its owner alone, account any device of the account.
+    /// Defaults to owner.
+    pub write: Option<WritePermission>,
+    /// Replace an artifact already published under this name. Without it a name that is taken is
+    /// refused, and the refusal says what is there.
+    pub replace: Option<bool>,
     /// Publish under this name, as a kebab-case slug, instead of the file's own name.
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactKind {
+    Site,
+    Document,
+    Audio,
+}
+
+impl ArtifactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ArtifactKind::Site => "site",
+            ArtifactKind::Document => "document",
+            ArtifactKind::Audio => "audio",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadPermission {
+    Private,
+    Account,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WritePermission {
+    Owner,
+    Account,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactSort {
+    Newest,
+    Name,
+    Largest,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactsParams {
+    /// Match a name, a title or a description.
+    pub query: Option<String>,
+    /// Narrow the list to one type.
+    #[serde(rename = "type")]
+    pub kind: Option<ArtifactKind>,
+    /// The order to read in: newest first, name A to Z, or largest first.
+    pub sort: Option<ArtifactSort>,
+    /// How many artifacts to answer.
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -218,6 +292,22 @@ fn repo_tag() -> Option<String> {
 
 fn not_found(name: &str) -> anyhow::Error {
     anyhow::anyhow!("no memory named {name}")
+}
+
+/// The files a publish names, in the order they are served. One file reads as `file_path` and a
+/// set as `file_paths`, and a call that names both publishes the single one first.
+fn publish_paths(params: &PublishParams) -> Result<Vec<std::path::PathBuf>> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(one) = &params.file_path {
+        paths.push(std::path::PathBuf::from(one));
+    }
+    if let Some(many) = &params.file_paths {
+        paths.extend(many.iter().map(std::path::PathBuf::from));
+    }
+    if paths.is_empty() {
+        bail!("pass file_path, or file_paths for an artifact of several files");
+    }
+    Ok(paths)
 }
 
 fn to_json<T: Serialize>(value: &T) -> Result<String> {
@@ -369,17 +459,68 @@ impl Recall {
 
     #[tool(
         name = "recall_publish",
-        description = "Publish a self-contained HTML page, carrying its own style, script and data: assets, and return the URL the user opens it on. Write the page to a file and pass its path, never its content. Publishing a name that already exists replaces that page at the same URL."
+        description = "Publish an artifact and return the URL the user opens it on: a site of self-contained HTML carrying its own style, script and data: assets, a markdown document recall renders, or a set of audio files that play as one artifact. Write the files to disk and pass their paths, never their content. A name that already holds an artifact is refused unless replace is true, and the refusal says what is there."
     )]
     async fn publish(&self, Parameters(params): Parameters<PublishParams>) -> Result<String, String> {
         blocking(move || {
-            let path = std::path::Path::new(&params.file_path);
-            let artifact = client()?.publish_file(path, params.name.as_deref())?;
-            to_json(&serde_json::json!({
-                "name": artifact.name,
-                "url": artifact.url,
-                "bytes": artifact.bytes,
-            }))
+            let paths = publish_paths(&params)?;
+            let first = paths
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("name at least one file to publish"))?;
+            let name = api::artifact_name(first, params.name.as_deref())?;
+            let published = client()?.publish(&api::PublishInput {
+                title: params.title.unwrap_or_else(|| name.clone()),
+                name,
+                kind: params.kind.unwrap_or(ArtifactKind::Site).as_str().to_string(),
+                description: params.description.unwrap_or_default(),
+                read: match params.read.unwrap_or(ReadPermission::Private) {
+                    ReadPermission::Private => "private".to_string(),
+                    ReadPermission::Account => "account".to_string(),
+                },
+                write: match params.write.unwrap_or(WritePermission::Owner) {
+                    WritePermission::Owner => "owner".to_string(),
+                    WritePermission::Account => "account".to_string(),
+                },
+                replace: params.replace.unwrap_or(false),
+                files: paths,
+            })?;
+            to_json(&published.artifact)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "recall_artifacts",
+        description = "List the artifacts this account has published, with the type, title, size, publish time and permissions of each and the URL it answers on."
+    )]
+    async fn artifacts(&self, Parameters(params): Parameters<ArtifactsParams>) -> Result<String, String> {
+        blocking(move || {
+            let page = client()?.artifacts(&api::ArtifactQuery {
+                query: params.query.unwrap_or_default(),
+                kind: params.kind.map(ArtifactKind::as_str).unwrap_or_default().to_string(),
+                sort: match params.sort {
+                    Some(ArtifactSort::Newest) => "newest".to_string(),
+                    Some(ArtifactSort::Name) => "name".to_string(),
+                    Some(ArtifactSort::Largest) => "largest".to_string(),
+                    None => String::new(),
+                },
+                limit: params.limit,
+            })?;
+            to_json(&page)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "recall_unpublish",
+        description = "Remove a published artifact and every one of its files. The address it answered on stops answering."
+    )]
+    async fn unpublish(&self, Parameters(params): Parameters<NameParams>) -> Result<String, String> {
+        blocking(move || {
+            if !client()?.unpublish(&params.name)? {
+                return Err(anyhow::anyhow!("no artifact named {}", params.name));
+            }
+            to_json(&serde_json::json!({ "unpublished": params.name }))
         })
         .await
     }
@@ -483,13 +624,15 @@ mod tests {
         assert_eq!(
             names(false),
             [
+                "recall_artifacts",
                 "recall_delete",
                 "recall_edit",
                 "recall_get",
                 "recall_list",
                 "recall_publish",
                 "recall_save",
-                "recall_search"
+                "recall_search",
+                "recall_unpublish"
             ]
         );
     }
@@ -508,7 +651,19 @@ mod tests {
         assert!(required("recall_list").is_empty());
         assert_eq!(required("recall_save"), ["body", "description", "name", "type"]);
         assert_eq!(required("recall_edit"), ["name"]);
-        assert_eq!(required("recall_publish"), ["file_path"]);
+        assert_eq!(required("recall_unpublish"), ["name"]);
+        // A publish takes one file or several, so neither path field is required on its own and
+        // the tool says which is missing rather than the schema.
+        assert!(required("recall_publish").is_empty());
+        assert!(required("recall_artifacts").is_empty());
+    }
+
+    #[test]
+    fn the_publish_schema_names_the_types_and_the_permissions() {
+        let text = schema("recall_publish").to_string();
+        for value in ["site", "document", "audio", "private", "account", "owner"] {
+            assert!(text.contains(&format!("\"{value}\"")), "{value} in {text}");
+        }
     }
 
     #[test]

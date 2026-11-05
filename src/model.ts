@@ -41,6 +41,7 @@ export interface ListInput {
   since: number;
   cursor: string;
   limit: number;
+  sort: string;
 }
 
 export interface MemoryHit {
@@ -58,7 +59,7 @@ export interface MemoryCounts {
 export const FRESH_WINDOW_DAYS = 30;
 export const FRESH_WINDOW_MS = FRESH_WINDOW_DAYS * 86_400_000;
 export const DEFAULT_MIN_SCORE = 0.55;
-const MAX_QUERY_CHARS = 2_000;
+export const MAX_QUERY_CHARS = 2_000;
 
 // Embedding is batched because indexing a session asks for a hundred vectors at once and one call
 // per chunk would be a hundred round trips. A memory asks for one and takes the first back.
@@ -151,6 +152,8 @@ export interface HistoryInput {
   repo: string;
   cursor: string;
   limit: number;
+  sort: string;
+  query: string;
 }
 
 export const labelKinds = ["host", "account"] as const;
@@ -368,7 +371,7 @@ export type Verify = (assertion: string) => Promise<Verification>;
 
 export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
 
-const fail = (error: string): { ok: false; error: string } => ({ ok: false, error });
+export const fail = (error: string): { ok: false; error: string } => ({ ok: false, error });
 
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const TAG = /^[a-z0-9][a-z0-9._:/-]*$/;
@@ -376,10 +379,10 @@ const TAG = /^[a-z0-9][a-z0-9._:/-]*$/;
 export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const isOneOf = <T extends string>(options: readonly T[], value: unknown): value is T =>
+export const isOneOf = <T extends string>(options: readonly T[], value: unknown): value is T =>
   typeof value === "string" && (options as readonly string[]).includes(value);
 
-const isInteger = (value: unknown, min: number, max: number): value is number =>
+export const isInteger = (value: unknown, min: number, max: number): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 
 export const parseName = (name: string): Parsed<string> =>
@@ -441,33 +444,40 @@ export const parseTypes = (values: string[]): Parsed<MemoryType[]> => {
 
 export const LIST_PARAMS = ["tag", "type", "since", "limit"] as const;
 
-export const parseList = (params: URLSearchParams): Parsed<ListInput> => {
+export const DEFAULT_PAGE_ROWS = 20;
+
+// The sort a list reads in is settled by the listing component, which owns the parameter name and
+// the keys, and arrives here already folded onto one the list holds. These parsers carry it so the
+// page reader picks its index off the same value the control marks.
+export const parseList = (params: URLSearchParams, sort: string): Parsed<ListInput> => {
   const given = (name: string): string[] => params.getAll(name).filter((value) => value !== "");
   const tags = parseTags(given("tag"));
   if (!tags.ok) return tags;
   const types = parseTypes(given("type"));
   if (!types.ok) return types;
   const since = Number(params.get("since") ?? 0);
-  const limit = Number(params.get("limit") ?? 20);
+  const limit = Number(params.get("limit") ?? DEFAULT_PAGE_ROWS);
   if (!isInteger(since, 0, Number.MAX_SAFE_INTEGER)) return fail("since must be a whole number of epoch milliseconds");
   if (!isInteger(limit, 1, 100)) return fail("limit must be a whole number from 1 to 100");
   return {
     ok: true,
-    value: { tags: tags.value, types: types.value, since, cursor: params.get("cursor") ?? "", limit },
+    value: { tags: tags.value, types: types.value, since, cursor: params.get("cursor") ?? "", limit, sort },
   };
 };
 
 export const HISTORY_PARAMS = ["host", "repo", "limit"] as const;
 
-export const parseHistory = (params: URLSearchParams): Parsed<HistoryInput> => {
+export const parseHistory = (params: URLSearchParams, sort: string): Parsed<HistoryInput> => {
   const host = params.get("host") ?? "";
   const repo = params.get("repo") ?? "";
   if (host.length > MAX_SESSION_TEXT_CHARS || repo.length > MAX_SESSION_TEXT_CHARS) {
     return fail(`host and repo must each hold at most ${MAX_SESSION_TEXT_CHARS} characters`);
   }
-  const limit = Number(params.get("limit") ?? 20);
+  const limit = Number(params.get("limit") ?? DEFAULT_PAGE_ROWS);
   if (!isInteger(limit, 1, 100)) return fail("limit must be a whole number from 1 to 100");
-  return { ok: true, value: { host, repo, cursor: params.get("cursor") ?? "", limit } };
+  const query = params.get("q") ?? "";
+  if (query.length > MAX_QUERY_CHARS) return fail(`q must hold at most ${MAX_QUERY_CHARS} characters`);
+  return { ok: true, value: { host, repo, cursor: params.get("cursor") ?? "", limit, sort, query } };
 };
 
 // The labels form names each field for the raw value it labels, as <kind>:<value>, so a submission

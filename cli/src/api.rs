@@ -3,8 +3,8 @@ use crate::transcripts::Appended;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ureq::http::Response;
 use ureq::{Agent, RequestBuilder};
 
@@ -64,13 +64,66 @@ struct Single {
 pub struct Artifact {
     pub name: String,
     pub url: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub title: String,
+    pub description: String,
+    pub read: String,
+    pub write: String,
+    pub file_count: i64,
     pub bytes: i64,
+    pub created_at: i64,
     pub updated_at: i64,
+    pub last_writer: String,
 }
 
-#[derive(Deserialize)]
-struct Published {
-    artifact: Artifact,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactPage {
+    pub artifacts: Vec<Artifact>,
+    pub next_cursor: String,
+    pub total: i64,
+    pub cut: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct Adopted {
+    adopted: i64,
+}
+
+/// What one publish sends. Every field is filled in by the caller rather than inferred by the
+/// service, which is what makes a republish naming no title replace the old title with the name.
+#[derive(Debug)]
+pub struct PublishInput {
+    pub name: String,
+    pub kind: String,
+    pub title: String,
+    pub description: String,
+    pub read: String,
+    pub write: String,
+    pub replace: bool,
+    pub files: Vec<PathBuf>,
+}
+
+/// What a listing is asked for. Each field passes straight to `GET /v1/artifacts`.
+#[derive(Debug, Default)]
+pub struct ArtifactQuery {
+    pub query: String,
+    pub kind: String,
+    pub sort: String,
+    pub limit: Option<u32>,
+}
+
+/// What one publish answers. `owned_by_another` says the name belongs to another account of this
+/// recall, which published it with `write: account`; the publish went through and rewrote that
+/// artifact's title and both its permissions, so the caller is told whose name they wrote under
+/// rather than reading a URL that looks like their own.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Published {
+    pub artifact: Artifact,
+    #[serde(default)]
+    pub owned_by_another: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,7 +171,7 @@ fn encode(value: &str) -> String {
 
 const MAX_NAME_LENGTH: usize = 100;
 
-/// The service names a page by a kebab-case slug of at most 100 characters: lower case, every run
+/// The service names an artifact by a kebab-case slug of at most 100 characters: lower case, every run
 /// of anything else a single dash.
 fn slug(text: &str) -> String {
     let mut name = text
@@ -139,8 +192,8 @@ fn slug(text: &str) -> String {
     name.trim_end_matches('-').to_string()
 }
 
-/// A page is published under the name the caller gave, or the name of the file it was written to.
-/// Both go through the same slug, so neither reaches the service in a shape it refuses.
+/// An artifact is published under the name the caller gave, or the name of the first file it was
+/// written to. Both go through the same slug, so neither reaches the service in a shape it refuses.
 pub fn artifact_name(path: &Path, given: Option<&str>) -> Result<String> {
     let source = match given {
         Some(given) => given.to_string(),
@@ -148,9 +201,25 @@ pub fn artifact_name(path: &Path, given: Option<&str>) -> Result<String> {
     };
     let name = slug(&source);
     if name.is_empty() {
-        bail!("{source:?} holds no letter or digit to name a page by");
+        bail!("{source:?} holds no letter or digit to name an artifact by");
     }
     Ok(name)
+}
+
+#[derive(Deserialize)]
+struct Refusal {
+    error: String,
+}
+
+/// The refusal the service named, where it named one. Every refusal it sends carries an `error`
+/// the reader is meant to act on — which name is taken, when it was last written, what to pass
+/// instead — and that string is printed as it stands rather than the JSON around it. A refusal
+/// from the edge rather than the service names nothing, and reads as whatever it sent.
+fn refused(text: &str) -> Option<String> {
+    match serde_json::from_str::<Refusal>(text) {
+        Ok(refusal) if !refusal.error.is_empty() => Some(refusal.error),
+        _ => None,
+    }
 }
 
 fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq::Body>> {
@@ -159,22 +228,21 @@ fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq
         return Ok(response);
     }
     let text = response.body_mut().read_to_string().unwrap_or_default();
+    let named = refused(&text);
+    let message = named.clone().unwrap_or_else(|| text.trim().to_string());
     if status.is_server_error() {
-        bail!(
-            "{what} failed: the recall service had an error ({status}): {}",
-            text.trim()
-        );
+        bail!("{what} failed: the recall service had an error ({status}): {message}");
     }
     let hint = match status.as_u16() {
         300..=399 => "; Cloudflare Access redirected the call, check RECALL_ENDPOINT",
-        401 | 403 => "; run recall login",
+        401 | 403 if named.is_none() => "; run recall login",
         _ => "",
     };
-    bail!("{what} failed with {status}: {}{hint}", text.trim())
+    bail!("{what} failed with {status}: {message}{hint}")
 }
 
-/// A page runs to 16 MB, and a long session's transcript to several; neither fits in the twenty
-/// seconds every other call gets.
+/// An artifact runs to 64 MB, and a long session's transcript to several; neither fits in the
+/// twenty seconds every other call gets.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn agent() -> Agent {
@@ -853,26 +921,176 @@ impl Client {
         Ok(sent.message)
     }
 
-    /// Publishes the page on disk, so its HTML travels from the file to the service without
-    /// passing through whatever asked for it. An existing name is replaced and keeps its URL.
-    pub fn publish_file(&self, path: &Path, name: Option<&str>) -> Result<Artifact> {
-        let name = artifact_name(path, name)?;
-        let html = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    /// Publishes the files on disk, so their bytes travel from the file to the service without
+    /// passing through whatever asked for it. The files land in the order they were named, which is
+    /// the track order of an audio artifact, and the first of them is what the bare address serves.
+    ///
+    /// A name that already holds an artifact is refused unless `replace` says otherwise, and the
+    /// refusal the service sends names what is there and is printed as it stands.
+    pub fn publish(&self, input: &PublishInput) -> Result<Published> {
+        let files = artifact_files(&input.files)?;
+        let manifest = serde_json::json!({
+            "type": input.kind,
+            "title": input.title,
+            "description": input.description,
+            "read": input.read,
+            "write": input.write,
+            "files": files
+                .iter()
+                .map(|file| serde_json::json!({ "path": file.path, "bytes": file.bytes }))
+                .collect::<Vec<_>>(),
+        });
+        let manifest = manifest.to_string();
+        let boundary = boundary(&manifest, &files);
+        let body = multipart(&boundary, &manifest, &files);
+        let replace = if input.replace { "?replace=true" } else { "" };
         let request = self
             .agent
-            .put(self.url(&format!("/v1/artifacts/{}", encode(&name))))
+            .put(self.url(&format!("/v1/artifacts/{}{replace}", encode(&input.name))))
+            .header("content-type", &format!("multipart/form-data; boundary={boundary}"))
             .config()
             .timeout_global(Some(PUBLISH_TIMEOUT))
             .build();
-        let response = self.authed(request).send(&html[..])?;
-        let published: Published = check(response, &format!("publishing {name}"))?
+        let response = self.authed(request).send(&body[..])?;
+        let published: Published = check(response, &format!("publishing {}", input.name))?
             .body_mut()
             .read_json()
-            .with_context(|| {
-                format!("reading back where {name} is published; a service older than 0.8 names no url")
-            })?;
-        Ok(published.artifact)
+            .with_context(|| format!("reading back where {} is published", input.name))?;
+        Ok(published)
     }
+
+    pub fn artifacts(&self, query: &ArtifactQuery) -> Result<ArtifactPage> {
+        let mut params: Vec<String> = Vec::new();
+        if !query.query.is_empty() {
+            params.push(format!("q={}", encode(&query.query)));
+        }
+        if !query.kind.is_empty() {
+            params.push(format!("type={}", encode(&query.kind)));
+        }
+        if !query.sort.is_empty() {
+            params.push(format!("sort={}", encode(&query.sort)));
+        }
+        if let Some(limit) = query.limit {
+            params.push(format!("limit={limit}"));
+        }
+        let suffix = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
+        let response = self
+            .authed(self.agent.get(self.url(&format!("/v1/artifacts{suffix}"))))
+            .call()?;
+        Ok(check(response, "listing artifacts")?.body_mut().read_json()?)
+    }
+
+    /// Deletes the artifact and every one of its files. A name that holds none answers false, which
+    /// is what the command reports rather than claiming it removed something.
+    pub fn unpublish(&self, name: &str) -> Result<bool> {
+        let response = self
+            .authed(self.agent.delete(self.url(&format!("/v1/artifacts/{}", encode(name)))))
+            .call()?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        check(response, &format!("unpublishing {name}"))?;
+        Ok(true)
+    }
+
+    /// Pulls the artifacts published before a row carried their type into the listing. It is run
+    /// once per deployment: a migration cannot read storage and nothing sweeps on a schedule.
+    pub fn adopt_artifacts(&self) -> Result<i64> {
+        let response = self
+            .authed(self.agent.post(self.url("/v1/artifacts/adopt")))
+            .send_empty()?;
+        let adopted: Adopted = check(response, "adopting artifacts")?.body_mut().read_json()?;
+        Ok(adopted.adopted)
+    }
+}
+
+/// The boundary of one publish body. A file holds arbitrary bytes, so a fixed boundary is a string
+/// an audio file can contain, and a file containing it splits its own part and is refused for a
+/// byte count the caller can do nothing about. Each publish draws its own and then reads the bytes
+/// it is about to send: a candidate that occurs in any part is discarded and the next one drawn, so
+/// the boundary that ships appears nowhere in the body it delimits.
+fn boundary(manifest: &str, files: &[PublishFile]) -> String {
+    let mut seed = u128::from(std::process::id())
+        ^ SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+    loop {
+        let candidate = format!("recall-publish-{seed:032x}");
+        let needle = candidate.as_bytes();
+        let clear = !contains(manifest.as_bytes(), needle) && files.iter().all(|file| !contains(&file.body, needle));
+        if clear {
+            return candidate;
+        }
+        seed = seed
+            .wrapping_mul(0x5851_f42d_4c95_7f2d)
+            .wrapping_add(0x1405_7b7e_f767_814f);
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+#[derive(Debug)]
+struct PublishFile {
+    path: String,
+    bytes: usize,
+    body: Vec<u8>,
+}
+
+/// The path each file answers on under the artifact, taken from the file's own name so a reader
+/// finds it where the markdown or the HTML pointed at it.
+fn artifact_files(paths: &[PathBuf]) -> Result<Vec<PublishFile>> {
+    if paths.is_empty() {
+        bail!("name at least one file to publish");
+    }
+    let mut files = Vec::new();
+    let mut taken = HashSet::new();
+    for path in paths {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        if name.is_empty() || !name.starts_with(|first: char| first.is_ascii_alphanumeric()) {
+            bail!("{} has no file name a reader could address it by", path.display());
+        }
+        if !taken.insert(name.clone()) {
+            bail!("{name} is named twice; one publish holds each file once");
+        }
+        let body = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        files.push(PublishFile {
+            path: name,
+            bytes: body.len(),
+            body,
+        });
+    }
+    Ok(files)
+}
+
+fn multipart(boundary: &str, manifest: &str, files: &[PublishFile]) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    let mut part = |headers: String, bytes: &[u8]| {
+        body.extend_from_slice(format!("--{boundary}\r\n{headers}\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    };
+    part(
+        "content-disposition: form-data; name=\"manifest\"\r\ncontent-type: application/json".to_string(),
+        manifest.as_bytes(),
+    );
+    for file in files {
+        part(
+            format!(
+                "content-disposition: form-data; name=\"file\"; filename=\"{}\"",
+                file.path
+            ),
+            &file.body,
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
 }
 
 #[cfg(test)]
@@ -1051,6 +1269,78 @@ mod tests {
         let devices = [device("d-1", "laptop"), device("d-2", "laptop-c4e2")];
         let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
         assert_eq!(resolve_target(&devices, refuse, "laptop-c4e2").unwrap(), host("d-2"));
+    }
+
+    #[test]
+    fn prints_the_refusal_the_service_named_and_nothing_around_it() {
+        let body = serde_json::json!({
+            "error": "panel-episode-12 already holds an audio artifact of 41.2 MB, last written 2026-11-04T09:12Z by you@example.com; pass --replace to replace it",
+            "artifact": { "name": "panel-episode-12", "type": "audio", "bytes": 43_200_100 },
+        })
+        .to_string();
+        let named = refused(&body).expect("the service named a refusal");
+        assert!(
+            named.starts_with("panel-episode-12 already holds an audio artifact"),
+            "{named}"
+        );
+        assert!(named.ends_with("pass --replace to replace it"), "{named}");
+        assert_eq!(refused("<html>Access denied</html>"), None);
+        assert_eq!(refused("{\"error\":\"\"}"), None);
+    }
+
+    #[test]
+    fn names_each_file_by_its_own_name_and_refuses_one_twice() {
+        let dir = std::env::temp_dir().join(format!("recall-publish-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = dir.join("Track-01.MP3");
+        let two = dir.join("track-02.mp3");
+        std::fs::write(&one, "first").unwrap();
+        std::fs::write(&two, "second-track").unwrap();
+
+        let files = artifact_files(&[one.clone(), two.clone()]).unwrap();
+        assert_eq!(
+            files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["track-01.mp3", "track-02.mp3"]
+        );
+        assert_eq!(files.iter().map(|file| file.bytes).collect::<Vec<_>>(), [5, 12]);
+
+        let twice = artifact_files(&[one.clone(), one.clone()]).unwrap_err().to_string();
+        assert!(twice.contains("named twice"), "{twice}");
+        assert!(artifact_files(&[]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writes_the_manifest_first_and_a_part_per_file() {
+        let files = vec![PublishFile {
+            path: "index.html".into(),
+            bytes: 10,
+            body: b"<p>one</p>".to_vec(),
+        }];
+        let body = String::from_utf8(multipart("xyz", "{\"type\":\"site\"}", &files)).unwrap();
+        assert_eq!(
+            body,
+            "--xyz\r\ncontent-disposition: form-data; name=\"manifest\"\r\ncontent-type: application/json\r\n\r\n{\"type\":\"site\"}\r\n--xyz\r\ncontent-disposition: form-data; name=\"file\"; filename=\"index.html\"\r\n\r\n<p>one</p>\r\n--xyz--\r\n"
+        );
+    }
+
+    #[test]
+    fn draws_a_boundary_no_part_holds() {
+        let manifest = "{\"type\":\"audio\"}";
+        let plain = boundary(manifest, &[]);
+        let held = vec![PublishFile {
+            path: "track-01.mp3".into(),
+            bytes: plain.len(),
+            body: plain.clone().into_bytes(),
+        }];
+        let drawn = boundary(manifest, &held);
+        assert_ne!(drawn, plain);
+        assert!(
+            !held[0]
+                .body
+                .windows(drawn.len())
+                .any(|window| window == drawn.as_bytes())
+        );
     }
 
     #[test]

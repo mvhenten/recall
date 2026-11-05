@@ -1,3 +1,13 @@
+import {
+  type ArtifactFile,
+  type ArtifactListInput,
+  type ArtifactRecord,
+  type ArtifactType,
+  artifactTypes,
+  contentTypeFor,
+  type ReadPermission,
+  type WritePermission,
+} from "./artifacts";
 import type { Caller } from "./device";
 import {
   DAY_MS,
@@ -122,7 +132,11 @@ export const deleteMemory = async (db: D1Database, userId: string, memoryId: str
   await db.prepare("DELETE FROM memories WHERE user_id = ? AND memory_id = ?").bind(userId, memoryId).run();
 };
 
-const encodeCursor = (at: number, id: string): string => btoa(JSON.stringify([at, id]));
+// Where a page of a list stops: the value the order is keyed on, and the row id that breaks a tie
+// on it. The value is a string where the order is a name, which is why it is not a number alone.
+export type Cursor = [number | string, string];
+
+const encodeCursor = (at: number | string, id: string): string => btoa(JSON.stringify([at, id]));
 
 const readCursorJson = (cursor: string): unknown => {
   try {
@@ -132,32 +146,78 @@ const readCursorJson = (cursor: string): unknown => {
   }
 };
 
-export const decodeCursor = (cursor: string): [number, string] | null => {
-  if (cursor === "") return [Number.MAX_SAFE_INTEGER, ""];
+// The empty cursor is page one, which for a descending order is a value no row can be above and
+// for an ascending one a value no row can be below. The two-element shape is the one the dashboard
+// has always issued, so a bookmarked page link from before this still decodes and pages.
+export const decodeCursor = (cursor: string, direction: "desc" | "asc"): Cursor | null => {
+  if (cursor === "") return direction === "desc" ? [Number.MAX_SAFE_INTEGER, ""] : ["", ""];
   const parsed = readCursorJson(cursor);
-  if (!Array.isArray(parsed) || typeof parsed[0] !== "number" || typeof parsed[1] !== "string") return null;
-  return [parsed[0], parsed[1]];
+  if (!Array.isArray(parsed) || typeof parsed[1] !== "string") return null;
+  const at = parsed[0];
+  if (typeof at !== "number" && typeof at !== "string") return null;
+  return [at, parsed[1]];
 };
+
+// One order of one list: the predicate that walks past the cursor, the clause that names the index
+// serving it, which way the cursor runs, and where a row's own cursor comes from. Nothing is
+// ordered in the Worker, so a list grows an order by growing this table and nothing else.
+interface Order<Row> {
+  keyset: string;
+  by: string;
+  direction: "desc" | "asc";
+  cursorOf: (row: Row) => Cursor;
+}
+
+const orderFor = <Row>(orders: Record<string, Order<Row>>, sort: string): Order<Row> => {
+  const order = orders[sort];
+  if (order === undefined) throw new Error(`no order named ${sort}`);
+  return order;
+};
+
+// memories_by_user_created, memories (user_id, name) and memories_by_recall_count in that order.
+const MEMORY_ORDERS: Record<string, Order<Memory>> = {
+  newest: {
+    keyset: "(m.created_at < ?4 OR (m.created_at = ?4 AND m.memory_id < ?5))",
+    by: "m.created_at DESC, m.memory_id DESC",
+    direction: "desc",
+    cursorOf: (memory) => [memory.createdAt, memory.memoryId],
+  },
+  name: {
+    keyset: "m.name > ?4",
+    by: "m.name",
+    direction: "asc",
+    cursorOf: (memory) => [memory.name, memory.name],
+  },
+  recalled: {
+    keyset: "(m.recall_count < ?4 OR (m.recall_count = ?4 AND m.name > ?5))",
+    by: "m.recall_count DESC, m.name",
+    direction: "desc",
+    cursorOf: (memory) => [memory.recallCount, memory.name],
+  },
+};
+
+export const memoryCursorDirection = (sort: string): "desc" | "asc" => orderFor(MEMORY_ORDERS, sort).direction;
 
 export const listMemories = async (
   db: D1Database,
   userId: string,
   input: ListInput,
-  [cursorCreatedAt, cursorId]: [number, string],
+  [cursorAt, cursorId]: Cursor,
 ): Promise<{ memories: Memory[]; nextCursor: string }> => {
+  const order = orderFor(MEMORY_ORDERS, input.sort);
   const { results } = await db
     .prepare(
       `SELECT ${MEMORY_COLUMNS} FROM memories m
        WHERE m.user_id = ?1 AND ${TAG_FILTER} AND ${typeFilter(7)} AND m.created_at >= ?3
-         AND (m.created_at < ?4 OR (m.created_at = ?4 AND m.memory_id < ?5))
-       ORDER BY m.created_at DESC, m.memory_id DESC
+         AND ${order.keyset}
+       ORDER BY ${order.by}
        LIMIT ?6`,
     )
     .bind(
       userId,
       JSON.stringify(input.tags),
       input.since,
-      cursorCreatedAt,
+      cursorAt,
       cursorId,
       input.limit + 1,
       JSON.stringify(input.types),
@@ -165,7 +225,7 @@ export const listMemories = async (
     .all<MemoryRow>();
   const memories = results.slice(0, input.limit).map(toMemory);
   const last = memories.at(-1);
-  const nextCursor = results.length > input.limit && last ? encodeCursor(last.createdAt, last.memoryId) : "";
+  const nextCursor = results.length > input.limit && last ? encodeCursor(...order.cursorOf(last)) : "";
   return { memories, nextCursor };
 };
 
@@ -416,27 +476,70 @@ const pastSessions = (liveSlot: number): string =>
    LEFT JOIN sessions s ON s.user_id = h.user_id AND s.session_id = h.session_id
      AND s.last_activity_at > ?${liveSlot}`;
 
+// session_history_by_activity and session_history_by_agent_name in that order.
+const HISTORY_ORDERS: Record<string, Order<PastSession>> = {
+  newest: {
+    keyset: "(h.last_activity_at < ?4 OR (h.last_activity_at = ?4 AND h.session_id < ?5))",
+    by: "h.last_activity_at DESC, h.session_id DESC",
+    direction: "desc",
+    cursorOf: (session) => [session.lastActivityAt, session.sessionId],
+  },
+  agent: {
+    keyset: "(h.agent_name > ?4 OR (h.agent_name = ?4 AND h.session_id > ?5))",
+    by: "h.agent_name, h.session_id",
+    direction: "asc",
+    cursorOf: (session) => [session.agentName, session.sessionId],
+  },
+};
+
+export const historyCursorDirection = (sort: string): "desc" | "asc" => orderFor(HISTORY_ORDERS, sort).direction;
+
 export const listSessionHistory = async (
   db: D1Database,
   userId: string,
   input: HistoryInput,
-  [cursorLastActivityAt, cursorSessionId]: [number, string],
+  [cursorAt, cursorSessionId]: Cursor,
   now: number,
 ): Promise<{ sessions: PastSession[]; nextCursor: string }> => {
+  const order = orderFor(HISTORY_ORDERS, input.sort);
   const { results } = await db
     .prepare(
       `${pastSessions(7)}
        WHERE h.user_id = ?1 AND (?2 = '' OR h.host = ?2) AND (?3 = '' OR h.repo = ?3)
-         AND (h.last_activity_at < ?4 OR (h.last_activity_at = ?4 AND h.session_id < ?5))
-       ORDER BY h.last_activity_at DESC, h.session_id DESC
+         AND ${order.keyset}
+       ORDER BY ${order.by}
        LIMIT ?6`,
     )
-    .bind(userId, input.host, input.repo, cursorLastActivityAt, cursorSessionId, input.limit + 1, now - SESSION_TTL_MS)
+    .bind(userId, input.host, input.repo, cursorAt, cursorSessionId, input.limit + 1, now - SESSION_TTL_MS)
     .all<PastSessionRow>();
   const sessions = results.slice(0, input.limit).map(toPastSession);
   const last = sessions.at(-1);
-  const nextCursor = results.length > input.limit && last ? encodeCursor(last.lastActivityAt, last.sessionId) : "";
+  const nextCursor = results.length > input.limit && last ? encodeCursor(...order.cursorOf(last)) : "";
   return { sessions, nextCursor };
+};
+
+// History by what a session was about. The index stores its own copy of the focus, the commit
+// subject and the agent name, so one match is one read of the history row beside it. A relevance
+// order has no keyset, so a search is one bounded page and never carries a cursor.
+export const searchSessionHistory = async (
+  db: D1Database,
+  userId: string,
+  input: HistoryInput,
+  match: string,
+  limit: number,
+  now: number,
+): Promise<{ sessions: PastSession[]; cut: boolean }> => {
+  const { results } = await db
+    .prepare(
+      `${pastSessions(6)}
+       JOIN session_history_fts f ON f.session_id = h.session_id AND f.user_id = h.user_id
+       WHERE session_history_fts MATCH ?2 AND h.user_id = ?1
+         AND (?3 = '' OR h.host = ?3) AND (?4 = '' OR h.repo = ?4)
+       ORDER BY bm25(session_history_fts) LIMIT ?5`,
+    )
+    .bind(userId, match, input.host, input.repo, limit + 1, now - SESSION_TTL_MS)
+    .all<PastSessionRow>();
+  return { sessions: results.slice(0, limit).map(toPastSession), cut: results.length > limit };
 };
 
 const SESSION_IDS_PAGE = 100;
@@ -1136,6 +1239,326 @@ export const countedFiles = async (db: D1Database, userId: string, sessionId: st
     .bind(userId, sessionId)
     .all<{ file: string }>();
   return results.map((row) => row.file);
+};
+
+interface ArtifactRow {
+  name: string;
+  rev: number;
+  type: ArtifactType;
+  title: string;
+  description: string;
+  read_perm: ReadPermission;
+  write_perm: WritePermission;
+  entry_path: string;
+  files: string;
+  file_count: number;
+  bytes: number;
+  created_at: number;
+  updated_at: number;
+  user_id: string;
+  last_writer: string;
+}
+
+// `last_writer` is the writer's first email. A device token carries a user and `principals` maps
+// several emails to one, so the account is as precise as the writer can be named; an account whose
+// emails have all been withdrawn names none.
+const ARTIFACT_COLUMNS = `a.name, a.rev, a.type, a.title, a.description, a.read_perm, a.write_perm, a.entry_path,
+  a.files, a.file_count, a.bytes, a.created_at, a.updated_at, a.user_id,
+  COALESCE((SELECT email FROM principals WHERE user_id = a.last_writer_user_id ORDER BY email LIMIT 1), '') AS last_writer`;
+
+const toArtifact = (row: ArtifactRow): ArtifactRecord => ({
+  name: row.name,
+  rev: row.rev,
+  type: row.type,
+  title: row.title,
+  description: row.description,
+  read: row.read_perm,
+  write: row.write_perm,
+  entryPath: row.entry_path,
+  files: JSON.parse(row.files) as ArtifactFile[],
+  fileCount: row.file_count,
+  bytes: row.bytes,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+  ownerUserId: row.user_id,
+  lastWriter: row.last_writer,
+});
+
+// artifacts_by_updated, the unique (user_id, name) and artifacts_by_bytes in that order.
+const ARTIFACT_ORDERS: Record<string, Order<ArtifactRecord>> = {
+  newest: {
+    keyset: "(a.updated_at < ?3 OR (a.updated_at = ?3 AND a.name > ?4))",
+    by: "a.updated_at DESC, a.name",
+    direction: "desc",
+    cursorOf: (artifact) => [artifact.updatedAt, artifact.name],
+  },
+  name: {
+    keyset: "a.name > ?3",
+    by: "a.name",
+    direction: "asc",
+    cursorOf: (artifact) => [artifact.name, artifact.name],
+  },
+  largest: {
+    keyset: "(a.bytes < ?3 OR (a.bytes = ?3 AND a.name > ?4))",
+    by: "a.bytes DESC, a.name",
+    direction: "desc",
+    cursorOf: (artifact) => [artifact.bytes, artifact.name],
+  },
+};
+
+export const artifactCursorDirection = (sort: string): "desc" | "asc" => orderFor(ARTIFACT_ORDERS, sort).direction;
+
+export const getArtifact = async (db: D1Database, userId: string, name: string): Promise<ArtifactRecord | null> => {
+  const row = await db
+    .prepare(`SELECT ${ARTIFACT_COLUMNS} FROM artifacts a WHERE a.user_id = ?1 AND a.name = ?2`)
+    .bind(userId, name)
+    .first<ArtifactRow>();
+  return row === null ? null : toArtifact(row);
+};
+
+// Which artifact a name on the artifact hostname means. The reader's own comes first and is served
+// whatever its read permission says; otherwise the one published for the account to read. A name
+// that holds neither is the caller's 404, and so is one the read permission refuses.
+export const resolveArtifact = async (
+  db: D1Database,
+  readerUserId: string,
+  name: string,
+): Promise<ArtifactRecord | null> => {
+  const own = await getArtifact(db, readerUserId, name);
+  if (own !== null) return own;
+  const shared = await db
+    .prepare(
+      `SELECT ${ARTIFACT_COLUMNS} FROM artifacts a
+       WHERE a.name = ?1 AND a.read_perm = 'account' ORDER BY a.user_id LIMIT 1`,
+    )
+    .bind(name)
+    .first<ArtifactRow>();
+  return shared === null ? null : toArtifact(shared);
+};
+
+export const listArtifactPage = async (
+  db: D1Database,
+  userId: string,
+  input: ArtifactListInput,
+  [cursorAt, cursorName]: Cursor,
+): Promise<{ artifacts: ArtifactRecord[]; nextCursor: string }> => {
+  const order = orderFor(ARTIFACT_ORDERS, input.sort);
+  const { results } = await db
+    .prepare(
+      `SELECT ${ARTIFACT_COLUMNS} FROM artifacts a
+       WHERE a.user_id = ?1 AND (?2 = '' OR a.type = ?2) AND ${order.keyset}
+       ORDER BY ${order.by}
+       LIMIT ?5`,
+    )
+    .bind(userId, input.type, cursorAt, cursorName, input.limit + 1)
+    .all<ArtifactRow>();
+  const artifacts = results.slice(0, input.limit).map(toArtifact);
+  const last = artifacts.at(-1);
+  const nextCursor = results.length > input.limit && last ? encodeCursor(...order.cursorOf(last)) : "";
+  return { artifacts, nextCursor };
+};
+
+// The shelf by what a reader typed, name heaviest, then title, then description — the weights the
+// memory search already uses over the same three fields.
+export const searchArtifacts = async (
+  db: D1Database,
+  userId: string,
+  type: string,
+  match: string,
+  limit: number,
+): Promise<{ artifacts: ArtifactRecord[]; cut: boolean }> => {
+  const { results } = await db
+    .prepare(
+      `SELECT ${ARTIFACT_COLUMNS} FROM artifacts_fts f JOIN artifacts a ON a.artifact_seq = f.rowid
+       WHERE artifacts_fts MATCH ?2 AND a.user_id = ?1 AND (?3 = '' OR a.type = ?3)
+       ORDER BY bm25(artifacts_fts, 5.0, 2.0, 1.0) LIMIT ?4`,
+    )
+    .bind(userId, match, type, limit + 1)
+    .all<ArtifactRow>();
+  return { artifacts: results.slice(0, limit).map(toArtifact), cut: results.length > limit };
+};
+
+export interface ArtifactCounts {
+  total: number;
+  byType: Array<{ type: ArtifactType; count: number }>;
+}
+
+// The second read a page of the shelf costs: the total for the heading and a count per type for
+// the chips. It walks the account's own rows, which is what the memory counts already do.
+export const artifactCounts = async (db: D1Database, userId: string): Promise<ArtifactCounts> => {
+  const { results } = await db
+    .prepare("SELECT type, COUNT(*) AS n FROM artifacts WHERE user_id = ?1 GROUP BY type")
+    .bind(userId)
+    .all<{ type: ArtifactType; n: number }>();
+  const counted = new Map(results.map((row) => [row.type, row.n]));
+  return {
+    total: results.reduce((running, row) => running + row.n, 0),
+    byType: artifactTypes.filter((type) => counted.has(type)).map((type) => ({ type, count: counted.get(type) ?? 0 })),
+  };
+};
+
+export interface ArtifactCommit {
+  userId: string;
+  name: string;
+  rev: number;
+  type: ArtifactType;
+  title: string;
+  description: string;
+  read: ReadPermission;
+  write: WritePermission;
+  files: ArtifactFile[];
+  at: number;
+  writerUserId: string;
+}
+
+// The revision the caller owns, claimed before a byte of it is written. The upsert is what makes
+// the claim exclusive: two publishes of one name read the same live revision and each is handed a
+// different number here, so neither streams into the prefix the other will commit.
+export const claimRevision = async (db: D1Database, userId: string, name: string): Promise<number> => {
+  const row = await db
+    .prepare(
+      `INSERT INTO artifact_revisions (user_id, name, rev_next) VALUES (?1, ?2, 1)
+       ON CONFLICT (user_id, name) DO UPDATE SET rev_next = artifact_revisions.rev_next + 1
+       RETURNING rev_next`,
+    )
+    .bind(userId, name)
+    .first<{ rev_next: number }>();
+  if (row === null) throw new Error(`claiming a revision of ${name} returned no row`);
+  return row.rev_next;
+};
+
+const entryOf = (commit: ArtifactCommit): ArtifactFile => {
+  const entry = commit.files[0];
+  if (entry === undefined) throw new Error(`a publish of ${commit.name} named no file`);
+  return entry;
+};
+
+const bytesOf = (commit: ArtifactCommit): number => commit.files.reduce((running, file) => running + file.bytes, 0);
+
+// The publish of a name that held nothing when the gates ran. `UNIQUE (user_id, name)` is what
+// decides a race between two first publishes: the second writes no row and is told the name is
+// taken rather than replacing what the first one just committed.
+export const createArtifact = async (db: D1Database, commit: ArtifactCommit): Promise<boolean> => {
+  const result = await db
+    .prepare(
+      `INSERT INTO artifacts (user_id, name, rev, type, title, description, read_perm, write_perm,
+                              entry_path, files, file_count, bytes, created_at, updated_at,
+                              last_writer_user_id)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14)
+       ON CONFLICT (user_id, name) DO NOTHING`,
+    )
+    .bind(
+      commit.userId,
+      commit.name,
+      commit.rev,
+      commit.type,
+      commit.title,
+      commit.description,
+      commit.read,
+      commit.write,
+      entryOf(commit).path,
+      JSON.stringify(commit.files),
+      commit.files.length,
+      bytesOf(commit),
+      commit.at,
+      commit.writerUserId,
+    )
+    .run();
+  return result.meta.changes > 0;
+};
+
+// The publish of a name that held an artifact. The WHERE makes it a compare-and-swap on the
+// revision read before the write: of two publishes racing under one name, one moves the row
+// forward and the other changes nothing and is told so. A row that has since been unpublished
+// matches nothing, so the publish is refused rather than recreating an artifact whose files the
+// unpublish has already deleted. `created_at` is left alone, because the artifact is being
+// replaced and not recreated.
+export const replaceArtifact = async (db: D1Database, commit: ArtifactCommit, fromRev: number): Promise<boolean> => {
+  const result = await db
+    .prepare(
+      `UPDATE artifacts SET rev = ?3, type = ?4, title = ?5, description = ?6, read_perm = ?7,
+                            write_perm = ?8, entry_path = ?9, files = ?10, file_count = ?11,
+                            bytes = ?12, updated_at = ?13, last_writer_user_id = ?14
+       WHERE user_id = ?1 AND name = ?2 AND rev = ?15`,
+    )
+    .bind(
+      commit.userId,
+      commit.name,
+      commit.rev,
+      commit.type,
+      commit.title,
+      commit.description,
+      commit.read,
+      commit.write,
+      entryOf(commit).path,
+      JSON.stringify(commit.files),
+      commit.files.length,
+      bytesOf(commit),
+      commit.at,
+      commit.writerUserId,
+      fromRev,
+    )
+    .run();
+  return result.meta.changes > 0;
+};
+
+export const deleteArtifactRow = async (db: D1Database, userId: string, name: string): Promise<boolean> => {
+  const result = await db.prepare("DELETE FROM artifacts WHERE user_id = ?1 AND name = ?2").bind(userId, name).run();
+  return result.meta.changes > 0;
+};
+
+// Whether another account already publishes this name for the account to read. The hostname has no
+// user segment, so two account-readable artifacts under one name would be two artifacts at one
+// address; the second publish is refused rather than resolved by an arbitrary tie-break.
+export const accountReadableElsewhere = async (db: D1Database, userId: string, name: string): Promise<boolean> => {
+  const row = await db
+    .prepare("SELECT user_id FROM artifacts WHERE name = ?2 AND read_perm = 'account' AND user_id <> ?1 LIMIT 1")
+    .bind(userId, name)
+    .first<{ user_id: string }>();
+  return row !== null;
+};
+
+const LEGACY_PAGE = 1_000;
+
+// The artifacts published before a row carried their type. The operator runs it once per
+// deployment: a migration cannot read the bucket and nothing may scan on a schedule, so this is
+// the one listing of a user's prefix in the feature and it is a request that asks for it.
+//
+// The delimiter leaves out everything under the container layout, so only the bare keys answer and
+// a row that already exists is left exactly as it is.
+export const adoptArtifacts = async (db: D1Database, bucket: R2Bucket, userId: string): Promise<number> => {
+  const prefix = `${userId}/`;
+  const legacy: R2Object[] = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await bucket.list({ prefix, delimiter: "/", cursor, limit: LEGACY_PAGE });
+    legacy.push(...page.objects);
+    if (!page.truncated) break;
+    cursor = page.cursor;
+  }
+  const { results } = await db
+    .prepare("SELECT name FROM artifacts WHERE user_id = ?1")
+    .bind(userId)
+    .all<{ name: string }>();
+  const known = new Set(results.map((row) => row.name));
+  const taking = legacy.filter((object) => !known.has(object.key.slice(prefix.length)));
+  if (taking.length === 0) return 0;
+  await db.batch(
+    taking.map((object) => {
+      const name = object.key.slice(prefix.length);
+      const files: ArtifactFile[] = [{ path: name, bytes: object.size, contentType: contentTypeFor(name) }];
+      return db
+        .prepare(
+          `INSERT INTO artifacts (user_id, name, rev, type, title, description, read_perm, write_perm,
+                                  entry_path, files, file_count, bytes, created_at, updated_at,
+                                  last_writer_user_id)
+           VALUES (?1, ?2, 0, 'site', ?2, '', 'private', 'owner', ?2, ?3, 1, ?4, ?5, ?5, ?1)
+           ON CONFLICT (user_id, name) DO NOTHING`,
+        )
+        .bind(userId, name, JSON.stringify(files), object.size, object.uploaded.getTime());
+    }),
+  );
+  return taking.length;
 };
 
 export const recall = async (db: D1Database, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {
