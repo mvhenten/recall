@@ -8,6 +8,54 @@ export interface Artifact extends Stored {
   url: string;
 }
 
+export const artifactTypes = ["site", "document", "audio"] as const;
+export type ArtifactType = (typeof artifactTypes)[number];
+
+export const readPermissions = ["private", "account"] as const;
+export type ReadPermission = (typeof readPermissions)[number];
+
+export const writePermissions = ["owner", "account"] as const;
+export type WritePermission = (typeof writePermissions)[number];
+
+export interface ArtifactFile {
+  path: string;
+  bytes: number;
+  contentType: string;
+}
+
+export interface ArtifactRecord {
+  name: string;
+  rev: number;
+  type: ArtifactType;
+  title: string;
+  description: string;
+  read: ReadPermission;
+  write: WritePermission;
+  entryPath: string;
+  files: ArtifactFile[];
+  fileCount: number;
+  bytes: number;
+  createdAt: number;
+  updatedAt: number;
+  ownerUserId: string;
+  lastWriter: string;
+}
+
+export interface ArtifactView {
+  name: string;
+  url: string;
+  type: ArtifactType;
+  title: string;
+  description: string;
+  read: ReadPermission;
+  write: WritePermission;
+  fileCount: number;
+  bytes: number;
+  createdAt: number;
+  updatedAt: number;
+  lastWriter: string;
+}
+
 export const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
 export const ARTIFACT_CONTENT_TYPE = "text/html; charset=utf-8";
