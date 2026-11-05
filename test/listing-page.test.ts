@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseArtifactList, parseArtifactType, parseAudioFiles, parseFilePath, parseManifest } from "../src/artifacts";
 import { ARTIFACT_SORTS, HISTORY_SORTS, MEMORY_SORTS, sortInForce, sortKeys } from "../src/listing";
 import { decodeCursor } from "../src/store";
+import { harness } from "./harness";
 
 const manifest = (over: Record<string, unknown> = {}): unknown => ({
   type: "site",
@@ -135,5 +136,48 @@ describe("the sorts each list holds", () => {
     expect(sortInForce(url, ARTIFACT_SORTS)).toEqual({ sort: "newest", unknownSort: "duration" });
     const held = new URL("https://recall.test/dashboard/artifacts?sort=largest");
     expect(sortInForce(held, ARTIFACT_SORTS)).toEqual({ sort: "largest", unknownSort: "" });
+  });
+});
+
+describe("the history listing", () => {
+  const synced = async () => {
+    const h = await harness();
+    const email = `alice-${crypto.randomUUID()}@example.com`;
+    await h.invite(email);
+    const alice = h.clientWithToken(await h.login(email));
+    return { h, email, alice };
+  };
+
+  const historyTab = async (h: Awaited<ReturnType<typeof harness>>, email: string, query: string): Promise<string> => {
+    const response = await h.send(`/dashboard/history${query}`, {
+      headers: { "cf-access-jwt-assertion": await h.assertionFor(email) },
+    });
+    expect(response.status).toBe(200);
+    return response.text();
+  };
+
+  it("finds a session by what it was about, once however often it synced", async () => {
+    const { h, email, alice } = await synced();
+    const sessionId = crypto.randomUUID();
+    await alice.sync(sessionId, { focus: { first: "widen the burnup chart", latest: "widen the burnup chart" } });
+    await alice.sync(sessionId, { focus: { first: "widen the burnup chart", latest: "ship the burnup chart" } });
+    const other = crypto.randomUUID();
+    await alice.sync(other, { focus: { first: "rewrite the installer", latest: "rewrite the installer" } });
+
+    const found = await historyTab(h, email, "?q=burnup");
+    expect(found).toContain("burnup chart");
+    expect(found).not.toContain("rewrite the installer");
+    expect(found.split(sessionId).length - 1).toBe(1);
+
+    const none = await historyTab(h, email, "?q=nothingmatchesthis");
+    expect(none).toContain("No session matches this search.");
+  });
+
+  it("orders by agent name as well as by activity", async () => {
+    const { h, email, alice } = await synced();
+    await alice.sync(crypto.randomUUID(), { focus: { first: "one", latest: "one" } });
+    const page = await historyTab(h, email, "?sort=agent");
+    expect(page).toContain("agent name");
+    expect(page).toContain('aria-current="page"');
   });
 });

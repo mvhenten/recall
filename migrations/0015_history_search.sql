@@ -15,7 +15,11 @@ CREATE VIRTUAL TABLE session_history_fts USING fts5 (
   tokenize = 'porter unicode61'
 );
 
+-- The history write is an INSERT OR REPLACE, and SQLite fires a delete trigger for the row a
+-- REPLACE displaced only where recursive triggers are on. So the insert clears the session's row
+-- itself: one session keeps one row here however many times it syncs.
 CREATE TRIGGER session_history_fts_insert AFTER INSERT ON session_history BEGIN
+  DELETE FROM session_history_fts WHERE session_id = new.session_id;
   INSERT INTO session_history_fts (session_id, user_id, focus_first, focus_latest, commit_subject, agent_name)
   VALUES (new.session_id, new.user_id, new.focus_first, new.focus_latest, new.commit_subject, new.agent_name);
 END;
