@@ -1,4 +1,4 @@
-import type { ArtifactType, ArtifactView } from "./artifacts";
+import { type ArtifactType, type ArtifactView, artifactTypes } from "./artifacts";
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
 import {
   ARTIFACT_SORTS,
@@ -634,6 +634,7 @@ export const historyPage = (
   known: HistoryFilters,
   sessions: PastSession[],
   nextCursor: string,
+  cut: boolean,
   labels: Labels,
 ): Response => {
   const query = url.searchParams.get("q") ?? "";
@@ -674,7 +675,7 @@ export const historyPage = (
       groups.length === 0 ? "" : `<div class="hist">${groups.map((group) => dayBlock(group, labels)).join("")}</div>`,
     empty: historyEmpty(query, filtered),
     nextCursor,
-    cut: false,
+    cut,
   };
   return shell(email, HISTORY_TAB, live, HISTORY_TAB.label, "kept forever", listingMain(url, listing));
 };
@@ -1659,6 +1660,15 @@ const artifactEmpty = (query: string, type: string): { headline: string; hint: s
   };
 };
 
+// Only the types the shelf actually holds get a chip, plus the one that is active: a filter that
+// empties its own count has to keep its chip, or the reader cannot see it or clear it.
+const artifactChips = (counts: ArtifactCounts, active: string): ListingChip[] => {
+  const counted = new Map(counts.byType.map((entry) => [entry.type, entry.count]));
+  return artifactTypes
+    .filter((type) => counted.has(type) || type === active)
+    .map((type) => ({ value: type, label: `${type} ${counted.get(type) ?? 0}` }));
+};
+
 const artifactMeta = (shown: number, counts: ArtifactCounts, narrowed: boolean): string => {
   const noun = counts.total === 1 ? "artifact" : "artifacts";
   return narrowed ? `${shown} of ${counts.total} ${noun}` : `${counts.total} ${noun}`;
@@ -1685,7 +1695,7 @@ export const artifactsPage = (email: string, live: Live, url: URL, published: Pu
     ariaLabel: "Filter by type",
     allLabel: `All ${counts.total}`,
     active: type,
-    chips: counts.byType.map((entry) => ({ value: entry.type, label: `${entry.type} ${entry.count}` })),
+    chips: artifactChips(counts, type),
   };
   const listing: Listing = {
     tab: ARTIFACTS_TAB,

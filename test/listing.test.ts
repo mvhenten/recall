@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { ARTIFACTS_TAB } from "../src/dashboard";
+import type { ArtifactView } from "../src/artifacts";
+import { ARTIFACTS_TAB, type ArtifactTypeCount, artifactsPage, type Published } from "../src/dashboard";
 import { ARTIFACT_SORTS, CURSOR_PARAM, type Listing, listingLink, SORT_PARAM, sortInForce } from "../src/listing";
+import type { Live } from "../src/model";
 
 const listing = (search: string): Listing => ({
   tab: ARTIFACTS_TAB,
@@ -60,6 +62,45 @@ describe("the listing component's links", () => {
   it("clears a parameter a change empties", () => {
     const url = at("?q=panel&type=audio");
     expect(listingLink(listing("panel"), url, { q: "" })).toBe("/dashboard/artifacts?type=audio");
+  });
+});
+
+describe("the artifacts tab's type chips", () => {
+  const live: Live = { sessions: 0, busy: 0, sessionsToday: 0, today: [] };
+
+  const site: ArtifactView = {
+    name: "burn-up",
+    url: "https://art.test/burn-up/",
+    type: "site",
+    title: "Burn-up",
+    description: "",
+    read: "private",
+    write: "owner",
+    fileCount: 1,
+    bytes: 11,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+    lastWriter: "alice@example.com",
+  };
+
+  const shelf = (artifacts: ArtifactView[], byType: ArtifactTypeCount[]): Published => ({
+    kind: "shelf",
+    shelf: { artifacts, counts: { total: 2, byType }, nextCursor: "", cut: false },
+  });
+
+  const page = (query: string, artifacts: ArtifactView[], byType: ArtifactTypeCount[]): Promise<string> =>
+    artifactsPage("alice@example.com", live, at(query), shelf(artifacts, byType)).text();
+
+  it("keeps the chip of the type in force once its count empties, so the filter can still be cleared", async () => {
+    const drawn = await page("?type=audio", [], [{ type: "site", count: 2 }]);
+    expect(drawn).toContain('<a href="/dashboard/artifacts?type=audio" aria-current="page">audio 0</a>');
+    expect(drawn).toContain('<a href="/dashboard/artifacts">All 2</a>');
+  });
+
+  it("offers no chip for a type the shelf holds none of", async () => {
+    const drawn = await page("", [site], [{ type: "site", count: 2 }]);
+    expect(drawn).toContain(">site 2</a>");
+    expect(drawn).not.toContain(">audio 0</a>");
   });
 });
 

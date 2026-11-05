@@ -11,9 +11,6 @@ export const CURSOR_PARAM = "cursor";
 // bounded page and the component says so when the match set was cut to this.
 export const MAX_SEARCH_MATCHES = 50;
 
-// What a paged list draws, which is deliberately shorter than a search answers.
-export const PAGE_ROWS = 20;
-
 export interface ListingSort {
   key: string;
   label: string;
