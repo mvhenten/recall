@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { DAY_MS, USAGE_RETENTION_MS } from "../src/model";
-import { MAX_CHUNK_BYTES } from "../src/transcripts";
+import { followedBatch } from "../src/transcript-plan";
+import { archivedSince, MAX_CHUNK_BYTES } from "../src/transcripts";
 import { harness } from "./harness";
 
 const held = async (response: Response): Promise<Record<string, number>> => {
@@ -149,6 +150,59 @@ describe("transcript archive", () => {
     expect(also?.offset).toBe(told?.offset);
     expect((await client.archive("s-race", "main", told?.offset ?? 0, "!")).status).toBe(200);
     expect((await held(await client.transcript("s-race"))).main).toBe((told?.offset ?? 0) + 1);
+  });
+
+  // A stretch keyed before where the reader has read to, and ending past it, holds its unread
+  // tail in no other object. The listing starts one stretch back from the reader's place, so the
+  // straddler comes back and the reader reads forward across it from where it stands.
+  it("names the stretch that begins before the reader has read to and ends past it", async () => {
+    const userId = `straddler-${crypto.randomUUID()}`;
+    const key = (offset: number): string => `${userId}/s-tail/main/${String(offset).padStart(16, "0")}`;
+    await env.TRANSCRIPTS.put(key(0), "a".repeat(100));
+    await env.TRANSCRIPTS.put(key(50), "b".repeat(150));
+
+    const runs = await archivedSince(env.TRANSCRIPTS, userId, "s-tail", "main", 100);
+
+    expect(followedBatch(runs, 100, 65_536)).toEqual({
+      batch: [{ run: 0, offset: 50, skip: 50, bytes: 100 }],
+      at: 200,
+    });
+  });
+
+  // Two writers reach one file at once: one lands a later stretch, the box takes it, and the
+  // other then lands the stretch below it, whose tail runs past where the box has read. A cursor
+  // keyed by the last key taken would never name that stretch again and the bytes past it would
+  // be missing until the page was reloaded.
+  it("names a stretch written below a key the reader has already taken", async () => {
+    const userId = `backfiller-${crypto.randomUUID()}`;
+    const key = (offset: number): string => `${userId}/s-late/main/${String(offset).padStart(16, "0")}`;
+    await env.TRANSCRIPTS.put(key(200), "y".repeat(50));
+    const taken = await archivedSince(env.TRANSCRIPTS, userId, "s-late", "main", 150);
+    expect(followedBatch(taken, 150, 65_536).at).toBe(250);
+
+    await env.TRANSCRIPTS.put(key(150), "x".repeat(150));
+    const late = await archivedSince(env.TRANSCRIPTS, userId, "s-late", "main", 250);
+
+    expect(followedBatch(late, 250, 65_536)).toEqual({
+      batch: [{ run: 0, offset: 150, skip: 100, bytes: 50 }],
+      at: 300,
+    });
+  });
+
+  // One stretch back and no further, whatever the file has run to: no stretch holds more than
+  // MAX_CHUNK_BYTES, so a key below that floor cannot reach past the reader and listing it would
+  // only cost a beat the length of the session.
+  it("reaches back one stretch and leaves the rest of a long file alone", async () => {
+    const userId = `deep-${crypto.randomUUID()}`;
+    const key = (offset: number): string => `${userId}/s-deep/main/${String(offset).padStart(16, "0")}`;
+    const from = 4 * MAX_CHUNK_BYTES;
+    await env.TRANSCRIPTS.put(key(from - MAX_CHUNK_BYTES - 1), "a");
+    await env.TRANSCRIPTS.put(key(from - MAX_CHUNK_BYTES), "b");
+    await env.TRANSCRIPTS.put(key(from), "c");
+
+    const runs = await archivedSince(env.TRANSCRIPTS, userId, "s-deep", "main", from);
+
+    expect(runs.map((run) => run.from)).toEqual([from - MAX_CHUNK_BYTES, from]);
   });
 
   it("keeps a session's files once its row has moved to the history", async () => {

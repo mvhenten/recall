@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { Run } from "../src/transcript-plan";
 import {
   type Fetched,
+  followedBatch,
+  followedTexts,
   gapsIn,
   groupedReads,
   joinedTexts,
@@ -9,6 +11,7 @@ import {
   MAX_PLANNED_READS,
   type PlannedRead,
   plannedBatch,
+  tailNote,
   type Walk,
   walkNote,
 } from "../src/transcript-plan";
@@ -32,7 +35,7 @@ describe("listing a file", () => {
   it("names every read of a file small enough to name, and counts the bytes that can be read", () => {
     const runs = [written(0, 3, 10), written(100, 2, 10)];
 
-    expect(listedRuns(runs)).toEqual({ runs, from: 0, bytes: 50 });
+    expect(listedRuns(runs)).toEqual({ runs, from: 0, readable: 50 });
     expect(gapsIn(listedRuns(runs))).toEqual({ bytes: 70, places: 1 });
   });
 
@@ -49,7 +52,7 @@ describe("listing a file", () => {
 
     expect(listing.runs).toHaveLength(1);
     expect(listing.runs.reduce((all, one) => all + one.reads.length, 0)).toBe(MAX_PLANNED_READS);
-    expect(listing).toMatchObject({ from: 500, bytes: MAX_PLANNED_READS * 10 });
+    expect(listing).toMatchObject({ from: 500, readable: MAX_PLANNED_READS * 10 });
     // What it left off is not a hole in the archive, and is not reported as one.
     expect(gapsIn(listing)).toEqual({ bytes: 0, places: 0 });
   });
@@ -59,7 +62,7 @@ describe("listing a file", () => {
 
     expect(listing.runs).toHaveLength(1);
     expect(listing.runs[0]).toMatchObject({ from: 200, to: (MAX_PLANNED_READS + 20) * 10 });
-    expect(listing).toMatchObject({ from: 200, bytes: MAX_PLANNED_READS * 10 });
+    expect(listing).toMatchObject({ from: 200, readable: MAX_PLANNED_READS * 10 });
   });
 });
 
@@ -148,6 +151,92 @@ describe("saying how the walk went", () => {
       "40 kB of 74 kB read, and the last 20 kB of it holds no prose at all. Load earlier to keep reading.",
     );
     expect(walkNote(walk({ loaded: 40_960, through: false }))).toBe("40 kB of 74 kB read. Scroll up for more.");
+  });
+});
+
+describe("saying what following has to say", () => {
+  // A reader who has scrolled back is not carried to the foot of the box, so the line is the only
+  // thing that can tell them the session has said something since; a session that has ended says
+  // so, rather than leaving a box that simply stops moving; and a reader at the foot watching
+  // turns arrive is told nothing at all.
+  it("counts what landed below a reader, and gives way to the end of the session", () => {
+    expect(tailNote({ newer: 1, ended: false })).toBe("1 newer turn has arrived below.");
+    expect(tailNote({ newer: 2, ended: true })).toBe("2 newer turns have arrived below.");
+    expect(tailNote({ newer: 0, ended: true })).toBe("This session has ended, so nothing more will arrive.");
+    expect(tailNote({ newer: 0, ended: false })).toBe("");
+  });
+});
+
+describe("following a file still being written", () => {
+  it("reads forward over the stretches past the cursor and never over one already read", () => {
+    const runs = [written(0, 3, 100)];
+
+    const first = followedBatch(runs, 200, 1_000);
+    expect(first.batch).toEqual([read(0, 200, 0, 100)]);
+    expect(first.at).toBe(300);
+    expect(followedBatch(runs, first.at, 1_000)).toEqual({ batch: [], at: 300 });
+  });
+
+  // A beat behind a hidden tab comes back to more than one step's worth. Taking reads whole keeps
+  // the cursor on a stretch boundary, so the next beat asks for stretches and not for part of one.
+  it("stops at the step, taking every read whole, and takes the rest on the next beat", () => {
+    const runs = [written(0, 5, 100)];
+
+    const first = followedBatch(runs, 0, 250);
+    expect(first.batch).toEqual([read(0, 0, 0, 100), read(0, 100, 0, 100), read(0, 200, 0, 100)]);
+    expect(first.at).toBe(300);
+
+    const second = followedBatch(runs, first.at, 250);
+    expect(second.batch).toEqual([read(0, 300, 0, 100), read(0, 400, 0, 100)]);
+    expect(second.at).toBe(500);
+  });
+
+  it("takes only the unread tail of a stretch the cursor sits inside", () => {
+    const runs: Run[] = [{ from: 0, to: 140, reads: [{ offset: 0, skip: 0, bytes: 140 }] }];
+
+    expect(followedBatch(runs, 100, 1_000)).toEqual({ batch: [read(0, 0, 100, 40)], at: 140 });
+  });
+
+  it("steps over a hole and names the run each read sits in", () => {
+    const runs = [written(0, 1, 50), written(900, 1, 50)];
+
+    expect(followedBatch(runs, 50, 1_000)).toEqual({ batch: [read(1, 900, 0, 50)], at: 950 });
+  });
+
+  it("holds back the part line a beat ends on and joins it to the beat that completes it", () => {
+    const first = followedTexts([{ run: 0, at: 0, text: '{"a":1}\n{"b":' }], "");
+    expect(first.texts).toEqual(['{"a":1}\n']);
+    expect(first.remnant).toBe('{"b":');
+
+    const second = followedTexts([{ run: 0, at: 13, text: "2}\n" }], first.remnant);
+    expect(second.texts).toEqual(['{"b":2}\n']);
+    expect(second.remnant).toBe("");
+  });
+
+  it("keeps holding an entry longer than one beat until the beat that completes it lands", () => {
+    const first = followedTexts([{ run: 0, at: 0, text: "{start:" }], "");
+    expect(first.texts).toEqual([""]);
+    const second = followedTexts([{ run: 0, at: 7, text: "middle" }], first.remnant);
+    expect(second.texts).toEqual([""]);
+    expect(second.remnant).toBe("{start:middle");
+    const third = followedTexts([{ run: 0, at: 13, text: "}\n" }], second.remnant);
+    expect(third.texts).toEqual(["{start:middle}\n"]);
+    expect(third.remnant).toBe("");
+  });
+
+  // The torn line either side of a hole is left to fail to parse rather than glued into an entry
+  // the session never wrote.
+  it("carries nothing across a hole inside one beat", () => {
+    const joined = followedTexts(
+      [
+        { run: 0, at: 0, text: '{"a":1}\n{"b"' },
+        { run: 1, at: 900, text: ':2}\n{"c":3}\n' },
+      ],
+      "",
+    );
+
+    expect(joined.texts).toEqual(['{"a":1}\n', ':2}\n{"c":3}\n']);
+    expect(joined.remnant).toBe("");
   });
 });
 

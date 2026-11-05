@@ -1,9 +1,10 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
+import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Mailbox, type Message } from "../src/mailbox";
-import type { Read, Run } from "../src/transcript-plan";
+import { SESSION_TTL_MS } from "../src/model";
+import { followedBatch, type Plan, type Reach, type Read } from "../src/transcript-plan";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -49,14 +50,6 @@ const entry = (index: number, pad = 1_200 + ((index * 137) % 1_600)): string =>
 
 const transcriptOf = (entries: number): string =>
   `${Array.from({ length: entries }, (_, index) => entry(index)).join("\n")}\n`;
-
-interface Plan {
-  path: string;
-  file: string;
-  bytes: number;
-  step: number;
-  runs: Run[];
-}
 
 const planOf = (html: string): Plan => {
   const found = /<script type="application\/json" id="txplan">([^<]*)<\/script>/.exec(html)?.[1];
@@ -174,7 +167,7 @@ describe("a session page", () => {
     expect(html).toContain('<span class="in">Account</span><span class="iv">work</span>');
 
     const plan = planOf(html);
-    expect(plan).toMatchObject({ file: "main", bytes: `${entry(1)}\n`.length });
+    expect(plan).toMatchObject({ file: "main", readable: `${entry(1)}\n`.length });
     expect(await reassembled(h, plan, you.assertion)).toBe(`${entry(1)}\n`);
 
     // The box is filled by a script this Worker serves, off bytes it fetches back from this Worker,
@@ -235,7 +228,7 @@ describe("the transcript manifest", () => {
     expect(body.length).toBeGreaterThan(TRANSCRIPT_STEP_BYTES * 2);
 
     const plan = planOf(await read(h, "/dashboard/sessions/cafe0001", you.assertion));
-    expect(plan.bytes).toBe(body.length);
+    expect(plan.readable).toBe(body.length);
     expect(plan.runs).toHaveLength(1);
     expect(plan.runs[0]).toMatchObject({ from: 0, to: body.length });
     expect(plan.runs[0]?.reads.every((read) => read.skip === 0)).toBe(true);
@@ -258,7 +251,7 @@ describe("the transcript manifest", () => {
     const plan = planOf(html);
     // What the page counts down is what can be read, so the progress line reaches the end of a
     // holed file rather than stopping short of it by the size of the hole for ever.
-    expect(plan.bytes).toBe(head.length + tail.length);
+    expect(plan.readable).toBe(head.length + tail.length);
     expect(plan.runs.map((run) => ({ from: run.from, to: run.to }))).toEqual([
       { from: 0, to: head.length },
       { from: 50_000, to: 50_000 + tail.length },
@@ -277,7 +270,7 @@ describe("the transcript manifest", () => {
 
     const html = await read(h, "/dashboard/sessions/cafe0005", you.assertion);
     expect(html).toContain("The archive never got 9000 bytes of this file, in 1 place.");
-    expect(planOf(html).bytes).toBe(tail.length);
+    expect(planOf(html).readable).toBe(tail.length);
   });
 
   it("says which files a session archived, and says so when it never archived the one asked for", async () => {
@@ -338,6 +331,129 @@ describe("the transcript bytes", () => {
     expect(
       (await h.send(named, { headers: { "cf-access-jwt-assertion": you.assertion, range: "bytes=0-9" } })).status,
     ).toBe(400);
+  });
+});
+
+// One beat of a box following a session still being written. It carries the box's one cursor:
+// how far it has read the file to.
+const beatOf = (h: Harness, plan: Plan, from: number, assertion: string): Promise<Response> =>
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${from}`, {
+    headers: { "cf-access-jwt-assertion": assertion },
+  });
+
+// What the box puts on screen off one beat: the listing read forward from where the reader
+// stands, and the bytes of every read that plan names. A listing reaches back over stretches the
+// reader already has, so this is the only reading of it that says what the reader sees.
+const followed = async (h: Harness, plan: Plan, reach: Reach, from: number, assertion: string): Promise<string> => {
+  const parts: string[] = [];
+  for (const read of followedBatch(reach.runs, from, TRANSCRIPT_STEP_BYTES).batch) {
+    const response = await bytesOf(h, plan, read, assertion);
+    expect(response.status).toBe(206);
+    parts.push(await response.text());
+  }
+  return parts.join("");
+};
+
+describe("following a transcript as it is written", () => {
+  it("says nothing of a file that has not grown, and reading a beat forward gives the appended bytes once", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const head = transcriptOf(3);
+    const grew = transcriptOf(2);
+    const at = await archivedBody(h, you.laptop, "beef0010", head);
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0010", you.assertion));
+    expect(plan.follow).toEqual({ from: head.length, every: TRANSCRIPT_FOLLOW_MS });
+
+    // Nothing has landed since the page was drawn, so the beat names no stretch at all.
+    const first = await beatOf(h, plan, at, you.assertion);
+    expect(first.headers.get("cache-control")).toBe("no-store");
+    expect(await first.json()).toEqual({ running: true, runs: [] });
+
+    await archivedBody(h, you.laptop, "beef0010", grew, at);
+    await h.deliver();
+    const moved: Reach = await (await beatOf(h, plan, at, you.assertion)).json();
+
+    expect(moved.running).toBe(true);
+    expect(await followed(h, plan, moved, at, you.assertion)).toBe(grew);
+  });
+
+  // The whole point of the cursor: whatever the listing names, the reader reads forward from its
+  // own place in the file, so nothing the box has shown is fetched or rendered a second time.
+  it("reads forward from where the reader stands, however many stretches the listing names", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const starts: number[] = [];
+    let at = 0;
+    for (let beat = 0; beat < 4; beat += 1) {
+      starts.push(at);
+      at = await archivedBody(h, you.laptop, "beef0011", transcriptOf(2), at);
+    }
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0011", you.assertion));
+
+    const behind: Reach = await (await beatOf(h, plan, starts[1] ?? 0, you.assertion)).json();
+    const caught: Reach = await (await beatOf(h, plan, at, you.assertion)).json();
+
+    expect(followedBatch(behind.runs, starts[1] ?? 0, TRANSCRIPT_STEP_BYTES)).toMatchObject({ at });
+    expect(await followed(h, plan, behind, starts[1] ?? 0, you.assertion)).toBe(transcriptOf(2).repeat(3));
+    expect(caught.runs).toEqual([]);
+  });
+
+  // The extent the beat reads is a cache the storage event keeps, and a session no event has ever
+  // landed for keeps no row at all. That never corrects itself, so the objects are listed
+  // regardless rather than answering "nothing new" for as long as the tab is open.
+  it("lists the objects for a session no storage event has cached", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const grew = transcriptOf(2);
+    const at = await archivedBody(h, you.laptop, "beef0014", transcriptOf(2));
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0014", you.assertion));
+    await archivedBody(h, you.laptop, "beef0014", grew, at);
+
+    const beat: Reach = await (await beatOf(h, plan, at, you.assertion)).json();
+
+    expect(await h.indexMark(you.userId, "beef0014")).toBeNull();
+    expect(await followed(h, plan, beat, at, you.assertion)).toBe(grew);
+  });
+
+  it("says a session nobody is running is no longer worth following", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const at = await archivedBody(h, you.laptop, "beef0012", transcriptOf(3));
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0012", you.assertion));
+    h.tick(SESSION_TTL_MS + 1);
+
+    const cold: Reach = await (await beatOf(h, plan, at, you.assertion)).json();
+    expect(cold.running).toBe(false);
+    expect(planOf(await read(h, "/dashboard/sessions/beef0012", you.assertion)).follow).toBeNull();
+  });
+
+  // A delegated turn's file derives nothing and so keeps no extent off the objects. Following one
+  // would cost a listing of the whole prefix a beat, so the page does not offer it and the route
+  // refuses it rather than quietly paying for it.
+  it("follows the session's own file and no other", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    await archivedBody(h, you.laptop, "beef0013", transcriptOf(3));
+    expect((await you.laptop.archive("beef0013", "task-7", 0, transcriptOf(2))).status).toBe(200);
+    await h.deliver();
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0013?file=task-7", you.assertion));
+    const main = { ...plan, file: "main" };
+
+    expect(plan.follow).toBeNull();
+    expect((await beatOf(h, plan, 0, you.assertion)).status).toBe(400);
+    expect((await beatOf(h, { ...plan, file: "../main" }, 0, you.assertion)).status).toBe(400);
+    expect((await beatOf(h, main, -1, you.assertion)).status).toBe(400);
+    expect(
+      (
+        await h.send(`${plan.path}?file=main`, {
+          headers: { "cf-access-jwt-assertion": you.assertion },
+        })
+      ).status,
+    ).toBe(400);
+    expect((await beatOf(h, main, 0, await h.assertionFor("stranger@example.com"))).status).toBe(403);
   });
 });
 

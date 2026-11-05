@@ -8,6 +8,10 @@
 // joined to the batch loaded after it, which holds the rest of that line. A run boundary is a hole
 // in the archive, and nothing is joined across one.
 //
+// A session still being written is followed the other way round: one cursor says how far the file
+// has been read to, the stretches past it are read forward, and the part line at the end of a
+// batch is the remnant the next batch completes.
+//
 // Nothing here touches a document or a network, so the whole of the arithmetic a wrong window
 // hides in is read and exercised on its own.
 
@@ -42,17 +46,18 @@ export interface Listing {
   /// front of the first run is a hole in the archive only when nothing was left off.
   from: number;
   /// How many of the file's bytes the listing can actually read, which is every byte of its runs
-  /// and none of the holes between them. It is what a reader counts up to, so a holed file reads
-  /// as finished when it is finished rather than stopping short for ever.
-  bytes: number;
+  /// and none of the holes between them. It is a count and never a place in the file: a reader
+  /// counts up to it, so a holed file reads as finished when it is finished rather than stopping
+  /// short for ever.
+  readable: number;
 }
 
-const readable = (runs: Run[]): number => runs.reduce((all, run) => all + run.to - run.from, 0);
+const readableIn = (runs: Run[]): number => runs.reduce((all, run) => all + run.to - run.from, 0);
 
 // The newest reads of a file, up to the ceiling, and where the listing begins.
 export const listedRuns = (runs: Run[]): Listing => {
   const total = runs.reduce((all, run) => all + run.reads.length, 0);
-  if (total <= MAX_PLANNED_READS) return { runs, from: 0, bytes: readable(runs) };
+  if (total <= MAX_PLANNED_READS) return { runs, from: 0, readable: readableIn(runs) };
   let drop = total - MAX_PLANNED_READS;
   const kept: Run[] = [];
   for (const run of runs) {
@@ -66,8 +71,33 @@ export const listedRuns = (runs: Run[]): Listing => {
     if (head === undefined) continue;
     kept.push({ from: head.offset + head.skip, to: run.to, reads });
   }
-  return { runs: kept, from: kept[0]?.from ?? 0, bytes: readable(kept) };
+  return { runs: kept, from: kept[0]?.from ?? 0, readable: readableIn(kept) };
 };
+
+// Where the box starts following a file still being written, and how often it beats. `from` is a
+// place in the file and never a count of bytes.
+export interface Follow {
+  from: number;
+  every: number;
+}
+
+// What the page hands the browser: the route a stretch is read off, the manifest the walk is
+// planned against, and where to pick a file still being written up from.
+export interface Plan {
+  path: string;
+  file: string;
+  readable: number;
+  step: number;
+  runs: Run[];
+  follow: Follow | null;
+}
+
+// What a beat is answered with: whether anyone is still running the session, and how the end of
+// its file lays out around and past where the reader has read.
+export interface Reach {
+  running: boolean;
+  runs: Run[];
+}
 
 export interface Gaps {
   bytes: number;
@@ -154,11 +184,55 @@ export const groupedReads = (fetched: Fetched[]): Group[] => {
 };
 
 export interface Joined {
-  /// The whole lines each group holds, newest group first, which is the order they go in at the
-  /// top of the box.
+  /// The whole lines each group holds, in the order they go into the box.
   texts: string[];
   remnant: string;
 }
+
+export interface FollowedBatch {
+  /// The reads to fetch, oldest first.
+  batch: PlannedRead[];
+  /// Where the file has been read to once every read of the batch has landed.
+  at: number;
+}
+
+// The next batch of a file a session is still writing, reading forward from where the reader has
+// got to. Every byte already read is passed over, so nothing on screen is rendered twice, and a
+// read is taken whole or not at all, so the cursor lands on a stretch boundary and the listing
+// that names the next batch starts there with no part-read stretch behind it.
+export const followedBatch = (runs: Run[], from: number, step: number): FollowedBatch => {
+  const batch: PlannedRead[] = [];
+  let at = from;
+  let budget = step;
+  for (const [index, run] of runs.entries()) {
+    for (const read of run.reads) {
+      const ends = read.offset + read.skip + read.bytes;
+      if (ends <= at) continue;
+      if (budget <= 0) return { batch, at };
+      const begins = Math.max(at, read.offset + read.skip);
+      batch.push({ run: index, offset: read.offset, skip: begins - read.offset, bytes: ends - begins });
+      budget -= ends - begins;
+      at = ends;
+    }
+  }
+  return { batch, at };
+};
+
+// The groups turned into text that parses, reading forward, newest group last. A batch ends
+// wherever the archive has got to and not on a line end, so the last line of a group is a part
+// line: it is held back and joined to the group fetched after it. Two groups of one batch sit
+// either side of a hole, so nothing is carried from the one to the other.
+export const followedTexts = (groups: Group[], remnant: string): Joined => {
+  const texts: string[] = [];
+  let held = remnant;
+  for (const [index, group] of groups.entries()) {
+    const text = (index === 0 ? held : "") + group.text;
+    const cut = text.lastIndexOf("\n");
+    held = cut < 0 ? text : text.slice(cut + 1);
+    texts.push(cut < 0 ? "" : text.slice(0, cut + 1));
+  }
+  return { texts, remnant: held };
+};
 
 // How far the walk has got, and how much of it the reader can see. `shown` is what keeps the note
 // honest: a walk that read every byte and rendered no turn is the one answer the box must never
@@ -178,9 +252,30 @@ export interface Walk {
   through: boolean;
 }
 
+// What a box following a session still being written has to say for itself. It is a line of its
+// own under the box and never part of the walk's: the two read different objects and fail apart
+// from each other, so a tail nobody can read says nothing about how far back the reader can walk,
+// and a walk that has given up must not take the live news down with it.
+export interface Tail {
+  /// Turns that landed at the foot of the box while the reader was reading further up, and zero
+  /// while the reader is at the foot and watching them arrive.
+  newer: number;
+  /// Whether the session the box was following has ended, so nothing more will land.
+  ended: boolean;
+}
+
 const kb = (bytes: number): string => (bytes < 1_024 ? `${bytes} B` : `${Math.round(bytes / 1_024)} kB`);
 
-// What the box has to say for itself, so what the reader is told and what the reader can see
+// A reader who has scrolled back is told what arrived rather than being carried to it, and a
+// session that has ended is said to have ended rather than leaving a box that simply stops moving.
+export const tailNote = (tail: Tail): string => {
+  if (tail.newer > 0) {
+    return `${tail.newer} newer ${tail.newer === 1 ? "turn has" : "turns have"} arrived below.`;
+  }
+  return tail.ended ? "This session has ended, so nothing more will arrive." : "";
+};
+
+// What the walk has to say for itself, so what the reader is told and what the reader can see
 // cannot disagree.
 export const walkNote = (walk: Walk): string => {
   const whole = `The whole of ${walk.file} is here, ${kb(walk.bytes)} of it`;
@@ -198,10 +293,11 @@ export const walkNote = (walk: Walk): string => {
   return `${read} read. Scroll up for more.`;
 };
 
-// The groups turned into text that parses. A batch starts wherever its budget ran out and not on a
-// line end, so the head of a group is a part line: it is held back and joined to the group fetched
-// after it. A group that begins where its run begins has nothing in front of it, so nothing is
-// held back there and nothing is carried across the hole beyond it.
+// The groups turned into text that parses, reading backwards, newest group first. A batch starts
+// wherever its budget ran out and not on a line end, so the head of a group is a part line: it is
+// held back and joined to the group fetched after it. A group that begins where its run begins has
+// nothing in front of it, so nothing is held back there and nothing is carried across the hole
+// beyond it.
 export const joinedTexts = (groups: Group[], runs: Run[], remnant: string): Joined => {
   const texts: string[] = [];
   let held = remnant;
