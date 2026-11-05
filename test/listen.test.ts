@@ -8,6 +8,10 @@ import {
   MESSAGE_TTL_MS,
   type Message,
   type MessageFrame,
+  ORDERS,
+  ORDERS_HEADER,
+  SWEEP_INTERVAL_MS,
+  SWEPT_AT,
 } from "../src/mailbox";
 import { type Client, harness } from "./harness";
 
@@ -16,6 +20,7 @@ type Harness = Awaited<ReturnType<typeof harness>>;
 interface Listener {
   socket: WebSocket;
   received: Message[];
+  tokens: Map<string, string>;
   closed: number[];
 }
 
@@ -55,22 +60,26 @@ const send = async (client: Client, toDeviceId: string, body: string): Promise<v
 
 const listen = async (h: Harness, token: string): Promise<Listener> => {
   const response = await h.send("/v1/messages/listen", {
-    headers: { authorization: `Bearer ${token}`, upgrade: "websocket" },
+    headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
   expect(response.status).toBe(101);
   const socket = response.webSocket;
   if (!socket) throw new Error("the listen upgrade carried no socket");
   socket.accept();
-  const listener: Listener = { socket, received: [], closed: [] };
+  const listener: Listener = { socket, received: [], tokens: new Map(), closed: [] };
   socket.addEventListener("message", (event) => {
     const frame: MessageFrame = JSON.parse(String(event.data));
     listener.received.push(frame.message);
+    listener.tokens.set(frame.message.messageId, frame.token);
   });
   socket.addEventListener("close", (event) => listener.closed.push(event.code));
   return listener;
 };
 
-const ackFrame = (messageId: string): string => JSON.stringify({ type: "ack", messageId } satisfies AckFrame);
+const ack = (listener: Listener, messageId: string): void => {
+  const token = listener.tokens.get(messageId) ?? "";
+  listener.socket.send(JSON.stringify({ type: "ack", messageId, token } satisfies AckFrame));
+};
 
 const eventually = async (ready: () => boolean | Promise<boolean>, what: string): Promise<void> => {
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -98,7 +107,7 @@ describe("messages listen", () => {
       "pushed while connected",
     ]);
 
-    for (const message of desktop.received) desktop.socket.send(ackFrame(message.messageId));
+    for (const message of desktop.received) ack(desktop, message.messageId);
     await eventually(async () => (await queued(userId, desktopId, h.now())).length === 0, "both acks");
     expect(await queued(userId, laptopId, h.now())).toHaveLength(1);
   });
@@ -120,8 +129,8 @@ describe("messages listen", () => {
     await eventually(() => reconnected.received.length === 2, "the redelivery");
     expect(reconnected.received.map((message) => message.messageId)).toEqual([first.messageId, second.messageId]);
 
-    reconnected.socket.send(ackFrame(first.messageId));
-    reconnected.socket.send(ackFrame(first.messageId));
+    ack(reconnected, first.messageId);
+    ack(reconnected, first.messageId);
     await eventually(async () => (await queued(userId, desktopId, h.now())).length === 1, "the ack");
     expect((await queued(userId, desktopId, h.now()))[0]?.messageId).toBe(second.messageId);
   });
@@ -135,28 +144,31 @@ describe("messages listen", () => {
 
     const live = await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
       await mailbox.enqueue(
-        { toDeviceId: laptopId, toSessionId: "", fromSessionId: "", body: "past the TTL" },
+        { kind: "news", toDeviceId: laptopId, toSessionId: "", fromSessionId: "", body: "past the TTL" },
         from,
         now - MESSAGE_TTL_MS - 1,
       );
       await mailbox.enqueue(
-        { toDeviceId: orphanId, toSessionId: "", fromSessionId: "", body: "nobody holds this device" },
+        { kind: "news", toDeviceId: orphanId, toSessionId: "", fromSessionId: "", body: "nobody holds this device" },
         from,
         now,
       );
       return mailbox.enqueue(
-        { toDeviceId: laptopId, toSessionId: "", fromSessionId: "", body: "still within the TTL" },
+        { kind: "news", toDeviceId: laptopId, toSessionId: "", fromSessionId: "", body: "still within the TTL" },
         from,
         now,
       );
     });
-    if (!live) throw new Error("the mailbox refused the message it had room for");
+    if (live === null) throw new Error("the mailbox refused the message it had room for");
 
     const desktop = await listen(h, desktopToken);
     expect((await laptop.request("DELETE", `/v1/devices/${desktopId}`)).status).toBe(204);
+    await runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) =>
+      state.storage.put(SWEPT_AT, now - SWEEP_INTERVAL_MS - 1),
+    );
     expect(await runDurableObjectAlarm(mailboxOf(userId))).toBe(true);
 
-    expect(await queued(userId, laptopId, now)).toEqual([live]);
+    expect(await queued(userId, laptopId, now)).toEqual([live.message]);
     expect(await queued(userId, orphanId, now)).toEqual([]);
     await eventually(() => desktop.closed.includes(CLOSE_REVOKED), "the revoked socket closing");
   });

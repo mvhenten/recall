@@ -312,12 +312,46 @@ struct Devices {
     devices: Vec<Device>,
 }
 
+/// A service too old to name a kind sends news, which is what every message was before orders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    News,
+    Order,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::News => "news",
+            Kind::Order => "order",
+        }
+    }
+}
+
+/// What the service made of a send. `reason` is what the sender is told when nobody took it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum Outcome {
+    Fanout,
+    #[serde(rename_all = "camelCase")]
+    Taken {
+        session_id: String,
+    },
+    Untaken {
+        reason: String,
+    },
+}
+
 /// `to_session_id` is the one session the message is addressed to, or empty for every session the
 /// host has registered.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub message_id: String,
+    #[serde(default)]
+    pub kind: Kind,
     pub to_device_id: String,
     pub to_session_id: String,
     pub from_device_id: String,
@@ -334,9 +368,13 @@ pub struct Message {
     pub expires_at: i64,
 }
 
-#[derive(Deserialize)]
-struct Sent {
-    message: Message,
+/// `outcome` is absent from a service that predates orders, which is the only thing that tells
+/// such a service apart from one that answered.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Sent {
+    pub message: Message,
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
 }
 
 /// One Claude Code session on one of the hosts signed in as this user, as the service holds it.
@@ -906,10 +944,11 @@ impl Client {
     /// `from_session_id` is the session this send is running inside, which the service turns into
     /// the handle the delivered message tells its reader to answer on. It is empty where the
     /// sending process cannot say which session asked, and the header then names the host.
-    pub fn send(&self, target: &Target, from_session_id: &str, body: &str) -> Result<Message> {
+    pub fn send(&self, target: &Target, kind: Kind, from_session_id: &str, body: &str) -> Result<Sent> {
         let response = self
             .authed(self.agent.post(self.url("/v1/messages")))
             .send_json(serde_json::json!({
+                "kind": kind.as_str(),
                 "toDeviceId": target.device_id,
                 "toSessionId": target.session_id,
                 "fromSessionId": from_session_id,
@@ -918,7 +957,7 @@ impl Client {
         let sent: Sent = check(response, &format!("sending to {}", target.device_id))?
             .body_mut()
             .read_json()?;
-        Ok(sent.message)
+        Ok(sent)
     }
 
     /// Publishes the files on disk, so their bytes travel from the file to the service without

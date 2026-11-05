@@ -246,6 +246,20 @@ enum Command {
         )]
         message: Vec<String>,
     },
+    #[command(about = "Send an instruction one session on the target host carries out, and report which one took it")]
+    Order {
+        #[arg(
+            value_name = "TO",
+            help = "A host from recall devices — its label, its name or its id — whose sessions compete for the order, or a session handle from recall sessions for one of them"
+        )]
+        to: String,
+        #[arg(
+            value_name = "ORDER",
+            num_args = 1..,
+            help = "The order; stdin when omitted or -"
+        )]
+        message: Vec<String>,
+    },
     #[command(about = "Hold the connection that carries messages from your other hosts to this one")]
     Listen {
         #[arg(
@@ -508,6 +522,32 @@ fn message_body(words: &[String]) -> Result<String> {
         bail!("the message is empty");
     }
     Ok(text)
+}
+
+/// Why an order reached nobody, in the words the sender reads. A service that answers with a
+/// fanout, or with no outcome at all, predates orders and handed it to every session on the host,
+/// which is the thing an order exists to avoid.
+pub fn order_refusal(sent: &api::Sent, to: &str) -> String {
+    let id = &sent.message.message_id;
+    match &sent.outcome {
+        Some(api::Outcome::Taken { session_id }) => format!("order {id} was taken by {session_id}"),
+        Some(api::Outcome::Untaken { reason }) => format!("order {id} reached no session on {to}: {reason}"),
+        _ => format!("the recall serving {to} is too old to carry an order, so order {id} went out as news; update it"),
+    }
+}
+
+/// An order is worth nothing to the sender who cannot tell whether anyone picked it up, so one
+/// nobody took ends the command with the reason the service gave rather than a line that reads
+/// like success. A host that is listening and names no session loses the order; one that is not
+/// listening keeps it for a session that attaches within the ten minutes of the grace.
+fn report_order(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
+    let Some(api::Outcome::Taken { session_id }) = &sent.outcome else {
+        bail!("{}", order_refusal(sent, to));
+    };
+    if !json {
+        println!("order {} taken by {session_id} on {to}", sent.message.message_id);
+    }
+    Ok(())
 }
 
 /// One sync carries both halves of what a host knows about a session: the document, and the usage
@@ -886,12 +926,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let body = message_body(&message)?;
             let client = client()?;
             let target = api::resolve_target(&client.devices()?, || client.sessions(), &to)?;
-            let sent = client.send(&target, &sending_session(), &body)?;
+            let sent = client.send(&target, api::Kind::News, &sending_session(), &body)?;
+            if cli.json {
+                print_json(&sent.message)?;
+            } else {
+                println!("sent {} to {to}", sent.message.message_id);
+            }
+        }
+        Command::Order { to, message } => {
+            require_messaging(&settings::load(&cli.settings)?)?;
+            let body = message_body(&message)?;
+            let client = client()?;
+            let target = api::resolve_target(&client.devices()?, || client.sessions(), &to)?;
+            let sent = client.send(&target, api::Kind::Order, &sending_session(), &body)?;
             if cli.json {
                 print_json(&sent)?;
-            } else {
-                println!("sent {} to {to}", sent.message_id);
             }
+            report_order(&sent, &to, cli.json)?;
         }
         Command::Logout => {
             match client()?.revoke_device("current") {

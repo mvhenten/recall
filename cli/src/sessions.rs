@@ -458,6 +458,59 @@ pub async fn to_host(dir: &Path, body: &str, created_at: i64, now: i64) -> Optio
     Some(write_all(registrations, body).await)
 }
 
+/// What became of an order on this host. `Refused` is a session that would not take the write, so
+/// the order goes back for the next one to try. `Waiting` is a host with nothing to run an order
+/// sent that recently; `Retired` is the same host once the order is older than the grace.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Placed {
+    Taken(String),
+    Refused,
+    Waiting,
+    Retired,
+}
+
+/// Delivers an order to the one session that should act on it, by the same rule `to_host` picks
+/// its sessions by: the newest that was already running when the order was sent, and otherwise
+/// the newest registered now. Past `HOST_GRACE` there is nobody left to wait for.
+pub async fn to_one(dir: &Path, body: &str, created_at: i64, now: i64) -> Placed {
+    let registrations = addressable(dir);
+    if let Some(running) = registrations
+        .iter()
+        .find(|registered| registered.started_at <= created_at)
+    {
+        return place(running, body).await;
+    }
+    let grace = i64::try_from(HOST_GRACE.as_millis()).unwrap_or(i64::MAX);
+    if now.saturating_sub(created_at) > grace {
+        return Placed::Retired;
+    }
+    match registrations.first() {
+        Some(newest) => place(newest, body).await,
+        None => Placed::Waiting,
+    }
+}
+
+/// Delivers an order to the one session it names. A session this host cannot address is the end of
+/// it: no other session was addressed, so there is nothing to hand the order to.
+pub async fn to_one_session(dir: &Path, session_id: &str, body: &str) -> Placed {
+    let Some(registered) = addressable(dir)
+        .into_iter()
+        .find(|registered| registered.session_id == session_id)
+    else {
+        return Placed::Retired;
+    };
+    place(&registered, body).await
+}
+
+async fn place(registered: &Registered, body: &str) -> Placed {
+    let mut fanout = Fanout::default();
+    write_or_prune(registered, body, &mut fanout).await;
+    if fanout.delivered == 0 {
+        return Placed::Refused;
+    }
+    Placed::Taken(registered.session_id.clone())
+}
+
 /// Delivers a message body to the one session named, so a handle reaches that session and nothing
 /// else sharing its socket. A session this host cannot address takes nothing: it has ended, lost
 /// its inbox, or sits behind a newer registration on its socket, which Claude would discard.
@@ -723,8 +776,84 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_order_reaches_one_of_several_listening_sessions_and_names_it() {
+        let sandbox = Sandbox::new("order-one-of-three");
+        let mine = std::process::id() as i32;
+        let sockets: Vec<PathBuf> = (0..3)
+            .map(|index| sandbox.dir.join(format!("inbox-{index}.sock")))
+            .collect();
+        let listeners: Vec<UnixListener> = sockets.iter().map(|path| UnixListener::bind(path).unwrap()).collect();
+        for (index, socket) in sockets.iter().enumerate() {
+            sandbox.register(&format!("s-{index}"), socket, mine);
+        }
+
+        let accepting = tokio::spawn(async move {
+            let mut written = Vec::new();
+            for (index, listener) in listeners.iter().enumerate() {
+                if tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_ok()
+                {
+                    written.push(index);
+                }
+            }
+            written
+        });
+        let placed = to_one(&sandbox.sessions(), "rerun the migration", STARTED_AT, STARTED_AT).await;
+
+        let Placed::Taken(session_id) = placed else {
+            panic!("a host with three registered sessions must place an order, got {placed:?}");
+        };
+        assert!(
+            ["s-0", "s-1", "s-2"].contains(&session_id.as_str()),
+            "the order names the session it went to, got {session_id}"
+        );
+        assert_eq!(
+            accepting.await.unwrap().len(),
+            1,
+            "exactly one of the three inboxes is written to"
+        );
+    }
+
     fn grace_ms() -> i64 {
         i64::try_from(HOST_GRACE.as_millis()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_order_no_session_can_take_waits_out_the_grace_and_is_then_retired() {
+        let sandbox = Sandbox::new("order-nobody");
+        let dir = sandbox.sessions();
+        let sent = STARTED_AT;
+
+        assert_eq!(to_one(&dir, "rerun the migration", sent, sent).await, Placed::Waiting);
+        assert_eq!(
+            to_one(&dir, "rerun the migration", sent, sent + grace_ms() + 1).await,
+            Placed::Retired
+        );
+        assert_eq!(
+            to_one_session(&dir, "s-gone", "rerun the migration").await,
+            Placed::Retired,
+            "an order named at a session this host no longer has is nobody else's to take"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_a_dead_session_will_not_take_is_refused_rather_than_swallowed() {
+        let sandbox = Sandbox::new("order-refused");
+        let socket = sandbox.dir.join("inbox.sock");
+        drop(UnixListener::bind(&socket).unwrap());
+        sandbox.register("s-dead", &socket, std::process::id() as i32);
+
+        assert_eq!(
+            to_one_session(&sandbox.sessions(), "s-dead", "rerun the migration").await,
+            Placed::Refused
+        );
+        assert_eq!(
+            to_one_session(&sandbox.sessions(), "s-dead", "rerun the migration").await,
+            Placed::Retired,
+            "the refusal took the registration with it, so there is nothing left to try"
+        );
     }
 
     #[tokio::test]

@@ -84,8 +84,10 @@ import {
   MAX_QUEUED_MESSAGES,
   type Mailbox,
   NOW_HEADER,
+  ORDERS_HEADER,
   parseSend,
   type Sender,
+  type SendInput,
 } from "./mailbox";
 import { render } from "./markdown";
 import {
@@ -691,9 +693,9 @@ export const createApp = (deps: Deps): App => {
       return error(404, `no session ${toSessionId} on device ${toDeviceId}`);
     }
     const sender = await senderOf(env.DB, caller, fromSessionId, now);
-    const message = await mailboxFor(env, caller.userId).enqueue(input.value, sender, now);
-    if (message === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
-    return json({ message }, 201);
+    const sent = await mailboxFor(env, caller.userId).enqueue(input.value, sender, now);
+    if (sent === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
+    return json(sent, 201);
   };
 
   const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
@@ -702,6 +704,7 @@ export const createApp = (deps: Deps): App => {
         upgrade: "websocket",
         [DEVICE_HEADER]: caller.deviceId,
         [NOW_HEADER]: String(deps.now()),
+        [ORDERS_HEADER]: request.headers.get(ORDERS_HEADER) ?? "",
       },
     });
     return mailboxFor(env, caller.userId).fetch(upgrade);
@@ -1124,9 +1127,9 @@ export const createApp = (deps: Deps): App => {
       return refuse("The host that ran this session is signed out, so the bus has nowhere to deliver it.", 400);
     }
     const sender: Sender = { deviceId: DASHBOARD_DEVICE, host: DASHBOARD_DEVICE, name: email };
-    const input = { toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
-    const message = await mailboxFor(env, userId).enqueue(input, sender, deps.now());
-    if (message === null) {
+    const input: SendInput = { kind: "news", toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
+    const sent = await mailboxFor(env, userId).enqueue(input, sender, deps.now());
+    if (sent === null) {
       return refuse(`This account already holds ${MAX_QUEUED_MESSAGES} queued messages, so the bus took nothing.`, 400);
     }
     return new Response(null, {
