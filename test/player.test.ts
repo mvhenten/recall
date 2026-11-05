@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { NO_TRACK, type PlayerEvent, type PlayerState, step, type TrackState } from "../src/player";
+import { type PlayerEvent, type PlayerState, step, type TrackState } from "../src/player";
 
-const player = (tracks: TrackState[], current = NO_TRACK): PlayerState => ({ tracks, current });
+const player = (tracks: TrackState[], current: number | null = null): PlayerState => ({ tracks, current });
 
 const walk = (state: PlayerState, events: PlayerEvent[]): PlayerState => events.reduce(step, state);
 
@@ -50,11 +50,11 @@ describe("the audio player's state machine", () => {
 
   it("ending the last track marks every track ended and plays nothing", () => {
     const state = walk(player(["idle", "idle"]), [{ kind: "start", track: 1 }, { kind: "playing" }, { kind: "ended" }]);
-    expect(state).toEqual({ tracks: ["ended", "ended"], current: NO_TRACK });
+    expect(state).toEqual({ tracks: ["ended", "ended"], current: null });
   });
 
   it("starting anything clears every ended mark", () => {
-    const ended = player(["ended", "ended", "ended"], NO_TRACK);
+    const ended = player(["ended", "ended", "ended"], null);
     expect(step(ended, { kind: "start", track: 0 })).toEqual({
       tracks: ["buffering", "idle", "idle"],
       current: 0,
@@ -77,17 +77,17 @@ describe("the audio player's state machine", () => {
       { kind: "playing" },
       { kind: "ended" },
     ]);
-    expect(state).toEqual({ tracks: ["refused", "ended"], current: NO_TRACK });
+    expect(state).toEqual({ tracks: ["refused", "ended"], current: null });
   });
 
   it("starts a refused track again when the reader fires its control", () => {
-    const refused = player(["refused", "idle"], NO_TRACK);
+    const refused = player(["refused", "idle"], null);
     expect(step(refused, { kind: "start", track: 0 })).toEqual({ tracks: ["buffering", "idle"], current: 0 });
   });
 
   it("plays nothing when the last track is refused", () => {
     const state = walk(player(["idle", "idle"]), [{ kind: "start", track: 1 }, { kind: "refused" }]);
-    expect(state).toEqual({ tracks: ["idle", "refused"], current: NO_TRACK });
+    expect(state).toEqual({ tracks: ["idle", "refused"], current: null });
   });
 
   it("does nothing when an unavailable track's control is fired", () => {
@@ -113,7 +113,7 @@ describe("the audio player's state machine", () => {
 
   it("holds an unavailable mark when every other track has ended", () => {
     const state = step(player(["ended", "unavailable", "playing"], 2), { kind: "ended" });
-    expect(state).toEqual({ tracks: ["ended", "unavailable", "ended"], current: NO_TRACK });
+    expect(state).toEqual({ tracks: ["ended", "unavailable", "ended"], current: null });
   });
 
   it("leaves next and previous inert at the ends of the list and when nothing plays", () => {

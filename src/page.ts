@@ -13,6 +13,31 @@ export const escapeHtml = (text: string): string =>
     (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char,
   );
 
+// One palette for every page recall draws itself, on either hostname. Light and dark both come
+// from prefers-color-scheme, so a page names a token and never a colour.
+export const TOKENS = `:root{color-scheme:light dark;
+--bg:#f5f6f8;--surface:#fff;--surface2:#edeff4;
+--ink:#171a20;--dim:#5a6373;--faint:#636c7c;
+--line:#e2e5eb;--line2:#d2d7e0;
+--accent:#3451b2;--on-accent:#fff;
+--live:#157a42;--good:#157a42;--warn:#96670a;--bad:#b3362c;
+--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;
+--bar:#8595ac;--grid:#e7eaef;--axis:#c6ccd6;
+--h0:#eef1f6;--h1:#dbe9fa;--h2:#9ec5f4;--h3:#5598e7;--h4:#256abf;--h5:#0d366b;
+--t-user:#3451b2;--t-project:#157a62;--t-reference:#7a56c9;--t-feedback:#b4541f;
+--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+--sans:system-ui,-apple-system,"Segoe UI",sans-serif}
+@media (prefers-color-scheme:dark){:root{
+--bg:#111318;--surface:#1a1d24;--surface2:#232733;
+--ink:#e7eaf0;--dim:#9aa3b2;--faint:#868f9e;
+--line:#2a2f3a;--line2:#394050;
+--accent:#93aaff;--on-accent:#121419;
+--live:#56c988;--good:#56c988;--warn:#d9a441;--bad:#e4766c;
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;
+--bar:#5c6c85;--grid:#232833;--axis:#394050;
+--h0:#20242e;--h1:#182c49;--h2:#1f4572;--h3:#2a62a4;--h4:#3987e5;--h5:#9ec5f4;
+--t-user:#93aaff;--t-project:#45c0a0;--t-reference:#a98ff0;--t-feedback:#e08a4e}}`;
+
 const DEVICE_STYLE = `body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a;background:#fff}
 code{font-size:1.6rem;letter-spacing:.15em}button,input{font:inherit;padding:.5rem 1rem;margin:.25rem .5rem .25rem 0}
 @media (prefers-color-scheme:dark){body{color:#eee;background:#161616}}`;
@@ -24,6 +49,24 @@ const BASE_CSP =
 // written into the page, so the policy names the origin and no inline script runs at all; and the
 // only host the page may fetch from is this one, which is where the transcript comes from.
 export const SCRIPT_CSP = `${BASE_CSP}; script-src 'self'; connect-src 'self'`;
+
+// recall's own pages on the artifact hostname. They are not the publisher's bytes, so they take
+// none of the sandbox a site takes; they carry no form either, so nothing may be submitted from
+// one at all.
+export const ARTIFACT_PAGE_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
+
+// The player, and nothing else on that hostname, runs a script and plays media. It connects
+// nowhere: the audio element issues its own range requests against the file route.
+export const ARTIFACT_PLAYER_CSP = `${ARTIFACT_PAGE_CSP}; script-src 'self'; media-src 'self'`;
+
+// A size of a megabyte or more reads in MB to one decimal, on a dashboard row and on an artifact
+// page alike, so the same artifact never prints two different sizes.
+export const sizeText = (bytes: number): string => {
+  if (bytes < 1_024) return `${bytes} B`;
+  if (bytes < 1_048_576) return `${Math.round(bytes / 1_024)} kB`;
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
+};
 
 // A page sets more than one cookie when it both holds a form token and clears a one-shot notice,
 // and `set-cookie` is the one header that cannot be folded into a second value, so a list of

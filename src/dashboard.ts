@@ -1,5 +1,18 @@
-import type { Artifact } from "./artifacts";
+import type { ArtifactType, ArtifactView } from "./artifacts";
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
+import {
+  ARTIFACT_SORTS,
+  CURSOR_PARAM,
+  emptyState,
+  HISTORY_SORTS,
+  type Listing,
+  type ListingChip,
+  type ListingFilter,
+  listingMain,
+  MEMORY_SORTS,
+  SORT_PARAM,
+  sortInForce,
+} from "./listing";
 import {
   DAY_MS,
   type DayWindow,
@@ -39,8 +52,8 @@ import {
   usageDay,
   usageMonth,
 } from "./model";
-import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE } from "./page";
-import { type Follow, gapsIn, type Listing, listedRuns, type Plan, type Run } from "./transcript-plan";
+import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE, sizeText, TOKENS } from "./page";
+import { type Follow, gapsIn, listedRuns, type Plan, type Run, type Listing as RunListing } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
 import { MAIN_FILE } from "./transcripts";
 
@@ -73,29 +86,6 @@ const FOCUS_FIRST_CHARS = 80;
 
 export const tabForPath = (pathname: string): Tab | null =>
   TABS.find((tab) => tab.path === pathname.replace(/\/$/, "")) ?? null;
-
-const TOKENS = `:root{color-scheme:light dark;
---bg:#f5f6f8;--surface:#fff;--surface2:#edeff4;
---ink:#171a20;--dim:#5a6373;--faint:#636c7c;
---line:#e2e5eb;--line2:#d2d7e0;
---accent:#3451b2;--on-accent:#fff;
---live:#157a42;--good:#157a42;--warn:#96670a;--bad:#b3362c;
---s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;
---bar:#8595ac;--grid:#e7eaef;--axis:#c6ccd6;
---h0:#eef1f6;--h1:#dbe9fa;--h2:#9ec5f4;--h3:#5598e7;--h4:#256abf;--h5:#0d366b;
---t-user:#3451b2;--t-project:#157a62;--t-reference:#7a56c9;--t-feedback:#b4541f;
---mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
---sans:system-ui,-apple-system,"Segoe UI",sans-serif}
-@media (prefers-color-scheme:dark){:root{
---bg:#111318;--surface:#1a1d24;--surface2:#232733;
---ink:#e7eaf0;--dim:#9aa3b2;--faint:#868f9e;
---line:#2a2f3a;--line2:#394050;
---accent:#93aaff;--on-accent:#121419;
---live:#56c988;--good:#56c988;--warn:#d9a441;--bad:#e4766c;
---s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;
---bar:#5c6c85;--grid:#232833;--axis:#394050;
---h0:#20242e;--h1:#182c49;--h2:#1f4572;--h3:#2a62a4;--h4:#3987e5;--h5:#9ec5f4;
---t-user:#93aaff;--t-project:#45c0a0;--t-reference:#a98ff0;--t-feedback:#e08a4e}}`;
 
 const STYLE = `${TOKENS}
 *{box-sizing:border-box}
@@ -168,6 +158,13 @@ main{padding:1rem;display:grid;gap:.7rem;align-content:start}
 .chips{display:flex;gap:.4rem;flex-wrap:nowrap;overflow-x:auto;padding-bottom:.2rem}
 .chips a{font:400 .74rem/1 var(--mono);color:var(--dim);text-decoration:none;white-space:nowrap;padding:.35rem .55rem;border:1px solid var(--line2);border-radius:999px;background:var(--surface)}
 .chips a[aria-current]{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+.sorts{display:flex;gap:.3rem;flex-wrap:wrap}
+.sorts a,.sorts span{font:400 .74rem/1 var(--mono);color:var(--dim);text-decoration:none;white-space:nowrap;padding:.35rem .55rem;border:1px solid var(--line2);border-radius:4px;background:var(--surface)}
+.sorts a[aria-current]{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+.sorts a:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.sorts.inert span{border-style:dashed;color:var(--faint);background:none}
+.sortwhy{margin:0;font:400 .74rem/1.4 var(--mono);color:var(--faint)}
+.atitle{font:400 .8rem/1.35 var(--sans);color:var(--dim);overflow-wrap:anywhere}
 .strip{list-style:none;display:flex;flex-wrap:wrap;gap:.3rem .9rem;margin:0;padding:0;font:400 .74rem/1.5 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
 .strip strong{color:var(--ink);font-weight:600}
 .more{margin:.4rem 0 0;font-size:.85rem}
@@ -299,10 +296,19 @@ main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
 .hist{grid-template-columns:1fr 1fr;gap:1.2rem 1rem}
 .hrow{grid-template-columns:8.5rem 9rem 14rem minmax(0,1fr) 4.5rem 5.5rem}
 .hrow .tm{grid-area:1/1}
-.arow{grid-template-columns:minmax(0,1fr) 6rem 11rem}
-.arow .h{grid-area:1/1}
-.arow .ab{grid-area:1/2}
-.arow .at{grid-area:1/3}
+.arow{grid-template-columns:minmax(0,1fr) 7rem 5rem 8.5rem 7.5rem 9rem;align-items:start}
+.arow .h{grid-area:1/1/3/2;display:grid;gap:.1rem;align-content:start}
+.arow .h b{font-size:.84rem}
+.arow .aty{grid-area:1/2}
+.arow .afc{grid-area:2/2}
+.arow .ab{grid-area:1/3/3/4}
+.arow .at{grid-area:1/4/3/5}
+.arow .ard{grid-area:1/5}
+.arow .awr{grid-area:2/5}
+.arow .alw{grid-area:1/6/3/7;text-align:left}
+.arow .aty,.arow .afc,.arow .ard,.arow .awr,.arow .alw{font:400 .78rem/1.35 var(--mono);color:var(--dim);overflow-wrap:anywhere}
+.arow .afc,.arow .awr{color:var(--faint)}
+.arow.lhead{align-items:center}
 .memories{grid-template-columns:repeat(auto-fill,minmax(18rem,1fr));gap:1rem}
 .chips{flex-wrap:wrap;overflow-x:visible}
 .kpis{grid-template-columns:repeat(5,1fr);gap:1rem}
@@ -350,9 +356,6 @@ const focusHtml = (focus: Focus): string => {
 
 const isBusy = (session: { lastActivityAt: number }, now: number): boolean =>
   now - session.lastActivityAt < IDLE_AFTER_MS;
-
-const emptyState = (headline: string, hint: string): string =>
-  `<div class="empty"><b>${escapeHtml(headline)}</b><p>${escapeHtml(hint)}</p></div>`;
 
 // Anthropic's published list prices in US dollars per million tokens. A cache write is the
 // five-minute write rate, 1.25x input, and a cache read is 0.1x input. Tokens are stored and the
@@ -515,15 +518,45 @@ const oldestIdleCard = (sessions: Session[], now: number): string => {
   return `<div class="rk"><b>Oldest idle</b><p><strong>${escapeHtml(oldest.name)}</strong> · idle ${age(oldest.lastActivityAt, now)} on ${escapeHtml(repoAtBranch(oldest.repo, oldest.branch))}</p><p>Started ${age(oldest.startedAt, now)} ago · ${oldest.prompts} ${oldest.prompts === 1 ? "prompt" : "prompts"}.</p></div>`;
 };
 
-export const sessionsPage = (email: string, live: Live, sessions: Session[], labels: Labels, now: number): Response => {
-  const main =
-    sessions.length === 0
-      ? emptyState(
-          "No session is running on any of your hosts.",
-          "A session appears here within a minute of its first prompt.",
-        )
-      : `<div class="withrail">${ledger(sessions, labels, now)}<div class="rail">${hostsCard(sessions, labels, now)}${oldestIdleCard(sessions, now)}</div></div>`;
-  return shell(email, SESSIONS_TAB, live, SESSIONS_TAB.label, `${live.sessions} live · ${live.busy} busy`, main);
+// Sessions supplies its rows and nothing else: no paging, no search and no sort, so it draws no
+// toolrow and no page end. Its ledger and its rail cards are one block at the wide breakpoint, so
+// they ride in as the rows they are.
+export const sessionsPage = (
+  email: string,
+  live: Live,
+  url: URL,
+  sessions: Session[],
+  labels: Labels,
+  now: number,
+): Response => {
+  const listing: Listing = {
+    tab: SESSIONS_TAB,
+    noun: { one: "session", many: "sessions" },
+    params: [],
+    search: null,
+    filters: [],
+    sorts: [],
+    sort: "",
+    unknownSort: "",
+    rows:
+      sessions.length === 0
+        ? ""
+        : `<div class="withrail">${ledger(sessions, labels, now)}<div class="rail">${hostsCard(sessions, labels, now)}${oldestIdleCard(sessions, now)}</div></div>`,
+    empty: {
+      headline: "No session is running on any of your hosts.",
+      hint: "A session appears here within a minute of its first prompt.",
+    },
+    nextCursor: "",
+    cut: false,
+  };
+  return shell(
+    email,
+    SESSIONS_TAB,
+    live,
+    SESSIONS_TAB.label,
+    `${live.sessions} live · ${live.busy} busy`,
+    listingMain(url, listing),
+  );
 };
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
@@ -564,41 +597,33 @@ const historyRow = (session: PastSession, labels: Labels): string =>
 const dayBlock = (group: DayGroup, labels: Labels): string =>
   `<section class="day">${dayHead(group)}<ol class="sessions" role="list">${group.sessions.map((session) => historyRow(session, labels)).join("")}</ol></section>`;
 
-const tabLink = (tab: Tab, keep: readonly string[], url: URL, changes: Record<string, string>): string => {
-  const next = new URLSearchParams();
-  for (const name of keep) {
-    const value = url.searchParams.get(name) ?? "";
-    if (value !== "") next.set(name, value);
-  }
-  for (const [name, value] of Object.entries(changes)) {
-    if (value === "") next.delete(name);
-    else next.set(name, value);
-  }
-  const query = next.toString();
-  return escapeHtml(query === "" ? tab.path : `${tab.path}?${query}`);
-};
-
-const historyLink = (url: URL, changes: Record<string, string>): string =>
-  tabLink(HISTORY_TAB, HISTORY_PARAMS, url, changes);
-
-const historyChips = (
-  url: URL,
-  name: string,
-  label: string,
-  all: string,
-  active: string,
-  values: string[],
-  names: Map<string, string>,
-): string => {
-  const chip = (value: string, text: string): string =>
-    `<a href="${historyLink(url, { [name]: value })}"${value === active ? ' aria-current="page"' : ""}>${escapeHtml(text)}</a>`;
-  return `<nav class="chips" aria-label="${escapeHtml(label)}">${chip("", all)}${values.map((value) => chip(value, labelled(names, value))).join("")}</nav>`;
-};
-
+// Only the values the account actually holds get a chip, plus the one that is active, so a filter
+// never offers a row that cannot exist.
 const offered = (values: string[], active: string): string[] => {
   const present = new Set(values.filter((value) => value !== ""));
   if (active !== "") present.add(active);
   return [...present].sort();
+};
+
+const HISTORY_LIST_PARAMS = ["q", SORT_PARAM, CURSOR_PARAM, ...HISTORY_PARAMS] as const;
+
+const chipsOf = (values: string[], names: Map<string, string>): ListingChip[] =>
+  values.map((value) => ({ value, label: labelled(names, value) }));
+
+const historyEmpty = (query: string, filtered: boolean): { headline: string; hint: string } => {
+  if (query !== "") {
+    return { headline: "No session matches this search.", hint: "Clear the search to read every session." };
+  }
+  if (filtered) {
+    return {
+      headline: "No session matches this filter.",
+      hint: "Clear the filter to read every host and every repo.",
+    };
+  }
+  return {
+    headline: "No session is in your history yet.",
+    hint: "A session lands here as soon as it syncs, and stays forever.",
+  };
 };
 
 export const historyPage = (
@@ -611,46 +636,57 @@ export const historyPage = (
   nextCursor: string,
   labels: Labels,
 ): Response => {
+  const query = url.searchParams.get("q") ?? "";
   const filtered = filter.host !== "" || filter.repo !== "";
   const groups = byDay(sessions);
-  const older =
-    nextCursor === ""
-      ? ""
-      : `<p class="more"><a href="${historyLink(url, { cursor: nextCursor })}">Older sessions</a></p>`;
-  const listing =
-    groups.length === 0
-      ? emptyState(
-          filtered ? "No session matches this filter." : "No session is in your history yet.",
-          filtered
-            ? "Clear the filter to read every host and every repo."
-            : "A session lands here as soon as it syncs, and stays forever.",
-        )
-      : `<div class="hist">${groups.map((group) => dayBlock(group, labels)).join("")}</div>${older}`;
-  const filters = `<div class="toolrow">${historyChips(url, "host", "Filter by host", "All hosts", filter.host, offered(known.hosts, filter.host), labels.hosts)}${historyChips(url, "repo", "Filter by repo", "All repos", filter.repo, offered(known.repos, filter.repo), new Map())}</div>`;
-  return shell(email, HISTORY_TAB, live, HISTORY_TAB.label, "kept forever", `${filters}${listing}`);
+  const chosen = sortInForce(url, HISTORY_SORTS);
+  const listing: Listing = {
+    tab: HISTORY_TAB,
+    noun: { one: "session", many: "sessions" },
+    params: HISTORY_LIST_PARAMS,
+    search: {
+      param: "q",
+      placeholder: "Search sessions…",
+      ariaLabel: "Search sessions",
+      value: query,
+      fields: [],
+    },
+    filters: [
+      {
+        param: "host",
+        ariaLabel: "Filter by host",
+        allLabel: "All hosts",
+        active: filter.host,
+        chips: chipsOf(offered(known.hosts, filter.host), labels.hosts),
+      },
+      {
+        param: "repo",
+        ariaLabel: "Filter by repo",
+        allLabel: "All repos",
+        active: filter.repo,
+        chips: chipsOf(offered(known.repos, filter.repo), new Map()),
+      },
+    ],
+    sorts: HISTORY_SORTS,
+    sort: chosen.sort,
+    unknownSort: chosen.unknownSort,
+    rows:
+      groups.length === 0 ? "" : `<div class="hist">${groups.map((group) => dayBlock(group, labels)).join("")}</div>`,
+    empty: historyEmpty(query, filtered),
+    nextCursor,
+    cut: false,
+  };
+  return shell(email, HISTORY_TAB, live, HISTORY_TAB.label, "kept forever", listingMain(url, listing));
 };
 
-const memoryLink = (url: URL, changes: Record<string, string>): string =>
-  tabLink(MEMORY_TAB, ["q", ...LIST_PARAMS], url, changes);
+const MEMORY_LIST_PARAMS = ["q", SORT_PARAM, CURSOR_PARAM, ...LIST_PARAMS] as const;
 
-const findForm = (url: URL, filter: ListInput): string => {
-  const type = filter.types[0] ?? "";
-  const keepType = type === "" ? "" : `<input type="hidden" name="type" value="${escapeHtml(type)}">`;
-  return `<form class="find" method="get" action="${MEMORY_TAB.path}">
-<input type="search" name="q" value="${escapeHtml(url.searchParams.get("q") ?? "")}" placeholder="Search memories…" aria-label="Search memories">
-<input name="tag" value="${escapeHtml(filter.tags[0] ?? "")}" placeholder="tag" aria-label="Filter by tag">${keepType}
-<button type="submit">Search</button></form>`;
-};
-
-const typeChips = (url: URL, filter: ListInput, counts: MemoryCounts): string => {
+const memoryChips = (filter: ListInput, counts: MemoryCounts): ListingChip[] => {
   const active = filter.types[0] ?? "";
   const counted = new Map(counts.byType.map((entry) => [entry.type, entry.count]));
-  const chip = (type: string, label: string): string =>
-    `<a href="${memoryLink(url, { type })}"${type === active ? ' aria-current="page"' : ""}>${label}</a>`;
-  const present = memoryTypes.filter((type) => counted.has(type) || type === active);
-  return `<nav class="chips" aria-label="Filter by type">${chip("", `All ${counts.total}`)}${present
-    .map((type) => chip(type, `${type} ${counted.get(type) ?? 0}`))
-    .join("")}</nav>`;
+  return memoryTypes
+    .filter((type) => counted.has(type) || type === active)
+    .map((type) => ({ value: type, label: `${type} ${counted.get(type) ?? 0}` }));
 };
 
 const countsStrip = (counts: MemoryCounts): string => {
@@ -681,13 +717,53 @@ ${tags === "" ? "" : `<p class="tags">${tags}</p>`}
 <p class="mfoot">${recallFoot(memory, now)}${scored}</p></li>`;
 };
 
-const memoryGrid = (cards: string[], headline: string, hint: string): string =>
-  cards.length === 0 ? emptyState(headline, hint) : `<ol class="memories" role="list">${cards.join("")}</ol>`;
-
 const memoryTotal = (counts: MemoryCounts): string => `${counts.total} ${counts.total === 1 ? "memory" : "memories"}`;
 
-const memoryMain = (url: URL, filter: ListInput, counts: MemoryCounts, grid: string, older: string): string =>
-  `<div class="toolrow">${findForm(url, filter)}${typeChips(url, filter, counts)}</div>${countsStrip(counts)}${grid}${older}`;
+// The counts strip and the cards are Memory's own rows, so they ride inside the component rather
+// than around it, and the strip keeps the place it already had under the toolrow.
+const memoryRows = (counts: MemoryCounts, cards: string[]): string =>
+  cards.length === 0 ? "" : `${countsStrip(counts)}<ol class="memories" role="list">${cards.join("")}</ol>`;
+
+// The tag box is the one field in any toolrow that is neither the search nor a chip: a tag is free
+// text and a chip group holds a fixed set, so it rides the search form as a field of its own.
+const memoryListing = (
+  url: URL,
+  filter: ListInput,
+  counts: MemoryCounts,
+  rows: string,
+  empty: { headline: string; hint: string },
+  nextCursor: string,
+): Listing => {
+  const chosen = sortInForce(url, MEMORY_SORTS);
+  return {
+    tab: MEMORY_TAB,
+    noun: { one: "memory", many: "memories" },
+    params: MEMORY_LIST_PARAMS,
+    search: {
+      param: "q",
+      placeholder: "Search memories…",
+      ariaLabel: "Search memories",
+      value: url.searchParams.get("q") ?? "",
+      fields: [{ param: "tag", placeholder: "tag", ariaLabel: "Filter by tag", value: filter.tags[0] ?? "" }],
+    },
+    filters: [
+      {
+        param: "type",
+        ariaLabel: "Filter by type",
+        allLabel: `All ${counts.total}`,
+        active: filter.types[0] ?? "",
+        chips: memoryChips(filter, counts),
+      },
+    ],
+    sorts: MEMORY_SORTS,
+    sort: chosen.sort,
+    unknownSort: chosen.unknownSort,
+    rows,
+    empty,
+    nextCursor,
+    cut: false,
+  };
+};
 
 export const memoriesPage = (
   email: string,
@@ -699,23 +775,18 @@ export const memoriesPage = (
   nextCursor: string,
   now: number,
 ): Response => {
-  const older =
-    nextCursor === ""
-      ? ""
-      : `<p class="more"><a href="${memoryLink(url, { cursor: nextCursor })}">Older memories</a></p>`;
-  const grid = memoryGrid(
-    memories.map((memory) => memoryCard(memory, now, "")),
-    "No memory is saved yet.",
-    "Save one with recall save.",
+  const listing = memoryListing(
+    url,
+    filter,
+    counts,
+    memoryRows(
+      counts,
+      memories.map((memory) => memoryCard(memory, now, "")),
+    ),
+    { headline: "No memory is saved yet.", hint: "Save one with recall save." },
+    nextCursor,
   );
-  return shell(
-    email,
-    MEMORY_TAB,
-    live,
-    MEMORY_TAB.label,
-    memoryTotal(counts),
-    memoryMain(url, filter, counts, grid, older),
-  );
+  return shell(email, MEMORY_TAB, live, MEMORY_TAB.label, memoryTotal(counts), listingMain(url, listing));
 };
 
 export const memorySearchPage = (
@@ -727,19 +798,18 @@ export const memorySearchPage = (
   hits: MemoryHit[],
   now: number,
 ): Response => {
-  const grid = memoryGrid(
-    hits.map((hit) => memoryCard(hit.memory, now, hit.score.toFixed(3))),
-    "No memory matches this search.",
-    "Try fewer words, or drop the type filter.",
+  const listing = memoryListing(
+    url,
+    filter,
+    counts,
+    memoryRows(
+      counts,
+      hits.map((hit) => memoryCard(hit.memory, now, hit.score.toFixed(3))),
+    ),
+    { headline: "No memory matches this search.", hint: "Clear the search to read every memory." },
+    "",
   );
-  return shell(
-    email,
-    MEMORY_TAB,
-    live,
-    MEMORY_TAB.label,
-    memoryTotal(counts),
-    memoryMain(url, filter, counts, grid, ""),
-  );
+  return shell(email, MEMORY_TAB, live, MEMORY_TAB.label, memoryTotal(counts), listingMain(url, listing));
 };
 
 export const memoryBodyPage = (email: string, live: Live, memory: Memory, now: number): Response => {
@@ -1327,8 +1397,6 @@ export interface SessionView {
   send: SessionSend;
 }
 
-const kb = (bytes: number): string => (bytes < 1_024 ? `${bytes} B` : `${Math.round(bytes / 1_024)} kB`);
-
 const moment = (at: number): string => new Date(at).toISOString().slice(0, 16).replace("T", " ");
 
 const sessionState = (session: PastSession, now: number): string => {
@@ -1439,7 +1507,7 @@ const planJson = (plan: unknown): string => JSON.stringify(plan).replaceAll("<",
 // archiving began late has no beginning at all. The entry that straddles a hole cannot be read,
 // and saying so is what keeps a reader from taking the entries either side of it for the whole
 // conversation.
-const holeNote = (listing: Listing): string => {
+const holeNote = (listing: RunListing): string => {
   const { bytes, places } = gapsIn(listing);
   if (bytes === 0) return "";
   return `<p class="callout">The archive never got ${bytes} bytes of this file, in ${places} ${places === 1 ? "place" : "places"}. Whatever entry each gap falls inside is not shown.</p>`;
@@ -1447,10 +1515,10 @@ const holeNote = (listing: Listing): string => {
 
 // What a manifest held back says for itself. The reader is told the box stops short of the start
 // of the file rather than being left to read the oldest turn it shows as the first one there was.
-const trimNote = (listing: Listing, bytes: number): string =>
+const trimNote = (listing: RunListing, bytes: number): string =>
   listing.from === 0
     ? ""
-    : `<p class="callout">This file runs to ${kb(bytes)}. The last ${kb(bytes - listing.from)} of it is listed here; the stretches before that are not, so the box stops short of the start of the session.</p>`;
+    : `<p class="callout">This file runs to ${sizeText(bytes)}. The last ${sizeText(bytes - listing.from)} of it is listed here; the stretches before that are not, so the box stops short of the start of the session.</p>`;
 
 // What the box follows, and nothing when there is nothing to follow. `from` is the end of the
 // manifest, which is the first byte the box has not been handed, so following starts where the
@@ -1492,7 +1560,7 @@ const transcriptCard = (view: SessionView): string => {
   };
   return insightCard(
     "Transcript",
-    `${held.file} · ${kb(held.bytes)}`,
+    `${held.file} · ${sizeText(held.bytes)}`,
     `${fileChips(id, held.files, held.file)}${trimNote(listing, held.bytes)}${holeNote(listing)}
 <div class="scroller" id="tx" tabindex="0" aria-label="Transcript">
 <p class="txtop"><button type="button" id="txmore">Load earlier</button></p>
@@ -1533,26 +1601,70 @@ ${transcriptCard(view)}
   );
 };
 
-// How many published pages the tab draws. The listing is newest first, so the cap holds the page
-// to a bounded number of rows however many an account has published, and the count beside the
-// heading still reads the whole shelf.
-export const ARTIFACTS_SHOWN = 200;
+export const ARTIFACT_LIST_PARAMS = ["q", "type", SORT_PARAM, CURSOR_PARAM, "limit"] as const;
+
+export interface ArtifactTypeCount {
+  type: ArtifactType;
+  count: number;
+}
+
+// One read of the rows and one read of the counts the chips print, which is what a page of any
+// list in the dashboard costs.
+export interface ArtifactCounts {
+  total: number;
+  byType: ArtifactTypeCount[];
+}
+
+// One page of the shelf. A search answers a bounded match set in relevance order and sets `cut`
+// when it had more to give; a paged walk answers a cursor instead. The two never both apply.
+export interface ArtifactShelf {
+  artifacts: ArtifactView[];
+  counts: ArtifactCounts;
+  nextCursor: string;
+  cut: boolean;
+}
 
 // What the tab has to show. A deployment naming no artifact hostname publishes nothing at all,
 // which is a different answer from an account that has published nothing yet; the page says which
 // rather than drawing the same empty shelf for both.
-export type Published = { kind: "off" } | { kind: "pages"; pages: Artifact[]; total: number };
+export type Published = { kind: "off" } | { kind: "shelf"; shelf: ArtifactShelf };
 
 const ARTIFACT_HEAD =
-  '<li class="srow arow lhead" aria-hidden="true"><span>Page</span><span class="r">Size</span><span class="r">Published</span></li>';
+  '<li class="srow arow lhead" aria-hidden="true"><span>Artifact</span><span>Type</span><span class="r">Size</span><span class="r">Published</span><span>Access</span><span>Last writer</span></li>';
 
-// A page answers on the artifact hostname, behind its own Access application, so it opens in a tab
-// of its own rather than taking the dashboard's.
-const artifactRow = (artifact: Artifact): string =>
-  `<li class="srow arow"><p class="h"><b><a href="${escapeHtml(artifact.url)}" target="_blank" rel="noreferrer">${escapeHtml(artifact.name)}</a></b></p>
-<p class="smeta"><span class="ab">${kb(artifact.bytes)}</span><span class="at">${escapeHtml(moment(artifact.updatedAt))}</span></p></li>`;
+const fileCount = (artifact: ArtifactView): string => {
+  if (artifact.fileCount < 2) return "";
+  return `${artifact.fileCount} ${artifact.type === "audio" ? "tracks" : "files"}`;
+};
 
-export const artifactsPage = (email: string, live: Live, published: Published): Response => {
+// An artifact answers on the artifact hostname, behind its own Access application, so the name
+// opens in a tab of its own rather than taking the dashboard's. It is the row's only link.
+const artifactRow = (artifact: ArtifactView): string => {
+  const title = artifact.title === artifact.name ? "" : `<span class="atitle">${escapeHtml(artifact.title)}</span>`;
+  const count = fileCount(artifact);
+  return `<li class="srow arow"><p class="h"><b><a href="${escapeHtml(artifact.url)}" target="_blank" rel="noreferrer">${escapeHtml(artifact.name)}</a></b>${title}</p>
+<p class="smeta"><span class="aty">${escapeHtml(artifact.type)}</span>${count === "" ? "" : `<span class="afc">${escapeHtml(count)}</span>`}<span class="ab">${escapeHtml(sizeText(artifact.bytes))}</span><span class="at">${escapeHtml(moment(artifact.updatedAt))}</span><span class="ard">${escapeHtml(`r ${artifact.read}`)}</span><span class="awr">${escapeHtml(`w ${artifact.write}`)}</span><span class="alw">${escapeHtml(artifact.lastWriter)}</span></p></li>`;
+};
+
+const artifactEmpty = (query: string, type: string): { headline: string; hint: string } => {
+  if (query !== "") {
+    return { headline: "No artifact matches this search.", hint: "Clear the search to read every artifact." };
+  }
+  if (type !== "") {
+    return { headline: "No artifact matches this filter.", hint: "Clear the filter to read every artifact." };
+  }
+  return {
+    headline: "No artifact is published yet.",
+    hint: "Publish one with recall publish, and it lands here with the address it answers on.",
+  };
+};
+
+const artifactMeta = (shown: number, counts: ArtifactCounts, narrowed: boolean): string => {
+  const noun = counts.total === 1 ? "artifact" : "artifacts";
+  return narrowed ? `${shown} of ${counts.total} ${noun}` : `${counts.total} ${noun}`;
+};
+
+export const artifactsPage = (email: string, live: Live, url: URL, published: Published): Response => {
   if (published.kind === "off") {
     return shell(
       email,
@@ -1560,23 +1672,52 @@ export const artifactsPage = (email: string, live: Live, published: Published): 
       live,
       ARTIFACTS_TAB.label,
       "not enabled",
-      `<div class="notice"><b>This deployment publishes no pages.</b>
-<p>It names no artifact hostname, so there is no second host to serve a page from and nothing here to browse. Naming one and deploying turns publishing on.</p></div>`,
+      `<div class="notice"><b>This deployment publishes no artifacts.</b>
+<p>It names no artifact hostname, so there is no second host to serve an artifact from and nothing here to browse. Naming one and deploying turns publishing on.</p></div>`,
     );
   }
-  const { pages, total } = published;
-  const capped =
-    total > pages.length
-      ? `<p class="callout">${escapeHtml(`The newest ${pages.length} of ${total} are listed.`)}</p>`
-      : "";
-  const main =
-    total === 0
-      ? emptyState(
-          "No page is published yet.",
-          "Publish one with recall publish, and it lands here with the address it answers on.",
-        )
-      : `<ol class="sessions" role="list">${ARTIFACT_HEAD}${pages.map(artifactRow).join("")}</ol>${capped}`;
-  return shell(email, ARTIFACTS_TAB, live, ARTIFACTS_TAB.label, `${total} ${total === 1 ? "page" : "pages"}`, main);
+  const { artifacts, counts, nextCursor, cut } = published.shelf;
+  const query = url.searchParams.get("q") ?? "";
+  const type = url.searchParams.get("type") ?? "";
+  const chosen = sortInForce(url, ARTIFACT_SORTS);
+  const typeFilter: ListingFilter = {
+    param: "type",
+    ariaLabel: "Filter by type",
+    allLabel: `All ${counts.total}`,
+    active: type,
+    chips: counts.byType.map((entry) => ({ value: entry.type, label: `${entry.type} ${entry.count}` })),
+  };
+  const listing: Listing = {
+    tab: ARTIFACTS_TAB,
+    noun: { one: "artifact", many: "artifacts" },
+    params: ARTIFACT_LIST_PARAMS,
+    search: {
+      param: "q",
+      placeholder: "Search artifacts…",
+      ariaLabel: "Search artifacts",
+      value: query,
+      fields: [],
+    },
+    filters: [typeFilter],
+    sorts: ARTIFACT_SORTS,
+    sort: chosen.sort,
+    unknownSort: chosen.unknownSort,
+    rows:
+      artifacts.length === 0
+        ? ""
+        : `<ol class="sessions" role="list">${ARTIFACT_HEAD}${artifacts.map(artifactRow).join("")}</ol>`,
+    empty: artifactEmpty(query, type),
+    nextCursor,
+    cut,
+  };
+  return shell(
+    email,
+    ARTIFACTS_TAB,
+    live,
+    ARTIFACTS_TAB.label,
+    artifactMeta(artifacts.length, counts, query !== "" || type !== ""),
+    listingMain(url, listing),
+  );
 };
 
 const labelRows = (kind: LabelKind, values: string[], names: Map<string, string>): string =>
