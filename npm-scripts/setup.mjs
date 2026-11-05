@@ -302,7 +302,15 @@ const config = {
   vars: {
     ACCESS_TEAM_DOMAIN: teamDomain,
     ACCESS_AUD: browserApp.aud,
-    ...(artifactApp ? { ARTIFACT_HOSTNAME: artifactHostname, ARTIFACT_ACCESS_AUD: artifactApp.aud } : {}),
+    // The dashboard's own host is bound with the artifact host, because every artifact page
+    // carries one link back to the dashboard and the artifact host cannot derive its address.
+    ...(artifactApp
+      ? {
+          ARTIFACT_HOSTNAME: artifactHostname,
+          ARTIFACT_ACCESS_AUD: artifactApp.aud,
+          DASHBOARD_HOSTNAME: hostname,
+        }
+      : {}),
   },
 };
 mkdirSync(WORK, { recursive: true });

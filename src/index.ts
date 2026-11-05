@@ -15,9 +15,13 @@ export interface Env {
   TRANSCRIPTS: R2Bucket;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
-  // The three arrive together, or not at all: a deployment that publishes no pages binds none.
+  // The four arrive together, or not at all: a deployment that publishes no artifacts binds none.
+  // The dashboard hostname is among them because every artifact page carries one link back to the
+  // dashboard, which answers on a second host; a deployment that cannot name that host publishes
+  // no artifacts rather than drawing a link to nowhere.
   ARTIFACT_HOSTNAME?: string;
   ARTIFACT_ACCESS_AUD?: string;
+  DASHBOARD_HOSTNAME?: string;
   ARTIFACTS?: R2Bucket;
 }
 
@@ -42,9 +46,19 @@ const workersAiEmbedder = (ai: Ai): Embedder => ({
 let app: ReturnType<typeof createApp> | undefined;
 
 const artifactHost = (env: Env, keys: KeySource, issuer: string): ArtifactHost | null => {
-  const { ARTIFACT_HOSTNAME: hostname, ARTIFACT_ACCESS_AUD: audience, ARTIFACTS: bucket } = env;
-  if (!hostname || !audience || !bucket) return null;
-  return { hostname, verify: accessVerifier(keys, issuer, audience), bucket };
+  const {
+    ARTIFACT_HOSTNAME: hostname,
+    ARTIFACT_ACCESS_AUD: audience,
+    DASHBOARD_HOSTNAME: dashboard,
+    ARTIFACTS: bucket,
+  } = env;
+  if (!hostname || !audience || !dashboard || !bucket) return null;
+  return {
+    hostname,
+    verify: accessVerifier(keys, issuer, audience),
+    bucket,
+    dashboard: `https://${dashboard}/dashboard`,
+  };
 };
 
 const appFor = (env: Env): ReturnType<typeof createApp> => {

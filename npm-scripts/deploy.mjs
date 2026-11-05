@@ -229,9 +229,15 @@ const deployConfig = {
   vars: {
     ACCESS_TEAM_DOMAIN: output("access_team_domain"),
     ACCESS_AUD: output("access_aud"),
+    // The dashboard's own host is bound with the artifact host, because every artifact page
+    // carries one link back to the dashboard and the artifact host cannot derive its address.
     ...(artifactHostname === ""
       ? {}
-      : { ARTIFACT_HOSTNAME: artifactHostname, ARTIFACT_ACCESS_AUD: output("artifact_access_aud") }),
+      : {
+          ARTIFACT_HOSTNAME: artifactHostname,
+          ARTIFACT_ACCESS_AUD: output("artifact_access_aud"),
+          DASHBOARD_HOSTNAME: hostname,
+        }),
   },
 };
 const deployConfigPath = join(ROOT, "wrangler.deploy.json");
