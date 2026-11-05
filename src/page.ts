@@ -52,9 +52,11 @@ export const SCRIPT_CSP = `${BASE_CSP}; script-src 'self'; connect-src 'self'`;
 
 // recall's own pages on the artifact hostname. They are not the publisher's bytes, so they take
 // none of the sandbox a site takes; they carry no form either, so nothing may be submitted from
-// one at all.
+// one at all. `img-src 'self'` is what a rendered document needs, and no wider: the renderer
+// resolves a relative image into the artifact's own address, and an image a document points at
+// another host with stays blocked, because a page here reaches no host but this one.
 export const ARTIFACT_PAGE_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
+  "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
 
 // The player, and nothing else on that hostname, runs a script and plays media. It connects
 // nowhere: the audio element issues its own range requests against the file route.

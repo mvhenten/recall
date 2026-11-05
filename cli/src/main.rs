@@ -1098,9 +1098,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             let first = files.first().context("name at least one file to publish")?;
             let name = api::artifact_name(first, name.as_deref())?;
-            let artifact = client()?.publish(&api::PublishInput {
+            let published = client()?.publish(&api::PublishInput {
                 title: title.unwrap_or_else(|| name.clone()),
-                name,
+                name: name.clone(),
                 kind,
                 description,
                 read,
@@ -1109,9 +1109,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 files,
             })?;
             if cli.json {
-                print_json(&artifact)?;
+                print_json(&published)?;
             } else {
-                println!("{}", artifact.url);
+                if published.owned_by_another {
+                    eprintln!(
+                        "recall: {name} belongs to another account of this recall, which published it for the account to write; this publish replaced its files, its title and both its permissions"
+                    );
+                }
+                println!("{}", published.artifact.url);
             }
         }
         Command::Artifacts {

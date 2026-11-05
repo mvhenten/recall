@@ -79,8 +79,6 @@ export const MEMORY_SORTS: ListingSort[] = [
   { key: "recalled", label: "most recalled" },
 ];
 
-export const sortKeys = (sorts: readonly ListingSort[]): string[] => sorts.map((sort) => sort.key);
-
 // A sort the list does not hold reads in the default order and says so, rather than answering an
 // error page: a bookmark built when the list had another sort still loads the list.
 export const sortInForce = (url: URL, sorts: readonly ListingSort[]): { sort: string; unknownSort: string } => {

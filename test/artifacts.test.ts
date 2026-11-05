@@ -1,6 +1,8 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { ArtifactView } from "../src/artifacts";
+import { type ArtifactView, RAW_INLINE_BYTES } from "../src/artifacts";
 import { DEVICE_CODE_LIMITS } from "../src/device";
+import { claimRevision } from "../src/store";
 import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -120,18 +122,54 @@ describe("publishing", () => {
 
   it("holds the files of a replacement under their own revision", async () => {
     const { h, alice, assertion } = await publisher();
-    await alice.publishArtifact("deck", {
+    expect(
+      (
+        await alice.publishArtifact("deck", {
+          type: "document",
+          files: [
+            { path: "deck.md", body: "# one\n" },
+            { path: "style.css", body: "p{color:red}" },
+          ],
+        })
+      ).status,
+    ).toBe(200);
+    const replaced = await alice.publishArtifact("deck", {
+      type: "document",
+      replace: true,
+      files: [{ path: "deck.md", body: "# two\n" }],
+    });
+    expect(replaced.status).toBe(200);
+
+    expect(await (await h.sendToArtifactHost("/deck", assertion)).text()).toContain("<h1>two</h1>");
+    expect((await h.sendToArtifactHost("/deck/style.css", assertion)).status).toBe(404);
+    const page = await listed(alice);
+    expect(page.artifacts[0]?.fileCount).toBe(1);
+  });
+
+  it("hands two claims on one name revisions of their own", async () => {
+    const { h, email } = await publisher();
+    const userId = await h.userIdFor(email);
+    const claimed = await Promise.all([
+      claimRevision(env.DB, userId, "contested"),
+      claimRevision(env.DB, userId, "contested"),
+      claimRevision(env.DB, userId, "contested"),
+    ]);
+    expect([...claimed].sort((left, right) => left - right)).toEqual([1, 2, 3]);
+  });
+
+  it("refuses a site naming more than one file and names the types that hold several", async () => {
+    const { alice } = await publisher();
+    const refused = await alice.publishArtifact("two-file-site", {
       files: [
         { path: "index.html", body: "<p>one</p>" },
         { path: "style.css", body: "p{color:red}" },
       ],
     });
-    await alice.publishArtifact("deck", { replace: true, files: [{ path: "index.html", body: "<p>two</p>" }] });
-
-    expect(await (await h.sendToArtifactHost("/deck", assertion)).text()).toBe("<p>two</p>");
-    expect((await h.sendToArtifactHost("/deck/style.css", assertion)).status).toBe(404);
-    const page = await listed(alice);
-    expect(page.artifacts[0]?.fileCount).toBe(1);
+    expect(refused.status).toBe(400);
+    const body: { error: string } = await refused.json();
+    expect(body.error).toContain("a site holds one file");
+    expect(body.error).toContain("document");
+    expect(body.error).toContain("audio");
   });
 });
 
@@ -213,7 +251,10 @@ describe("the artifact hostname", () => {
     expect(html).toContain("The spec");
     expect(html).toContain("what it does");
     expect(html).not.toContain("<script");
-    expect(rendered.headers.get("content-security-policy") ?? "").toContain("default-src 'none'");
+    const csp = rendered.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("img-src 'self'");
+    expect(csp).not.toContain("sandbox");
 
     const raw = await h.sendToArtifactHost("/spec?view=raw", assertion);
     expect(await raw.text()).toContain("# Heading");
@@ -270,6 +311,21 @@ describe("the artifact hostname", () => {
     const html = await raw.text();
     expect(html).toContain("too long to render");
     expect(html).toContain("2.0 MB");
+  });
+
+  it("inlines the start of a long source and points at the file for the rest", async () => {
+    const { h, alice, assertion } = await publisher();
+    const source = `# Long\n\n${"x".repeat(RAW_INLINE_BYTES)}the-very-end`;
+    await alice.publishArtifact("capped-doc", { type: "document", files: [{ path: "capped.md", body: source }] });
+
+    const html = await (await h.sendToArtifactHost("/capped-doc?view=raw", assertion)).text();
+    expect(html).toContain("This view shows the start of the file.");
+    expect(html).toContain('href="/capped-doc/capped.md"');
+    expect(html).not.toContain("the-very-end");
+
+    const whole = await h.sendToArtifactHost("/capped-doc/capped.md", assertion);
+    expect(whole.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
+    expect(await whole.text()).toBe(source);
   });
 
   it("says when a document holds no text, and keeps both views", async () => {
@@ -430,6 +486,54 @@ describe("a write permission", () => {
     expect(body.error).toContain("owner");
     expect(body.error).not.toContain("site");
     expect((await bob.request("DELETE", "/v1/artifacts/owned-ledger")).status).toBe(403);
+  });
+
+  it("leaves another account its own first publish under an account-readable name", async () => {
+    const { h, alice, bob, assertion } = await twoUsers();
+    await alice.publishArtifact("notes", {
+      read: "account",
+      write: "owner",
+      files: [{ path: "index.html", body: "<p>alice</p>" }],
+    });
+    const mine = await bob.publishArtifact("notes", { files: [{ path: "index.html", body: "<p>bob</p>" }] });
+    expect(mine.status).toBe(200);
+    expect(await (await h.sendToArtifactHost("/notes", assertion)).text()).toBe("<p>alice</p>");
+
+    const bobEmail = (await bob.request("GET", "/v1/artifacts/notes")).json() as Promise<{ artifact: ArtifactView }>;
+    expect((await bobEmail).artifact.bytes).toBe("<p>bob</p>".length);
+  });
+
+  it("answers an artifact shared with the caller the same way its files answer", async () => {
+    const { alice, bob } = await twoUsers();
+    await alice.publishArtifact("shared-spec", {
+      read: "account",
+      write: "owner",
+      files: [{ path: "index.html", body: "<p>shared</p>" }],
+    });
+    const metadata = await bob.request("GET", "/v1/artifacts/shared-spec");
+    const file = await bob.request("GET", "/v1/artifacts/shared-spec/index.html");
+    expect([metadata.status, file.status]).toEqual([200, 200]);
+    const { artifact }: { artifact: ArtifactView } = await metadata.json();
+    expect(artifact.read).toBe("account");
+  });
+
+  it("says in the publish whether the name belongs to another account", async () => {
+    const { alice, bob } = await twoUsers();
+    await alice.publishArtifact("shared-board", {
+      read: "account",
+      write: "account",
+      files: [{ path: "index.html", body: "<p>mine</p>" }],
+    });
+    const mine = await alice.publishArtifact("own-board", { files: [{ path: "index.html", body: "<p>mine</p>" }] });
+    expect(await mine.json()).toMatchObject({ ownedByAnother: false });
+
+    const theirs = await bob.publishArtifact("shared-board", {
+      replace: true,
+      read: "account",
+      write: "account",
+      files: [{ path: "index.html", body: "<p>theirs</p>" }],
+    });
+    expect(await theirs.json()).toMatchObject({ ownedByAnother: true });
   });
 
   it("lets another account replace an artifact written for the account", async () => {

@@ -27,6 +27,19 @@ CREATE TABLE artifacts (
   UNIQUE (user_id, name)
 );
 
+-- Which revision the next publish of a name owns. A publish claims one here before a byte lands,
+-- so two publishes racing under one name stream into prefixes of their own and neither can write
+-- into the revision the other is committing. The counter never goes back: a name unpublished and
+-- published again claims a revision no earlier writer can still be streaming into. A row exists
+-- for every name that has ever been published, which is why the claim is an upsert and not an
+-- update — a first publish has no artifact row to count from.
+CREATE TABLE artifact_revisions (
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  rev_next INTEGER NOT NULL,
+  PRIMARY KEY (user_id, name)
+) WITHOUT ROWID;
+
 CREATE INDEX artifacts_by_updated ON artifacts (user_id, updated_at DESC, name);
 CREATE INDEX artifacts_by_bytes ON artifacts (user_id, bytes DESC, name);
 

@@ -24,6 +24,7 @@ import {
   parseArtifactList,
   parseFilePath,
   parseManifest,
+  RAW_INLINE_BYTES,
   readArtifactFile,
 } from "./artifacts";
 import { chunkTurns } from "./chunks";
@@ -143,8 +144,9 @@ import {
   chunkExcerpts,
   chunkMatches,
   chunkVectors,
-  commitArtifact,
+  claimRevision,
   countedFiles,
+  createArtifact,
   decodeCursor,
   deleteArtifactRow,
   deleteMemory,
@@ -175,6 +177,7 @@ import {
   readStats,
   recall,
   recordUsage,
+  replaceArtifact,
   resolveArtifact,
   saveMemory,
   searchArtifacts,
@@ -761,23 +764,39 @@ export const createApp = (deps: Deps): App => {
     return object;
   };
 
+  // The start of the entry, and no more. The raw view is the fallback for a document too long to
+  // render, so it is the one view handed a file of up to 32 MB: it reads a bounded range rather
+  // than the whole object, because the page escapes what it prints and concatenates it into one
+  // string. A range can cut a UTF-8 sequence in half, and a decoder left mid-stream holds the
+  // trailing bytes back rather than printing a replacement character for them.
+  const entryHead = async (bucket: R2Bucket, record: ArtifactRecord, bytes: number): Promise<string> => {
+    const object = await bucket.get(fileKey(record.ownerUserId, record.name, record.rev, record.entryPath), {
+      range: { offset: 0, length: bytes },
+    });
+    if (object === null) {
+      throw new Error(`artifact ${record.name} names ${record.entryPath} and storage holds no such file`);
+    }
+    return new TextDecoder().decode(await object.arrayBuffer(), { stream: true });
+  };
+
   // The rendered view, the raw view, and the redirect that stands in for a render too long to
   // spend the CPU on. Both views are recall's own HTML off the publisher's markdown, so neither
   // carries a script and the renderer escapes every character it prints.
   const documentView = async (url: URL, host: ArtifactHost, record: ArtifactRecord): Promise<Response> => {
-    const raw = url.searchParams.get("view") === RAW_VIEW;
     const entry = record.files[0];
     if (entry === undefined) throw new Error(`artifact ${record.name} names no file`);
-    if (!raw && entry.bytes > RENDER_CEILING_BYTES) {
+    if (url.searchParams.get("view") === RAW_VIEW) {
+      const source = await entryHead(host.bucket, record, RAW_INLINE_BYTES);
+      return rawDocumentPage(record, host.dashboard, source, entry.bytes > RAW_INLINE_BYTES);
+    }
+    if (entry.bytes > RENDER_CEILING_BYTES) {
       return new Response(null, {
         status: 302,
         headers: { location: `/${encodeURIComponent(record.name)}?view=${RAW_VIEW}`, "cache-control": "no-store" },
       });
     }
     const source = await (await entryBody(host.bucket, record)).text();
-    return raw
-      ? rawDocumentPage(record, host.dashboard, source)
-      : documentPage(record, host.dashboard, render(source, record.name));
+    return documentPage(record, host.dashboard, render(source, record.name));
   };
 
   // The player, with every entry the manifest names checked against storage as the page is drawn:
@@ -1157,22 +1176,24 @@ export const createApp = (deps: Deps): App => {
     const match = filter.query === "" ? null : ftsQuery(filter.query);
     const page =
       filter.query === ""
-        ? await listSessionHistory(
-            db,
-            userId,
-            filter,
-            pageCursor(filter.cursor, historyCursorDirection(filter.sort)),
-            now,
-          )
+        ? {
+            ...(await listSessionHistory(
+              db,
+              userId,
+              filter,
+              pageCursor(filter.cursor, historyCursorDirection(filter.sort)),
+              now,
+            )),
+            cut: false,
+          }
         : {
             nextCursor: "",
-            sessions:
-              match === null
-                ? []
-                : (await searchSessionHistory(db, userId, filter, match, MAX_SEARCH_MATCHES, now)).sessions,
+            ...(match === null
+              ? { sessions: [], cut: false }
+              : await searchSessionHistory(db, userId, filter, match, MAX_SEARCH_MATCHES, now)),
           };
     const [known, labels] = await Promise.all([sessionHistoryFilters(db, userId), readLabels(db, userId)]);
-    return historyPage(email, live, url, filter, known, page.sessions, page.nextCursor, labels);
+    return historyPage(email, live, url, filter, known, page.sessions, page.nextCursor, page.cut, labels);
   };
 
   const memoryBody = async (
@@ -1338,23 +1359,44 @@ export const createApp = (deps: Deps): App => {
       409,
     );
 
-  // A write names the artifact it would replace the way a read names the one it would open: the
-  // caller's own first, then the one this recall publishes for the account to read. A private
-  // artifact of another user is not at this address and is not what a publish here replaces.
+  // What a write would replace. The caller's own row comes first and is the only one a write that
+  // is not replacing anything may find: one account publishing a name for the account to read must
+  // not take that name away from everyone else, who would otherwise be refused their own first
+  // publish under it. A caller who does mean to replace reaches the account-readable one, and the
+  // write permission decides whether they may.
   const writeTarget = async (
     db: D1Database,
     userId: string,
     name: string,
+    replacing: boolean,
   ): Promise<ArtifactRecord | Response | null> => {
-    const record = await resolveArtifact(db, userId, name);
-    if (record === null || record.ownerUserId === userId || record.write === "account") return record;
+    const own = await getArtifact(db, userId, name);
+    if (own !== null) return own;
+    if (!replacing) return null;
+    const shared = await resolveArtifact(db, userId, name);
+    if (shared === null || shared.write === "account") return shared;
     return error(403, "this artifact's write permission is owner, and only its owner replaces or deletes it");
   };
 
-  // The publish. The manifest, the stored row and the gates come first and write nothing; then
-  // every file streams into the revision after the live one, where no reader can reach it; then one
-  // compare-and-swap moves the row forward, which is the publish. Anything that fails before that
-  // statement leaves the artifact and every one of its files exactly as they were.
+  // The revision a failed publish wrote, and the one a publish that worked replaced. Neither is
+  // reachable from any address once the commit has run, so a delete that fails costs a dead
+  // revision an unpublish collects later rather than the answer the caller is owed.
+  const collect = (bucket: R2Bucket, userId: string, name: string, rev: number): Promise<void> =>
+    deleteRevision(bucket, userId, name, rev).catch((failure: unknown) => {
+      console.error(
+        JSON.stringify({
+          error: failure instanceof Error ? failure.message : String(failure),
+          collecting: `${userId}/${name}/${rev}`,
+          stack: failure instanceof Error ? failure.stack : "",
+        }),
+      );
+    });
+
+  // The publish. The manifest, the stored row and the gates come first and write nothing; then the
+  // revision is claimed in D1, so the prefix every file streams into is one no other writer can
+  // reach; then one compare-and-swap moves the row forward, which is the publish. Anything that
+  // fails before that statement leaves the artifact and every one of its files exactly as they
+  // were.
   const publish = async (
     request: Request,
     url: URL,
@@ -1381,19 +1423,24 @@ export const createApp = (deps: Deps): App => {
     const declaredFiles = manifest.value.files;
     const total = declaredFiles.reduce((running, file) => running + file.bytes, 0);
     if (total > MAX_ARTIFACT_BYTES || declaredFiles.some((file) => file.bytes > MAX_FILE_BYTES)) return tooLarge();
-    const target = await writeTarget(db, caller.userId, name);
+    const replacing = url.searchParams.get("replace") === "true";
+    const target = await writeTarget(db, caller.userId, name, replacing);
     if (target instanceof Response) return target;
-    if (target !== null && url.searchParams.get("replace") !== "true") return conflict(target);
+    if (target !== null && !replacing) return conflict(target);
     const owner = target?.ownerUserId ?? caller.userId;
     if (manifest.value.read === "account" && (await accountReadableElsewhere(db, owner, name))) {
       return error(409, `another account publishes ${name} for this recall to read; publish it under another name`);
     }
-    const rev = (target?.rev ?? 0) + 1;
+    const rev = await claimRevision(db, owner, name);
+    const refuse = async (status: number, message: string): Promise<Response> => {
+      await collect(host.bucket, owner, name, rev);
+      return error(status, message);
+    };
     const files: ArtifactFile[] = [];
     for (const file of declaredFiles) {
       const part = await parts.nextPart();
       if (part === null) {
-        return error(400, `the manifest names ${declaredFiles.length} files and the body holds ${files.length}`);
+        return refuse(400, `the manifest names ${declaredFiles.length} files and the body holds ${files.length}`);
       }
       // R2 takes a stream whose length is known, so the length the manifest declared is the length
       // the object is written at and the part is held to it exactly.
@@ -1402,16 +1449,15 @@ export const createApp = (deps: Deps): App => {
       const written = await parts.pipe(sized.writable, file.bytes);
       if (!written.ok) {
         await stored.catch(() => undefined);
-        return error(400, `${file.path} holds ${written.bytes} bytes and the manifest names ${file.bytes}`);
+        return refuse(400, `${file.path} holds ${written.bytes} bytes and the manifest names ${file.bytes}`);
       }
       await stored;
       files.push({ path: file.path, bytes: file.bytes, contentType: contentTypeFor(file.path) });
     }
-    const committed = await commitArtifact(db, {
+    const commit = {
       userId: owner,
       name,
       rev,
-      fromRev: target?.rev ?? 0,
       type: manifest.value.type,
       title: manifest.value.title,
       description: manifest.value.description,
@@ -1420,20 +1466,24 @@ export const createApp = (deps: Deps): App => {
       files,
       at: deps.now(),
       writerUserId: caller.userId,
-    });
-    const saved = await getArtifact(db, owner, name);
+    };
+    const committed =
+      target === null ? await createArtifact(db, commit) : await replaceArtifact(db, commit, target.rev);
     if (!committed) {
-      return saved === null
+      await collect(host.bucket, owner, name, rev);
+      const held = await getArtifact(db, owner, name);
+      return held === null
         ? error(409, `${name} was written by another request while this one was publishing`)
-        : conflict(saved);
+        : conflict(held);
     }
+    const saved = await getArtifact(db, owner, name);
     if (saved === null) throw new Error(`artifact ${name} vanished right after it was published`);
-    if (target !== null) await deleteRevision(host.bucket, owner, name, target.rev);
-    return json({ artifact: viewOf(host, saved) });
+    if (target !== null) await collect(host.bucket, owner, name, target.rev);
+    return json({ artifact: viewOf(host, saved), ownedByAnother: owner !== caller.userId });
   };
 
   const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
-    const target = await writeTarget(db, caller.userId, name);
+    const target = await writeTarget(db, caller.userId, name, true);
     if (target instanceof Response) return target;
     if (target === null) {
       // An artifact published before a row carried its type has bytes and no row, and unpublishing
@@ -1498,7 +1548,9 @@ export const createApp = (deps: Deps): App => {
     if (request.method === "PUT") return publish(request, url, db, host, caller, name.value);
     if (request.method === "DELETE") return unpublish(db, bucket, caller, name.value);
     if (request.method !== "GET") return error(405, "method not allowed");
-    const record = await getArtifact(db, userId, name.value);
+    // The same artifact a read of one of its files names, so a shared artifact never answers its
+    // files over the API while refusing to say anything about itself.
+    const record = await resolveArtifact(db, userId, name.value);
     if (record === null) return error(404, `no artifact named ${name.value}`);
     return json({ artifact: viewOf(host, record) });
   };

@@ -468,7 +468,7 @@ impl Recall {
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("name at least one file to publish"))?;
             let name = api::artifact_name(first, params.name.as_deref())?;
-            let artifact = client()?.publish(&api::PublishInput {
+            let published = client()?.publish(&api::PublishInput {
                 title: params.title.unwrap_or_else(|| name.clone()),
                 name,
                 kind: params.kind.unwrap_or(ArtifactKind::Site).as_str().to_string(),
@@ -484,7 +484,7 @@ impl Recall {
                 replace: params.replace.unwrap_or(false),
                 files: paths,
             })?;
-            to_json(&artifact)
+            to_json(&published)
         })
         .await
     }

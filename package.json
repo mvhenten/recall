@@ -36,8 +36,5 @@
     "esbuild@0.28.2": true,
     "sharp@0.35.5": true
   },
-  "license": "MIT",
-  "dependencies": {
-    "zod": "^4.6.6"
-  }
+  "license": "MIT"
 }

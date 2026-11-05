@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseArtifactList, parseArtifactType, parseAudioFiles, parseFilePath, parseManifest } from "../src/artifacts";
-import { ARTIFACT_SORTS, HISTORY_SORTS, MEMORY_SORTS, sortInForce, sortKeys } from "../src/listing";
+import { ARTIFACT_SORTS, sortInForce } from "../src/listing";
 import { decodeCursor } from "../src/store";
 import { harness } from "./harness";
 
@@ -125,12 +125,6 @@ describe("the cursor", () => {
 });
 
 describe("the sorts each list holds", () => {
-  it("names a key per sort, default first", () => {
-    expect(sortKeys(ARTIFACT_SORTS)).toEqual(["newest", "name", "largest"]);
-    expect(sortKeys(HISTORY_SORTS)).toEqual(["newest", "agent"]);
-    expect(sortKeys(MEMORY_SORTS)).toEqual(["newest", "name", "recalled"]);
-  });
-
   it("reads a sort it does not hold in the default order and says which it was", () => {
     const url = new URL("https://recall.test/dashboard/artifacts?sort=duration");
     expect(sortInForce(url, ARTIFACT_SORTS)).toEqual({ sort: "newest", unknownSort: "duration" });

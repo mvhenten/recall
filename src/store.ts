@@ -1,4 +1,3 @@
-import { z } from "zod";
 import {
   type ArtifactFile,
   type ArtifactListInput,
@@ -1267,8 +1266,6 @@ const ARTIFACT_COLUMNS = `a.name, a.rev, a.type, a.title, a.description, a.read_
   a.files, a.file_count, a.bytes, a.created_at, a.updated_at, a.user_id,
   COALESCE((SELECT email FROM principals WHERE user_id = a.last_writer_user_id ORDER BY email LIMIT 1), '') AS last_writer`;
 
-const fileSchema = z.array(z.object({ path: z.string(), bytes: z.number(), contentType: z.string() }));
-
 const toArtifact = (row: ArtifactRow): ArtifactRecord => ({
   name: row.name,
   rev: row.rev,
@@ -1278,7 +1275,7 @@ const toArtifact = (row: ArtifactRow): ArtifactRecord => ({
   read: row.read_perm,
   write: row.write_perm,
   entryPath: row.entry_path,
-  files: fileSchema.parse(JSON.parse(row.files)),
+  files: JSON.parse(row.files) as ArtifactFile[],
   fileCount: row.file_count,
   bytes: row.bytes,
   createdAt: row.created_at,
@@ -1404,7 +1401,6 @@ export interface ArtifactCommit {
   userId: string;
   name: string;
   rev: number;
-  fromRev: number;
   type: ArtifactType;
   title: string;
   description: string;
@@ -1415,27 +1411,41 @@ export interface ArtifactCommit {
   writerUserId: string;
 }
 
-// The publish, in one statement after every byte has landed under the new revision. The WHERE
-// makes it a compare-and-swap on the revision read before the write: of two publishes racing under
-// one name, one moves the row forward and the other changes nothing and is told so. `created_at`
-// is left alone on the update branch, because the artifact is being replaced and not recreated.
-export const commitArtifact = async (db: D1Database, commit: ArtifactCommit): Promise<boolean> => {
+// The revision the caller owns, claimed before a byte of it is written. The upsert is what makes
+// the claim exclusive: two publishes of one name read the same live revision and each is handed a
+// different number here, so neither streams into the prefix the other will commit.
+export const claimRevision = async (db: D1Database, userId: string, name: string): Promise<number> => {
+  const row = await db
+    .prepare(
+      `INSERT INTO artifact_revisions (user_id, name, rev_next) VALUES (?1, ?2, 1)
+       ON CONFLICT (user_id, name) DO UPDATE SET rev_next = artifact_revisions.rev_next + 1
+       RETURNING rev_next`,
+    )
+    .bind(userId, name)
+    .first<{ rev_next: number }>();
+  if (row === null) throw new Error(`claiming a revision of ${name} returned no row`);
+  return row.rev_next;
+};
+
+const entryOf = (commit: ArtifactCommit): ArtifactFile => {
   const entry = commit.files[0];
   if (entry === undefined) throw new Error(`a publish of ${commit.name} named no file`);
-  const bytes = commit.files.reduce((running, file) => running + file.bytes, 0);
+  return entry;
+};
+
+const bytesOf = (commit: ArtifactCommit): number => commit.files.reduce((running, file) => running + file.bytes, 0);
+
+// The publish of a name that held nothing when the gates ran. `UNIQUE (user_id, name)` is what
+// decides a race between two first publishes: the second writes no row and is told the name is
+// taken rather than replacing what the first one just committed.
+export const createArtifact = async (db: D1Database, commit: ArtifactCommit): Promise<boolean> => {
   const result = await db
     .prepare(
       `INSERT INTO artifacts (user_id, name, rev, type, title, description, read_perm, write_perm,
                               entry_path, files, file_count, bytes, created_at, updated_at,
                               last_writer_user_id)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14)
-       ON CONFLICT (user_id, name) DO UPDATE SET
-         rev = excluded.rev, type = excluded.type, title = excluded.title,
-         description = excluded.description, read_perm = excluded.read_perm,
-         write_perm = excluded.write_perm, entry_path = excluded.entry_path, files = excluded.files,
-         file_count = excluded.file_count, bytes = excluded.bytes, updated_at = excluded.updated_at,
-         last_writer_user_id = excluded.last_writer_user_id
-       WHERE artifacts.rev = ?15`,
+       ON CONFLICT (user_id, name) DO NOTHING`,
     )
     .bind(
       commit.userId,
@@ -1446,13 +1456,47 @@ export const commitArtifact = async (db: D1Database, commit: ArtifactCommit): Pr
       commit.description,
       commit.read,
       commit.write,
-      entry.path,
+      entryOf(commit).path,
       JSON.stringify(commit.files),
       commit.files.length,
-      bytes,
+      bytesOf(commit),
       commit.at,
       commit.writerUserId,
-      commit.fromRev,
+    )
+    .run();
+  return result.meta.changes > 0;
+};
+
+// The publish of a name that held an artifact. The WHERE makes it a compare-and-swap on the
+// revision read before the write: of two publishes racing under one name, one moves the row
+// forward and the other changes nothing and is told so. A row that has since been unpublished
+// matches nothing, so the publish is refused rather than recreating an artifact whose files the
+// unpublish has already deleted. `created_at` is left alone, because the artifact is being
+// replaced and not recreated.
+export const replaceArtifact = async (db: D1Database, commit: ArtifactCommit, fromRev: number): Promise<boolean> => {
+  const result = await db
+    .prepare(
+      `UPDATE artifacts SET rev = ?3, type = ?4, title = ?5, description = ?6, read_perm = ?7,
+                            write_perm = ?8, entry_path = ?9, files = ?10, file_count = ?11,
+                            bytes = ?12, updated_at = ?13, last_writer_user_id = ?14
+       WHERE user_id = ?1 AND name = ?2 AND rev = ?15`,
+    )
+    .bind(
+      commit.userId,
+      commit.name,
+      commit.rev,
+      commit.type,
+      commit.title,
+      commit.description,
+      commit.read,
+      commit.write,
+      entryOf(commit).path,
+      JSON.stringify(commit.files),
+      commit.files.length,
+      bytesOf(commit),
+      commit.at,
+      commit.writerUserId,
+      fromRev,
     )
     .run();
   return result.meta.changes > 0;

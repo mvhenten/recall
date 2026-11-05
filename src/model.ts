@@ -379,7 +379,7 @@ const TAG = /^[a-z0-9][a-z0-9._:/-]*$/;
 export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const isOneOf = <T extends string>(options: readonly T[], value: unknown): value is T =>
+export const isOneOf = <T extends string>(options: readonly T[], value: unknown): value is T =>
   typeof value === "string" && (options as readonly string[]).includes(value);
 
 export const isInteger = (value: unknown, min: number, max: number): value is number =>

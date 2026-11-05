@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ureq::http::Response;
 use ureq::{Agent, RequestBuilder};
 
@@ -114,9 +114,16 @@ pub struct ArtifactQuery {
     pub limit: Option<u32>,
 }
 
-#[derive(Deserialize)]
-struct Published {
-    artifact: Artifact,
+/// What one publish answers. `owned_by_another` says the name belongs to another account of this
+/// recall, which published it with `write: account`; the publish went through and rewrote that
+/// artifact's title and both its permissions, so the caller is told whose name they wrote under
+/// rather than reading a URL that looks like their own.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Published {
+    pub artifact: Artifact,
+    #[serde(default)]
+    pub owned_by_another: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -920,7 +927,7 @@ impl Client {
     ///
     /// A name that already holds an artifact is refused unless `replace` says otherwise, and the
     /// refusal the service sends names what is there and is printed as it stands.
-    pub fn publish(&self, input: &PublishInput) -> Result<Artifact> {
+    pub fn publish(&self, input: &PublishInput) -> Result<Published> {
         let files = artifact_files(&input.files)?;
         let manifest = serde_json::json!({
             "type": input.kind,
@@ -933,12 +940,14 @@ impl Client {
                 .map(|file| serde_json::json!({ "path": file.path, "bytes": file.bytes }))
                 .collect::<Vec<_>>(),
         });
-        let body = multipart(BOUNDARY, &manifest.to_string(), &files);
+        let manifest = manifest.to_string();
+        let boundary = boundary(&manifest, &files);
+        let body = multipart(&boundary, &manifest, &files);
         let replace = if input.replace { "?replace=true" } else { "" };
         let request = self
             .agent
             .put(self.url(&format!("/v1/artifacts/{}{replace}", encode(&input.name))))
-            .header("content-type", &format!("multipart/form-data; boundary={BOUNDARY}"))
+            .header("content-type", &format!("multipart/form-data; boundary={boundary}"))
             .config()
             .timeout_global(Some(PUBLISH_TIMEOUT))
             .build();
@@ -947,7 +956,7 @@ impl Client {
             .body_mut()
             .read_json()
             .with_context(|| format!("reading back where {} is published", input.name))?;
-        Ok(published.artifact)
+        Ok(published)
     }
 
     pub fn artifacts(&self, query: &ArtifactQuery) -> Result<ArtifactPage> {
@@ -999,10 +1008,33 @@ impl Client {
     }
 }
 
-/// The boundary of a publish body. The parts carry a manifest and raw file bytes, and this string
-/// cannot occur in either: the manifest is JSON holding no hyphen run, and a part that did hold it
-/// would be refused by the service for the length it declared.
-const BOUNDARY: &str = "recall-publish-boundary-0ad8f3c1";
+/// The boundary of one publish body. A file holds arbitrary bytes, so a fixed boundary is a string
+/// an audio file can contain, and a file containing it splits its own part and is refused for a
+/// byte count the caller can do nothing about. Each publish draws its own and then reads the bytes
+/// it is about to send: a candidate that occurs in any part is discarded and the next one drawn, so
+/// the boundary that ships appears nowhere in the body it delimits.
+fn boundary(manifest: &str, files: &[PublishFile]) -> String {
+    let mut seed = u128::from(std::process::id())
+        ^ SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+    loop {
+        let candidate = format!("recall-publish-{seed:032x}");
+        let needle = candidate.as_bytes();
+        let clear = !contains(manifest.as_bytes(), needle) && files.iter().all(|file| !contains(&file.body, needle));
+        if clear {
+            return candidate;
+        }
+        seed = seed
+            .wrapping_mul(0x5851_f42d_4c95_7f2d)
+            .wrapping_add(0x1405_7b7e_f767_814f);
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
 
 #[derive(Debug)]
 struct PublishFile {
@@ -1289,6 +1321,25 @@ mod tests {
         assert_eq!(
             body,
             "--xyz\r\ncontent-disposition: form-data; name=\"manifest\"\r\ncontent-type: application/json\r\n\r\n{\"type\":\"site\"}\r\n--xyz\r\ncontent-disposition: form-data; name=\"file\"; filename=\"index.html\"\r\n\r\n<p>one</p>\r\n--xyz--\r\n"
+        );
+    }
+
+    #[test]
+    fn draws_a_boundary_no_part_holds() {
+        let manifest = "{\"type\":\"audio\"}";
+        let plain = boundary(manifest, &[]);
+        let held = vec![PublishFile {
+            path: "track-01.mp3".into(),
+            bytes: plain.len(),
+            body: plain.clone().into_bytes(),
+        }];
+        let drawn = boundary(manifest, &held);
+        assert_ne!(drawn, plain);
+        assert!(
+            !held[0]
+                .body
+                .windows(drawn.len())
+                .any(|window| window == drawn.as_bytes())
         );
     }
 

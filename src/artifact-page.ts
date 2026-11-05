@@ -1,4 +1,4 @@
-import type { ArtifactFile, ArtifactRecord } from "./artifacts";
+import { type ArtifactFile, type ArtifactRecord, RAW_INLINE_BYTES } from "./artifacts";
 import { ARTIFACT_PAGE_CSP, ARTIFACT_PLAYER_CSP, escapeHtml, htmlPage, sizeText, TOKENS } from "./page";
 import type { PlayerPlan } from "./player";
 import { PLAYER_SCRIPT } from "./player-view.generated";
@@ -159,19 +159,33 @@ export const documentPage = (record: ArtifactRecord, dashboard: string, rendered
 
 // The published bytes, escaped into one block. Over the render ceiling the rendered control is
 // drawn inert and out of the tab order, so a reader who aims at it reads why rather than finding a
-// dead link.
-export const rawDocumentPage = (record: ArtifactRecord, dashboard: string, source: string): Response => {
-  const { bytes } = entryOf(record);
+// dead link. `source` arrives already cut to what the page may hold, and `capped` says whether
+// anything was left out: the file's own address serves the whole of it as text/markdown, so the
+// notice points there rather than leaving a reader to guess the view is complete.
+export const rawDocumentPage = (
+  record: ArtifactRecord,
+  dashboard: string,
+  source: string,
+  capped: boolean,
+): Response => {
+  const entry = entryOf(record);
+  const { bytes } = entry;
   const over = bytes > RENDER_CEILING_BYTES;
+  const address = `/${encodeURIComponent(record.name)}/${entry.path}`;
   const notice = over
     ? `<div class="notice"><b>${escapeHtml("This document is too long to render.")}</b><p>${escapeHtml(
         `recall renders a document of up to ${sizeText(RENDER_CEILING_BYTES)} and this one is ${sizeText(bytes)}, so its address answers the raw view. Split it into smaller files and republish to read it rendered.`,
       )}</p></div>`
     : "";
+  const cut = capped
+    ? `<div class="notice"><b>${escapeHtml("This view shows the start of the file.")}</b><p>${escapeHtml(
+        `${entry.path} runs to ${sizeText(bytes)} and this page prints the first ${sizeText(RAW_INLINE_BYTES)} of it.`,
+      )} <a href="${escapeHtml(address)}">${escapeHtml(address)}</a> ${escapeHtml("serves the whole file.")}</p></div>`
+    : "";
   return page({
     title: record.title,
     badge: record.type,
-    main: `${heading(record, documentMeta(record))}${views(record, true, !over)}${notice}<pre class="src">${escapeHtml(
+    main: `${heading(record, documentMeta(record))}${views(record, true, !over)}${notice}${cut}<pre class="src">${escapeHtml(
       source,
     )}</pre>${footer(record, dashboard)}`,
     status: 200,

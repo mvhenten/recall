@@ -45,6 +45,10 @@ const workersAiEmbedder = (ai: Ai): Embedder => ({
 
 let app: ReturnType<typeof createApp> | undefined;
 
+// The four arrive together or not at all. A deployment that binds some of them meant to publish
+// artifacts, and reading that back as "this deployment publishes no artifacts" is the same answer a
+// deployment that never wanted the feature gets, so a half-bound one names what it is missing
+// instead. A deployment upgraded before a deploy bound the dashboard host is exactly that case.
 const artifactHost = (env: Env, keys: KeySource, issuer: string): ArtifactHost | null => {
   const {
     ARTIFACT_HOSTNAME: hostname,
@@ -52,7 +56,19 @@ const artifactHost = (env: Env, keys: KeySource, issuer: string): ArtifactHost |
     DASHBOARD_HOSTNAME: dashboard,
     ARTIFACTS: bucket,
   } = env;
-  if (!hostname || !audience || !dashboard || !bucket) return null;
+  const bindings = [
+    ["ARTIFACT_HOSTNAME", hostname],
+    ["ARTIFACT_ACCESS_AUD", audience],
+    ["DASHBOARD_HOSTNAME", dashboard],
+    ["ARTIFACTS", bucket],
+  ] as const;
+  const missing = bindings.filter(([, value]) => !value).map(([name]) => name);
+  if (missing.length === bindings.length) return null;
+  if (!hostname || !audience || !dashboard || !bucket) {
+    throw new Error(
+      `this deployment publishes artifacts and binds no ${missing.join(", ")}; run npm run deploy to bind every one of them`,
+    );
+  }
   return {
     hostname,
     verify: accessVerifier(keys, issuer, audience),

@@ -79,7 +79,6 @@ describe("the multipart reader", () => {
       expect(await two.text()).toBe("p{color:red}");
 
       expect(await parts.nextPart()).toBeNull();
-      expect(parts.truncated()).toBe(false);
     }
   });
 
@@ -113,15 +112,6 @@ describe("the multipart reader", () => {
     await parts.nextPart();
     expect(await parts.text(4)).toBeNull();
     expect((await parts.nextPart())?.filename).toBe("index.html");
-  });
-
-  it("says when the body stopped inside a part", async () => {
-    const parts = readMultipart(bodyOf(BODY.slice(0, BODY.indexOf("<p>one</p>") + 4)), "xyz");
-    await parts.nextPart();
-    await parts.text(1_000);
-    await parts.nextPart();
-    expect(await parts.pipe(sink().writable, 4)).toEqual({ ok: true, bytes: 4 });
-    expect(parts.truncated()).toBe(true);
   });
 
   it("answers no part for a body that holds none", async () => {

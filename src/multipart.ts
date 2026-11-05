@@ -68,9 +68,6 @@ export interface MultipartBody {
   // request is still being received. A part that does not hold exactly `exact` bytes aborts the
   // stream rather than closing it, which is what stops a short or a lying part from being stored.
   pipe(into: WritableStream<Bytes>, exact: number): Promise<{ ok: boolean; bytes: number }>;
-  // Whether the body ended where a delimiter should have been, which means the part last read is
-  // short of what the client meant to send.
-  truncated(): boolean;
 }
 
 export const readMultipart = (body: ReadableStream<Bytes>, boundary: string): MultipartBody => {
@@ -83,7 +80,6 @@ export const readMultipart = (body: ReadableStream<Bytes>, boundary: string): Mu
   let drained = false;
   let started = false;
   let inPart = false;
-  let short = false;
 
   const pull = async (): Promise<boolean> => {
     if (drained) return false;
@@ -118,7 +114,6 @@ export const readMultipart = (body: ReadableStream<Bytes>, boundary: string): Mu
       if (held.length > keep) return take(held.length - keep);
       if (!(await pull())) {
         inPart = false;
-        short = true;
         const rest = take(held.length);
         return rest.length === 0 ? null : rest;
       }
@@ -207,6 +202,5 @@ export const readMultipart = (body: ReadableStream<Bytes>, boundary: string): Mu
         await writer.write(next);
       }
     },
-    truncated: (): boolean => short,
   };
 };

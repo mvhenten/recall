@@ -82,4 +82,32 @@ describe("the markdown renderer", () => {
     expect(rendered("")).toBe("");
     expect(rendered("\n\n  \n")).toBe("");
   });
+
+  it("keeps a relative link inside the artifact and refuses a protocol-relative one", () => {
+    const climbed = rendered("[up](../../other/secret.md)\n");
+    expect(climbed).toContain('href="/spec/other/secret.md"');
+    expect(climbed).not.toContain("..");
+    const host = rendered("[out](//evil.example.com/x)\n");
+    expect(host).not.toContain("href");
+    expect(host).toContain("[out]");
+  });
+
+  it("prints a marker the publisher wrote as nothing rather than as markup", () => {
+    const held = rendered("Call `one` and \u0000 then `two`.\n");
+    expect(held).toContain("<code>one</code>");
+    expect(held).toContain("<code>two</code>");
+    expect(held).not.toContain("\u0000");
+    expect(rendered("line \u0001 break\n")).toBe("<p>line  break</p>");
+  });
+
+  it("stops nesting past its ceiling instead of running out of stack", () => {
+    const quoted = rendered(`${">".repeat(3_000)} deep\n`);
+    expect(quoted).toContain("deep");
+    expect(quoted.match(/<blockquote>/g)).toHaveLength(17);
+    const listed = rendered(
+      Array.from({ length: 2_000 }, (_one, level) => `${" ".repeat(level * 2)}- item ${level}`).join("\n"),
+    );
+    expect(listed).toContain("item 1999");
+    expect(listed.match(/<ul>/g)).toHaveLength(17);
+  });
 });

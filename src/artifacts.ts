@@ -1,5 +1,4 @@
-import { z } from "zod";
-import { DEFAULT_PAGE_ROWS, fail, isInteger, MAX_QUERY_CHARS, type Parsed } from "./model";
+import { DEFAULT_PAGE_ROWS, fail, isInteger, isOneOf, isRecord, MAX_QUERY_CHARS, type Parsed } from "./model";
 
 export const artifactTypes = ["site", "document", "audio"] as const;
 export type ArtifactType = (typeof artifactTypes)[number];
@@ -57,6 +56,12 @@ export const MAX_DESCRIPTION_CHARS = 500;
 export const MAX_PATH_CHARS = 200;
 export const MAX_PATH_SEGMENTS = 3;
 
+// How much of a document's source the raw view inlines. The page escapes what it prints and
+// concatenates it into one HTML string, so inlining a 32 MB file would hold three copies of it in
+// UTF-16 at once; past this only the start is read and the page points at the file's own address,
+// which streams the rest as text/markdown.
+export const RAW_INLINE_BYTES = 128 * 1024;
+
 export const ARTIFACT_CONTENT_TYPE = "text/html; charset=utf-8";
 
 export const AUDIO_EXTENSIONS = ["mp3", "m4a", "aac", "ogg", "opus", "wav", "flac"] as const;
@@ -111,37 +116,7 @@ export const artifactPrefix = (userId: string, name: string): string => `${userI
 
 export const revisionPrefix = (userId: string, name: string, rev: number): string => `${userId}/${name}/${rev}/`;
 
-const typeSchema = z.enum(artifactTypes);
-const readSchema = z.enum(readPermissions);
-const writeSchema = z.enum(writePermissions);
-const titleSchema = z.string().max(MAX_TITLE_CHARS);
-const descriptionSchema = z.string().max(MAX_DESCRIPTION_CHARS);
-
 const SEGMENT = /^[a-z0-9][a-z0-9._-]*$/;
-
-const pathSchema = z
-  .string()
-  .max(MAX_PATH_CHARS)
-  .transform((path) => path.toLowerCase())
-  .refine((path) => {
-    const segments = path.split("/");
-    return segments.length <= MAX_PATH_SEGMENTS && segments.every((segment) => SEGMENT.test(segment));
-  });
-
-// Each file's size is declared, because R2 takes a stream only where its length is known: the
-// publish hands the part to storage as it arrives rather than buffering it, and a part that does
-// not hold exactly what was declared is refused instead of stored short.
-const manifestSchema = z.object({
-  type: typeSchema,
-  title: titleSchema,
-  description: descriptionSchema,
-  read: readSchema,
-  write: writeSchema,
-  files: z
-    .array(z.object({ path: pathSchema, bytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER) }))
-    .min(1)
-    .max(MAX_FILES),
-});
 
 export interface ManifestFile {
   path: string;
@@ -163,15 +138,26 @@ const WRITE_MESSAGE = `write must be one of ${writePermissions.join(", ")}`;
 const META_MESSAGE = `title must hold at most ${MAX_TITLE_CHARS} characters and description at most ${MAX_DESCRIPTION_CHARS}`;
 const FILES_MESSAGE = `files must name 1 to ${MAX_FILES} files`;
 const PATH_MESSAGE = `a file path holds at most ${MAX_PATH_SEGMENTS} segments of [a-z0-9][a-z0-9._-]* and at most ${MAX_PATH_CHARS} characters`;
+const BYTES_MESSAGE = "each file must declare bytes as a whole number of zero or more";
+const MANIFEST_MESSAGE = "the manifest must name type, title, description, read, write and files";
 
-export const parseArtifactType = (value: unknown): Parsed<ArtifactType> => {
-  const parsed = typeSchema.safeParse(value);
-  return parsed.success ? { ok: true, value: parsed.data } : fail(TYPE_MESSAGE);
-};
+// A site is served inside `sandbox`, which gives it an opaque origin, so `'self'` matches nothing
+// and a page can never load a second file of its own. The sandbox is what keeps one publisher's
+// page away from another's, so the refusal names the two types that do hold several files.
+const SITE_MESSAGE =
+  "a site holds one file: it is served in a sandbox with an opaque origin and cannot load a second file of its own. Publish a document or an audio artifact to hold more than one file";
+
+export const parseArtifactType = (value: unknown): Parsed<ArtifactType> =>
+  isOneOf(artifactTypes, value) ? { ok: true, value } : fail(TYPE_MESSAGE);
 
 export const parseFilePath = (value: unknown): Parsed<string> => {
-  const parsed = pathSchema.safeParse(value);
-  return parsed.success ? { ok: true, value: parsed.data } : fail(PATH_MESSAGE);
+  if (typeof value !== "string" || value.length > MAX_PATH_CHARS) return fail(PATH_MESSAGE);
+  const path = value.toLowerCase();
+  const segments = path.split("/");
+  if (segments.length > MAX_PATH_SEGMENTS || !segments.every((segment) => SEGMENT.test(segment))) {
+    return fail(PATH_MESSAGE);
+  }
+  return { ok: true, value: path };
 };
 
 // Every track of an audio artifact plays in a browser's audio element, so the extensions are the
@@ -185,28 +171,37 @@ export const parseAudioFiles = (paths: readonly string[]): Parsed<string[]> => {
   return { ok: true, value: [...paths] };
 };
 
-const MESSAGES: Record<string, string> = {
-  type: TYPE_MESSAGE,
-  read: READ_MESSAGE,
-  write: WRITE_MESSAGE,
-  title: META_MESSAGE,
-  description: META_MESSAGE,
-};
-
-const manifestMessage = (error: z.ZodError): string => {
-  const issue = error.issues[0];
-  const field = String(issue?.path[0] ?? "");
-  if (field === "files") return issue?.path.length === 1 ? FILES_MESSAGE : PATH_MESSAGE;
-  return MESSAGES[field] ?? "the manifest must name type, title, description, read, write and files";
+// Each file's size is declared, because R2 takes a stream only where its length is known: the
+// publish hands the part to storage as it arrives rather than buffering it, and a part that does
+// not hold exactly what was declared is refused instead of stored short.
+const parseManifestFiles = (value: unknown): Parsed<ManifestFile[]> => {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_FILES) return fail(FILES_MESSAGE);
+  const named: ManifestFile[] = [];
+  for (const file of value) {
+    if (!isRecord(file)) return fail(FILES_MESSAGE);
+    const path = parseFilePath(file.path);
+    if (!path.ok) return path;
+    if (!isInteger(file.bytes, 0, Number.MAX_SAFE_INTEGER)) return fail(BYTES_MESSAGE);
+    named.push({ path: path.value, bytes: file.bytes });
+  }
+  return { ok: true, value: named };
 };
 
 // The publish's first gate. A manifest that names a type, a permission, a title or a path the
 // service does not take is refused here, before a byte of the body is read and before storage is
 // touched at all.
 export const parseManifest = (value: unknown): Parsed<Manifest> => {
-  const parsed = manifestSchema.safeParse(value);
-  if (!parsed.success) return fail(manifestMessage(parsed.error));
-  const { type, title, description, read, write, files } = parsed.data;
+  if (!isRecord(value)) return fail(MANIFEST_MESSAGE);
+  const { type, title, description, read, write } = value;
+  if (!isOneOf(artifactTypes, type)) return fail(TYPE_MESSAGE);
+  if (typeof title !== "string" || title.length > MAX_TITLE_CHARS) return fail(META_MESSAGE);
+  if (typeof description !== "string" || description.length > MAX_DESCRIPTION_CHARS) return fail(META_MESSAGE);
+  if (!isOneOf(readPermissions, read)) return fail(READ_MESSAGE);
+  if (!isOneOf(writePermissions, write)) return fail(WRITE_MESSAGE);
+  const parsed = parseManifestFiles(value.files);
+  if (!parsed.ok) return parsed;
+  const files = parsed.value;
+  if (type === "site" && files.length > 1) return fail(SITE_MESSAGE);
   const paths = files.map((file) => file.path);
   if (new Set(paths).size !== paths.length) return fail("files must name each path once");
   if (type === "audio") {
@@ -256,20 +251,6 @@ export const headArtifactFile = (
   rev: number,
   path: string,
 ): Promise<R2Object | null> => bucket.head(fileKey(userId, name, rev, path));
-
-export const putArtifactFile = async (
-  bucket: R2Bucket,
-  userId: string,
-  name: string,
-  rev: number,
-  path: string,
-  body: ReadableStream | ArrayBuffer,
-): Promise<R2Object> => {
-  const key = fileKey(userId, name, rev, path);
-  const object = await bucket.put(key, body);
-  if (object === null) throw new Error(`R2 stored no object at ${key}`);
-  return object;
-};
 
 const deletePrefix = async (bucket: R2Bucket, prefix: string): Promise<void> => {
   let cursor: string | undefined;
