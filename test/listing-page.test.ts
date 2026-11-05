@@ -1,14 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  parseArtifactList,
-  parseArtifactMeta,
-  parseArtifactType,
-  parseAudioFiles,
-  parseFilePath,
-  parseManifest,
-  parseReadPermission,
-  parseWritePermission,
-} from "../src/artifacts";
+import { parseArtifactList, parseArtifactType, parseAudioFiles, parseFilePath, parseManifest } from "../src/artifacts";
 import { ARTIFACT_SORTS, HISTORY_SORTS, MEMORY_SORTS, sortInForce, sortKeys } from "../src/listing";
 import { decodeCursor } from "../src/store";
 
@@ -29,22 +20,25 @@ describe("the artifact parsers", () => {
     expect(refused).toEqual({ ok: false, error: "type must be one of site, document, audio" });
   });
 
-  it("refuses a permission outside the two each takes", () => {
-    expect(parseReadPermission("account")).toEqual({ ok: true, value: "account" });
-    expect(parseWritePermission("owner")).toEqual({ ok: true, value: "owner" });
-    expect(parseReadPermission("world")).toEqual({ ok: false, error: "read must be one of private, account" });
-    expect(parseWritePermission("anyone")).toEqual({ ok: false, error: "write must be one of owner, account" });
+  it("refuses a permission outside the two each takes, naming both", () => {
+    expect(parseManifest(manifest({ read: "account", write: "account" })).ok).toBe(true);
+    expect(parseManifest(manifest({ read: "world" }))).toEqual({
+      ok: false,
+      error: "read must be one of private, account",
+    });
+    expect(parseManifest(manifest({ write: "anyone" }))).toEqual({
+      ok: false,
+      error: "write must be one of owner, account",
+    });
   });
 
   it("holds the title and the description to their limits", () => {
-    expect(parseArtifactMeta("Title", "About it")).toEqual({
-      ok: true,
-      value: { title: "Title", description: "About it" },
-    });
-    expect(parseArtifactMeta("x".repeat(200), "y".repeat(500)).ok).toBe(true);
-    expect(parseArtifactMeta("x".repeat(201), "").ok).toBe(false);
-    expect(parseArtifactMeta("", "y".repeat(501)).ok).toBe(false);
-    expect(parseArtifactMeta(42, "").ok).toBe(false);
+    const meta = (title: unknown, description: unknown): boolean => parseManifest(manifest({ title, description })).ok;
+    expect(meta("x".repeat(200), "y".repeat(500))).toBe(true);
+    expect(meta("x".repeat(201), "")).toBe(false);
+    expect(meta("", "y".repeat(501))).toBe(false);
+    expect(meta(42, "")).toBe(false);
+    expect(parseManifest(manifest({ title: "x".repeat(201) })).ok).toBe(false);
   });
 
   it("case-folds a file path and refuses one that climbs out of the artifact", () => {

@@ -143,18 +143,15 @@ const manifestSchema = z.object({
     .max(MAX_FILES),
 });
 
-export interface ArtifactMeta {
-  title: string;
-  description: string;
-}
-
 export interface ManifestFile {
   path: string;
   bytes: number;
 }
 
-export interface Manifest extends ArtifactMeta {
+export interface Manifest {
   type: ArtifactType;
+  title: string;
+  description: string;
   read: ReadPermission;
   write: WritePermission;
   files: ManifestFile[];
@@ -170,21 +167,6 @@ const PATH_MESSAGE = `a file path holds at most ${MAX_PATH_SEGMENTS} segments of
 export const parseArtifactType = (value: unknown): Parsed<ArtifactType> => {
   const parsed = typeSchema.safeParse(value);
   return parsed.success ? { ok: true, value: parsed.data } : fail(TYPE_MESSAGE);
-};
-
-export const parseReadPermission = (value: unknown): Parsed<ReadPermission> => {
-  const parsed = readSchema.safeParse(value);
-  return parsed.success ? { ok: true, value: parsed.data } : fail(READ_MESSAGE);
-};
-
-export const parseWritePermission = (value: unknown): Parsed<WritePermission> => {
-  const parsed = writeSchema.safeParse(value);
-  return parsed.success ? { ok: true, value: parsed.data } : fail(WRITE_MESSAGE);
-};
-
-export const parseArtifactMeta = (title: unknown, description: unknown): Parsed<ArtifactMeta> => {
-  const parsed = z.object({ title: titleSchema, description: descriptionSchema }).safeParse({ title, description });
-  return parsed.success ? { ok: true, value: parsed.data } : fail(META_MESSAGE);
 };
 
 export const parseFilePath = (value: unknown): Parsed<string> => {
