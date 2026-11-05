@@ -16,6 +16,7 @@ type Harness = Awaited<ReturnType<typeof harness>>;
 interface Listener {
   socket: WebSocket;
   received: Message[];
+  tokens: Map<string, string>;
   closed: number[];
 }
 
@@ -61,16 +62,20 @@ const listen = async (h: Harness, token: string): Promise<Listener> => {
   const socket = response.webSocket;
   if (!socket) throw new Error("the listen upgrade carried no socket");
   socket.accept();
-  const listener: Listener = { socket, received: [], closed: [] };
+  const listener: Listener = { socket, received: [], tokens: new Map(), closed: [] };
   socket.addEventListener("message", (event) => {
     const frame: MessageFrame = JSON.parse(String(event.data));
     listener.received.push(frame.message);
+    listener.tokens.set(frame.message.messageId, frame.token);
   });
   socket.addEventListener("close", (event) => listener.closed.push(event.code));
   return listener;
 };
 
-const ackFrame = (messageId: string): string => JSON.stringify({ type: "ack", messageId } satisfies AckFrame);
+const ack = (listener: Listener, messageId: string): void => {
+  const token = listener.tokens.get(messageId) ?? "";
+  listener.socket.send(JSON.stringify({ type: "ack", messageId, token } satisfies AckFrame));
+};
 
 const eventually = async (ready: () => boolean | Promise<boolean>, what: string): Promise<void> => {
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -98,7 +103,7 @@ describe("messages listen", () => {
       "pushed while connected",
     ]);
 
-    for (const message of desktop.received) desktop.socket.send(ackFrame(message.messageId));
+    for (const message of desktop.received) ack(desktop, message.messageId);
     await eventually(async () => (await queued(userId, desktopId, h.now())).length === 0, "both acks");
     expect(await queued(userId, laptopId, h.now())).toHaveLength(1);
   });
@@ -120,8 +125,8 @@ describe("messages listen", () => {
     await eventually(() => reconnected.received.length === 2, "the redelivery");
     expect(reconnected.received.map((message) => message.messageId)).toEqual([first.messageId, second.messageId]);
 
-    reconnected.socket.send(ackFrame(first.messageId));
-    reconnected.socket.send(ackFrame(first.messageId));
+    ack(reconnected, first.messageId);
+    ack(reconnected, first.messageId);
     await eventually(async () => (await queued(userId, desktopId, h.now())).length === 1, "the ack");
     expect((await queued(userId, desktopId, h.now()))[0]?.messageId).toBe(second.messageId);
   });

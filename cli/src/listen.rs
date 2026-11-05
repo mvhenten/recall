@@ -216,9 +216,6 @@ fn delivered_body(message: &Message) -> String {
     format!("{}\n{}", header(message), message.body)
 }
 
-/// News goes to every session on the host, as it always has. An order goes to one, and the
-/// receipt names it, so the mailbox can tell its sender who took it and hold the order back from
-/// every other session until that is settled.
 async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) -> Reply {
     let started = Instant::now();
     if seen.contains(&message.message_id) {

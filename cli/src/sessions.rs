@@ -458,11 +458,9 @@ pub async fn to_host(dir: &Path, body: &str, created_at: i64, now: i64) -> Optio
     Some(write_all(registrations, body).await)
 }
 
-/// What became of an order on this host. `Taken` names the one session that has it, which the
-/// mailbox records and the sender is shown. `Refused` is a session that would not take the write,
-/// so the order goes back for the next one to try. `Waiting` is a host with nothing to run an
-/// order sent that recently, which the lease retries; `Retired` is the same host once the order
-/// is older than the grace, and there is nothing left to wait for.
+/// What became of an order on this host. `Refused` is a session that would not take the write, so
+/// the order goes back for the next one to try. `Waiting` is a host with nothing to run an order
+/// sent that recently; `Retired` is the same host once the order is older than the grace.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Placed {
     Taken(String),
@@ -471,10 +469,9 @@ pub enum Placed {
     Retired,
 }
 
-/// Delivers an order to the one session that should act on it: the newest that was already
-/// running when the order was sent, since a session that started afterwards has no idea what the
-/// order refers to, and otherwise the newest registered now, so a host momentarily between
-/// sessions still takes it. Past `HOST_GRACE` there is nobody left to wait for.
+/// Delivers an order to the one session that should act on it, by the same rule `to_host` picks
+/// its sessions by: the newest that was already running when the order was sent, and otherwise
+/// the newest registered now. Past `HOST_GRACE` there is nobody left to wait for.
 pub async fn to_one(dir: &Path, body: &str, created_at: i64, now: i64) -> Placed {
     let registrations = addressable(dir);
     if let Some(running) = registrations
@@ -493,8 +490,8 @@ pub async fn to_one(dir: &Path, body: &str, created_at: i64, now: i64) -> Placed
     }
 }
 
-/// Delivers an order to the one session it names. A session this host cannot address is the end
-/// of it: no other session on the host was addressed, so there is nothing to hand the order to.
+/// Delivers an order to the one session it names. A session this host cannot address is the end of
+/// it: no other session was addressed, so there is nothing to hand the order to.
 pub async fn to_one_session(dir: &Path, session_id: &str, body: &str) -> Placed {
     let Some(registered) = addressable(dir)
         .into_iter()
@@ -779,9 +776,6 @@ mod tests {
         }
     }
 
-    /// The bug orders exist for: a host-addressed message reaches every session here, so three
-    /// sessions all ran the same fleet instruction. An order reaches one of them, names it, and
-    /// leaves the others hearing nothing at all.
     #[tokio::test]
     async fn an_order_reaches_one_of_several_listening_sessions_and_names_it() {
         let sandbox = Sandbox::new("order-one-of-three");
@@ -826,9 +820,6 @@ mod tests {
         i64::try_from(HOST_GRACE.as_millis()).unwrap()
     }
 
-    /// A host with nothing to run an order waits while the order is still fresh, so a host between
-    /// sessions takes it when the next one starts, and is retired once the grace is over. Waiting
-    /// is what leaves the mailbox holding the order for its lease to offer again.
     #[tokio::test]
     async fn an_order_no_session_can_take_waits_out_the_grace_and_is_then_retired() {
         let sandbox = Sandbox::new("order-nobody");
@@ -847,8 +838,6 @@ mod tests {
         );
     }
 
-    /// A session that would not take the write loses its registration and the order comes back
-    /// unplaced, so the mailbox hands it to the next session rather than counting it delivered.
     #[tokio::test]
     async fn an_order_a_dead_session_will_not_take_is_refused_rather_than_swallowed() {
         let sandbox = Sandbox::new("order-refused");

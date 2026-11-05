@@ -472,14 +472,14 @@ impl Recall {
 
     #[tool(
         name = "recall_order",
-        description = "Give one Claude Code session on another host an instruction to carry out, and learn which session took it. Unlike recall_send, which every session on the host reads, an order is held by the one session that takes it, so a fleet instruction is run once per host instead of once per session. Name a host as recall devices shows it, or by its label. An order no session takes is an error saying so, and the order stays queued for ten minutes for a session to pick up."
+        description = "Give one Claude Code session on another host an instruction to carry out, and learn which session took it. Unlike recall_send, which every session on the host reads, an order is held by the one session that takes it, so a fleet instruction is run once per host instead of once per session. Name a host as recall devices shows it, or by its label. An order no session takes is an error saying so, and nothing is left behind for a session to run later."
     )]
     async fn order(&self, Parameters(params): Parameters<OrderParams>) -> Result<String, String> {
         blocking(move || {
             let client = client()?;
             let target = api::resolve_target(&client.devices()?, || client.sessions(), &params.to)?;
             let sent = client.send(&target, api::Kind::Order, &crate::sending_session(), &params.order)?;
-            let api::Outcome::Taken { session_id } = &sent.outcome else {
+            let Some(api::Outcome::Taken { session_id }) = &sent.outcome else {
                 bail!("{}", crate::order_refusal(&sent, &params.to));
             };
             to_json(&serde_json::json!({

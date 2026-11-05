@@ -312,9 +312,7 @@ struct Devices {
     devices: Vec<Device>,
 }
 
-/// News reaches every session the host has registered; an order reaches one of them, under a
-/// lease, and the host reports which session took it. A service too old to name a kind sends
-/// news, which is what every message was before orders.
+/// A service too old to name a kind sends news, which is what every message was before orders.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -332,12 +330,10 @@ impl Kind {
     }
 }
 
-/// What the service made of a send. News is queued for the whole host; an order is either taken
-/// by one named session or it is not, and `reason` is what the sender is told.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What the service made of a send. `reason` is what the sender is told when nobody took it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Outcome {
-    #[default]
     Fanout,
     #[serde(rename_all = "camelCase")]
     Taken {
@@ -372,11 +368,13 @@ pub struct Message {
     pub expires_at: i64,
 }
 
+/// `outcome` is absent from a service that predates orders, which is the only thing that tells
+/// such a service apart from one that answered.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Sent {
     pub message: Message,
     #[serde(default)]
-    pub outcome: Outcome,
+    pub outcome: Option<Outcome>,
 }
 
 /// One Claude Code session on one of the hosts signed in as this user, as the service holds it.
