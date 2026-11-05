@@ -1,3 +1,4 @@
+import type { Artifact } from "./artifacts";
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
 import {
   DAY_MS,
@@ -54,16 +55,18 @@ const BOOKMARK = '<path d="M6 3.5h8v13l-4-3.1-4 3.1z"/>';
 const BARS = '<path d="M5.5 16V10.5M10 16V5.5M14.5 16V8.5M3.5 16h13"/>';
 const SPARK = '<path d="M10 3l1.7 5.1L17 10l-5.3 1.9L10 17l-1.7-5.1L3 10l5.3-1.9z"/>';
 const TAG = '<path d="M3.3 10.6 10.6 3.3h6.1v6.1L9.4 16.7z"/><circle cx="13.4" cy="6.6" r="1.2"/>';
+const SHEET = '<path d="M5.5 3.5h5.9l3.1 3.1v9.9h-9z"/><path d="M11.2 3.5v3.4h3.3"/>';
 
 export const SESSIONS_TAB: Tab = { path: "/dashboard", label: "Sessions", icon: DISC };
 export const HISTORY_TAB: Tab = { path: "/dashboard/history", label: "History", icon: CLOCK };
 export const MEMORY_TAB: Tab = { path: "/dashboard/memory", label: "Memory", icon: BOOKMARK };
+export const ARTIFACTS_TAB: Tab = { path: "/dashboard/artifacts", label: "Artifacts", icon: SHEET };
 
 export const STATS_TAB: Tab = { path: "/dashboard/stats", label: "Stats", icon: BARS };
 export const INSIGHTS_TAB: Tab = { path: "/dashboard/insights", label: "Insights", icon: SPARK };
 export const LABELS_TAB: Tab = { path: "/dashboard/labels", label: "Labels", icon: TAG };
 
-export const TABS: Tab[] = [SESSIONS_TAB, HISTORY_TAB, MEMORY_TAB, STATS_TAB, INSIGHTS_TAB, LABELS_TAB];
+export const TABS: Tab[] = [SESSIONS_TAB, HISTORY_TAB, MEMORY_TAB, ARTIFACTS_TAB, STATS_TAB, INSIGHTS_TAB, LABELS_TAB];
 
 const FOCUS_FIRST_CHARS = 80;
 
@@ -103,7 +106,7 @@ a{color:var(--accent)}
 .brand i{flex:none;width:.55rem;height:.55rem;border-radius:2px;background:var(--accent);margin-right:.45rem}
 .swho{margin:0;font:400 .72rem/1.4 var(--mono);color:var(--faint);overflow-wrap:anywhere}
 .ssum{display:none}
-.snav{position:fixed;inset:auto 0 0 0;z-index:1;display:grid;grid-template-columns:repeat(6,1fr);border-top:1px solid var(--line);background:var(--surface)}
+.snav{position:fixed;inset:auto 0 0 0;z-index:1;display:grid;grid-template-columns:repeat(7,1fr);border-top:1px solid var(--line);background:var(--surface)}
 .snav a{display:grid;gap:.18rem;justify-items:center;padding:.5rem .15rem .55rem;font-size:.62rem;letter-spacing:.02em;color:var(--dim);text-decoration:none}
 .snav a svg{width:1.25rem;height:1.25rem;stroke:currentcolor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 .snav a[aria-current]{color:var(--accent);font-weight:600}
@@ -288,12 +291,16 @@ main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
 .rp{grid-area:1/3;font:400 .8rem/1.3 var(--mono);color:var(--dim);overflow-wrap:anywhere}
 .ag{grid-area:1/5}
 .pr{grid-area:1/6}
-.ag,.pr{font:400 .8rem/1 var(--mono);font-variant-numeric:tabular-nums;color:var(--dim);text-align:right}
+.ag,.pr,.ab,.at{font:400 .8rem/1 var(--mono);font-variant-numeric:tabular-nums;color:var(--dim);text-align:right}
 .lhead .r{text-align:right}
 .unit{display:none}
 .hist{grid-template-columns:1fr 1fr;gap:1.2rem 1rem}
 .hrow{grid-template-columns:8.5rem 9rem 14rem minmax(0,1fr) 4.5rem 5.5rem}
 .hrow .tm{grid-area:1/1}
+.arow{grid-template-columns:minmax(0,1fr) 6rem 11rem}
+.arow .h{grid-area:1/1}
+.arow .ab{grid-area:1/2}
+.arow .at{grid-area:1/3}
 .memories{grid-template-columns:repeat(auto-fill,minmax(18rem,1fr));gap:1rem}
 .chips{flex-wrap:wrap;overflow-x:visible}
 .kpis{grid-template-columns:repeat(5,1fr);gap:1rem}
@@ -1505,6 +1512,52 @@ ${transcriptCard(view)}
     { "set-cookie": cookies, "content-security-policy": SCRIPT_CSP },
     status,
   );
+};
+
+// How many published pages the tab draws. The listing is newest first, so the cap holds the page
+// to a bounded number of rows however many an account has published, and the count beside the
+// heading still reads the whole shelf.
+export const ARTIFACTS_SHOWN = 200;
+
+// What the tab has to show. A deployment naming no artifact hostname publishes nothing at all,
+// which is a different answer from an account that has published nothing yet; the page says which
+// rather than drawing the same empty shelf for both.
+export type Published = { kind: "off" } | { kind: "pages"; pages: Artifact[]; total: number };
+
+const ARTIFACT_HEAD =
+  '<li class="srow arow lhead" aria-hidden="true"><span>Page</span><span class="r">Size</span><span class="r">Published</span></li>';
+
+// A page answers on the artifact hostname, behind its own Access application, so it opens in a tab
+// of its own rather than taking the dashboard's.
+const artifactRow = (artifact: Artifact): string =>
+  `<li class="srow arow"><p class="h"><b><a href="${escapeHtml(artifact.url)}" target="_blank" rel="noreferrer">${escapeHtml(artifact.name)}</a></b></p>
+<p class="smeta"><span class="ab">${kb(artifact.bytes)}</span><span class="at">${escapeHtml(moment(artifact.updatedAt))}</span></p></li>`;
+
+export const artifactsPage = (email: string, live: Live, published: Published): Response => {
+  if (published.kind === "off") {
+    return shell(
+      email,
+      ARTIFACTS_TAB,
+      live,
+      ARTIFACTS_TAB.label,
+      "not enabled",
+      `<div class="notice"><b>This deployment publishes no pages.</b>
+<p>It names no artifact hostname, so there is no second host to serve a page from and nothing here to browse. Naming one and deploying turns publishing on.</p></div>`,
+    );
+  }
+  const { pages, total } = published;
+  const capped =
+    total > pages.length
+      ? `<p class="callout">${escapeHtml(`The newest ${pages.length} of ${total} are listed.`)}</p>`
+      : "";
+  const main =
+    total === 0
+      ? emptyState(
+          "No page is published yet.",
+          "Publish one with recall publish, and it lands here with the address it answers on.",
+        )
+      : `<ol class="sessions" role="list">${ARTIFACT_HEAD}${pages.map(artifactRow).join("")}</ol>${capped}`;
+  return shell(email, ARTIFACTS_TAB, live, ARTIFACTS_TAB.label, `${total} ${total === 1 ? "page" : "pages"}`, main);
 };
 
 const labelRows = (kind: LabelKind, values: string[], names: Map<string, string>): string =>

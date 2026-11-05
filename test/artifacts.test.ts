@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { type Artifact, MAX_ARTIFACT_BYTES } from "../src/artifacts";
+import { DEVICE_CODE_LIMITS } from "../src/device";
 import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
+
+type Harness = Awaited<ReturnType<typeof harness>>;
 
 const PAGE = `<!doctype html><html lang="en"><head><title>burn-up</title><style>body{color:#0f0}</style></head>
 <body><h1>Burn-up</h1><img src="data:image/gif;base64,R0lGODlhAQABAAAAACw="><script>document.title="drawn"</script></body></html>`;
@@ -85,6 +88,45 @@ describe("the artifact hostname", () => {
 
     expect((await h.sendToArtifactHost("/burn-up", await h.assertionFor(bob, ARTIFACT_AUDIENCE))).status).toBe(404);
     expect((await h.sendToArtifactHost("/burn-up", assertion)).status).toBe(200);
+  });
+});
+
+const artifactsTab = async (h: Harness, assertion: string): Promise<string> => {
+  const response = await h.send("/dashboard/artifacts", { headers: { "cf-access-jwt-assertion": assertion } });
+  expect(response.status).toBe(200);
+  return response.text();
+};
+
+describe("the artifacts tab", () => {
+  it("lists the signed-in user's pages with the address each answers on, and no stranger's", async () => {
+    const { h, email, alice } = await publisher();
+    await alice.publish("burn-up", "<p>burn-up</p>");
+    await alice.publish("q3-report", PAGE);
+    const bob = `bob-${crypto.randomUUID()}@example.com`;
+    await h.invite(bob);
+    await h.clientWithToken(await h.login(bob)).publish("bobs-ledger", PAGE);
+
+    const html = await artifactsTab(h, await h.assertionFor(email));
+    expect(html).toContain(`href="https://${ARTIFACT_HOSTNAME}/burn-up"`);
+    expect(html).toContain(`href="https://${ARTIFACT_HOSTNAME}/q3-report"`);
+    expect(html).toContain("14 B");
+    expect(html).not.toContain("bobs-ledger");
+  });
+
+  it("tells a deployment that publishes no pages apart from an account that has published none", async () => {
+    const on = await harness();
+    const owner = `alice-${crypto.randomUUID()}@example.com`;
+    await on.invite(owner);
+    const empty = await artifactsTab(on, await on.assertionFor(owner));
+    expect(empty).toContain("No page is published yet.");
+    expect(empty).not.toContain("This deployment publishes no pages.");
+
+    const off = await harness("up", DEVICE_CODE_LIMITS, "off");
+    const elsewhere = `alice-${crypto.randomUUID()}@example.com`;
+    await off.invite(elsewhere);
+    const disabled = await artifactsTab(off, await off.assertionFor(elsewhere));
+    expect(disabled).toContain("This deployment publishes no pages.");
+    expect(disabled).not.toContain("No page is published yet.");
   });
 });
 

@@ -95,7 +95,11 @@ const USAGE_DELTA: Record<string, unknown> = {
   at: 1_700_000_060_000,
 };
 
-export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS) => {
+export const harness = async (
+  keys: "up" | "down" = "up",
+  deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS,
+  artifacts: "on" | "off" = "on",
+) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
   const { n, e } = await exportJWK(publicKey);
   if (!n || !e) throw new Error("the generated key has no RSA modulus");
@@ -108,11 +112,14 @@ export const harness = async (keys: "up" | "down" = "up", deviceCodeLimits: Devi
   const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
   const app = createApp({
     verify: accessVerifier(source, ISSUER, AUDIENCE),
-    artifactHost: {
-      hostname: ARTIFACT_HOSTNAME,
-      verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
-      bucket: env.ARTIFACTS,
-    },
+    artifactHost:
+      artifacts === "off"
+        ? null
+        : {
+            hostname: ARTIFACT_HOSTNAME,
+            verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
+            bucket: env.ARTIFACTS,
+          },
     embedder: wordEmbedder,
     deviceCodeLimits,
     now: () => clock,
