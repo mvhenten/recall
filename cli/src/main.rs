@@ -114,16 +114,50 @@ enum Command {
     },
     #[command(about = "Delete a memory")]
     Delete { name: String },
-    #[command(about = "Publish a self-contained HTML page and print the URL it answers on")]
+    #[command(about = "Publish an artifact and print the URL it answers on")]
     Publish {
-        #[arg(value_name = "FILE", help = "The HTML file to publish")]
-        file: PathBuf,
+        #[arg(
+            value_name = "FILE",
+            required = true,
+            help = "The files to publish, in track order for an audio artifact"
+        )]
+        files: Vec<PathBuf>,
         #[arg(
             long,
-            help = "Publish under this name, as a kebab-case slug; defaults to the file's own name, and an existing name is replaced"
+            help = "Publish under this name, as a kebab-case slug; defaults to the first file's own name"
         )]
         name: Option<String>,
+        #[arg(long = "type", default_value = "site", value_parser = ["site", "document", "audio"])]
+        kind: String,
+        #[arg(long, help = "The heading the artifact's page carries; defaults to its name")]
+        title: Option<String>,
+        #[arg(long, default_value = "", help = "A line under the title")]
+        description: String,
+        #[arg(long, default_value = "private", value_parser = ["private", "account"])]
+        read: String,
+        #[arg(long, default_value = "owner", value_parser = ["owner", "account"])]
+        write: String,
+        #[arg(long, help = "Replace an artifact already published under this name")]
+        replace: bool,
     },
+    #[command(about = "List the artifacts this account has published")]
+    Artifacts {
+        #[arg(value_name = "QUERY", help = "Match a name, a title or a description")]
+        query: Option<String>,
+        #[arg(long = "type", value_parser = ["site", "document", "audio"])]
+        kind: Option<String>,
+        #[arg(long, value_parser = ["newest", "name", "largest"])]
+        sort: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(
+            long,
+            help = "Take the artifacts published before they carried a type into the listing; run once per deployment"
+        )]
+        adopt: bool,
+    },
+    #[command(about = "Remove a published artifact and every one of its files")]
+    Unpublish { name: String },
     #[command(about = "Print the repo tag of the current directory")]
     Repo,
     #[command(about = "Sign this host in through the browser and store its device token")]
@@ -1052,12 +1086,75 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("deleted {name}");
             }
         }
-        Command::Publish { file, name } => {
-            let artifact = client()?.publish_file(&file, name.as_deref())?;
+        Command::Publish {
+            files,
+            name,
+            kind,
+            title,
+            description,
+            read,
+            write,
+            replace,
+        } => {
+            let first = files.first().context("name at least one file to publish")?;
+            let name = api::artifact_name(first, name.as_deref())?;
+            let artifact = client()?.publish(&api::PublishInput {
+                title: title.unwrap_or_else(|| name.clone()),
+                name,
+                kind,
+                description,
+                read,
+                write,
+                replace,
+                files,
+            })?;
             if cli.json {
                 print_json(&artifact)?;
             } else {
                 println!("{}", artifact.url);
+            }
+        }
+        Command::Artifacts {
+            query,
+            kind,
+            sort,
+            limit,
+            adopt,
+        } => {
+            let client = client()?;
+            if adopt {
+                let adopted = client.adopt_artifacts()?;
+                if cli.json {
+                    print_json(&serde_json::json!({ "adopted": adopted }))?;
+                } else {
+                    println!("adopted {adopted}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let page = client.artifacts(&api::ArtifactQuery {
+                query: query.unwrap_or_default(),
+                kind: kind.unwrap_or_default(),
+                sort: sort.unwrap_or_default(),
+                limit,
+            })?;
+            if cli.json {
+                print_json(&page)?;
+            } else {
+                print!("{}", markdown::render_artifacts(&page.artifacts));
+                if page.cut {
+                    println!("(the search matched more than this; add a word to narrow it)");
+                }
+            }
+        }
+        Command::Unpublish { name } => {
+            if !client()?.unpublish(&name)? {
+                eprintln!("recall: no artifact named {name}");
+                return Ok(ExitCode::from(1));
+            }
+            if cli.json {
+                print_json(&serde_json::json!({ "unpublished": name }))?;
+            } else {
+                println!("unpublished {name}");
             }
         }
     }

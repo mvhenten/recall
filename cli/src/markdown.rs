@@ -1,4 +1,4 @@
-use crate::api::{Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit};
+use crate::api::{Artifact, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit};
 use crate::sessions;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -129,6 +129,37 @@ pub fn render_list(memories: &[Memory]) -> String {
                 memory.description,
                 memory.tags.join(", "),
                 iso(memory.created_at)
+            )
+        })
+        .collect()
+}
+
+/// A size of a megabyte or more reads in MB to one decimal, the way the dashboard and the artifact
+/// pages print it, so one artifact never shows two different sizes.
+pub fn size(bytes: i64) -> String {
+    if bytes < 1_024 {
+        return format!("{bytes} B");
+    }
+    if bytes < 1_048_576 {
+        return format!("{} kB", (bytes as f64 / 1_024.0).round());
+    }
+    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+}
+
+pub fn render_artifacts(artifacts: &[Artifact]) -> String {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "- **{}** ({}) {} {} {} `r {} w {}`\n  {}\n",
+                artifact.name,
+                artifact.kind,
+                artifact.title,
+                size(artifact.bytes),
+                iso(artifact.updated_at),
+                artifact.read,
+                artifact.write,
+                artifact.url
             )
         })
         .collect()
@@ -379,6 +410,37 @@ mod tests {
                 body: "Body line\n".into(),
             }
         );
+    }
+
+    #[test]
+    fn prints_a_megabyte_or_more_in_mb_to_one_decimal() {
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(2_048), "2 kB");
+        assert_eq!(size(1_048_576), "1.0 MB");
+        assert_eq!(size(43_200_100), "41.2 MB");
+    }
+
+    #[test]
+    fn prints_a_row_per_artifact_with_its_type_size_time_and_permissions() {
+        let artifacts = [Artifact {
+            name: "panel-episode-12".into(),
+            url: "https://artifact.recall.test/panel-episode-12".into(),
+            kind: "audio".into(),
+            title: "Episode 12".into(),
+            description: "the panel on rollout".into(),
+            read: "account".into(),
+            write: "owner".into(),
+            file_count: 3,
+            bytes: 43_200_100,
+            created_at: 1_761_744_000_000,
+            updated_at: 1_761_744_000_000,
+            last_writer: "you@example.com".into(),
+        }];
+        assert_eq!(
+            render_artifacts(&artifacts),
+            "- **panel-episode-12** (audio) Episode 12 41.2 MB 2025-10-29T13:20:00Z `r account w owner`\n  https://artifact.recall.test/panel-episode-12\n"
+        );
+        assert_eq!(render_artifacts(&[]), "");
     }
 
     #[test]
