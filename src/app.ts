@@ -470,7 +470,7 @@ export const createApp = (deps: Deps): App => {
       const named = agentName(bite.text.slice(0, HEAD_BYTES));
       if (named !== "") await nameSession(env.DB, userId, sessionId, named);
     }
-    const chunks = chunkTurns(readTurns(bite.text));
+    const chunks = chunkTurns(readTurns(bite.text, MAIN_FILE));
     const indexed: IndexedChunk[] = [];
     for (let at = 0; at < chunks.length; at += EMBED_BATCH) {
       const batch = chunks.slice(at, at + EMBED_BATCH);

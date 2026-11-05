@@ -160,6 +160,44 @@ export interface Joined {
   remnant: string;
 }
 
+// How far the walk has got, and how much of it the reader can see. `shown` is what keeps the note
+// honest: a walk that read every byte and rendered no turn is the one answer the box must never
+// give as success, since an empty box under "the whole of it is here" leaves the reader unable to
+// tell an empty transcript from a broken page from the wrong file picked.
+export interface Walk {
+  file: string;
+  /// How many of the file's bytes the listing can read.
+  bytes: number;
+  /// How many of those have been read so far.
+  loaded: number;
+  /// How many turns stand in the box.
+  shown: number;
+  /// Bytes read since the last turn landed, and zero while the walk is still going.
+  dry: number;
+  /// Whether the walk has reached the start of the listing.
+  through: boolean;
+}
+
+const kb = (bytes: number): string => (bytes < 1_024 ? `${bytes} B` : `${Math.round(bytes / 1_024)} kB`);
+
+// What the box has to say for itself, so what the reader is told and what the reader can see
+// cannot disagree.
+export const walkNote = (walk: Walk): string => {
+  const whole = `The whole of ${walk.file} is here, ${kb(walk.bytes)} of it`;
+  if (walk.through) {
+    if (walk.shown > 0) return `${whole}.`;
+    return `${whole}, and none of it is prose this reader knows how to show, so the box above is empty.`;
+  }
+  const read = `${kb(walk.loaded)} of ${kb(walk.bytes)}`;
+  if (walk.shown === 0) {
+    return `${read} of ${walk.file} read, and none of it is prose this reader knows how to show, so the box above is still empty. Load earlier to keep reading.`;
+  }
+  if (walk.dry > 0) {
+    return `${read} read, and the last ${kb(walk.dry)} of it holds no prose at all. Load earlier to keep reading.`;
+  }
+  return `${read} read. Scroll up for more.`;
+};
+
 // The groups turned into text that parses. A batch starts wherever its budget ran out and not on a
 // line end, so the head of a group is a part line: it is held back and joined to the group fetched
 // after it. A group that begins where its run begins has nothing in front of it, so nothing is
