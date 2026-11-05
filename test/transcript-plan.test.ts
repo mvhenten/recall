@@ -35,7 +35,7 @@ describe("listing a file", () => {
   it("names every read of a file small enough to name, and counts the bytes that can be read", () => {
     const runs = [written(0, 3, 10), written(100, 2, 10)];
 
-    expect(listedRuns(runs)).toEqual({ runs, from: 0, bytes: 50 });
+    expect(listedRuns(runs)).toEqual({ runs, from: 0, readable: 50 });
     expect(gapsIn(listedRuns(runs))).toEqual({ bytes: 70, places: 1 });
   });
 
@@ -52,7 +52,7 @@ describe("listing a file", () => {
 
     expect(listing.runs).toHaveLength(1);
     expect(listing.runs.reduce((all, one) => all + one.reads.length, 0)).toBe(MAX_PLANNED_READS);
-    expect(listing).toMatchObject({ from: 500, bytes: MAX_PLANNED_READS * 10 });
+    expect(listing).toMatchObject({ from: 500, readable: MAX_PLANNED_READS * 10 });
     // What it left off is not a hole in the archive, and is not reported as one.
     expect(gapsIn(listing)).toEqual({ bytes: 0, places: 0 });
   });
@@ -62,7 +62,7 @@ describe("listing a file", () => {
 
     expect(listing.runs).toHaveLength(1);
     expect(listing.runs[0]).toMatchObject({ from: 200, to: (MAX_PLANNED_READS + 20) * 10 });
-    expect(listing).toMatchObject({ from: 200, bytes: MAX_PLANNED_READS * 10 });
+    expect(listing).toMatchObject({ from: 200, readable: MAX_PLANNED_READS * 10 });
   });
 });
 
@@ -156,20 +156,13 @@ describe("saying how the walk went", () => {
 
 describe("saying what following has to say", () => {
   // A reader who has scrolled back is not carried to the foot of the box, so the line is the only
-  // thing that can tell them the session has said something since.
-  it("counts the turns that landed below a reader who has scrolled back", () => {
+  // thing that can tell them the session has said something since; a session that has ended says
+  // so, rather than leaving a box that simply stops moving; and a reader at the foot watching
+  // turns arrive is told nothing at all.
+  it("counts what landed below a reader, and gives way to the end of the session", () => {
     expect(tailNote({ newer: 1, ended: false })).toBe("1 newer turn has arrived below.");
-    expect(tailNote({ newer: 3, ended: false })).toBe("3 newer turns have arrived below.");
-  });
-
-  it("says a followed session has ended, so a box that stops moving is not read as a broken one", () => {
-    expect(tailNote({ newer: 0, ended: true })).toBe("This session has ended, so nothing more will arrive.");
     expect(tailNote({ newer: 2, ended: true })).toBe("2 newer turns have arrived below.");
-  });
-
-  // Nothing to say is said with nothing, so the line under the box is not there at all while a
-  // reader at the foot is watching turns arrive.
-  it("says nothing of a box at the foot of a session still writing", () => {
+    expect(tailNote({ newer: 0, ended: true })).toBe("This session has ended, so nothing more will arrive.");
     expect(tailNote({ newer: 0, ended: false })).toBe("");
   });
 });

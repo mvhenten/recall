@@ -141,6 +141,7 @@ import {
   writeChunks,
   writeLabels,
 } from "./store";
+import type { Reach } from "./transcript-plan";
 import {
   archivedFiles,
   archivedSince,
@@ -801,11 +802,11 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
-  // Whether anyone is still running the session, and the stretches of its file past the one the
-  // reader last took. A box following a live session beats against this, so it answers off the
-  // cheapest readings there are: the extent the storage event caches says whether the file has
-  // grown past where the reader has read, and a beat that finds it has not opens no object and
-  // lists nothing at all.
+  // Whether anyone is still running the session, and the stretches of its file around and past
+  // where the reader has read. A box following a live session beats against this, so it answers
+  // off the cheapest readings there are: the extent the storage event caches says whether the
+  // file has grown past where the reader has read, and a beat that finds it has not opens no
+  // object and lists nothing at all.
   //
   // That extent is a cache and lags the objects for as long as the event behind it is in flight,
   // so it is trusted to say a file has grown and never to say it has not. A session no event has
@@ -813,9 +814,9 @@ export const createApp = (deps: Deps): App => {
   // objects are listed regardless, so a reader is never left watching a box that beats on in
   // silence about a session writing away.
   //
-  // `from` is how far the reader has read and `after` the stretch it last took, because a
-  // listing is keyed by where a stretch starts and the two part company over one that straddles
-  // the reader's place in the file.
+  // `from` is how far the reader has read, and the only cursor there is: the listing reaches one
+  // stretch back from it so that a stretch straddling it, or written below a key already taken,
+  // is named too, and the reader reads forward from `from` across whatever comes back.
   //
   // Only the session's own file is followed. Every other file is a delegated turn, which derives
   // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
@@ -827,15 +828,14 @@ export const createApp = (deps: Deps): App => {
     if (file.value !== MAIN_FILE) return error(400, `only ${MAIN_FILE} is followed as it is written`);
     const from = parseChunkOffset(url.searchParams.get("from"));
     if (!from.ok) return error(400, from.error);
-    const after = parseChunkOffset(url.searchParams.get("after"));
-    if (!after.ok) return error(400, after.error);
     const [mark, device] = await Promise.all([
       indexMark(env.DB, userId, session.value),
       liveSessionDevice(env.DB, userId, session.value, deps.now()),
     ]);
     const grown = mark === null || mark.archived > from.value;
-    const runs = grown ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, after.value) : [];
-    return json({ running: device !== null, runs }, 200, { "cache-control": "no-store" });
+    const runs = grown ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value) : [];
+    const reach: Reach = { running: device !== null, runs };
+    return json(reach, 200, { "cache-control": "no-store" });
   };
 
   // One session the dashboard can read and talk to. The page is reached by clicking a row of the

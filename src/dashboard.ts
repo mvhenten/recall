@@ -39,7 +39,7 @@ import {
   usageMonth,
 } from "./model";
 import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE } from "./page";
-import { gapsIn, type Listing, listedRuns, type Run } from "./transcript-plan";
+import { type Follow, gapsIn, type Listing, listedRuns, type Plan, type Run } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
 import { MAIN_FILE } from "./transcripts";
 
@@ -1451,7 +1451,7 @@ const trimNote = (listing: Listing, bytes: number): string =>
 // whether one is holding it is the fact the beat itself answers with, so the page that starts
 // following and the beat that ends it cannot disagree about what live means. Only the session's
 // own file keeps an extent cheap enough to beat against.
-const followOf = (view: SessionView, file: string, bytes: number): { from: number; every: number } | null =>
+const followOf = (view: SessionView, file: string, bytes: number): Follow | null =>
   view.deviceId !== null && file === MAIN_FILE ? { from: bytes, every: TRANSCRIPT_FOLLOW_MS } : null;
 
 const transcriptCard = (view: SessionView): string => {
@@ -1475,10 +1475,10 @@ const transcriptCard = (view: SessionView): string => {
     );
   }
   const listing = listedRuns(held.runs);
-  const plan = {
+  const plan: Plan = {
     path: `${sessionPath(id)}/${TRANSCRIPT_SEGMENT}`,
     file: held.file,
-    bytes: listing.bytes,
+    readable: listing.readable,
     step: TRANSCRIPT_STEP_BYTES,
     runs: listing.runs,
     follow: followOf(view, held.file, held.bytes),

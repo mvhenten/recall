@@ -11,41 +11,20 @@
 // asking how far the file now reaches, and reads forward from where it has got to. The beat runs
 // on the client and nothing on the server ever goes looking for a session to follow.
 
-import type { Run } from "../src/transcript-plan";
 import {
   type Fetched,
   followedBatch,
   followedTexts,
   groupedReads,
   joinedTexts,
+  type Plan,
   type PlannedRead,
   plannedBatch,
+  type Reach,
   tailNote,
   walkNote,
 } from "../src/transcript-plan";
 import { readTurns, type Turn } from "../src/turns";
-
-// Where the box starts following a file still being written, and how often it beats.
-interface Follow {
-  from: number;
-  every: number;
-}
-
-interface Plan {
-  path: string;
-  file: string;
-  bytes: number;
-  step: number;
-  runs: Run[];
-  follow: Follow | null;
-}
-
-// What the server says of a file still being written: whether anyone is still running the
-// session, and the stretches past the one the box last took.
-interface Reach {
-  running: boolean;
-  runs: Run[];
-}
 
 // How many batches in a row may come back with no prose in them before the reader stops and says
 // so. A transcript is mostly machinery — tool calls, results, file snapshots — and a stretch of
@@ -57,11 +36,11 @@ const BLANK_STEPS = 4;
 // no longer showing what the session is saying, and a reader must not have to guess that.
 const FOLLOW_TRIES = 3;
 
-// The slowest the box beats. A session saying nothing says nothing for minutes at a time, and a
-// tab left open on one would otherwise ask thousands of times a day; each beat that brings no
-// bytes doubles the wait up to this, and the first that brings some puts it back to the pace the
-// page chose. A session being written to is followed at that pace throughout.
-const FOLLOW_SLOWEST_MS = 300_000;
+// The slowest the box beats. Each beat that brings no bytes doubles the wait up to this, and the
+// first that brings some puts it back to the pace the page chose. Only a tab someone is looking
+// at beats at all, so this is paid by a reader watching the box: a minute is as long as one may
+// be left waiting for a turn the archive already holds.
+const FOLLOW_SLOWEST_MS = 60_000;
 
 // How near the foot of the box counts as being at the foot. A reader watching the bottom is
 // carried along; a reader who has scrolled back is left exactly where they are.
@@ -114,17 +93,15 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
   let busy = false;
   let broken = false;
 
-  // The two forward cursors and what hangs off them. `at` is how far the file has been read to:
-  // it starts at the end of the manifest the page was handed, which is the first byte the
-  // backward walk will never read, so following can only ever add turns the box has not shown.
-  // `after` is where the last stretch taken begins, which is what a listing is keyed by, and it
-  // starts at the newest stretch the manifest names. `reaches` grows with the file, so the note
-  // counts against what the archive holds now rather than what it held when the page was drawn.
+  // The forward cursor and what hangs off it. `at` is how far the file has been read to: it
+  // starts at the end of the manifest the page was handed, which is the first byte the backward
+  // walk will never read, so following can only ever add turns the box has not shown. `reaches`
+  // grows with the file, so the note counts against what the archive holds now rather than what
+  // it held when the page was drawn.
   const following = plan.follow;
   const pace = following === null ? 0 : following.every;
   let at = following === null ? 0 : following.from;
-  let after = reads[reads.length - 1]?.offset ?? 0;
-  let reaches = plan.bytes;
+  let reaches = plan.readable;
   let trailing = "";
   let newer = 0;
   let ended = false;
@@ -316,14 +293,14 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
     lost(why, signedOut);
   };
 
-  // One beat. It asks what has landed since the stretch it last took, and reads forward only over
-  // what it has not read: nothing already on screen is fetched again, and the cursors move only
-  // by the bytes that came back. A batch is capped at the same step the backward walk takes, so a
-  // tab left hidden for an hour catches up over several beats rather than in one enormous read.
+  // One beat. It asks how the end of the file now lays out, and reads forward only over what it
+  // has not read: nothing already on screen is fetched again, and the cursor moves only by the
+  // bytes that came back. A batch is capped at the same step the backward walk takes, so a tab
+  // left hidden for an hour catches up over several beats rather than in one enormous read.
   const follow = async (): Promise<void> => {
     if (following === null || chasing || adrift) return;
     chasing = true;
-    const got = await asked(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}&after=${after}`, {}, at);
+    const got = await asked(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}`, {}, at);
     if (!got.ok) {
       chasing = false;
       missed(got.why, got.signedOut);
@@ -350,10 +327,13 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
     let walked = 0;
     for (const read of planned.batch) walked += read.bytes;
     at = planned.at;
-    after = planned.batch[planned.batch.length - 1]?.offset ?? after;
     reaches += walked;
     loaded += walked;
-    every = walked > 0 ? pace : Math.min(every * 2, FOLLOW_SLOWEST_MS);
+    // A batch cut off by its own budget leaves the box behind what the listing already named, so
+    // the next beat follows at once rather than waiting out a pace meant for a box that is level.
+    const listed = reach.runs[reach.runs.length - 1]?.to ?? at;
+    if (at < listed) every = 0;
+    else every = walked > 0 ? pace : Math.min(every * 2, FOLLOW_SLOWEST_MS);
 
     const joined = followedTexts(groupedReads(fetched), trailing);
     trailing = joined.remnant;

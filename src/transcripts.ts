@@ -9,7 +9,7 @@
 // derived from that key by the consumer the storage event wakes, and nothing derived is ever
 // asked a question the objects can answer, so a row that disagrees with them is wrong by
 // definition and is written over by the listing that found it out.
-import { MAX_PLANNED_READS, type Run } from "./transcript-plan";
+import type { Run } from "./transcript-plan";
 
 const OFFSET_DIGITS = 16;
 
@@ -219,32 +219,35 @@ export const archivedTranscript = async (
     .sort((left, right) => (left.file < right.file ? -1 : 1));
 };
 
-// How one file lays out past the stretch a reader has taken, for a box following a session still
-// writing it. The listing starts at the key after that stretch rather than at the head of the
-// prefix, so a beat costs a page of whatever has landed since the reader last asked and never
-// grows with the length of the session.
+// How many keys one beat of a following box lists. A truncated listing is already the right
+// answer: the reader takes what its own step allows and comes straight back for the rest, so a
+// tab that woke to a day of writing catches up over several beats rather than being handed
+// thousands of reads it has no budget to fetch.
+const TAIL_LISTED_KEYS = 1_000;
+
+// How one file lays out around and past where a reader has read to, for a box following a session
+// still writing it. The listing starts one stretch back from there rather than at the head of the
+// prefix, so a beat costs a page of what the end of the file now holds and never grows with the
+// length of the session.
 //
-// The cursor is the key of the last stretch taken and never how far into the file the reader has
-// read. The two part company over a stretch that begins before the reader's byte cursor and ends
-// past it: its unread tail is in no other object, and a listing keyed off bytes leaves it out and
-// steps over bytes that exist nowhere else. The caller reads forward from its own byte cursor
-// across whatever comes back, so a stretch it has already read part of costs it nothing.
-//
-// One page of keys and no more. A truncated listing is already the right answer: the reader takes
-// what its own step allows and comes straight back for the rest, so a tab that woke to a day of
-// writing catches up over several beats rather than being handed thousands of reads it has no
-// budget to fetch.
+// One stretch back and no further, because no stretch holds more than MAX_CHUNK_BYTES: a key
+// below that floor cannot reach past `from`, and every key that can is named however late it
+// lands. Two writers at one file reach different offsets at once, so a stretch is written below a
+// key the reader has already taken, and a listing keyed by that key would never name it again.
+// Keys the reader has read come back as well, and cost it nothing: it reads forward from its own
+// byte cursor across whatever comes back.
 export const archivedSince = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
-  after: number,
+  from: number,
 ): Promise<Run[]> => {
+  const floor = Math.max(0, from - MAX_CHUNK_BYTES);
   const page = await bucket.list({
     prefix: filePrefix(userId, sessionId, file),
-    startAfter: chunkKey(userId, sessionId, file, after),
-    limit: MAX_PLANNED_READS,
+    ...(floor === 0 ? {} : { startAfter: chunkKey(userId, sessionId, file, floor - 1) }),
+    limit: TAIL_LISTED_KEYS,
   });
   const found: Chunk[] = [];
   for (const object of page.objects) {

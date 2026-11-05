@@ -46,17 +46,18 @@ export interface Listing {
   /// front of the first run is a hole in the archive only when nothing was left off.
   from: number;
   /// How many of the file's bytes the listing can actually read, which is every byte of its runs
-  /// and none of the holes between them. It is what a reader counts up to, so a holed file reads
-  /// as finished when it is finished rather than stopping short for ever.
-  bytes: number;
+  /// and none of the holes between them. It is a count and never a place in the file: a reader
+  /// counts up to it, so a holed file reads as finished when it is finished rather than stopping
+  /// short for ever.
+  readable: number;
 }
 
-const readable = (runs: Run[]): number => runs.reduce((all, run) => all + run.to - run.from, 0);
+const readableIn = (runs: Run[]): number => runs.reduce((all, run) => all + run.to - run.from, 0);
 
 // The newest reads of a file, up to the ceiling, and where the listing begins.
 export const listedRuns = (runs: Run[]): Listing => {
   const total = runs.reduce((all, run) => all + run.reads.length, 0);
-  if (total <= MAX_PLANNED_READS) return { runs, from: 0, bytes: readable(runs) };
+  if (total <= MAX_PLANNED_READS) return { runs, from: 0, readable: readableIn(runs) };
   let drop = total - MAX_PLANNED_READS;
   const kept: Run[] = [];
   for (const run of runs) {
@@ -70,8 +71,33 @@ export const listedRuns = (runs: Run[]): Listing => {
     if (head === undefined) continue;
     kept.push({ from: head.offset + head.skip, to: run.to, reads });
   }
-  return { runs: kept, from: kept[0]?.from ?? 0, bytes: readable(kept) };
+  return { runs: kept, from: kept[0]?.from ?? 0, readable: readableIn(kept) };
 };
+
+// Where the box starts following a file still being written, and how often it beats. `from` is a
+// place in the file and never a count of bytes.
+export interface Follow {
+  from: number;
+  every: number;
+}
+
+// What the page hands the browser: the route a stretch is read off, the manifest the walk is
+// planned against, and where to pick a file still being written up from.
+export interface Plan {
+  path: string;
+  file: string;
+  readable: number;
+  step: number;
+  runs: Run[];
+  follow: Follow | null;
+}
+
+// What a beat is answered with: whether anyone is still running the session, and how the end of
+// its file lays out around and past where the reader has read.
+export interface Reach {
+  running: boolean;
+  runs: Run[];
+}
 
 export interface Gaps {
   bytes: number;
