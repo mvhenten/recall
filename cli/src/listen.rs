@@ -1,11 +1,11 @@
 use crate::adopt;
-use crate::api::{Client, Message};
+use crate::api::{Client, Kind, Message};
 use crate::config;
 use crate::seen::Seen;
 use crate::sessions;
 use crate::settings::Settings;
 use crate::transcripts;
-use crate::ws::{self, Ended};
+use crate::ws::{self, Ended, Reply};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::Serialize;
@@ -216,25 +216,35 @@ fn delivered_body(message: &Message) -> String {
     format!("{}\n{}", header(message), message.body)
 }
 
-async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
+/// News goes to every session on the host, as it always has. An order goes to one, and the
+/// receipt names it, so the mailbox can tell its sender who took it and hold the order back from
+/// every other session until that is settled.
+async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) -> Reply {
     let started = Instant::now();
     if seen.contains(&message.message_id) {
         log(&format!("message:replayed:{}", message.message_id), started.elapsed());
-        return;
+        return Reply::Ack;
     }
     let body = delivered_body(message);
+    match message.kind {
+        Kind::News => news(message, sessions_dir, seen, &body, started).await,
+        Kind::Order => order(message, sessions_dir, seen, &body, started).await,
+    }
+}
+
+async fn news(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) -> Reply {
     let (target, fanout) = if message.to_session_id.is_empty() {
         let now = Timestamp::now().as_millisecond();
-        let Some(fanout) = sessions::to_host(sessions_dir, &body, message.created_at, now).await else {
+        let Some(fanout) = sessions::to_host(sessions_dir, body, message.created_at, now).await else {
             seen.record(&message.message_id);
             log(&format!("message:retired:{}", message.message_id), started.elapsed());
-            return;
+            return Reply::Ack;
         };
         ("host".to_string(), fanout)
     } else {
         (
             format!("session:{}", message.to_session_id),
-            sessions::to_session(sessions_dir, &message.to_session_id, &body).await,
+            sessions::to_session(sessions_dir, &message.to_session_id, body).await,
         )
     };
     seen.record(&message.message_id);
@@ -245,13 +255,41 @@ async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) {
         ),
         started.elapsed(),
     );
+    Reply::Ack
+}
+
+async fn order(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) -> Reply {
+    let placed = if message.to_session_id.is_empty() {
+        let now = Timestamp::now().as_millisecond();
+        sessions::to_one(sessions_dir, body, message.created_at, now).await
+    } else {
+        sessions::to_one_session(sessions_dir, &message.to_session_id, body).await
+    };
+    let id = &message.message_id;
+    let (outcome, reply) = match placed {
+        sessions::Placed::Taken(session_id) => {
+            seen.record(id);
+            (format!("taken:{session_id}"), Reply::Took(session_id))
+        }
+        sessions::Placed::Refused => ("refused".to_string(), Reply::Silent),
+        sessions::Placed::Waiting => ("waiting".to_string(), Reply::Silent),
+        sessions::Placed::Retired => {
+            seen.record(id);
+            ("retired".to_string(), Reply::Ack)
+        }
+    };
+    log(
+        &format!("order:{}:{id}:{outcome}", message.from_device_id),
+        started.elapsed(),
+    );
+    reply
 }
 
 async fn session(url: &str, token: &str, sessions_dir: &Path, seen: &mut Seen) -> Result<Ended> {
     let mut socket = ws::connect(url, token).await?;
     log("listen:connected", Duration::ZERO);
     ws::pump(&mut socket, async |message: Message| {
-        deliver(&message, sessions_dir, seen).await;
+        deliver(&message, sessions_dir, seen).await
     })
     .await
 }
@@ -761,6 +799,7 @@ mod tests {
     fn the_header_answers_on_the_handle_and_falls_back_to_the_device_id() {
         let sent = |from_device_id: &str, from_host: &str, from_name: &str| Message {
             message_id: "m-1".to_string(),
+            kind: Kind::News,
             to_device_id: "d-2".to_string(),
             to_session_id: String::new(),
             from_device_id: from_device_id.to_string(),
@@ -795,6 +834,7 @@ mod tests {
     fn the_header_gives_a_dashboard_message_no_reply_address() {
         let sent = |from_device_id: &str, from_host: &str| Message {
             message_id: "m-2".to_string(),
+            kind: Kind::News,
             to_device_id: "d-2".to_string(),
             to_session_id: "s-9".to_string(),
             from_device_id: from_device_id.to_string(),

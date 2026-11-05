@@ -6,7 +6,7 @@ Per-user semantic memory for coding agents. recall keeps the notes an agent lear
 - A Cloudflare Worker stores each user's memories in D1, with an embedding per memory and a full-text index, and answers searches with both.
 - `recall mcp` serves the same operations as MCP tools over stdio, for any harness that speaks MCP.
 - A Claude Code plugin gives Claude the recall tools, adds matching memories to each prompt, and either syncs Claude's auto-memory files to recall or replaces auto-memory outright.
-- An opt-in add-on carries messages between the Claude Code sessions on the hosts signed in as you.
+- An opt-in add-on carries messages between the Claude Code sessions on the hosts signed in as you: news every session there reads, or an order one of them carries out.
 - A dashboard in the browser reads the same store: live sessions, the session history, one session's transcript, the memories and what the tokens cost, and it sends a session a message.
 
 ## Install
@@ -86,7 +86,7 @@ In Claude Code:
 
 The plugin starts `recall mcp` as an MCP server and adds four hooks. The hooks need `node` 22 or later; the hooks and the server find `recall` on `PATH` or in `~/.cargo/bin`.
 
-- The MCP server offers `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`. They scope and tag like the CLI, from the directory Claude Code runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`.
+- The MCP server offers `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`, plus `recall_send` and `recall_order` while messaging is on. They scope and tag like the CLI, from the directory Claude Code runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`.
 - Before a `Write` to an auto-memory file, it saves the content to recall under the file name as a kebab-case slug (`agent_dispatch.md` becomes `agent-dispatch`), with the same tag rules as below, and blocks the write so the local memory folder stops growing; Claude is told the memory is in recall and how to read or change it. When the save fails or takes over 5 seconds, the write goes ahead locally as a fallback and a message shows the first error line. An `Edit` or `MultiEdit` to a memory file is blocked with a pointer to `recall edit <name>`, and any write to `MEMORY.md` is blocked because recall finds memories by search, not by index.
 - After a `Write` or `Edit` to an auto-memory file (under `autoMemoryDirectory`, or `~/.claude/projects/*/memory/` when that is unset; `MEMORY.md` excluded), it runs `recall save` under the same slug of the file name. `user` and `feedback` memories are saved as global; `project` and `reference` memories get the repo tag of the session's directory, or `global` outside a repo. When the save fails, a message says the memory was saved locally but not synced.
 - On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. Up to three matches from other scopes follow under "In other scopes:", each with its tags. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
@@ -152,14 +152,32 @@ A Claude Code session on one host can message one session, or every session, run
 recall config set messaging.enabled true
 recall devices                                        # the host names you can address
 recall sessions                                       # the session handles you can address
-recall send desktop-9f8a "pull main and rerun the migration"
-recall send desktop "pull main and rerun the migration"
-recall send core "pull main and rerun the migration"   # the label the dashboard gave that host
+recall send desktop-9f8a "the build is green"
+recall send desktop "the build is green"
+recall send core "the build is green"                  # the label the dashboard gave that host
 echo "the build is green" | recall send desktop
+recall order core "pull main and rerun the migration"  # one session there, not all of them
 recall listen --status                                # who can receive here, and who cannot
 ```
 
 `<to>` is a session handle as `recall sessions` prints it, which reaches that one session, or a host, which reaches every live session on it and is named by its label, its device name or its device id. The message arrives as a user turn. Claude addresses the same hosts and sessions through the `recall_send` MCP tool, registered only while messaging is on; Claude Code's own cross-session tools see only the machine they run on, so `recall_send` is the only route to a session elsewhere.
+
+### News and orders
+
+`recall send` is news: every session the host has registered reads it. `recall order` is an instruction one of them carries out, and the other sessions there never see it. Use news to tell a host something and an order to have something done — a publish, a migration, a fleet update that is not idempotent — because news sent to a host running three sessions is three sessions each doing the work and each answering.
+
+```
+$ recall order core "pull main and rerun the migration"
+order 4f2c… taken by ip-10-0-7-31-9f8a on core
+```
+
+An order nobody took is an error, not a quiet success: the command says which of the three things happened — no host is listening as that device, the host is listening but no session has taken it yet, or the host took the order back because it has no session that can act on it — and exits non-zero. `recall_order` is the same verb as an MCP tool, and refuses with the same reason.
+
+The mailbox decides which kind a message is, once, at send time; a message's kind never changes afterwards. News is pushed to every socket the host has open and the host fans it out. An order is pushed to one socket and **leased** for 60 seconds, and no other socket sees it while that lease stands — not a second connection, not the same host reconnecting. The host picks one of its sessions, writes the order into it, and reports back which session took it; that releases the order and is what the sender is shown. A host that reports nothing — its chosen session died, or the socket dropped before the receipt landed — keeps nothing: the lease runs out and the order is offered again, to whichever session is listening then. Sixty seconds is ten of the five-second timeouts the host allows itself to write into a session, and it is also the ceiling of the daemon's reconnect backoff, so a host that died holding an order cannot be the one that hands it back.
+
+Redelivery is therefore expected, and an order can arrive twice. The daemon's `seen.json` suppresses a duplicate before it reaches a session and releases it, so a host that reported late runs the order once.
+
+The lease timer is a Durable Object alarm set to the earliest outstanding lease and re-armed whenever that changes, which is one event per expiry rather than a pass over the queue. Nothing here polls, scans or reconciles.
 
 A name or label two hosts answer to is refused, naming both, rather than resolved to one of them. Only the device id, which is unique, settles an address on its own.
 
@@ -171,7 +189,7 @@ A handle is the host's device name, a dash and the first four characters of the 
 
 The plugin runs the listener. At session start the hook writes `$XDG_RUNTIME_DIR/recall/sessions/<session-id>.json`, carrying the session's `state`, the pid of its Claude process and, when it registered, the inbox socket and token, then runs `recall listen --ensure`. That starts a background daemon unless one already holds an exclusive `flock` on `$XDG_RUNTIME_DIR/recall/listen.lock`; the daemon holding it names itself in `listen.pid`, so `recall update` can end the one it replaced. The daemon holds one WebSocket to the Worker, reconnects with a backoff that doubles from a second to a minute, and writes each message it receives into the inbox of the session it names, or, when it names the host, into every registered socket that was already running when the message was sent. Session end takes the registry file out, and the daemon exits once the registry has stood empty for five minutes; the next session start brings it back. Each thirty second tick also unlinks the record of any session whose Claude process is gone and tells the service that session is over, and takes on the running sessions no record describes. It writes its own `listen:…`, `message:…` and `sessions:…` lines to the hooks log.
 
-Delivery rides on Claude Code's cross-session inbox, which sits behind the server-side gate `agents_cross_session_inbox`. With the gate off, Claude sets no `CLAUDE_CODE_MESSAGING_SOCKET`, the hooks log one line and stop, and no listener ever starts, so a message sent to such a host does sit in the queue until it expires. Everywhere else the queue only holds a message until a listener attaches: it takes the whole backlog and acks it, so a message is acked whether or not a session took it. A message addressed to the host goes to the sessions that were already running when it was sent; when none of those is left it still goes to whoever is registered, as long as it was sent in the last ten minutes, and past that it is retired unread as `message:retired:…` rather than landing in a session that has no idea what it refers to. A message addressed to one session handle reaches that session or nobody.
+Delivery rides on Claude Code's cross-session inbox, which sits behind the server-side gate `agents_cross_session_inbox`. With the gate off, Claude sets no `CLAUDE_CODE_MESSAGING_SOCKET`, the hooks log one line and stop, and no listener ever starts, so a message sent to such a host does sit in the queue until it expires. Everywhere else the queue only holds a message until a listener attaches: it takes the whole backlog and acks it, so a message is acked whether or not a session took it. A message addressed to the host goes to the sessions that were already running when it was sent; when none of those is left it still goes to whoever is registered, as long as it was sent in the last ten minutes, and past that it is retired unread as `message:retired:…` rather than landing in a session that has no idea what it refers to. A message addressed to one session handle reaches that session or nobody. An order follows the same rule on which session is eligible, and picks one of them rather than all; it is logged as `order:…:taken:<session>`, `order:…:refused`, `order:…:waiting` or `order:…:retired`.
 
 `recall listen --status` says why. It prints whether messaging is on and whether a listener holds the lock, then one line per running session: the session id, its directory, and what the hook recorded — `registered` with the pid that receives, `off` for messaging being off, `no-inbox` for a session Claude gave no inbox, `adopted` for one read out of its transcript, or the error a failed registry write raised. A session leaves the list at session end, or on the next read once its Claude process is gone, so a crash leaves nothing behind. Add `--json` for the same report as a document; it carries no socket and no token.
 

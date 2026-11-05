@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const SEND_TOOL: &str = "recall_send";
+const ORDER_TOOL: &str = "recall_order";
 
 const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. Where the deployment hosts artifacts, recall_publish puts a site of self-contained HTML, a markdown document or a set of audio files at a URL the user can open.";
 
@@ -126,6 +127,17 @@ pub struct SendParams {
     pub to: String,
     /// The message to deliver there.
     pub message: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrderParams {
+    /// The host whose sessions compete for the order, named either by the label its owner gave it
+    /// or by the name recall devices shows. One session on it takes the order and the others never
+    /// see it. A session handle instead orders that one session.
+    pub to: String,
+    /// The instruction to carry out there.
+    pub order: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -341,6 +353,7 @@ impl Recall {
         let mut tool_router = Self::tool_router();
         if !messaging_enabled {
             tool_router.remove_route(SEND_TOOL);
+            tool_router.remove_route(ORDER_TOOL);
         }
         Recall { tool_router }
     }
@@ -447,11 +460,32 @@ impl Recall {
         blocking(move || {
             let client = client()?;
             let target = api::resolve_target(&client.devices()?, || client.sessions(), &params.to)?;
-            let sent = client.send(&target, &crate::sending_session(), &params.message)?;
+            let sent = client.send(&target, api::Kind::News, &crate::sending_session(), &params.message)?;
             to_json(&serde_json::json!({
-                "messageId": sent.message_id,
-                "toDeviceId": sent.to_device_id,
-                "toSessionId": sent.to_session_id,
+                "messageId": sent.message.message_id,
+                "toDeviceId": sent.message.to_device_id,
+                "toSessionId": sent.message.to_session_id,
+            }))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "recall_order",
+        description = "Give one Claude Code session on another host an instruction to carry out, and learn which session took it. Unlike recall_send, which every session on the host reads, an order is held by the one session that takes it, so a fleet instruction is run once per host instead of once per session. Name a host as recall devices shows it, or by its label. An order no session takes is an error saying so, and the order stays queued for ten minutes for a session to pick up."
+    )]
+    async fn order(&self, Parameters(params): Parameters<OrderParams>) -> Result<String, String> {
+        blocking(move || {
+            let client = client()?;
+            let target = api::resolve_target(&client.devices()?, || client.sessions(), &params.to)?;
+            let sent = client.send(&target, api::Kind::Order, &crate::sending_session(), &params.order)?;
+            let api::Outcome::Taken { session_id } = &sent.outcome else {
+                bail!("{}", crate::order_refusal(&sent, &params.to));
+            };
+            to_json(&serde_json::json!({
+                "messageId": sent.message.message_id,
+                "toDeviceId": sent.message.to_device_id,
+                "takenBy": session_id,
             }))
         })
         .await
@@ -640,7 +674,10 @@ mod tests {
     #[test]
     fn serves_recall_send_only_when_messaging_is_enabled() {
         assert!(names(true).contains(&SEND_TOOL.to_string()));
+        assert!(names(true).contains(&ORDER_TOOL.to_string()));
+        assert!(!names(false).contains(&ORDER_TOOL.to_string()));
         assert_eq!(required("recall_send"), ["message", "to"]);
+        assert_eq!(required("recall_order"), ["order", "to"]);
     }
 
     #[test]

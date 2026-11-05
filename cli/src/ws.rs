@@ -38,8 +38,30 @@ pub fn listen_url(endpoint: &str) -> Result<String> {
     Ok(format!("{scheme}://{rest}/v1/messages/listen"))
 }
 
+/// What this host sends back about a message it was handed. `Ack` releases it with nobody named,
+/// `Took` names the one session that has the order, and `Silent` leaves the mailbox holding it:
+/// the lease runs out and the order goes to whoever is listening then.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reply {
+    Ack,
+    Took(String),
+    Silent,
+}
+
 pub fn ack(message_id: &str) -> String {
     serde_json::json!({ "type": "ack", "messageId": message_id }).to_string()
+}
+
+pub fn took(message_id: &str, session_id: &str) -> String {
+    serde_json::json!({ "type": "took", "messageId": message_id, "sessionId": session_id }).to_string()
+}
+
+fn receipt(message_id: &str, reply: Reply) -> Option<String> {
+    match reply {
+        Reply::Ack => Some(ack(message_id)),
+        Reply::Took(session_id) => Some(took(message_id, &session_id)),
+        Reply::Silent => None,
+    }
 }
 
 pub fn parse_frame(raw: &str) -> Result<Incoming> {
@@ -70,10 +92,11 @@ pub async fn connect(url: &str, token: &str) -> Result<Socket> {
     Ok(socket)
 }
 
-/// Reads the mailbox until it closes, handing every message to `on_message` and acking it
-/// afterwards. A message that cannot be delivered is acked all the same: the mailbox has no
-/// other host to hand it to, so redelivery would only replay it into the same silence.
-pub async fn pump(socket: &mut Socket, mut on_message: impl AsyncFnMut(Message)) -> Result<Ended> {
+/// Reads the mailbox until it closes, handing every message to `on_message` and sending back the
+/// receipt it asks for. News that cannot be delivered is acked all the same: the mailbox has no
+/// other host to hand it to, so redelivery would only replay it into the same silence. An order
+/// the host could not place is left unanswered instead, and its lease hands it back.
+pub async fn pump(socket: &mut Socket, mut on_message: impl AsyncFnMut(Message) -> Reply) -> Result<Ended> {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.tick().await;
     let mut silent = false;
@@ -97,11 +120,14 @@ pub async fn pump(socket: &mut Socket, mut on_message: impl AsyncFnMut(Message))
                     continue;
                 };
                 let message_id = message.message_id.clone();
-                on_message(*message).await;
+                let reply = on_message(*message).await;
+                let Some(frame) = receipt(&message_id, reply) else {
+                    continue;
+                };
                 socket
-                    .send(Frame::text(ack(&message_id)))
+                    .send(Frame::text(frame))
                     .await
-                    .context("acking a message")?;
+                    .context("reporting on a message")?;
             }
             Frame::Close(Some(close)) if u16::from(close.code) == CLOSE_REVOKED => return Ok(Ended::Revoked),
             Frame::Close(_) => return Ok(Ended::Closed),
@@ -113,9 +139,11 @@ pub async fn pump(socket: &mut Socket, mut on_message: impl AsyncFnMut(Message))
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Kind;
     use tokio::net::TcpListener;
 
     const MESSAGE: &str = r#"{"type":"message","message":{"messageId":"m-1","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"ship it","createdAt":1,"expiresAt":2}}"#;
+    const ORDER: &str = r#"{"type":"message","message":{"messageId":"m-2","kind":"order","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"rerun the migration","createdAt":1,"expiresAt":2}}"#;
 
     #[test]
     fn the_endpoint_becomes_the_listen_url() {
@@ -171,14 +199,89 @@ mod tests {
             .await
             .unwrap();
         let mut delivered = Vec::new();
-        let ended = pump(&mut socket, async |message: Message| delivered.push(message.body))
-            .await
-            .unwrap();
+        let ended = pump(&mut socket, async |message: Message| {
+            delivered.push(message.body);
+            Reply::Ack
+        })
+        .await
+        .unwrap();
 
         assert!(matches!(ended, Ended::Closed));
         assert_eq!(delivered, vec!["ship it"]);
         let reply: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
         assert_eq!(reply, serde_json::json!({ "type": "ack", "messageId": "m-1" }));
+    }
+
+    /// An order the host placed comes back naming the one session that has it, which is what the
+    /// mailbox records and the sender is shown. An order the host could not place comes back as
+    /// nothing at all: the mailbox goes on holding it, and its lease is what offers it again.
+    #[tokio::test]
+    async fn an_order_reports_the_session_that_took_it_and_says_nothing_when_none_did() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Frame::text(ORDER)).await.unwrap();
+            socket.send(Frame::text(MESSAGE)).await.unwrap();
+            let mut replies = Vec::new();
+            while let Some(frame) = socket.next().await {
+                let Ok(Frame::Text(text)) = frame else { break };
+                replies.push(text.to_string());
+                if replies.len() == 2 {
+                    break;
+                }
+            }
+            socket.close(None).await.unwrap();
+            replies
+        });
+
+        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v1/messages/listen"), "t-token")
+            .await
+            .unwrap();
+        pump(&mut socket, async |message: Message| match message.kind {
+            Kind::Order => Reply::Took("s-9f8a".to_string()),
+            Kind::News => Reply::Ack,
+        })
+        .await
+        .unwrap();
+
+        let replies: Vec<Value> = server
+            .await
+            .unwrap()
+            .iter()
+            .map(|reply| serde_json::from_str(reply).unwrap())
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                serde_json::json!({ "type": "took", "messageId": "m-2", "sessionId": "s-9f8a" }),
+                serde_json::json!({ "type": "ack", "messageId": "m-1" }),
+            ]
+        );
+    }
+
+    /// A pump that answers nothing leaves the socket silent, so the mailbox holds the order and
+    /// the only thing that moves it is the lease running out.
+    #[tokio::test]
+    async fn an_order_the_host_could_not_place_sends_no_receipt_at_all() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Frame::text(ORDER)).await.unwrap();
+            let answered = tokio::time::timeout(Duration::from_millis(250), socket.next()).await;
+            socket.close(None).await.unwrap();
+            answered.is_ok()
+        });
+
+        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v1/messages/listen"), "t-token")
+            .await
+            .unwrap();
+        pump(&mut socket, async |_: Message| Reply::Silent).await.unwrap();
+
+        assert!(!server.await.unwrap(), "a silent reply writes nothing back");
     }
 
     #[tokio::test]
@@ -202,7 +305,7 @@ mod tests {
         let mut socket = connect(&format!("ws://127.0.0.1:{port}/v1/messages/listen"), "t-token")
             .await
             .unwrap();
-        let ended = pump(&mut socket, async |_: Message| ()).await.unwrap();
+        let ended = pump(&mut socket, async |_: Message| Reply::Ack).await.unwrap();
         assert!(matches!(ended, Ended::Revoked));
     }
 }

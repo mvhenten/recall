@@ -114,9 +114,10 @@ describe("messages", () => {
     await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
       for (let index = 0; index < MAX_QUEUED_MESSAGES; index += 1) {
         await mailbox.enqueue(
-          { toDeviceId: desktopId, toSessionId: "", fromSessionId: "", body: `queued ${index}` },
+          { kind: "news", toDeviceId: desktopId, toSessionId: "", fromSessionId: "", body: `queued ${index}` },
           { deviceId: desktopId, host: "desktop", name: "" },
           h.now(),
+          0,
         );
       }
     });
