@@ -735,8 +735,15 @@ impl transcripts::Store for Client {
         self.transcript_held(session_id)
     }
 
-    fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<transcripts::Appended> {
-        self.append_transcript(session_id, file, offset, bytes)
+    fn append(
+        &self,
+        session_id: &str,
+        file: &str,
+        from: i64,
+        through: i64,
+        bytes: &[u8],
+    ) -> Result<transcripts::Appended> {
+        self.append_transcript(session_id, file, from, through, bytes)
     }
 }
 

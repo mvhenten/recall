@@ -15,19 +15,24 @@
 // Nothing here touches a document or a network, so the whole of the arithmetic a wrong window
 // hides in is read and exercised on its own.
 
-// One ranged read of one stretch: which object to open, how much of its head to pass over, and
-// how many bytes to take. `skip` is zero for every stretch an archive wrote in order; it is other
-// than zero only where a stretch overlaps the one before it, and then it is what keeps the bytes
-// they share out of the file twice.
+// One ranged read of one stretch: which object to open, where that object's first byte falls in
+// the archive, how much of its head to pass over, and how many bytes to take. `at` names the
+// object and `offset` places it, and the two carry the same number only for a stretch stored
+// before a redacted stretch could run to another length than the file it was read from. `skip` is
+// zero for every stretch an archive wrote in order; it is other than zero only where a stretch
+// overlaps the one before it, and then it is what keeps the bytes they share out of the file twice.
 export interface Read {
+  at: string;
   offset: number;
   skip: number;
   bytes: number;
 }
 
 // One span of a file every byte of which sits in some object. Two stretches that meet exactly are
-// one run; a stretch that lands past the end of the one before it opens another, since the bytes
-// between them are in no object and the lines either side of the gap do not join up.
+// one run; a stretch stored past the end of what the archive accounts for opens another, since the
+// bytes between them are in no object and the lines either side of the gap do not join up. Only a
+// stretch keyed by one offset can land there: one keyed by both its ends is taken where the archive
+// reaches exactly the place in the file it begins at, so a file keyed that way is one run.
 export interface Run {
   from: number;
   to: number;
@@ -35,9 +40,10 @@ export interface Run {
 }
 
 // How many ranged reads a page is willing to name. The manifest is written into every view of the
-// page, at some forty bytes a read, and a session archived in small stretches holds tens of
-// thousands of them; past this the oldest are left off, rather than shipping a megabyte of
-// manifest to read a transcript nobody scrolls that far back through.
+// page, at some eighty-five bytes a read — a read names the stretch it opens, and a name is
+// thirty-three characters — and a session archived in small stretches holds tens of thousands of
+// them; past this the oldest are left off, rather than shipping a megabyte of manifest to read a
+// transcript nobody scrolls that far back through.
 export const MAX_PLANNED_READS = 500;
 
 export interface Listing {
@@ -75,7 +81,8 @@ export const listedRuns = (runs: Run[]): Listing => {
 };
 
 // Where the box starts following a file still being written, and how often it beats. `from` is a
-// place in the file and never a count of bytes.
+// place in the archive — the end of the manifest the page was handed — and never a place in the
+// file: the two part company the moment a stretch redacts to another length than its span.
 export interface Follow {
   from: number;
   every: number;
@@ -146,7 +153,7 @@ export const plannedBatch = (reads: PlannedRead[], edge: number, pending: number
     const read = reads[at - 1];
     if (read === undefined) break;
     const take = Math.min(left, budget);
-    batch.unshift({ run: read.run, offset: read.offset, skip: read.skip + left - take, bytes: take });
+    batch.unshift({ run: read.run, at: read.at, offset: read.offset, skip: read.skip + left - take, bytes: take });
     budget -= take;
     left -= take;
     if (left === 0) {
@@ -210,7 +217,7 @@ export const followedBatch = (runs: Run[], from: number, step: number): Followed
       if (ends <= at) continue;
       if (budget <= 0) return { batch, at };
       const begins = Math.max(at, read.offset + read.skip);
-      batch.push({ run: index, offset: read.offset, skip: begins - read.offset, bytes: ends - begins });
+      batch.push({ run: index, at: read.at, offset: read.offset, skip: begins - read.offset, bytes: ends - begins });
       budget -= ends - begins;
       at = ends;
     }

@@ -15,8 +15,15 @@ import {
   type Walk,
   walkNote,
 } from "../src/transcript-plan";
+import { legacyStretchName } from "../src/transcripts";
 
-const read = (run: number, offset: number, skip: number, bytes: number): PlannedRead => ({ run, offset, skip, bytes });
+const read = (run: number, offset: number, skip: number, bytes: number): PlannedRead => ({
+  run,
+  at: legacyStretchName(offset),
+  offset,
+  skip,
+  bytes,
+});
 
 const got = (planned: PlannedRead[], texts: string[]): Fetched[] =>
   planned.map((one, index) => ({ ...one, text: texts[index] ?? "" }));
@@ -28,7 +35,12 @@ const run = (from: number, to: number): Run => ({ from, to, reads: [] });
 const written = (from: number, stretches: number, bytes: number): Run => ({
   from,
   to: from + stretches * bytes,
-  reads: Array.from({ length: stretches }, (_, index) => ({ offset: from + index * bytes, skip: 0, bytes })),
+  reads: Array.from({ length: stretches }, (_, index) => ({
+    at: legacyStretchName(from + index * bytes),
+    offset: from + index * bytes,
+    skip: 0,
+    bytes,
+  })),
 });
 
 describe("listing a file", () => {
@@ -192,7 +204,7 @@ describe("following a file still being written", () => {
   });
 
   it("takes only the unread tail of a stretch the cursor sits inside", () => {
-    const runs: Run[] = [{ from: 0, to: 140, reads: [{ offset: 0, skip: 0, bytes: 140 }] }];
+    const runs: Run[] = [{ from: 0, to: 140, reads: [{ at: legacyStretchName(0), offset: 0, skip: 0, bytes: 140 }] }];
 
     expect(followedBatch(runs, 100, 1_000)).toEqual({ batch: [read(0, 0, 100, 40)], at: 140 });
   });

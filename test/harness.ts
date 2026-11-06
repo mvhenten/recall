@@ -89,12 +89,29 @@ export interface Client {
   search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
-  archive(sessionId: string, file: string, offset: number, body: BodyInit): Promise<Response>;
+  /// One stretch of a file no secret was taken out of, so the span of the file it accounts for is
+  /// its own length.
+  archive(sessionId: string, file: string, from: number, body: string | Uint8Array): Promise<Response>;
+  /// One stretch that accounts for a span of the file its own bytes do not run to, which is every
+  /// stretch a secret was taken out of.
+  archiveSpan(
+    sessionId: string,
+    file: string,
+    from: number,
+    through: number,
+    body: string | Uint8Array,
+  ): Promise<Response>;
+  /// One stretch as a host from before redaction offers it: one offset, meaning a place in the
+  /// archive and in the file at once.
+  archiveLegacy(sessionId: string, file: string, offset: number, body: string | Uint8Array): Promise<Response>;
   transcript(sessionId: string): Promise<Response>;
   readTranscript(sessionId: string, file: string): Promise<Response>;
   session(target: string): Promise<Response>;
   searchSessions(query: string, limit?: number): Promise<Response>;
 }
+
+const held = (body: string | Uint8Array): number =>
+  typeof body === "string" ? new TextEncoder().encode(body).byteLength : body.byteLength;
 
 const SESSION_DOCUMENT: Record<string, unknown> = {
   host: "laptop",
@@ -346,7 +363,20 @@ export const harness = async ({
       usage(sessionId, fields = {}) {
         return request("POST", `/v1/sessions/${sessionId}/usage`, { ...USAGE_DELTA, ...fields });
       },
-      archive(sessionId, file, offset, body) {
+      archive(sessionId, file, from, body) {
+        return this.archiveSpan(sessionId, file, from, from + held(body), body);
+      },
+      archiveSpan(sessionId, file, from, through, body) {
+        return send(
+          `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${from}&through=${through}`,
+          {
+            method: "PUT",
+            headers: { ...headers, "content-type": "application/x-ndjson" },
+            body,
+          },
+        );
+      },
+      archiveLegacy(sessionId, file, offset, body) {
         return send(`/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${offset}`, {
           method: "PUT",
           headers: { ...headers, "content-type": "application/x-ndjson" },

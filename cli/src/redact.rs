@@ -7,9 +7,10 @@
 //! it. A marker found inside a longer word is no marker at all: `task-7` is a branch, not a key.
 //!
 //! A match is written out as `[redacted:<kind>]`, which says what was there. That is shorter or
-//! longer than what it replaced, so the file on disk and the archive of it run to different
-//! lengths, and the caller carries its place in each. A placeholder is longer than most of what it
-//! stands in — twenty-eight bytes for an access key id's twenty — so a stretch read to the
+//! longer than what it replaced, so a stretch runs to a different length than the bytes it was
+//! read from, and every answer here says how many of those bytes it accounts for. A placeholder is
+//! longer than most of what it stands in — twenty-eight bytes for an access key id's twenty — so a
+//! stretch read to the
 //! largest body the caller may send can redact to more than that, and a caller says how much it
 //! can take rather than finding out from a service that refuses the body.
 //!
@@ -123,47 +124,6 @@ fn leading(next: Option<&Piece<'_>>) -> usize {
 /// pasted into one is written out as a placeholder like any other.
 pub fn text(line: &str) -> String {
     String::from_utf8_lossy(&redact(line.as_bytes(), None, true).bytes).into_owned()
-}
-
-/// Where the end of an archive falls in the stretch of the file that holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Place {
-    /// A byte written out as it was read, this many bytes into the stretch.
-    At(usize),
-    /// Inside a placeholder, which stands for bytes the archive never held, so no place in the
-    /// file answers for the end. `past` is where what the placeholder stood in ends, which is the
-    /// first place a reading can carry on from without writing out the rest of a secret the
-    /// archive holds the front of.
-    Within { past: usize },
-    /// Past everything the stretch writes out.
-    Beyond,
-}
-
-/// Where in the file the archive's end falls, for an end that lands inside a stretch rather than
-/// on the cut some pass made.
-pub fn source_of(input: &[u8], before: Option<u8>, whole: bool, archive: usize) -> Place {
-    let (pieces, _) = pieces(input, before, whole);
-    let mut at = 0;
-    let mut out = 0;
-    for piece in pieces {
-        match piece {
-            Piece::Kept(run) => {
-                if archive <= out + run.len() {
-                    return Place::At(at + archive - out);
-                }
-                at += run.len();
-                out += run.len();
-            }
-            Piece::Hidden { kind, span, .. } => {
-                if archive < out + hidden(kind) {
-                    return Place::Within { past: at + span };
-                }
-                at += span;
-                out += hidden(kind);
-            }
-        }
-    }
-    Place::Beyond
 }
 
 /// The run of a stretch that is written out, piece by piece, and where it is cut.
@@ -735,33 +695,6 @@ mod tests {
             "[redacted:private-key]\n",
             "and the pass that holds the whole block writes it out as one"
         );
-    }
-
-    #[test]
-    fn where_the_archive_ends_is_a_place_in_the_file_unless_it_falls_inside_a_secret() {
-        let line = b"id AKIAZZ7EXAMPLE9QTVB2 end\n";
-        let archive = redact(line, None, true).bytes;
-
-        assert_eq!(source_of(line, None, true, 0), Place::At(0));
-        assert_eq!(
-            source_of(line, None, true, 3),
-            Place::At(3),
-            "a byte sent as it was read is its own place"
-        );
-        assert_eq!(
-            source_of(line, None, true, 3 + hidden("aws-access-key-id")),
-            Place::At(3 + "AKIAZZ7EXAMPLE9QTVB2".len()),
-            "the end of a placeholder is the end of what it stood in"
-        );
-        assert_eq!(
-            source_of(line, None, true, 3 + hidden("aws-access-key-id") - 1),
-            Place::Within {
-                past: 3 + "AKIAZZ7EXAMPLE9QTVB2".len()
-            },
-            "and a place inside one is no place in the file, which the end of what it stood in is"
-        );
-        assert_eq!(source_of(line, None, true, archive.len()), Place::At(line.len()));
-        assert_eq!(source_of(line, None, true, archive.len() + 1), Place::Beyond);
     }
 
     #[test]

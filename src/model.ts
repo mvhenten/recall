@@ -1,4 +1,4 @@
-import { MAX_CHUNK_BYTES } from "./transcripts";
+import { isStretchName, MAX_STRETCH_BYTES } from "./transcripts";
 
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
 export const modes = ["hybrid", "vector", "text"] as const;
@@ -567,11 +567,45 @@ export const parseCountedFiles = (value: unknown): Parsed<string[]> => {
   return { ok: true, value: [...files] };
 };
 
-export const parseChunkOffset = (value: string | null): Parsed<number> => {
+export const parseStretchOffset = (value: string | null): Parsed<number> => {
   const offset = Number(value);
   return value !== null && value !== "" && isInteger(offset, 0, Number.MAX_SAFE_INTEGER)
     ? { ok: true, value: offset }
     : fail("offset must be a whole number of bytes into the file");
+};
+
+// Which stretch of a file a reader is asking for, named the way the archive stores it. It is the
+// name and never a place in the archive: where a redacted stretch sits there is the sizes of the
+// stretches in front of it, which the manifest the reader is reading against already said.
+export const parseStretchName = (value: string | null): Parsed<string> =>
+  value !== null && isStretchName(value)
+    ? { ok: true, value }
+    : fail("at must name a stretch, as <start> or <start>.<end> in sixteen digits each");
+
+// Which stretch a box following a file has read to the end of, and nothing when it has read nothing
+// of it. It is what bounds the listing a beat pays for: a stretch keyed by both its ends sits where
+// the sizes of the stretches in front of it put it, and this says which those are without the beat
+// listing them.
+export const parseStretchCursor = (value: string | null): Parsed<string> =>
+  value === null || value === "" || isStretchName(value)
+    ? { ok: true, value: value ?? "" }
+    : fail("after must name a stretch, as <start> or <start>.<end> in sixteen digits each");
+
+// Which stretch of a file an append is offering: where it begins in the file on disk, and where it
+// ends there. A host that names only `offset` is one from before a redacted stretch could run to
+// another length than the file it was read from, and means a place in the archive by it; its
+// stretches are stored and read back on those terms.
+export type StretchSpan = { kind: "source"; from: number; through: number } | { kind: "archive"; from: number };
+
+export const parseStretchSpan = (params: URLSearchParams): Parsed<StretchSpan> => {
+  const offset = parseStretchOffset(params.get("offset"));
+  if (!offset.ok) return offset;
+  const asked = params.get("through");
+  if (asked === null) return { ok: true, value: { kind: "archive", from: offset.value } };
+  const through = Number(asked);
+  return isInteger(through, offset.value + 1, offset.value + MAX_STRETCH_BYTES)
+    ? { ok: true, value: { kind: "source", from: offset.value, through } }
+    : fail(`through must be past offset, by at most ${MAX_STRETCH_BYTES} bytes`);
 };
 
 const BYTE_RANGE = /^bytes=([0-9]{1,16})-([0-9]{1,16})$/;
@@ -590,9 +624,9 @@ export const parseByteRange = (header: string | null): Parsed<ByteRange> => {
   const last = Number(found?.[2]);
   return found !== null &&
     isInteger(first, 0, Number.MAX_SAFE_INTEGER) &&
-    isInteger(last, first, first + MAX_CHUNK_BYTES - 1)
+    isInteger(last, first, first + MAX_STRETCH_BYTES - 1)
     ? { ok: true, value: { offset: first, length: last - first + 1 } }
-    : fail(`range must be bytes=<first>-<last>, spanning at most ${MAX_CHUNK_BYTES} bytes`);
+    : fail(`range must be bytes=<first>-<last>, spanning at most ${MAX_STRETCH_BYTES} bytes`);
 };
 
 const parseFocus = (value: unknown): Parsed<Focus> => {

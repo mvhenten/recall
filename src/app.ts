@@ -120,7 +120,6 @@ import {
   type MemoryType,
   type Parsed,
   parseByteRange,
-  parseChunkOffset,
   parseHistory,
   parseLabels,
   parseList,
@@ -131,6 +130,10 @@ import {
   parseSessionId,
   parseSessionScope,
   parseSessionSearch,
+  parseStretchCursor,
+  parseStretchName,
+  parseStretchOffset,
+  parseStretchSpan,
   parseTranscriptFile,
   parseUsage,
   type SaveInput,
@@ -266,18 +269,20 @@ import {
 } from "./tools";
 import type { Reach } from "./transcript-plan";
 import {
+  appendStretch,
   archivedFiles,
   archivedSince,
   archivedTranscript,
-  type Chunk,
-  cacheChunk,
+  cacheArchived,
+  legacyStretchName,
   MAIN_FILE,
-  MAX_CHUNK_BYTES,
-  parseChunkKey,
-  putChunk,
-  readChunk,
+  MAX_STRETCH_BYTES,
+  openStretch,
+  parseStretchKey,
+  putStretch,
   readStretch,
   readTranscript,
+  type Stretched,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
 
@@ -727,11 +732,10 @@ export const createApp = (deps: Deps): App => {
   // its own mark, so what the usage counter has read of the same file moves apart from it.
   //
   // The listing is counted off the objects, since a host deciding where to write next cannot be
-  // a second behind the archive. An append writes the object and nothing else: it claims no
-  // offset, so there is no second write to disagree with the first and nothing to give back when
-  // one fails, and where the file reaches afterwards is arithmetic rather than a read. The one
-  // append that costs a listing is the one beaten to its offset, which is told where the file
-  // reaches so it can carry on from there.
+  // a second behind the archive. An append is one read and one write and claims nothing: the read
+  // says how far into the file the archive reaches, the write lands only where the stretch begins
+  // exactly there, and how far the archive reaches afterwards is the stretch's own end. A writer
+  // beaten to the place is told the reach and carries on from it.
   const transcript = async (
     request: Request,
     url: URL,
@@ -758,14 +762,54 @@ export const createApp = (deps: Deps): App => {
         headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
       });
     }
-    const offset = parseChunkOffset(url.searchParams.get("offset"));
-    if (!offset.ok) return error(400, offset.error);
-    const tooLarge = error(413, `a transcript stretch must hold at most ${MAX_CHUNK_BYTES} bytes`);
-    if (Number(request.headers.get("content-length") ?? 0) > MAX_CHUNK_BYTES) return tooLarge;
+    const tooLarge = error(413, `a transcript stretch must hold at most ${MAX_STRETCH_BYTES} bytes`);
+    if (Number(request.headers.get("content-length") ?? 0) > MAX_STRETCH_BYTES) return tooLarge;
     const body = await request.arrayBuffer();
-    if (body.byteLength > MAX_CHUNK_BYTES) return tooLarge;
-    const end = await putChunk(env.TRANSCRIPTS, caller.userId, sessionId, file.value, offset.value, body);
-    if (end !== null) return json({ file: file.value, offset: end });
+    if (body.byteLength > MAX_STRETCH_BYTES) return tooLarge;
+    const span = parseStretchSpan(url.searchParams);
+    if (!span.ok) return error(400, span.error);
+    const asked = span.value;
+    // A host that named the span of the file its stretch accounts for is answered in places in
+    // that file; one that named an archive offset is answered in those. So the deploy that takes
+    // the span strands no host that has yet to learn to send one.
+    if (asked.kind === "source") {
+      const landed = await appendStretch(
+        env.TRANSCRIPTS,
+        caller.userId,
+        sessionId,
+        file.value,
+        asked.from,
+        asked.through,
+        body,
+      );
+      if (landed.kind === "refused") {
+        return json(
+          {
+            error: `the archive of ${file.value} reaches ${landed.through} bytes into the file; send the stretch starting there`,
+            through: landed.through,
+            named: landed.named,
+          },
+          409,
+        );
+      }
+      // How many bytes of the file the archive holds now, written down off the listing the append
+      // already paid for. The row is what a following box and the indexer are weighed against, so
+      // it goes down before the storage event wakes either of them.
+      if (file.value === MAIN_FILE) {
+        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived).run();
+      }
+      return json({ file: file.value, through: landed.through });
+    }
+    if (await putStretch(env.TRANSCRIPTS, caller.userId, sessionId, file.value, legacyStretchName(asked.from), body)) {
+      // The one offset this caller names is a place in the archive, so where its stretch ends is
+      // how many bytes of the file the archive holds — the one key form whose row needs no listing
+      // at all. It is folded in with MAX, so a stretch landing below one already there leaves the
+      // row where the further one put it.
+      if (file.value === MAIN_FILE) {
+        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength).run();
+      }
+      return json({ file: file.value, offset: asked.from + body.byteLength });
+    }
     const held = await archivedFiles(env.TRANSCRIPTS, caller.userId, sessionId);
     const reaches = held.find((archived) => archived.file === file.value)?.bytes;
     // The put was refused because an object already sits at that key, and the listing that found
@@ -1728,12 +1772,12 @@ export const createApp = (deps: Deps): App => {
     if (!session.ok) return error(400, session.error);
     const file = parseTranscriptFile(url.searchParams.get("file"));
     if (!file.ok) return error(400, file.error);
-    const at = parseChunkOffset(url.searchParams.get("at"));
+    const at = parseStretchName(url.searchParams.get("at"));
     if (!at.ok) return error(400, at.error);
     const asked = parseByteRange(request.headers.get("range"));
     if (!asked.ok) return error(416, asked.error);
     const { offset, length } = asked.value;
-    const object = await readChunk(env.TRANSCRIPTS, userId, session.value, file.value, at.value, { offset, length });
+    const object = await openStretch(env.TRANSCRIPTS, userId, session.value, file.value, at.value, { offset, length });
     if (object === null) {
       return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
     }
@@ -1762,9 +1806,12 @@ export const createApp = (deps: Deps): App => {
   // objects are listed regardless, so a reader is never left watching a box that beats on in
   // silence about a session writing away.
   //
-  // `from` is how far the reader has read, and the only cursor there is: the listing reaches one
-  // stretch back from it so that a stretch straddling it, or written below a key already taken,
-  // is named too, and the reader reads forward from `from` across whatever comes back.
+  // The cursor is where the reader has read to and the stretch it read to the end of, and the two
+  // come off the manifest the archive itself wrote: a read is taken whole, so `from` is always the
+  // end of the stretch `after` names. That pair is what bounds the listing a beat pays for — the
+  // page opens past `after` and its first object sits at `from` — so a beat over a session of ten
+  // thousand stretches costs what one over a session of ten costs. The reader reads forward from
+  // `from` across whatever comes back.
   //
   // Only the session's own file is followed. Every other file is a delegated turn, which derives
   // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
@@ -1774,14 +1821,18 @@ export const createApp = (deps: Deps): App => {
     const file = parseTranscriptFile(url.searchParams.get("file"));
     if (!file.ok) return error(400, file.error);
     if (file.value !== MAIN_FILE) return error(400, `only ${MAIN_FILE} is followed as it is written`);
-    const from = parseChunkOffset(url.searchParams.get("from"));
+    const from = parseStretchOffset(url.searchParams.get("from"));
     if (!from.ok) return error(400, from.error);
+    const after = parseStretchCursor(url.searchParams.get("after"));
+    if (!after.ok) return error(400, after.error);
     const [mark, device] = await Promise.all([
       indexMark(env.DB, userId, session.value),
       liveSessionDevice(env.DB, userId, session.value, deps.now()),
     ]);
     const grown = mark === null || mark.archived > from.value;
-    const runs = grown ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value) : [];
+    const runs = grown
+      ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value)
+      : [];
     const reach: Reach = { running: device !== null, runs };
     return json(reach, 200, { "cache-control": "no-store" });
   };
@@ -2775,43 +2826,44 @@ export const createApp = (deps: Deps): App => {
   };
 
   return {
-    // Everything the service derives from a stretch, done when the stretch lands. The storage
-    // event carries the object key, the key carries who wrote what where, and both the cache and
-    // the index are computed from that alone — never from what the consumer did last — so an
-    // event delivered twice writes the same rows and indexes nothing a second time.
+    // Indexing one session, done when a stretch of its own transcript lands. The storage event
+    // carries the object key, the key says which file of which session grew, and the index is
+    // then read off the objects of that file — never off what the consumer did last — so an event
+    // delivered twice indexes nothing a second time.
     //
-    // The cache goes down for the whole delivery in one batch; a D1 failure there fails the
-    // delivery and the retry writes the same rows again. Indexing is caught per session, and the
-    // messages that brought a session here are sent back for redelivery when it fails: a
-    // transcript the indexer cannot get through — a hole in the archive, an embedding call the
-    // model refuses — is tried again on its own while every other session's message acks.
+    // How many bytes of the file the archive holds is written by the append itself: a redacted
+    // stretch runs to another length than the file it was read from, so where it sits in the
+    // archive is the sizes of the stretches in front of it, and the append already paid for the
+    // listing that counts them. That leaves nothing here to count, and a beat of a following box
+    // costs one page of a listing however long the session has run.
+    //
+    // Indexing is caught per session, and the messages that brought a session here are sent back
+    // for redelivery when it fails: a transcript the indexer cannot get through — a hole in the
+    // archive, an embedding call the model refuses — is tried again on its own while every other
+    // session's message acks.
     async consume(env: AppEnv, delivered: readonly Delivered[]): Promise<void> {
-      const landed: Chunk[] = [];
-      const sessions = new Map<string, { chunk: Chunk; messages: Delivered[] }>();
+      const sessions = new Map<string, { stretch: Stretched; messages: Delivered[] }>();
       for (const message of delivered) {
         const event = isRecord(message.body) && isRecord(message.body.object) ? message.body.object : {};
-        const { key, size } = event;
-        const chunk = typeof key === "string" && typeof size === "number" ? parseChunkKey(key, size) : null;
-        if (chunk === null) {
+        const { key } = event;
+        const stretch = typeof key === "string" ? parseStretchKey(key) : null;
+        if (stretch === null) {
           console.error(JSON.stringify({ error: "no transcript stretch in this storage event", event: message.body }));
           message.ack();
           continue;
         }
-        landed.push(chunk);
-        if (chunk.file !== MAIN_FILE) continue;
-        const session = sessions.get(`${chunk.userId}/${chunk.sessionId}`);
-        if (session === undefined) sessions.set(`${chunk.userId}/${chunk.sessionId}`, { chunk, messages: [message] });
+        if (stretch.file !== MAIN_FILE) continue;
+        const session = sessions.get(`${stretch.userId}/${stretch.sessionId}`);
+        if (session === undefined)
+          sessions.set(`${stretch.userId}/${stretch.sessionId}`, { stretch, messages: [message] });
         else session.messages.push(message);
       }
-      if (landed.length === 0) return;
-      const cached = landed.flatMap((chunk) => cacheChunk(env.DB, chunk));
-      if (cached.length > 0) await env.DB.batch(cached);
-      for (const { chunk, messages } of sessions.values()) {
-        const caughtUp = await indexSession(env, chunk.userId, chunk.sessionId).catch((failure: unknown) => {
+      for (const { stretch, messages } of sessions.values()) {
+        const caughtUp = await indexSession(env, stretch.userId, stretch.sessionId).catch((failure: unknown) => {
           console.error(
             JSON.stringify({
               error: failure instanceof Error ? failure.message : String(failure),
-              indexing: chunk.sessionId,
+              indexing: stretch.sessionId,
               stack: failure instanceof Error ? failure.stack : "",
             }),
           );

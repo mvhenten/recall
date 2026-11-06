@@ -673,12 +673,21 @@ struct HistoryIds {
     next_cursor: String,
 }
 
-/// How far into one of a session's transcript files the service has been written. It is the only
-/// mark an archive resumes from, so nothing a host keeps locally can put the two out of step.
+/// One of a session's transcript files as the archive holds it: how many bytes of it are stored,
+/// how far into the file on disk those bytes reach, and whether every key behind that reach names
+/// both ends of the span of the file it holds. The first two differ because a stretch goes up
+/// redacted, and it is the second that an archive resumes from and a restore weighs a local file
+/// against, so nothing a host keeps locally can put the two out of step.
+///
+/// `named` reads as false where the service does not say, which leaves the reach unproven: the
+/// reading that stops rather than the one that writes a local transcript over.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeldFile {
     pub file: String,
     pub bytes: i64,
+    pub through: i64,
+    #[serde(default)]
+    pub named: bool,
 }
 
 #[derive(Deserialize)]
@@ -688,9 +697,14 @@ struct HeldFiles {
     counted: Vec<String>,
 }
 
+/// How far into one file the archive reaches, which is what an append answers with whether it
+/// landed or was beaten to the place it was offered at. A refusal says on which terms too: the
+/// writer that reached the place first may have been one whose key names a single offset.
 #[derive(Deserialize)]
 struct Extent {
-    offset: i64,
+    through: i64,
+    #[serde(default)]
+    named: bool,
 }
 
 /// The device a message is queued against, and the one session on it the message is for; an empty
@@ -1051,8 +1065,8 @@ impl Client {
         Ok(events.len())
     }
 
-    /// What the service holds of one session: how far into each transcript file it has been
-    /// written, counted off the stored objects, and which files have had their tokens counted. It
+    /// What the service holds of one session: how far into each transcript file the archive
+    /// reaches, counted off the stored objects, and which files have had their tokens counted. It
     /// answers only for a session the account already has on record. The count is a listing, so
     /// it is asked once per session and read from there.
     pub fn transcript_held(&self, session_id: &str) -> Result<crate::transcripts::Held> {
@@ -1066,19 +1080,38 @@ impl Client {
             .body_mut()
             .read_json()?;
         Ok(crate::transcripts::Held {
-            bytes: held.files.into_iter().map(|file| (file.file, file.bytes)).collect(),
+            reach: held
+                .files
+                .into_iter()
+                .map(|file| {
+                    (
+                        file.file,
+                        crate::transcripts::Reach {
+                            through: file.through,
+                            named: file.named,
+                        },
+                    )
+                })
+                .collect(),
             counted: held.counted.into_iter().collect(),
         })
     }
 
-    /// Appends one stretch to one of a session's transcript files and answers where the file
-    /// reaches once it is in. A stretch is stored under the offset it was sent at and only where
-    /// nothing is yet, so one already there — a retry, or another writer that reached the offset
-    /// first — is refused with where the file now reaches. That is the same answer: it is where
-    /// the next stretch goes.
-    pub fn append_transcript(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended> {
+    /// Appends one stretch to one of a session's transcript files and answers how far into the file
+    /// the archive reaches once it is in. A stretch is stored under the span of the file it
+    /// accounts for and only where nothing is yet, so one already there — a retry, or another
+    /// writer that reached the same place first — is refused with how far the archive now reaches.
+    /// That is the same answer: it is where the next stretch begins.
+    pub fn append_transcript(
+        &self,
+        session_id: &str,
+        file: &str,
+        from: i64,
+        through: i64,
+        bytes: &[u8],
+    ) -> Result<Appended> {
         let path = format!(
-            "{}/transcript?file={}&offset={offset}",
+            "{}/transcript?file={}&offset={from}&through={through}",
             Self::session_path(session_id),
             encode(file)
         );
@@ -1088,12 +1121,15 @@ impl Client {
             .send(bytes)?;
         if response.status().as_u16() == 409 {
             let extent: Extent = response.body_mut().read_json()?;
-            return Ok(Appended::Refused(extent.offset));
+            return Ok(Appended::Refused(crate::transcripts::Reach {
+                through: extent.through,
+                named: extent.named,
+            }));
         }
         let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
             .body_mut()
             .read_json()?;
-        Ok(Appended::Written(extent.offset))
+        Ok(Appended::Written(extent.through))
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {
