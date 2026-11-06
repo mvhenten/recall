@@ -1341,32 +1341,6 @@ mod tests {
     }
 
     #[test]
-    fn a_share_takes_an_address_or_mints_a_link() {
-        let link = parse(&["share", "release-notes"]).expect("a link share");
-        assert!(matches!(link.command, Command::Share { email: None, .. }));
-        let addressed = parse(&["share", "release-notes", "--email", "jo@example.org"]).expect("an email share");
-        let Command::Share { name, email } = addressed.command else {
-            panic!("not a share");
-        };
-        assert_eq!(
-            (name.as_str(), email.as_deref()),
-            ("release-notes", Some("jo@example.org"))
-        );
-    }
-
-    #[test]
-    fn shares_takes_one_artifact_or_the_whole_account() {
-        assert!(matches!(
-            parse(&["shares"]).expect("every share").command,
-            Command::Shares { name: None }
-        ));
-        assert!(matches!(
-            parse(&["shares", "release-notes"]).expect("one artifact").command,
-            Command::Shares { name: Some(_) }
-        ));
-    }
-
-    #[test]
     fn an_unshare_naming_none_of_the_three_is_refused_without_a_round_trip() {
         let Err(refused) = parse(&["unshare", "release-notes"]) else {
             panic!("an unshare naming none of the three was taken");

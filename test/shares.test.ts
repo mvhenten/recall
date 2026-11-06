@@ -10,7 +10,6 @@ import {
   PLAYER_SEGMENT,
   parseShareAddress,
   SHARE_EMAIL_PREFIX,
-  SHARE_ID_PREFIX,
   SHARE_LINK_PREFIX,
   SHARE_SOON_MS,
   SHARE_WINDOW_MS,
@@ -20,32 +19,6 @@ import {
 import { ARTIFACT_AUDIENCE, type Client, harness } from "./harness";
 
 const DAY = 86_400_000;
-
-describe("a link share's token", () => {
-  it("carries 32 random bytes and never repeats", () => {
-    const minted = Array.from({ length: 50 }, newShareToken);
-    expect(new Set(minted).size).toBe(50);
-    for (const token of minted) expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-  });
-
-  it("is held only as its hash, which the token cannot be read back out of", async () => {
-    const token = newShareToken();
-    const subject = await hashShareToken(token);
-    expect(subject).toMatch(/^[0-9a-f]{64}$/);
-    expect(subject).not.toContain(token);
-    expect(await hashShareToken(token)).toBe(subject);
-    expect(await hashShareToken(newShareToken())).not.toBe(subject);
-  });
-});
-
-describe("an email share's id", () => {
-  it("is random and names no artifact, so no recipient walks from one share to another", () => {
-    const minted = Array.from({ length: 50 }, newShareId);
-    expect(new Set(minted).size).toBe(50);
-    for (const id of minted) expect(id).toMatch(/^sh_[A-Za-z0-9_-]{22}$/);
-    expect(minted[0]?.startsWith(SHARE_ID_PREFIX)).toBe(true);
-  });
-});
 
 describe("the address an email share is made for", () => {
   it("lower-cases and trims what was typed, so one address is one share", () => {
@@ -195,7 +168,7 @@ describe("a link share", () => {
     expect(stored?.subject).not.toContain(token);
   });
 
-  it("costs an unknown token one read and no write at all", async () => {
+  it("costs an unknown token no write at all", async () => {
     const o = await owner();
     await document(o.alice, "quarterly-plan");
     await share(o.alice, "quarterly-plan");

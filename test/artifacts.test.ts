@@ -338,6 +338,7 @@ describe("the artifact hostname", () => {
     await alice.publishArtifact("empty-doc", { type: "document", files: [{ path: "empty.md", body: "" }] });
     const html = await (await h.sendToArtifactHost("/a/empty-doc", assertion)).text();
     expect(html).toContain("empty-doc holds no text.");
+    expect(html).toContain("Republish it with recall publish --replace");
     expect(html).toContain("?view=raw");
     expect(html).toContain(">Rendered<");
   });

@@ -181,8 +181,7 @@ import {
   createEmailShare,
   createLinkShare,
   decodeCursor,
-  deleteArtifactRow,
-  deleteArtifactShares,
+  deleteArtifactWithShares,
   deleteDeadEmailShare,
   deleteExpiredShare,
   deleteMemory,
@@ -1333,7 +1332,15 @@ export const createApp = (deps: Deps): App => {
       if (!address.ok) return kept({ flash: { tone: "refused", text: address.error }, emailDraft: typed });
       const addresses = shares.filter((share) => share.mode === "email");
       const renewing = addresses.some((share) => share.mode === "email" && share.address === address.value);
-      if (!renewing && addresses.length >= MAX_EMAIL_SHARES) return kept({});
+      if (!renewing && addresses.length >= MAX_EMAIL_SHARES) {
+        return kept({
+          flash: {
+            tone: "refused",
+            text: `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes, so ${address.value} was not shared.`,
+          },
+          emailDraft: typed,
+        });
+      }
       await deleteDeadEmailShare(db, userId, name, address.value, now);
       const made = await createEmailShare(db, {
         shareId: newShareId(),
@@ -1356,10 +1363,7 @@ export const createApp = (deps: Deps): App => {
         },
       });
     }
-    if (todo === "link") {
-      if (shares.some((share) => share.mode === "link")) return kept({ ask: { kind: "relink" } });
-      return mintedLink(false);
-    }
+    if (todo === "link") return mintedLink(false);
     if (todo === "relink") return mintedLink(true);
     if (todo === "extend") {
       const extended = await extendLinkShare(db, userId, name, now, expiresAt);
@@ -2013,10 +2017,9 @@ export const createApp = (deps: Deps): App => {
       await bucket.delete(legacy.key);
       return new Response(null, { status: 204 });
     }
-    await deleteArtifactRow(db, target.ownerUserId, name);
     // An unpublish takes every share on the name with it, so no share outlives the artifact it
     // grants read access to and a later publish of the same name cannot revive one.
-    await deleteArtifactShares(db, target.ownerUserId, name);
+    await deleteArtifactWithShares(db, target.ownerUserId, name);
     await deleteArtifactFiles(bucket, target.ownerUserId, name);
     return new Response(null, { status: 204 });
   };

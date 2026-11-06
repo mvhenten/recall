@@ -1503,9 +1503,14 @@ export const replaceArtifact = async (db: D1Database, commit: ArtifactCommit, fr
   return result.meta.changes > 0;
 };
 
-export const deleteArtifactRow = async (db: D1Database, userId: string, name: string): Promise<boolean> => {
-  const result = await db.prepare("DELETE FROM artifacts WHERE user_id = ?1 AND name = ?2").bind(userId, name).run();
-  return result.meta.changes > 0;
+// The artifact and every share on its name, in one batch: a failure between two statements would
+// leave shares keyed to a name no artifact holds, and a later publish of that name would revive
+// them.
+export const deleteArtifactWithShares = async (db: D1Database, userId: string, name: string): Promise<void> => {
+  await db.batch([
+    db.prepare("DELETE FROM artifacts WHERE user_id = ?1 AND name = ?2").bind(userId, name),
+    db.prepare("DELETE FROM artifact_shares WHERE user_id = ?1 AND name = ?2").bind(userId, name),
+  ]);
 };
 
 // Whether another account already publishes this name for the account to read. The hostname has no
@@ -1670,14 +1675,6 @@ export const recordShareUse = async (db: D1Database, shareId: string, at: number
 // renewal that landed in between is not thrown away.
 export const deleteExpiredShare = async (db: D1Database, shareId: string, at: number): Promise<void> => {
   await db.prepare("DELETE FROM artifact_shares WHERE share_id = ?1 AND expires_at <= ?2").bind(shareId, at).run();
-};
-
-export const deleteArtifactShares = async (db: D1Database, userId: string, name: string): Promise<number> => {
-  const result = await db
-    .prepare("DELETE FROM artifact_shares WHERE user_id = ?1 AND name = ?2")
-    .bind(userId, name)
-    .run();
-  return result.meta.changes;
 };
 
 // A dead share for the address about to be shared again, named by its full key. Without it the

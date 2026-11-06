@@ -83,16 +83,24 @@ pub struct Artifact {
     pub shares: Vec<Share>,
 }
 
-/// One grant of read access to one artifact. A link share carries no address: the token is printed
-/// once by the call that mints it and the service holds only its hash.
+/// Who one share admits, read straight off the `mode` the service discriminates its union on. A
+/// link share carries no address: the token is printed once by the call that mints it and the
+/// service holds only its hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum Audience {
+    Link,
+    Email { address: String },
+}
+
+/// One grant of read access to one artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Share {
-    pub mode: String,
+    #[serde(flatten)]
+    pub audience: Audience,
     pub share_id: String,
     pub name: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub address: String,
     pub created_at: i64,
     pub expires_at: i64,
     pub last_used_at: i64,
@@ -229,6 +237,10 @@ fn encode(value: &str) -> String {
 }
 
 const MAX_NAME_LENGTH: usize = 100;
+
+/// The cursor the service sends is what ends the walk through every share, so the walk is bounded
+/// rather than trusting it to empty.
+const MAX_SHARE_PAGES: usize = 100;
 
 /// The service names an artifact by a kebab-case slug of at most 100 characters: lower case, every run
 /// of anything else a single dash.
@@ -1146,7 +1158,7 @@ impl Client {
     pub fn every_share(&self) -> Result<Vec<Artifact>> {
         let mut shared: Vec<Artifact> = Vec::new();
         let mut cursor = String::new();
-        loop {
+        for _ in 0..MAX_SHARE_PAGES {
             let page = self.artifacts(&ArtifactQuery {
                 sort: "name".to_string(),
                 shares: true,
@@ -1163,6 +1175,7 @@ impl Client {
             }
             cursor = page.next_cursor;
         }
+        bail!("listing every share did not reach its last page in {MAX_SHARE_PAGES} reads");
     }
 
     pub fn unshare(&self, name: &str, scope: &Unshare) -> Result<Revoked> {
@@ -1271,6 +1284,22 @@ fn multipart(boundary: &str, manifest: &str, files: &[PublishFile]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_share_off_the_mode_the_service_discriminates_on() {
+        let listed: Shares = serde_json::from_str(
+            r#"{"shares":[
+                {"mode":"link","shareId":"sh_one","name":"release-notes","createdAt":1,"expiresAt":2,"lastUsedAt":1,"uses":0},
+                {"mode":"email","shareId":"sh_two","name":"release-notes","address":"jo@example.org","createdAt":1,"expiresAt":2,"lastUsedAt":1,"uses":3}
+            ]}"#,
+        )
+        .expect("the share listing");
+        let modes: Vec<&Audience> = listed.shares.iter().map(|share| &share.audience).collect();
+        assert!(
+            matches!(modes.as_slice(), [Audience::Link, Audience::Email { address }] if address == "jo@example.org")
+        );
+        assert_eq!(listed.shares[1].uses, 3);
+    }
 
     fn device(device_id: &str, name: &str) -> Device {
         Device {

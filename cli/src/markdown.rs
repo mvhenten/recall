@@ -1,4 +1,4 @@
-use crate::api::{Artifact, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit, Share};
+use crate::api::{Artifact, Audience, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit, Share};
 use crate::sessions;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -174,13 +174,12 @@ pub fn render_artifacts(artifacts: &[Artifact]) -> String {
         .collect()
 }
 
-/// A share's recipient: one named address, or the whole of who a link share admits. A link share
-/// holds no address field at all, so there is none to print by accident.
-fn recipient(share: &Share) -> String {
-    if share.mode == "link" {
-        return "anyone with the link".to_string();
+/// A share's mode and its recipient: one named address, or the whole of who a link share admits.
+fn admits(share: &Share) -> (&'static str, &str) {
+    match &share.audience {
+        Audience::Link => ("link", "anyone with the link"),
+        Audience::Email { address } => ("email", address),
     }
-    share.address.clone()
 }
 
 /// The fields one share row carries. `never opened` comes off the use count rather than off a
@@ -194,10 +193,11 @@ pub fn render_shares(shares: &[Share]) -> String {
             } else {
                 format!("{} opens, last {}", share.uses, iso(share.last_used_at))
             };
+            let (mode, recipient) = admits(share);
             format!(
                 "- **{}** ({}) created {} expires {} {}\n",
-                recipient(share),
-                share.mode,
+                recipient,
+                mode,
                 iso(share.created_at),
                 iso(share.expires_at),
                 opened
@@ -374,10 +374,9 @@ mod tests {
 
     fn link_share(name: &str, uses: i64) -> Share {
         Share {
-            mode: "link".into(),
+            audience: Audience::Link,
             share_id: "sh_one".into(),
             name: name.into(),
-            address: String::new(),
             created_at: 1_762_000_000_000,
             expires_at: 1_764_592_000_000,
             last_used_at: 1_762_000_000_000,
@@ -387,9 +386,10 @@ mod tests {
 
     fn email_share(name: &str, address: &str) -> Share {
         Share {
-            mode: "email".into(),
+            audience: Audience::Email {
+                address: address.into(),
+            },
             share_id: "sh_two".into(),
-            address: address.into(),
             ..link_share(name, 0)
         }
     }

@@ -2,7 +2,7 @@ import { type ArtifactFile, type ArtifactRecord, RAW_INLINE_BYTES } from "./arti
 import { ARTIFACT_PAGE_CSP, ARTIFACT_PLAYER_CSP, escapeHtml, htmlPage, sizeText, TOKENS } from "./page";
 import type { PlayerPlan } from "./player";
 import { PLAYER_SCRIPT } from "./player-view.generated";
-import { PLAYER_SEGMENT } from "./shares";
+import { FILE_SEGMENT, PLAYER_SEGMENT } from "./shares";
 
 // A document this long is not rendered: the bare address answers the raw view instead, and the
 // raw page names the ceiling, the document's own size and the fix. One constant, so changing the
@@ -199,18 +199,25 @@ const metaLine = (audience: Audience, record: ArtifactRecord, head: string): str
 const documentMeta = (record: ArtifactRecord, audience: Audience): string =>
   metaLine(audience, record, `${sizeText(entryOf(record).bytes)} · published ${moment(record.updatedAt)}`);
 
+const EMPTY_WHY =
+  "The markdown published under this name is empty. Republish it with recall publish --replace to fill it in, or read the raw view to see the file as it was published.";
+
+// A recipient cannot republish, so the copy names the one person who can do anything about it.
+const SHARED_EMPTY_WHY =
+  "The markdown published under this name is empty. Read the raw view to see the file as it was published, or ask whoever sent you this address about it.";
+
 // A document is recall's own HTML, rendered from the publisher's markdown, so it carries no script
 // at all and reads with scripts off. A document holding no text says so and keeps both view
 // controls, because the raw view's empty block is what proves the file was empty rather than the
 // renderer broken.
 export const documentPage = (record: ArtifactRecord, chrome: ArtifactChrome, rendered: string): Response => {
+  const { audience } = chrome;
   const main =
     rendered.trim() === ""
       ? `<div class="empty"><b>${escapeHtml(`${record.name} holds no text.`)}</b><p>${escapeHtml(
-          "The markdown published under this name is empty. Republish it with recall publish --replace to fill it in, or read the raw view to see the file as it was published.",
+          audience.kind === "recipient" ? SHARED_EMPTY_WHY : EMPTY_WHY,
         )}</p></div>`
       : `<div class="doc">${rendered}</div>`;
-  const { audience } = chrome;
   return page({
     title: record.title,
     badge: record.type,
@@ -239,7 +246,7 @@ export const rawDocumentPage = (
   const { audience } = chrome;
   const { bytes } = entry;
   const over = bytes > RENDER_CEILING_BYTES;
-  const address = `${chrome.base}/f/${entry.path}`;
+  const address = `${chrome.base}/${FILE_SEGMENT}/${entry.path}`;
   const notice = over
     ? `<div class="notice"><b>${escapeHtml("This document is too long to render.")}</b><p>${escapeHtml(
         `recall renders a document of up to ${sizeText(RENDER_CEILING_BYTES)} and this one is ${sizeText(bytes)}, so its address answers the raw view. Split it into smaller files and republish to read it rendered.`,

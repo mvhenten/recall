@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEVICE_CODE_LIMITS } from "../src/device";
+import type { PlayerPlan } from "../src/player";
 import { MAX_EMAIL_SHARES, SHARE_WINDOW_MS, type ShareView } from "../src/shares";
 import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
 
@@ -109,6 +110,9 @@ const mint = async (alice: Client, name: string, address?: string): Promise<Mint
 };
 
 const basePath = (address: string): string => new URL(address).pathname;
+
+// The whole address a minted link is printed on, read back off the one page that prints it.
+const linkPath = (html: string): string => /\/link\/[A-Za-z0-9_-]+/.exec(html)?.[0] ?? "";
 
 const read = (o: Owner, path: string, assertion: string | null = null): Promise<Response> =>
   o.h.sendToSharePrefix(path, assertion);
@@ -311,6 +315,63 @@ describe("the share page", () => {
     expect(page.html).not.toContain('class="snav"');
   });
 
+  it("mints an email share from the page, and refuses the twenty-first address out loud", async () => {
+    const o = await owner();
+    await publishDocument(o.alice, "quarterly-plan");
+
+    const made = await post(o, "quarterly-plan", { do: "email", address: "Jo@Example.org" });
+    expect(made.status).toBe(200);
+    expect(made.html).toContain("The share with jo@example.org is made. Send them this address.");
+    expect(made.html).toContain(`https://${ARTIFACT_HOSTNAME}/email/`);
+
+    for (let index = 1; index < MAX_EMAIL_SHARES; index += 1) {
+      await mint(o.alice, "quarterly-plan", `reader-${index}@example.com`);
+    }
+    const refused = await post(o, "quarterly-plan", { do: "email", address: "one-too-many@example.com" });
+    expect(refused.status).toBe(200);
+    expect(refused.html).toContain(
+      `quarterly-plan holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes, so one-too-many@example.com was not shared.`,
+    );
+    expect(refused.html).toContain('class="flash bad"');
+    expect(refused.html).toContain('value="one-too-many@example.com"');
+    expect(refused.html).not.toContain("is made");
+  });
+
+  it("replaces, extends and revokes a link from the page, and takes every share at once", async () => {
+    const o = await owner();
+    await publishDocument(o.alice, "release-notes");
+
+    const first = await post(o, "release-notes", { do: "link" });
+    const asked = await post(o, "release-notes", { do: "link" });
+    expect(asked.html).toContain("Replace the link share?");
+    expect(asked.html).not.toContain("/link/");
+
+    const replaced = await post(o, "release-notes", { do: "relink" });
+    expect(linkPath(replaced.html)).not.toBe(linkPath(first.html));
+    expect((await read(o, linkPath(first.html))).status).toBe(404);
+    expect((await read(o, linkPath(replaced.html))).status).toBe(200);
+
+    o.h.tick(SHARE_WINDOW_MS - 86_400_000);
+    expect((await sharePage(o, "release-notes")).html).toContain("1 day left");
+    const extended = await post(o, "release-notes", { do: "extend" });
+    expect(extended.html).toContain("The link share now stops working on");
+    expect(extended.html).not.toContain("day left");
+    expect((await read(o, linkPath(replaced.html))).status).toBe(200);
+
+    await mint(o.alice, "release-notes", "jo@example.org");
+    const page = await sharePage(o, "release-notes");
+    const linkShare = /\?revoke=(sh_[A-Za-z0-9_-]+)" aria-label="Revoke the link share"/.exec(page.html)?.[1] ?? "";
+    const revoked = await post(o, "release-notes", { do: "revoke", share: linkShare });
+    expect(revoked.html).toContain("The link share is revoked.");
+    expect(revoked.html).toContain("jo@example.org");
+    expect((await read(o, linkPath(replaced.html))).status).toBe(404);
+
+    const gone = await post(o, "release-notes", { do: "revoke-all" });
+    expect(gone.html).toContain("Every share on release-notes is revoked.");
+    expect(gone.html).toContain("release-notes is shared with nobody.");
+    expect(gone.html).not.toContain("jo@example.org");
+  });
+
   it("carries a share count on the Artifacts row that is itself the link to the share page", async () => {
     const o = await owner();
     await publishDocument(o.alice, "quarterly-plan");
@@ -431,6 +492,25 @@ describe("a page a recipient reaches", () => {
     const script = await read(o, `${base}/player.js`);
     expect(script.status).toBe(200);
     expect(script.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+
+    // The bundle builds each track's address itself, out of the plan's base and the file segment
+    // written out in browser/player.ts, so this plays the first track by fetching the address that
+    // line builds. The segment is spelled out here for the same reason it is spelled out there.
+    const plan: PlayerPlan = JSON.parse(/id="pplan">([^<]*)</.exec(html)?.[1] ?? "");
+    const track = await read(o, `${plan.base}/f/${plan.tracks[0]?.path}`);
+    expect(track.status).toBe(200);
+    expect(await track.text()).toBe("one");
+  });
+
+  it("tells a recipient of an empty document to ask the sender, never to republish it", async () => {
+    const o = await owner();
+    await o.alice.publishArtifact("empty-plan", { type: "document", files: [{ path: "empty.md", body: "" }] });
+    const base = basePath((await mint(o.alice, "empty-plan")).address);
+
+    const html = await (await read(o, base)).text();
+    expect(html).toContain("empty-plan holds no text.");
+    expect(html).toContain("ask whoever sent you this address about it");
+    expect(html).not.toContain("recall publish --replace");
   });
 
   it("answers one page for a dead share, with nothing to follow and no dashboard", async () => {

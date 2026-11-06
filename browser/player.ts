@@ -59,7 +59,8 @@ const boot = (parts: Parts, plan: PlayerPlan): void => {
   // A file answers under the file space of whatever base served the page, so the same line
   // addresses a track on an artifact's own page and on a shared one. The segment is written out
   // rather than imported from src/shares.ts, which would pull that module's dependencies into the
-  // bundle; it is FILE_SEGMENT there and is covered by the test that plays a shared track.
+  // bundle; it is FILE_SEGMENT there, and the test that plays a shared track fetches the address
+  // this line builds, so moving the segment fails that test rather than the player.
   const addressOf = (index: number): string => {
     const track = plan.tracks[index];
     if (track === undefined) throw new RangeError(`the player page names no track at ${index}`);
