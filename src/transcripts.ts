@@ -11,34 +11,51 @@
 // Where a stretch sits in the archive — the concatenation a reader of the file wants — is the
 // sizes of the stretches in front of it, counted off the same listing.
 //
-// A key of one segment is one written before redaction existed. A stretch then ran to exactly the
-// bytes it was read from, so its one offset named a place in the file and in the archive at once,
-// and `offset + size` named the end of both. Those keys are read on those terms for as long as
-// they are there; nothing rewrites them and nothing backfills them.
+// A key of one segment names one number, and what that number means depends on the host that wrote
+// it. Before redaction a stretch ran to exactly the bytes it was read from, so the one offset named
+// a place in the file and in the archive at once and `offset + size` named the end of both. v0.15.0
+// and v0.16.0 redacted and still wrote one offset, and there it is a place in the archive over a
+// body of another length than the span of the file it accounts for, so `offset + size` is no place
+// in the file at all. Those two releases must never be installed on a host: a host goes from 0.14.0
+// or earlier straight to the release that keys both ends.
 //
-// The object is the only write an append makes, and the key says everything about it: who, which
-// session, which file and where in it. Everything else the service holds about a transcript is
-// derived from that key by the consumer the storage event wakes, and nothing derived is ever
-// asked a question the objects can answer, so a row that disagrees with them is wrong by
-// definition and is written over by the listing that found it out.
+// So a reach resting on a key of one segment is handed over as what it is, and a host or a restore
+// told a number the file on disk disagrees with bails rather than reading on. Nothing rewrites those
+// keys and nothing backfills them.
+//
+// The key says everything about one object: who, which session, which file and where in it. An
+// append weighs its stretch against one listing of the file's prefix, and the one number worth
+// keeping off that listing — how many bytes of the session's own transcript the archive holds — is
+// written down beside the object rather than counted a second time by the consumer the storage
+// event wakes. Counting it there would have cost a listing of the whole prefix per stretch, which
+// is the length of the session; the price is a second write on the append path, and a row left
+// standing ahead of the objects where one of them is lost outright. Nothing derived is ever asked
+// a question the objects can answer, so every reading that must not lag lists them.
 import type { Run } from "./transcript-plan";
 
 const OFFSET_DIGITS = 16;
 
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
-export const MAX_CHUNK_BYTES = 1_048_576;
+export const MAX_STRETCH_BYTES = 1_048_576;
 
 // The name a session's own transcript is held under; mirrors MAIN in cli/src/transcripts.rs. Every
 // other name is a delegated turn, which the index never reads.
 export const MAIN_FILE = "main";
 
-export interface TranscriptFile {
+// How far into one file on disk the archive reaches, and whether every key behind that number
+// names both ends of the span it holds. One key of one segment anywhere behind the reach leaves it
+// unproven: only a host that did not redact meant a place in the file by such a number, and the
+// keys past it are read off where that one left the file. So the two are handed over said apart.
+export interface Extent {
+  through: number;
+  named: boolean;
+}
+
+export interface TranscriptFile extends Extent {
   file: string;
   /// How many bytes of this file the archive holds, which is the stretches it was written as laid
   /// end to end.
   bytes: number;
-  /// How far into the file on disk the archive reaches, which is where a host sends on from.
-  through: number;
 }
 
 const padded = (offset: number): string => String(offset).padStart(OFFSET_DIGITS, "0");
@@ -69,7 +86,7 @@ export interface Stretched {
   file: string;
 }
 
-export const parseChunkKey = (key: string): Stretched | null => {
+export const parseStretchKey = (key: string): Stretched | null => {
   const [userId, sessionId, file, name, ...rest] = key.split("/");
   if (userId === undefined || sessionId === undefined || file === undefined || name === undefined) return null;
   if (rest.length > 0 || userId === "" || sessionId === "" || file === "") return null;
@@ -82,18 +99,44 @@ interface Span {
   to: number;
 }
 
-// One stretch of one file: the name it is stored under, the span of the file it accounts for, and
-// the span of the archive its bytes occupy.
+// One stretch of one file: the name it is stored under, the span of the file it accounts for, the
+// span of the archive its bytes occupy, and whether its name said both ends of the first of those
+// or left it to be read off its own size.
 interface Stretch {
   name: string;
   source: Span;
   archive: Span;
+  named: boolean;
 }
 
-// How the stretches of one file lay out, in the order the file puts them. A one-segment name is
-// read on the terms it was written under: it names a place in the file and in the archive at once,
-// and the stretch runs to its own size in both, which is what lets one overlapping the stretch in
-// front of it be trimmed back to the bytes the file has not already had.
+// One object of one file's prefix, read off its name and its size and nothing else. It is the one
+// reading of a name there is: every layout below is handed these.
+interface Listed {
+  name: string;
+  size: number;
+  source: Span;
+  named: boolean;
+}
+
+const listedStretch = (name: string, size: number): Listed | null => {
+  const found = STRETCH_NAME.exec(name);
+  const opens = found?.[1];
+  if (opens === undefined) return null;
+  const from = Number(opens);
+  const end = found?.[2];
+  return {
+    name,
+    size,
+    source: { from, to: end === undefined ? from + size : Number(end) },
+    named: end !== undefined,
+  };
+};
+
+// How the stretches of one file lay out, in the order the file puts them, from `opens` in the
+// archive. A one-segment name is read on the terms it was written under: it names a place in the
+// file and in the archive at once, and the stretch runs to its own size in both, which is what
+// lets one overlapping the stretch in front of it be trimmed back to the bytes the file has not
+// already had.
 //
 // A two-segment name says where in the file the stretch begins and ends, and where it sits in the
 // archive is the sizes of the stretches in front of it. One of those cannot be trimmed: what it
@@ -101,46 +144,50 @@ interface Stretch {
 // two of them begin at one place — two writers that read the file at different instants, each told
 // the archive reached there — the longer is the one read and the other is passed over whole, which
 // leaves the archive accounting for every byte of the file exactly once.
-const laidOut = (listed: Array<{ name: string; size: number }>): Stretch[] => {
-  const parsed: Array<{ name: string; size: number; source: Span; named: boolean }> = [];
-  for (const object of listed) {
-    const found = STRETCH_NAME.exec(object.name);
-    const opens = found?.[1];
-    if (opens === undefined) continue;
-    const from = Number(opens);
-    const end = found?.[2];
-    parsed.push({
-      name: object.name,
-      size: object.size,
-      source: { from, to: end === undefined ? from + object.size : Number(end) },
-      named: end !== undefined,
-    });
-  }
-  parsed.sort((left, right) => left.source.from - right.source.from || right.source.to - left.source.to);
+//
+// The two forms share no scale, so a file that holds both is read on the later one's terms: once a
+// two-segment name has been seen, every one-segment name past it is passed over. Mixing them would
+// lay the same file out as runs with holes between them and place reads inside the wrong objects,
+// and nothing in the archive says which of two numbers at one place means which.
+const laidOut = (listed: Listed[], opens = 0): Stretch[] => {
+  const parsed = [...listed].sort(
+    (left, right) => left.source.from - right.source.from || right.source.to - left.source.to,
+  );
   const held: Stretch[] = [];
   let source = 0;
-  let archive = 0;
+  let archive = opens;
+  let spanned = false;
   for (const part of parsed) {
     if (!part.named) {
-      held.push({ name: part.name, source: part.source, archive: part.source });
+      if (spanned) continue;
+      held.push({ name: part.name, source: part.source, archive: part.source, named: false });
       source = Math.max(source, part.source.to);
       archive = Math.max(archive, part.source.to);
       continue;
     }
+    spanned = true;
     if (part.source.from < source) continue;
-    held.push({ name: part.name, source: part.source, archive: { from: archive, to: archive + part.size } });
+    held.push({
+      name: part.name,
+      source: part.source,
+      archive: { from: archive, to: archive + part.size },
+      named: true,
+    });
     source = part.source.to;
     archive += part.size;
   }
   return held;
 };
 
-const listedNames = async (bucket: R2Bucket, prefix: string): Promise<Array<{ name: string; size: number }>> => {
-  const found: Array<{ name: string; size: number }> = [];
+const listedNames = async (bucket: R2Bucket, prefix: string): Promise<Listed[]> => {
+  const found: Listed[] = [];
   let cursor: string | undefined;
   do {
     const page = await bucket.list({ prefix, cursor });
-    for (const object of page.objects) found.push({ name: object.key.slice(prefix.length), size: object.size });
+    for (const object of page.objects) {
+      const stretch = listedStretch(object.key.slice(prefix.length), object.size);
+      if (stretch !== null) found.push(stretch);
+    }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor !== undefined);
   return found;
@@ -148,7 +195,7 @@ const listedNames = async (bucket: R2Bucket, prefix: string): Promise<Array<{ na
 
 // The stretches one file was written as, laid out off one listing of its prefix.
 const stretches = (bucket: R2Bucket, userId: string, sessionId: string, file: string): Promise<Stretch[]> =>
-  listedNames(bucket, filePrefix(userId, sessionId, file)).then(laidOut);
+  listedNames(bucket, filePrefix(userId, sessionId, file)).then((listed) => laidOut(listed));
 
 const keyOf = (userId: string, sessionId: string, file: string, name: string): string =>
   `${filePrefix(userId, sessionId, file)}${name}`;
@@ -197,9 +244,12 @@ export interface Bite {
 // back for the rest. `through` always moves while stretches are left: a reader that takes it as
 // its mark cannot be handed the same bite twice, whatever the archive holds.
 //
-// A hole is a run of bytes no object covers, which is what a stretch sent past the end of the
-// file leaves behind. Those bytes exist nowhere, so the read steps over the hole to the next
-// stretch rather than reading across it as though the file ran on.
+// A hole is a run of bytes no object covers, which is what a stretch stored past the end of what
+// the archive accounts for leaves behind. A two-segment name lands only where the archive reaches
+// exactly the place in the file the stretch begins at, so a file keyed in that form holds no hole
+// and the step below is reached only by the one-segment form, where a key named a place nothing had
+// reached. Those bytes exist nowhere, so the read steps over the hole to the next stretch rather
+// than reading across it as though the file ran on.
 export const readStretch = async (
   bucket: R2Bucket,
   userId: string,
@@ -243,17 +293,33 @@ export const readStretch = async (
   return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
 };
 
-export interface ArchivedFile {
+export interface ArchivedFile extends Extent {
   file: string;
   bytes: number;
-  through: number;
   runs: Run[];
 }
+
+// How far into the file the stretches of it reach, and whether the key that said so named both
+// ends. One key of one segment anywhere behind the reach is enough to leave it unproven: the
+// number it names is a place in the file only if the host that wrote it did not redact, and the
+// keys past it are read off where that one left the file.
+const extentOf = (parts: Stretch[]): Extent =>
+  parts.reduce<Extent>(
+    (reach, part) => ({
+      through: Math.max(reach.through, part.source.to),
+      named: reach.named && part.named,
+    }),
+    { through: 0, named: true },
+  );
 
 // How one file lays out in the archive: the runs of it every byte of which sits in some object. A
 // run carries on while the next stretch is contiguous in the archive and in the file alike, since
 // a stretch that opens past where the file has been accounted for leaves bytes in no object and
 // the lines either side of that gap do not join up.
+//
+// That second reading is what the branch below trims an overlap against, and only the one-segment
+// form can reach it: a two-segment name lands where the archive reaches exactly the place in the
+// file it begins at, so two of those neither overlap nor leave a gap.
 const runsOf = (parts: Stretch[]): Run[] => {
   const runs: Run[] = [];
   let through = 0;
@@ -284,32 +350,37 @@ const runsOf = (parts: Stretch[]): Run[] => {
 
 const archivedFile = (file: string, parts: Stretch[]): ArchivedFile => {
   const runs = runsOf(parts);
-  return {
-    file,
-    bytes: runs[runs.length - 1]?.to ?? 0,
-    through: parts.reduce((furthest, part) => Math.max(furthest, part.source.to), 0),
-    runs,
-  };
+  return { file, bytes: runs[runs.length - 1]?.to ?? 0, ...extentOf(parts), runs };
 };
 
 // Every file a session archived and how each is laid out across objects, off one listing of the
 // session's prefix and nothing else. It opens no object: a reader hands this to the browser, which
 // fetches the bytes it wants against it.
+//
+// A listing of the session's prefix catches the objects of every file at once, so the name is read
+// here rather than under the file prefix: a key the archive did not write names no file and makes
+// none appear.
 export const archivedTranscript = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
 ): Promise<ArchivedFile[]> => {
   const prefix = sessionPrefix(userId, sessionId);
-  const byFile = new Map<string, Array<{ name: string; size: number }>>();
-  for (const object of await listedNames(bucket, prefix)) {
-    const [file, name, ...rest] = object.name.split("/");
-    if (file === undefined || file === "" || name === undefined || rest.length > 0) continue;
-    if (!isStretchName(name)) continue;
-    const held = byFile.get(file);
-    if (held === undefined) byFile.set(file, [{ name, size: object.size }]);
-    else held.push({ name, size: object.size });
-  }
+  const byFile = new Map<string, Listed[]>();
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor });
+    for (const object of page.objects) {
+      const [file, name, ...rest] = object.key.slice(prefix.length).split("/");
+      if (file === undefined || file === "" || name === undefined || rest.length > 0) continue;
+      const stretch = listedStretch(name, object.size);
+      if (stretch === null) continue;
+      const held = byFile.get(file);
+      if (held === undefined) byFile.set(file, [stretch]);
+      else held.push(stretch);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor !== undefined);
   return [...byFile]
     .map(([file, listed]) => archivedFile(file, laidOut(listed)))
     .sort((left, right) => (left.file < right.file ? -1 : 1));
@@ -321,22 +392,44 @@ export const archivedTranscript = async (
 const TAIL_LISTED_READS = 1_000;
 
 // How one file lays out past where a reader has read to, for a box following a session still
-// writing it. Where a stretch sits in the archive is the sizes of the stretches in front of it, so
-// the whole of the prefix is listed to place the end of it; what comes back is only the reads that
-// reach past the reader, and the oldest of those holds the bytes it wants next.
+// writing it. It is one page of the end of the prefix however long the file has run, so a beat
+// costs the same over a session of ten stretches and one of ten thousand.
 //
-// A read the reader is part way through comes back whole, so the stretch straddling its cursor is
-// named too: it reads forward from its own byte cursor across whatever comes back.
+// Where a two-segment stretch sits in the archive is the sizes of the stretches in front of it, so
+// a page that opens mid-file cannot place one on its own. The reader's cursor is what places it:
+// a read is taken whole or not at all, so `from` is always the end of some stretch, and `after`
+// names that stretch. The page starts past it and the first object in it opens at `from`. Both
+// numbers come off the manifest the archive itself wrote, so neither is the reader's arithmetic.
+//
+// A one-segment cursor is read on its own terms: the key names a place in the archive, so the page
+// reaches one stretch back from the reader instead — no stretch holds more than MAX_STRETCH_BYTES,
+// so a key below that floor cannot reach past the reader, and a stretch landing below a key the
+// reader has already taken, which only that form's writers can do, is named however late it lands.
 export const archivedSince = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
   from: number,
+  after: string,
 ): Promise<Run[]> => {
+  const prefix = filePrefix(userId, sessionId, file);
+  const spanned = after !== "" && listedStretch(after, 0)?.named === true;
+  const floor = spanned ? 0 : Math.max(0, from - MAX_STRETCH_BYTES);
+  const opens = spanned ? `${prefix}${after}` : `${prefix}${padded(floor - 1)}`;
+  const page = await bucket.list({
+    prefix,
+    limit: TAIL_LISTED_READS,
+    ...(spanned || floor > 0 ? { startAfter: opens } : {}),
+  });
+  const listed: Listed[] = [];
+  for (const object of page.objects) {
+    const stretch = listedStretch(object.key.slice(prefix.length), object.size);
+    if (stretch !== null) listed.push(stretch);
+  }
   const kept: Run[] = [];
   let budget = TAIL_LISTED_READS;
-  for (const run of runsOf(await stretches(bucket, userId, sessionId, file))) {
+  for (const run of runsOf(laidOut(listed, spanned ? from : 0))) {
     if (budget <= 0) break;
     const reads = run.reads.filter((read) => read.offset + read.skip + read.bytes > from).slice(0, budget);
     const head = reads[0];
@@ -351,7 +444,7 @@ export const archivedSince = async (
 // One stretch, opened by the name it is stored under and ranged by what the caller asked for.
 // Nothing is listed and nothing is parsed: a manifest already said which stretches a file holds,
 // and this hands back the bytes of one of them.
-export const readChunk = (
+export const openStretch = (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
@@ -379,7 +472,16 @@ export const putStretch = async (
   return written !== null;
 };
 
-export type Appended = { kind: "written"; through: number } | { kind: "refused"; through: number };
+export type Appended =
+  | {
+      kind: "written";
+      through: number;
+      /// How many bytes of the file the archive holds once this stretch is in it, which is the
+      /// count it held before plus the body just stored. The reach the stretch was weighed against
+      /// came off the same listing, so this costs no second one.
+      archived: number;
+    }
+  | ({ kind: "refused" } & Extent);
 
 // One stretch of a file, taken only where the archive reaches exactly the place in the file the
 // stretch begins at. Two writers read one file at different instants — a listener's beat and a
@@ -394,6 +496,11 @@ export type Appended = { kind: "written"; through: number } | { kind: "refused";
 // which is where its next stretch begins. Two appends whose listings both land before either write
 // leave one stretch read and the other passed over, and the next append from the writer that was
 // passed over is refused and told the reach, so the file comes back to one writer within a beat.
+//
+// The one listing answers both questions the append has: how far into the file the archive reaches,
+// which is what the stretch is weighed against, and how many bytes of the file it holds, which is
+// what the index and a following box are weighed against. The second is written down here rather
+// than counted again by the consumer the storage event wakes.
 export const appendStretch = async (
   bucket: R2Bucket,
   userId: string,
@@ -403,53 +510,38 @@ export const appendStretch = async (
   through: number,
   body: ArrayBuffer,
 ): Promise<Appended> => {
-  const reach = await archivedThrough(bucket, userId, sessionId, file);
-  if (reach !== from) return { kind: "refused", through: reach };
+  const parts = await stretches(bucket, userId, sessionId, file);
+  const reach = extentOf(parts);
+  if (reach.through !== from) return { kind: "refused", ...reach };
+  const runs = runsOf(parts);
   // A key already there names this same span of the same file, so the stretch is accounted for
-  // whichever writer put it there and the first to land is the one kept.
+  // whichever writer put it there and the first to land is the one kept. Both writers read the
+  // same bytes of the same file and redact them the same way, so the body is the same length
+  // either way and the count below holds whichever landed.
   await putStretch(bucket, userId, sessionId, file, stretchName(from, through), body);
-  return { kind: "written", through };
+  return { kind: "written", through, archived: (runs[runs.length - 1]?.to ?? 0) + body.byteLength };
 };
 
 // The one thing worth keeping off the objects: how many bytes of a session's own transcript the
-// archive holds. The indexer reads it on every pass and must not pay for a listing, and the
-// stretch that moved it is what wakes the indexer anyway. It is folded in with MAX, so an event
-// delivered twice, or behind one for a later stretch, leaves the row where the objects already put
-// it.
+// archive holds. The indexer reads it on every pass and must not pay for a listing, and the append
+// that moved it already paid for the listing that says it. It is folded in with MAX, so a write
+// that lands behind one for a later stretch leaves the row where the objects already put it.
 //
 // A delegated turn derives nothing — the index never reads one — so its stretch writes no row at
 // all. The archive answers for those files by listing them, which is the only reading that can
 // answer without lagging.
-export const cacheChunk = (db: D1Database, userId: string, sessionId: string, archived: number): D1PreparedStatement =>
+export const cacheArchived = (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  archived: number,
+): D1PreparedStatement =>
   db
     .prepare(
       `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)
        ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
     )
     .bind(userId, sessionId, archived);
-
-// How many bytes of one file the archive holds, counted off the objects. It is what the index and
-// a following box are weighed against, and a key and a size on their own cannot say it: an
-// object's place in the archive is the sizes of the objects in front of it.
-export const archivedBytes = async (
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-): Promise<number> => {
-  const runs = runsOf(await stretches(bucket, userId, sessionId, file));
-  return runs[runs.length - 1]?.to ?? 0;
-};
-
-// How far into one file on disk the archive reaches, counted off the keys. It is the one place a
-// host sends on from and the one a restore weighs a local file against.
-export const archivedThrough = async (
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-): Promise<number> =>
-  (await stretches(bucket, userId, sessionId, file)).reduce((furthest, part) => Math.max(furthest, part.source.to), 0);
 
 // How far into each of a session's files the archive reaches, counted off the objects and nothing
 // else. Every caller that acts on the answer reads it here — a host working out where to send the
@@ -458,5 +550,5 @@ export const archivedThrough = async (
 // short of one.
 export const archivedFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> =>
   (await archivedTranscript(bucket, userId, sessionId)).map(
-    ({ file, bytes, through }): TranscriptFile => ({ file, bytes, through }),
+    ({ file, bytes, through, named }): TranscriptFile => ({ file, bytes, through, named }),
   );

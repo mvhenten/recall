@@ -475,7 +475,14 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
         // adoption, so one here wrote the last of its files long ago and the end of each of them
         // is the end for good.
         for part in &session.parts {
-            let from = held.through.get(&part.source.file).copied().unwrap_or(0);
+            let from = held
+                .reach
+                .get(&part.source.file)
+                .copied()
+                .unwrap_or(transcripts::Reach {
+                    through: 0,
+                    named: true,
+                });
             done.bytes += transcripts::send_from(service, id, &part.source, from, Pass::Final)?.bytes;
         }
         sent(id, done);
@@ -617,12 +624,20 @@ mod tests {
     impl transcripts::Store for Fake {
         fn held(&self, session_id: &str) -> Result<transcripts::Held> {
             Ok(transcripts::Held {
-                through: self
+                reach: self
                     .reached
                     .borrow()
                     .iter()
                     .filter(|((held, _), _)| held == session_id)
-                    .map(|((_, file), through)| (file.clone(), *through))
+                    .map(|((_, file), through)| {
+                        (
+                            file.clone(),
+                            transcripts::Reach {
+                                through: *through,
+                                named: true,
+                            },
+                        )
+                    })
                     .collect(),
                 counted: self
                     .counted
@@ -646,7 +661,10 @@ mod tests {
             let mut reached = self.reached.borrow_mut();
             let at = reached.entry(held.clone()).or_default();
             if *at != from {
-                return Ok(transcripts::Appended::Refused(*at));
+                return Ok(transcripts::Appended::Refused(transcripts::Reach {
+                    through: *at,
+                    named: true,
+                }));
             }
             self.archive
                 .borrow_mut()

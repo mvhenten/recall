@@ -370,12 +370,20 @@ describe("the transcript bytes", () => {
   });
 });
 
-// One beat of a box following a session still being written. It carries the box's one cursor:
-// how far it has read the file to.
+// The stretch a reader standing at `from` read to the end of, which the browser carries beside its
+// byte cursor: a read is taken whole, so the cursor is always the end of one of them.
+const cursorOf = (plan: Plan, from: number): string => {
+  const held = plan.runs.flatMap((run) => run.reads).filter((read) => read.offset + read.skip + read.bytes <= from);
+  return held[held.length - 1]?.at ?? "";
+};
+
+// One beat of a box following a session still being written. It carries the box's cursor: how far
+// it has read the file to, and the stretch that place is the end of.
 const beatOf = (h: Harness, plan: Plan, from: number, assertion: string): Promise<Response> =>
-  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${from}`, {
-    headers: { "cf-access-jwt-assertion": assertion },
-  });
+  h.send(
+    `${plan.path}?file=${encodeURIComponent(plan.file)}&from=${from}&after=${encodeURIComponent(cursorOf(plan, from))}`,
+    { headers: { "cf-access-jwt-assertion": assertion } },
+  );
 
 // What the box puts on screen off one beat: the listing read forward from where the reader
 // stands, and the bytes of every read that plan names. A listing reaches back over stretches the
@@ -436,10 +444,10 @@ describe("following a transcript as it is written", () => {
     expect(caught.runs).toEqual([]);
   });
 
-  // The extent the beat reads is a cache the storage event keeps, and a session no event has ever
-  // landed for keeps no row at all. That never corrects itself, so the objects are listed
-  // regardless rather than answering "nothing new" for as long as the tab is open.
-  it("lists the objects for a session no storage event has cached", async () => {
+  // The extent the beat weighs the reader against is written by the append itself, off the listing
+  // it already paid for, so it is there before any storage event has been delivered and a box
+  // following a session is never told a file has not grown when it has.
+  it("lists the objects for a session no storage event has reached yet", async () => {
     const h = await harness();
     const you = await owner(h);
     const grew = transcriptOf(2);
@@ -449,7 +457,7 @@ describe("following a transcript as it is written", () => {
 
     const beat: Reach = await (await beatOf(h, plan, at, you.assertion)).json();
 
-    expect(await h.indexMark(you.userId, "beef0014")).toBeNull();
+    expect(await h.indexMark(you.userId, "beef0014")).toMatchObject({ archived: at + grew.length, bytes: 0 });
     expect(await followed(h, plan, beat, at, you.assertion)).toBe(grew);
   });
 

@@ -172,8 +172,9 @@ describe("indexing off the storage event", () => {
     expect(await h.chunks(userId, "s-aaa-poisoned")).toEqual([]);
   });
 
-  // A run of bytes no object covers, which is what a stretch written past the end of a file
-  // leaves behind, or an object the archive lost. Those bytes exist nowhere and never will.
+  // An object the archive lost. Its bytes exist nowhere and never will, and the row the appends
+  // wrote counts them, so the mark the indexer leaves stands short of it for good. The pass that
+  // finds nothing past where it has read stops rather than asking for those bytes on every event.
   it("steps over a stretch the archive lost rather than stalling on it", async () => {
     const h = await harness();
     const userId = `holed-${crypto.randomUUID()}`;
@@ -181,20 +182,24 @@ describe("indexing off the storage event", () => {
     await client.sync("s-holed");
     const head = named("nufogruzup") + about("the offset table");
     const lost = about("a stretch that never landed");
+    const tail = about("the labels tab");
     await client.archive("s-holed", "main", 0, head);
     await client.archive("s-holed", "main", bytes(head), lost);
-    await client.archive("s-holed", "main", bytes(head) + bytes(lost), about("the labels tab"));
+    await client.archive("s-holed", "main", bytes(head) + bytes(lost), tail);
     const keys = await env.TRANSCRIPTS.list({ prefix: `${userId}/s-holed/main/` });
     await env.TRANSCRIPTS.delete(keys.objects[1]?.key ?? "");
 
     await h.deliver();
 
     const mark = await h.indexMark(userId, "s-holed");
-    expect(mark?.bytes).toBe(mark?.archived);
-    const indexed = await h.chunks(userId, "s-holed");
-    expect(indexed.some((text) => text.includes("the offset table"))).toBe(true);
-    expect(indexed.some((text) => text.includes("the labels tab"))).toBe(true);
-    expect(indexed.some((text) => text.includes("never landed"))).toBe(false);
+    expect(mark?.bytes).toBe(bytes(head) + bytes(tail));
+    expect(mark?.archived).toBe(bytes(head) + bytes(lost) + bytes(tail));
+    const chunks = await h.chunks(userId, "s-holed");
+    await h.deliver();
+    expect(await h.chunks(userId, "s-holed")).toEqual(chunks);
+    expect(chunks.some((text) => text.includes("the offset table"))).toBe(true);
+    expect(chunks.some((text) => text.includes("the labels tab"))).toBe(true);
+    expect(chunks.some((text) => text.includes("never landed"))).toBe(false);
     expect((await hitsOf(await client.searchSessions("the labels tab")))[0]?.session.sessionId).toBe("s-holed");
   });
 });

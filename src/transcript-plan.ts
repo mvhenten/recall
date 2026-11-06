@@ -29,8 +29,10 @@ export interface Read {
 }
 
 // One span of a file every byte of which sits in some object. Two stretches that meet exactly are
-// one run; a stretch that lands past the end of the one before it opens another, since the bytes
-// between them are in no object and the lines either side of the gap do not join up.
+// one run; a stretch stored past the end of what the archive accounts for opens another, since the
+// bytes between them are in no object and the lines either side of the gap do not join up. Only a
+// stretch keyed by one offset can land there: one keyed by both its ends is taken where the archive
+// reaches exactly the place in the file it begins at, so a file keyed that way is one run.
 export interface Run {
   from: number;
   to: number;
@@ -38,9 +40,10 @@ export interface Run {
 }
 
 // How many ranged reads a page is willing to name. The manifest is written into every view of the
-// page, at some forty bytes a read, and a session archived in small stretches holds tens of
-// thousands of them; past this the oldest are left off, rather than shipping a megabyte of
-// manifest to read a transcript nobody scrolls that far back through.
+// page, at some eighty-five bytes a read — a read names the stretch it opens, and a name is
+// thirty-three characters — and a session archived in small stretches holds tens of thousands of
+// them; past this the oldest are left off, rather than shipping a megabyte of manifest to read a
+// transcript nobody scrolls that far back through.
 export const MAX_PLANNED_READS = 500;
 
 export interface Listing {
@@ -78,7 +81,8 @@ export const listedRuns = (runs: Run[]): Listing => {
 };
 
 // Where the box starts following a file still being written, and how often it beats. `from` is a
-// place in the file and never a count of bytes.
+// place in the archive — the end of the manifest the page was handed — and never a place in the
+// file: the two part company the moment a stretch redacts to another length than its span.
 export interface Follow {
   from: number;
   every: number;

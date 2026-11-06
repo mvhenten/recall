@@ -22,6 +22,14 @@
 //! than the bytes it was read from — but every position either side names a place in the file on
 //! disk, so there is nothing to map and nothing to read the file twice for.
 //!
+//! That holds only of a key that names both ends. v0.15.0 and v0.16.0 redacted and still stored a
+//! stretch under one offset, which there is a place in the archive, so a reach read off one of
+//! those keys is no place in the file and reading the file at it would leave the bytes between in
+//! no object at all. The service says which keys a reach rests on and a pass weighs the unproven
+//! kind against the file before it reads anything at it, so that reach stops the pass rather than
+//! moving it. Those two releases must never be installed on a host: a host goes from 0.14.0 or
+//! earlier straight to the release that keys both ends.
+//!
 //! A stretch of a file of turns is cut back to the last complete line it holds, the way
 //! `hooks/usage.mjs` cuts the same files, so a record half written is never sent as the half of it
 //! this host can see and a secret half written is never sent as the half of itself that is not one
@@ -51,9 +59,9 @@ pub const MAIN: &str = "main";
 /// under the path that turn reads.
 pub const TOOL_RESULT: &str = "tool-results.";
 
-/// The largest stretch one call carries; mirrors MAX_CHUNK_BYTES in src/transcripts.ts. A
+/// The largest stretch one call carries; mirrors MAX_STRETCH_BYTES in src/transcripts.ts. A
 /// transcript of any size goes up as a run of these rather than in one body.
-pub const MAX_CHUNK: usize = 1_048_576;
+pub const MAX_STRETCH: usize = 1_048_576;
 
 const NEWLINE: u8 = b'\n';
 
@@ -197,24 +205,38 @@ pub fn sources(transcript: &Path) -> Result<Sources> {
     Ok(found)
 }
 
+/// How far into one file on disk the archive reaches, and whether every key behind that number
+/// names both ends of the span of the file it holds.
+///
+/// A key of one segment names one number, and only a host that did not redact meant a place in the
+/// file by it: v0.15.0 and v0.16.0 redacted and still wrote one, and there the number is a place in
+/// the archive over a body of another length than the span it accounts for. So a reach `named` is
+/// false for is one nothing proves is a place in the file, and a pass told one the file on disk
+/// disagrees with bails rather than reading the file at it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reach {
+    pub through: i64,
+    pub named: bool,
+}
+
 /// What the service says about one session's transcript files: how far into each one the archive
 /// reaches, and which of them have had their tokens counted. The two move apart — a running
 /// session's lines are archived on a beat of their own, with no counting pass behind them — so
 /// neither ever stands in for the other.
 #[derive(Debug, Default)]
 pub struct Held {
-    pub through: HashMap<String, i64>,
+    pub reach: HashMap<String, Reach>,
     pub counted: HashSet<String>,
 }
 
 /// What an append answers: how far into the file the archive reaches afterwards, and whether these
 /// bytes are what put it there. A stretch beaten to its place is refused, and the archive then
 /// reaches where the writer that got there first left it — which is still where the next stretch
-/// begins.
+/// begins, on the same terms the reach a pass opened with came on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Appended {
     Written(i64),
-    Refused(i64),
+    Refused(Reach),
 }
 
 /// What the service answers about one session's files, and what it takes. A stretch is offered as
@@ -224,7 +246,7 @@ pub trait Store {
     fn append(&self, session_id: &str, file: &str, from: i64, through: i64, bytes: &[u8]) -> Result<Appended>;
 }
 
-/// The bytes of one file past `offset`, at most `MAX_CHUNK` and cut back to the last complete line
+/// The bytes of one file past `offset`, at most `MAX_STRETCH` and cut back to the last complete line
 /// they hold. A line longer than the whole stretch is read as it stands: the archive is a
 /// concatenation of byte ranges, so a line split across two stretches still reads whole.
 struct Bytes {
@@ -277,10 +299,10 @@ fn read_at(path: &Path, offset: i64, pass: Pass, holds: Holds) -> Result<Bytes> 
         .with_context(|| format!("reading {} from {offset}", path.display()))?;
     let mut read = Vec::new();
     file.by_ref()
-        .take(MAX_CHUNK as u64)
+        .take(MAX_STRETCH as u64)
         .read_to_end(&mut read)
         .with_context(|| format!("reading {}", path.display()))?;
-    let full = read.len() == MAX_CHUNK;
+    let full = read.len() == MAX_STRETCH;
     // A line longer than a whole stretch is read as it stands; one shorter than that is a record
     // the session is still writing, and what is held back of it is what says the bytes in hand are
     // not the last of the file.
@@ -311,14 +333,14 @@ enum Stretch {
     Waiting,
 }
 
-/// One stretch as the service takes it: a body of at most `MAX_CHUNK` bytes. The source is read to
+/// One stretch as the service takes it: a body of at most `MAX_STRETCH` bytes. The source is read to
 /// that and no further, but a placeholder is longer than most of what it stands in, so the stretch
 /// is written out to the length the service accepts and accounts for however much of the file that
 /// came to. Offering a longer body is a 413 the pass cannot act on and a stretch no later pass can
 /// get past either.
 fn stretch(path: &Path, offset: i64, pass: Pass, holds: Holds) -> Result<Stretch> {
     let read = read_at(path, offset, pass, holds)?;
-    let redacted = redact::within(&read.read, read.before, read.whole, MAX_CHUNK);
+    let redacted = redact::within(&read.read, read.before, read.whole, MAX_STRETCH);
     if redacted.source > 0 {
         return Ok(Stretch::Holding(redacted.bytes, redacted.source as i64));
     }
@@ -337,40 +359,60 @@ fn stretch(path: &Path, offset: i64, pass: Pass, holds: Holds) -> Result<Stretch
 /// How far into one file the archive reaches now, and how much of that this pass put there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reached {
-    pub through: i64,
+    pub reach: Reach,
     pub bytes: i64,
 }
 
 /// Sends what is left of one file from the place in it the archive already reaches, so nothing is
 /// read to find that place again. A file the service is already level with costs nothing, and one
-/// it has moved past is left alone: this host has nothing of it left to send.
-pub fn send_from(store: &impl Store, session_id: &str, source: &Source, from: i64, pass: Pass) -> Result<Reached> {
-    let mut at = from;
+/// keyed by both ends that the archive has moved past is left alone: another host archived more of
+/// the same session, and this one has nothing of it left to send.
+///
+/// A reach no key proves is a place in the file is weighed against the file itself before anything
+/// is read at it. One past the end of the file is the answer a host that redacted and still wrote
+/// one offset leaves behind, and acting on it would read the file at a byte that is not where the
+/// archive stopped: the bytes between would go into no object and the archive would concatenate
+/// across the gap without a word. So it stops the pass and says so.
+pub fn send_from(store: &impl Store, session_id: &str, source: &Source, from: Reach, pass: Pass) -> Result<Reached> {
+    let mut reach = from;
     let mut bytes = 0;
-    while at < source.size {
+    loop {
+        if !reach.named && reach.through > source.size {
+            bail!(
+                "the archive of {} of session {session_id} reaches {} bytes into a file this host holds {} of, under a key of one offset that no reading can place in the file; nothing more of it is sent",
+                source.file,
+                reach.through,
+                source.size
+            );
+        }
+        if reach.through >= source.size {
+            break;
+        }
+        let at = reach.through;
         let Stretch::Holding(sent, span) = stretch(&source.path, at, pass, source.holds)? else {
             break;
         };
         match store.append(session_id, &source.file, at, at + span, &sent)? {
             Appended::Written(through) => {
                 bytes += sent.len() as i64;
-                at = through;
+                reach = Reach { through, named: true };
             }
-            Appended::Refused(through) => {
+            Appended::Refused(refused) => {
                 // The writer that reached the place first says how far the archive reaches now,
                 // and a refusal answering with a place this pass is already at or past says
                 // nothing the pass can act on: it would offer the same stretch again.
-                if through <= at {
+                if refused.through <= at {
                     bail!(
-                        "the archive refused a stretch of {} of session {session_id} at {at} and answered that it reaches {through}",
-                        source.file
+                        "the archive refused a stretch of {} of session {session_id} at {at} and answered that it reaches {}",
+                        source.file,
+                        refused.through
                     );
                 }
-                at = through;
+                reach = refused;
             }
         }
     }
-    Ok(Reached { through: at, bytes })
+    Ok(Reached { reach, bytes })
 }
 
 /// A run of passes over the sessions on this host. It carries how far into each file the archive
@@ -381,7 +423,7 @@ pub fn send_from(store: &impl Store, session_id: &str, source: &Source, from: i6
 /// too dear to pay for on every beat.
 #[derive(Debug, Default)]
 pub struct Archive {
-    seen: HashMap<String, HashMap<String, i64>>,
+    seen: HashMap<String, HashMap<String, Reach>>,
 }
 
 impl Archive {
@@ -401,24 +443,27 @@ impl Archive {
         // the one call a run pays for, and only for a session it has never seen.
         let held = match self.seen.get(session_id) {
             Some(known) => {
-                if sources
-                    .found
-                    .iter()
-                    .all(|source| known.get(&source.file).is_some_and(|through| *through >= source.size))
-                {
+                if sources.found.iter().all(|source| {
+                    known
+                        .get(&source.file)
+                        .is_some_and(|reach| reach.through >= source.size)
+                }) {
                     return Ok(0);
                 }
                 known.clone()
             }
-            None => store.held(session_id)?.through,
+            None => store.held(session_id)?.reach,
         };
         let first = !self.seen.contains_key(session_id);
         let mut sent = 0;
         let mut ends = HashMap::new();
         for source in &sources.found {
-            let from = held.get(&source.file).copied().unwrap_or_default();
+            let from = held.get(&source.file).copied().unwrap_or(Reach {
+                through: 0,
+                named: true,
+            });
             let reached = send_from(store, session_id, source, from, pass)?;
-            ends.insert(source.file.clone(), reached.through);
+            ends.insert(source.file.clone(), reached.reach);
             sent += reached.bytes;
         }
         self.seen.insert(session_id.to_string(), ends);
@@ -518,13 +563,15 @@ mod tests {
             self.laid_out(file).last().map(|(_, through, _)| *through).unwrap_or(0)
         }
 
-        fn ends(&self) -> HashMap<String, i64> {
+        /// Every key this store holds names both ends of its span, so every reach it answers with
+        /// is one a host can read as a place in the file.
+        fn ends(&self) -> HashMap<String, Reach> {
             let files: HashSet<String> = self.objects.borrow().keys().map(|(file, _, _)| file.clone()).collect();
             files
                 .into_iter()
                 .map(|file| {
-                    let reach = self.reach(&file);
-                    (file, reach)
+                    let through = self.reach(&file);
+                    (file, Reach { through, named: true })
                 })
                 .collect()
         }
@@ -549,24 +596,27 @@ mod tests {
         fn held(&self, _session_id: &str) -> Result<Held> {
             *self.asked.borrow_mut() += 1;
             Ok(Held {
-                through: self.ends(),
+                reach: self.ends(),
                 counted: HashSet::new(),
             })
         }
 
         fn append(&self, _session_id: &str, file: &str, from: i64, through: i64, bytes: &[u8]) -> Result<Appended> {
-            // A body past MAX_CHUNK_BYTES is a 413 the service answers with nothing a pass can
+            // A body past MAX_STRETCH_BYTES is a 413 the service answers with nothing a pass can
             // place, so every test here is a test that no stretch is offered as one.
-            if bytes.len() > MAX_CHUNK {
+            if bytes.len() > MAX_STRETCH {
                 bail!(
-                    "a body of {} bytes is more than the {MAX_CHUNK} a stretch may hold",
+                    "a body of {} bytes is more than the {MAX_STRETCH} a stretch may hold",
                     bytes.len()
                 );
             }
             *self.offered.borrow_mut() += 1;
             let reach = self.reach(file);
             if reach != from {
-                return Ok(Appended::Refused(reach));
+                return Ok(Appended::Refused(Reach {
+                    through: reach,
+                    named: true,
+                }));
             }
             self.objects
                 .borrow_mut()
@@ -661,6 +711,71 @@ mod tests {
         );
     }
 
+    /// Where a pass picks a file up, as a reach every key behind it names both ends of.
+    fn opens(through: i64) -> Reach {
+        Reach { through, named: true }
+    }
+
+    fn reached(through: i64, bytes: i64) -> Reached {
+        Reached {
+            reach: opens(through),
+            bytes,
+        }
+    }
+
+    /// A store whose keys name one offset each, which is what a host that redacted and still wrote
+    /// one leaves behind. The reach it answers with is a place in the archive, so nothing can read
+    /// it as a place in the file.
+    #[derive(Debug)]
+    struct Unplaced {
+        through: i64,
+    }
+
+    impl Store for Unplaced {
+        fn held(&self, _session_id: &str) -> Result<Held> {
+            Ok(Held {
+                reach: HashMap::from([(
+                    MAIN.to_string(),
+                    Reach {
+                        through: self.through,
+                        named: false,
+                    },
+                )]),
+                counted: HashSet::new(),
+            })
+        }
+
+        fn append(&self, _session_id: &str, _file: &str, _from: i64, _through: i64, _bytes: &[u8]) -> Result<Appended> {
+            panic!("a reach nothing can place in the file must offer no stretch at all");
+        }
+    }
+
+    /// The reach of a file keyed by one offset each is a count of redacted bytes, and a transcript
+    /// full of secrets reads to a longer archive than itself. Reading the file at that number would
+    /// open it past its own end: the bytes between would go into no object and the archive would
+    /// concatenate across the gap without a word. So the pass stops there.
+    #[test]
+    fn a_reach_past_the_file_under_a_key_of_one_offset_stops_the_pass() {
+        let sandbox = Sandbox::new("unplaced");
+        let transcript = sandbox.transcript("s-1", "one\ntwo\n");
+        let mut archive = Archive::default();
+        let stopped = archive
+            .send(&Unplaced { through: 16 }, "s-1", &transcript, Pass::Open)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            stopped.contains("reaches 16 bytes into a file this host holds 8 of"),
+            "the pass says which two numbers disagree: {stopped}"
+        );
+        assert!(
+            archive
+                .send(&Unplaced { through: 8 }, "s-1", &transcript, Pass::Open)
+                .is_ok(),
+            "a reach that is a place in the file is read on its own terms, whatever keyed it"
+        );
+    }
+
     #[test]
     fn a_stretch_sent_again_is_refused_with_where_the_file_reaches() {
         let sandbox = Sandbox::new("replayed");
@@ -669,16 +784,16 @@ mod tests {
         let source = sources(&transcript).unwrap().found.remove(0);
 
         assert_eq!(
-            send_from(&service, "s-1", &source, 0, Pass::Open).unwrap(),
-            Reached { through: 8, bytes: 8 },
+            send_from(&service, "s-1", &source, opens(0), Pass::Open).unwrap(),
+            reached(8, 8),
             "the archive reaches where the stretch ends in the file, which the append answers without a read"
         );
         // A host that lost its place and read the file from nothing again. The stretch is refused
         // with how far the archive reaches, which is where this pass ends up without writing
         // anything.
         assert_eq!(
-            send_from(&service, "s-1", &source, 0, Pass::Open).unwrap(),
-            Reached { through: 8, bytes: 0 },
+            send_from(&service, "s-1", &source, opens(0), Pass::Open).unwrap(),
+            reached(8, 0),
             "a refused stretch put nothing in the archive, so the pass counts none of it"
         );
 
@@ -757,7 +872,7 @@ mod tests {
         let sandbox = Sandbox::new("boundary");
         // One line longer than a stretch, cut eight bytes into a token that opens a word of its
         // own: a marker running on out of the padding is part of that word and no secret at all.
-        let head = "x".repeat(MAX_CHUNK - 9);
+        let head = "x".repeat(MAX_STRETCH - 9);
         let text = format!("{head} {TOKEN} tail\n");
         let transcript = sandbox.transcript("s-1", &text);
         let service = Fake::default();
@@ -899,7 +1014,7 @@ mod tests {
         let sandbox = Sandbox::new("stuck");
         // A private key block longer than one stretch: every pass reads the same megabyte, holds
         // the whole of it back, and has nothing to show for it.
-        let text = format!("-----BEGIN RSA PRIVATE KEY-----\n{}\n", "Zm".repeat(MAX_CHUNK));
+        let text = format!("-----BEGIN RSA PRIVATE KEY-----\n{}\n", "Zm".repeat(MAX_STRETCH));
         let transcript = sandbox.transcript("s-1", &text);
         let service = Fake::default();
 
@@ -1002,7 +1117,7 @@ mod tests {
         const KEY: &str = "sk-FAKE0000000000000000000000000000000000fake";
         for (sep, redacted) in [('x', false), (' ', true)] {
             let sandbox = Sandbox::new(&format!("head-{}", sep as u32));
-            let head = format!("{}{sep}", "x".repeat(MAX_CHUNK - 1));
+            let head = format!("{}{sep}", "x".repeat(MAX_STRETCH - 1));
             let transcript = sandbox.transcript("s-1", &format!("{head}{KEY}\n"));
             let service = Fake::default();
 
@@ -1092,7 +1207,7 @@ mod tests {
         archive.send(&service, "s-1", &transcript, Pass::Open).unwrap();
 
         assert!(
-            text.len() as i64 > 2 * MAX_CHUNK as i64,
+            text.len() as i64 > 2 * MAX_STRETCH as i64,
             "the file runs over three stretches"
         );
         assert_ne!(

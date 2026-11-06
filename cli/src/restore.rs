@@ -72,12 +72,33 @@ pub struct Restored {
 /// holds is the file redacted and a placeholder is not the length of the secret it stands in, so
 /// weighing the file against the size of the archive would read a complete transcript as a part and
 /// write over it, on the host that ran the session and is still writing it.
-fn stale(path: &Path, through: i64) -> Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(found) => Ok((found.len() as i64) < through),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+///
+/// A reach `named` is false for is one no key proves is a place in the file at all: v0.15.0 and
+/// v0.16.0 redacted and still stored a stretch under one offset, which is a place in the archive,
+/// and a transcript full of secrets reads to a far longer archive than itself. A complete local
+/// transcript would then read as a part and be written over with the redacted copy, which is the
+/// one loss a restore must never take. So a file on disk the archive reaches past under such a key
+/// is a disagreement and not a part: it stops the restore and says so, and a caller that wants the
+/// archive's copy of it says so by moving the local one out of the way.
+fn stale(path: &Path, held: &HeldFile) -> Result<bool> {
+    let found = match std::fs::metadata(path) {
+        Ok(found) => found,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let size = found.len() as i64;
+    if size >= held.through {
+        return Ok(false);
     }
+    if !held.named {
+        bail!(
+            "the archive of {} reaches {} bytes into the file under a key of one offset that no reading can place in the file, and {} holds {size}; it cannot be told a part from a whole transcript read back redacted, so it is left where it is",
+            held.file,
+            held.through,
+            path.display()
+        );
+    }
+    Ok(true)
 }
 
 /// One file, downloaded beside where it belongs and moved into place once it is whole. A download
@@ -128,7 +149,7 @@ pub fn restore(
     let mut done = Restored::default();
     for held in files {
         let path = file_path(projects, cwd, &session.session_id, &held.file);
-        if !stale(&path, held.through)? {
+        if !stale(&path, held)? {
             done.kept.push(path);
             continue;
         }
@@ -179,6 +200,15 @@ mod tests {
         );
     }
 
+    fn named(through: i64) -> HeldFile {
+        HeldFile {
+            file: MAIN.to_string(),
+            bytes: through,
+            through,
+            named: true,
+        }
+    }
+
     /// The archive answers in places in the file on disk, so the one thing a restore has to get
     /// right is which of the two holds more of the file. A transcript full of secrets reads to a
     /// far longer archive than itself — one access key id is twenty bytes on disk and twenty-eight
@@ -189,26 +219,29 @@ mod tests {
         let dir = crate::scratch("restore");
         let path = dir.join("s-1.jsonl");
 
-        assert!(stale(&path, 10).unwrap(), "a file that is not there is written");
+        assert!(stale(&path, &named(10)).unwrap(), "a file that is not there is written");
         std::fs::write(&path, "four\n").unwrap();
-        assert!(stale(&path, 10).unwrap(), "a part of the archive is written over");
         assert!(
-            !stale(&path, 5).unwrap(),
+            stale(&path, &named(10)).unwrap(),
+            "a part of the archive is written over"
+        );
+        assert!(
+            !stale(&path, &named(5)).unwrap(),
             "a file the archive is level with is left alone"
         );
         assert!(
-            !stale(&path, 2).unwrap(),
+            !stale(&path, &named(2)).unwrap(),
             "and one holding more than the archive is the live transcript, which is never truncated"
         );
 
         let text = "{\"text\":\"AKIAZZ7EXAMPLE9QTVB2\"}\n";
         std::fs::write(&path, text).unwrap();
         assert!(
-            !stale(&path, text.len() as i64).unwrap(),
+            !stale(&path, &named(text.len() as i64)).unwrap(),
             "a complete transcript is left alone, however long the archive of it runs"
         );
         assert!(
-            stale(&path, text.len() as i64 + 1).unwrap(),
+            stale(&path, &named(text.len() as i64 + 1)).unwrap(),
             "and one the archive reaches further into than this is a part"
         );
 
@@ -216,12 +249,50 @@ mod tests {
         // record, so the archive reaches the end of the line in front of it and no further.
         std::fs::write(&path, format!("one\n{}", "x".repeat(27))).unwrap();
         assert!(
-            stale(&path, 32).unwrap(),
+            stale(&path, &named(32)).unwrap(),
             "a local part the archive reaches past is fetched"
         );
         assert!(
-            !stale(&path, 31).unwrap(),
+            !stale(&path, &named(31)).unwrap(),
             "and one holding every byte the archive reaches is left alone"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A reach under a key of one offset is a place in the file only if the host that wrote it did
+    /// not redact, and nothing in the archive says which. So the one reading that could throw away
+    /// a complete transcript — the local file shorter than the reach — is refused outright instead
+    /// of being read as a part, and the file stays where it is.
+    #[test]
+    fn a_reach_no_key_places_in_the_file_never_writes_over_a_local_one() {
+        let dir = crate::scratch("restore-legacy");
+        let path = dir.join("s-2.jsonl");
+        let legacy = |through: i64| HeldFile {
+            file: MAIN.to_string(),
+            bytes: through,
+            through,
+            named: false,
+        };
+
+        assert!(
+            stale(&path, &legacy(10)).unwrap(),
+            "a file that is not there has nothing to lose, so it is still written"
+        );
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert!(
+            !stale(&path, &legacy(8)).unwrap(),
+            "a file the reach is level with is left alone, as under any key"
+        );
+        assert!(
+            !stale(&path, &legacy(4)).unwrap(),
+            "and one holding more than the reach is the live transcript"
+        );
+
+        let refused = stale(&path, &legacy(9)).unwrap_err().to_string();
+        assert!(
+            refused.contains("no reading can place in the file") && refused.contains("holds 8"),
+            "a reach past the local file stops the restore and names both numbers: {refused}"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

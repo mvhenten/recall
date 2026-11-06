@@ -95,12 +95,15 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
 
   // The forward cursor and what hangs off it. `at` is how far the file has been read to: it
   // starts at the end of the manifest the page was handed, which is the first byte the backward
-  // walk will never read, so following can only ever add turns the box has not shown. `reaches`
-  // grows with the file, so the note counts against what the archive holds now rather than what
-  // it held when the page was drawn.
+  // walk will never read, so following can only ever add turns the box has not shown. `after` is
+  // the stretch that cursor is the end of, and goes up with it: it is what lets a beat list one
+  // page of the end of the file rather than every object in front of it. `reaches` grows with the
+  // file, so the note counts against what the archive holds now rather than what it held when the
+  // page was drawn.
   const following = plan.follow;
   const pace = following === null ? 0 : following.every;
   let at = following === null ? 0 : following.from;
+  let after = reads[reads.length - 1]?.at ?? "";
   let reaches = plan.readable;
   let trailing = "";
   let newer = 0;
@@ -300,7 +303,11 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
   const follow = async (): Promise<void> => {
     if (following === null || chasing || adrift) return;
     chasing = true;
-    const got = await asked(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}`, {}, String(at));
+    const got = await asked(
+      `${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}&after=${encodeURIComponent(after)}`,
+      {},
+      String(at),
+    );
     if (!got.ok) {
       chasing = false;
       missed(got.why, got.signedOut);
@@ -326,6 +333,10 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
     if (head !== undefined && head.offset + head.skip !== at) trailing = "";
     let walked = 0;
     for (const read of planned.batch) walked += read.bytes;
+    // The batch ends where the last read of it ends, which is the end of that stretch: the cursor
+    // and the stretch it names go up together, so the next beat's page opens exactly there.
+    const last = planned.batch[planned.batch.length - 1];
+    if (last !== undefined) after = last.at;
     at = planned.at;
     reaches += walked;
     loaded += walked;

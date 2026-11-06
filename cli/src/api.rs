@@ -674,14 +674,20 @@ struct HistoryIds {
 }
 
 /// One of a session's transcript files as the archive holds it: how many bytes of it are stored,
-/// and how far into the file on disk those bytes reach. The two differ because a stretch goes up
+/// how far into the file on disk those bytes reach, and whether every key behind that reach names
+/// both ends of the span of the file it holds. The first two differ because a stretch goes up
 /// redacted, and it is the second that an archive resumes from and a restore weighs a local file
 /// against, so nothing a host keeps locally can put the two out of step.
+///
+/// `named` reads as false where the service does not say, which leaves the reach unproven: the
+/// reading that stops rather than the one that writes a local transcript over.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeldFile {
     pub file: String,
     pub bytes: i64,
     pub through: i64,
+    #[serde(default)]
+    pub named: bool,
 }
 
 #[derive(Deserialize)]
@@ -692,10 +698,13 @@ struct HeldFiles {
 }
 
 /// How far into one file the archive reaches, which is what an append answers with whether it
-/// landed or was beaten to the place it was offered at.
+/// landed or was beaten to the place it was offered at. A refusal says on which terms too: the
+/// writer that reached the place first may have been one whose key names a single offset.
 #[derive(Deserialize)]
 struct Extent {
     through: i64,
+    #[serde(default)]
+    named: bool,
 }
 
 /// The device a message is queued against, and the one session on it the message is for; an empty
@@ -1071,7 +1080,19 @@ impl Client {
             .body_mut()
             .read_json()?;
         Ok(crate::transcripts::Held {
-            through: held.files.into_iter().map(|file| (file.file, file.through)).collect(),
+            reach: held
+                .files
+                .into_iter()
+                .map(|file| {
+                    (
+                        file.file,
+                        crate::transcripts::Reach {
+                            through: file.through,
+                            named: file.named,
+                        },
+                    )
+                })
+                .collect(),
             counted: held.counted.into_iter().collect(),
         })
     }
@@ -1100,7 +1121,10 @@ impl Client {
             .send(bytes)?;
         if response.status().as_u16() == 409 {
             let extent: Extent = response.body_mut().read_json()?;
-            return Ok(Appended::Refused(extent.through));
+            return Ok(Appended::Refused(crate::transcripts::Reach {
+                through: extent.through,
+                named: extent.named,
+            }));
         }
         let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
             .body_mut()
