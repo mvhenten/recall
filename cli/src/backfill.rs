@@ -475,8 +475,7 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
         // adoption, so one here wrote the last of its files long ago and the end of each of them
         // is the end for good.
         for part in &session.parts {
-            let at = held.bytes.get(&part.source.file).copied().unwrap_or(0);
-            let from = transcripts::placed(&part.source, at)?;
+            let from = held.through.get(&part.source.file).copied().unwrap_or(0);
             done.bytes += transcripts::send_from(service, id, &part.source, from, Pass::Final)?.bytes;
         }
         sent(id, done);
@@ -573,6 +572,9 @@ mod tests {
         daily: RefCell<HashMap<(i64, String), i64>>,
         counted: RefCell<HashSet<(String, String)>>,
         archive: RefCell<HashMap<(String, String), Vec<u8>>>,
+        /// How far into each file the archive reaches, which is what the key of its last stretch
+        /// names and what an append is weighed against.
+        reached: RefCell<HashMap<(String, String), i64>>,
         history: RefCell<HashSet<String>>,
         ended: RefCell<Vec<String>>,
         fail_sync: String,
@@ -587,6 +589,7 @@ mod tests {
                 daily: dying.daily.clone(),
                 counted: dying.counted.clone(),
                 archive: dying.archive.clone(),
+                reached: dying.reached.clone(),
                 ..Fake::default()
             }
         }
@@ -614,12 +617,12 @@ mod tests {
     impl transcripts::Store for Fake {
         fn held(&self, session_id: &str) -> Result<transcripts::Held> {
             Ok(transcripts::Held {
-                bytes: self
-                    .archive
+                through: self
+                    .reached
                     .borrow()
                     .iter()
                     .filter(|((held, _), _)| held == session_id)
-                    .map(|((_, file), body)| (file.clone(), body.len() as i64))
+                    .map(|((_, file), through)| (file.clone(), *through))
                     .collect(),
                 counted: self
                     .counted
@@ -631,12 +634,27 @@ mod tests {
             })
         }
 
-        fn append(&self, session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<transcripts::Appended> {
-            let mut archive = self.archive.borrow_mut();
-            let body = archive.entry((session_id.to_string(), file.to_string())).or_default();
-            body.truncate(offset as usize);
-            body.extend_from_slice(bytes);
-            Ok(transcripts::Appended::Written(offset + bytes.len() as i64))
+        fn append(
+            &self,
+            session_id: &str,
+            file: &str,
+            from: i64,
+            through: i64,
+            bytes: &[u8],
+        ) -> Result<transcripts::Appended> {
+            let held = (session_id.to_string(), file.to_string());
+            let mut reached = self.reached.borrow_mut();
+            let at = reached.entry(held.clone()).or_default();
+            if *at != from {
+                return Ok(transcripts::Appended::Refused(*at));
+            }
+            self.archive
+                .borrow_mut()
+                .entry(held)
+                .or_default()
+                .extend_from_slice(bytes);
+            *at = through;
+            Ok(transcripts::Appended::Written(through))
         }
     }
 

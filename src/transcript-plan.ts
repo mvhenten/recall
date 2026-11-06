@@ -15,11 +15,14 @@
 // Nothing here touches a document or a network, so the whole of the arithmetic a wrong window
 // hides in is read and exercised on its own.
 
-// One ranged read of one stretch: which object to open, how much of its head to pass over, and
-// how many bytes to take. `skip` is zero for every stretch an archive wrote in order; it is other
-// than zero only where a stretch overlaps the one before it, and then it is what keeps the bytes
-// they share out of the file twice.
+// One ranged read of one stretch: which object to open, where that object's first byte falls in
+// the archive, how much of its head to pass over, and how many bytes to take. `at` names the
+// object and `offset` places it, and the two carry the same number only for a stretch stored
+// before a redacted stretch could run to another length than the file it was read from. `skip` is
+// zero for every stretch an archive wrote in order; it is other than zero only where a stretch
+// overlaps the one before it, and then it is what keeps the bytes they share out of the file twice.
 export interface Read {
+  at: string;
   offset: number;
   skip: number;
   bytes: number;
@@ -146,7 +149,7 @@ export const plannedBatch = (reads: PlannedRead[], edge: number, pending: number
     const read = reads[at - 1];
     if (read === undefined) break;
     const take = Math.min(left, budget);
-    batch.unshift({ run: read.run, offset: read.offset, skip: read.skip + left - take, bytes: take });
+    batch.unshift({ run: read.run, at: read.at, offset: read.offset, skip: read.skip + left - take, bytes: take });
     budget -= take;
     left -= take;
     if (left === 0) {
@@ -210,7 +213,7 @@ export const followedBatch = (runs: Run[], from: number, step: number): Followed
       if (ends <= at) continue;
       if (budget <= 0) return { batch, at };
       const begins = Math.max(at, read.offset + read.skip);
-      batch.push({ run: index, offset: read.offset, skip: begins - read.offset, bytes: ends - begins });
+      batch.push({ run: index, at: read.at, offset: read.offset, skip: begins - read.offset, bytes: ends - begins });
       budget -= ends - begins;
       at = ends;
     }

@@ -20,7 +20,7 @@
 //! turns go on naming the directory the session ran in.
 
 use crate::api::{Client, HeldFile, PastSession};
-use crate::transcripts::{self, Holds, MAIN, TOOL_RESULT};
+use crate::transcripts::{MAIN, TOOL_RESULT};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -63,18 +63,18 @@ pub struct Restored {
 }
 
 /// Whether a file already on disk may be written over. A transcript this host holds more of than
-/// the archive does is the live one, or one archived from a run that has not finished going up,
-/// and overwriting it would throw lines away; one it holds less of is a part the archive has the
-/// whole of.
+/// the archive reaches into is the live one, or one archived from a run that has not finished going
+/// up, and overwriting it would throw lines away; one it holds less of is a part the archive has
+/// the whole of.
 ///
-/// The two are weighed in the archive's own length and never the file's size on disk. What the
-/// archive holds is the file redacted, and a placeholder is not the length of the secret it stands
-/// in: one access key id is twenty bytes on disk and twenty-eight in the archive, so a complete
-/// transcript weighed by its size reads as a part of the archive and is written over — on the host
-/// that ran the session, over the transcript it is still writing.
-fn stale(path: &Path, archived: i64, holds: Holds) -> Result<bool> {
+/// Both numbers are places in the file on disk — the archive says how far into the file it reaches,
+/// not how many bytes it holds — so the comparison is the whole of the reading. What the archive
+/// holds is the file redacted and a placeholder is not the length of the secret it stands in, so
+/// weighing the file against the size of the archive would read a complete transcript as a part and
+/// write over it, on the host that ran the session and is still writing it.
+fn stale(path: &Path, through: i64) -> Result<bool> {
     match std::fs::metadata(path) {
-        Ok(_) => Ok(transcripts::archived_len(path, holds)? < archived),
+        Ok(found) => Ok((found.len() as i64) < through),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
@@ -128,7 +128,7 @@ pub fn restore(
     let mut done = Restored::default();
     for held in files {
         let path = file_path(projects, cwd, &session.session_id, &held.file);
-        if !stale(&path, held.bytes, transcripts::holds_of(&held.file))? {
+        if !stale(&path, held.through)? {
             done.kept.push(path);
             continue;
         }
@@ -179,66 +179,49 @@ mod tests {
         );
     }
 
+    /// The archive answers in places in the file on disk, so the one thing a restore has to get
+    /// right is which of the two holds more of the file. A transcript full of secrets reads to a
+    /// far longer archive than itself — one access key id is twenty bytes on disk and twenty-eight
+    /// redacted — and none of that enters the reading, which is why a complete transcript on the
+    /// host still writing it is never written over.
     #[test]
     fn a_transcript_this_host_holds_the_whole_of_is_left_where_it_is() {
         let dir = crate::scratch("restore");
         let path = dir.join("s-1.jsonl");
 
-        assert!(
-            stale(&path, 10, Holds::Turns).unwrap(),
-            "a file that is not there is written"
-        );
+        assert!(stale(&path, 10).unwrap(), "a file that is not there is written");
         std::fs::write(&path, "four\n").unwrap();
+        assert!(stale(&path, 10).unwrap(), "a part of the archive is written over");
         assert!(
-            stale(&path, 10, Holds::Turns).unwrap(),
-            "a part of the archive is written over"
-        );
-        assert!(
-            !stale(&path, 5, Holds::Turns).unwrap(),
+            !stale(&path, 5).unwrap(),
             "a file the archive is level with is left alone"
         );
         assert!(
-            !stale(&path, 2, Holds::Turns).unwrap(),
+            !stale(&path, 2).unwrap(),
             "and one holding more than the archive is the live transcript, which is never truncated"
         );
 
-        // One access key id is twenty bytes on disk and twenty-eight in the archive, so this
-        // complete transcript is the shorter of the two by size and the longer by what it holds.
         let text = "{\"text\":\"AKIAZZ7EXAMPLE9QTVB2\"}\n";
         std::fs::write(&path, text).unwrap();
-        let archived = transcripts::archived_len(&path, Holds::Turns).unwrap();
         assert!(
-            archived > text.len() as i64,
-            "the archive of this one runs longer than the file"
+            !stale(&path, text.len() as i64).unwrap(),
+            "a complete transcript is left alone, however long the archive of it runs"
         );
         assert!(
-            !stale(&path, archived, Holds::Turns).unwrap(),
-            "a complete transcript is left alone, however its size on disk compares"
-        );
-        assert!(
-            stale(&path, archived + 1, Holds::Turns).unwrap(),
-            "and one the archive holds more of than this is a part"
+            stale(&path, text.len() as i64 + 1).unwrap(),
+            "and one the archive reaches further into than this is a part"
         );
 
-        // A part of a transcript whose last line is cut off part way. The record it ends in the
-        // middle of is not one a sender puts up, so it weighs nothing here: the file holds four
-        // bytes of the archive and thirty-one bytes of itself.
+        // A part of a transcript whose last line is cut off part way. No pass archives that
+        // record, so the archive reaches the end of the line in front of it and no further.
         std::fs::write(&path, format!("one\n{}", "x".repeat(27))).unwrap();
         assert!(
-            stale(&path, 8, Holds::Turns).unwrap(),
-            "a local part ending part way into a line is fetched, whatever its size on disk"
+            stale(&path, 32).unwrap(),
+            "a local part the archive reaches past is fetched"
         );
         assert!(
-            !stale(&path, 4, Holds::Turns).unwrap(),
-            "and the complete lines of it still weigh what the archive holds of them"
-        );
-        assert!(
-            !stale(&path, 31, Holds::Output).unwrap(),
-            "a tool output has no lines to finish, so all thirty-one bytes of this one are the archive's"
-        );
-        assert!(
-            stale(&path, 32, Holds::Output).unwrap(),
-            "and an archive holding more than that holds more of it than this host does"
+            !stale(&path, 31).unwrap(),
+            "and one holding every byte the archive reaches is left alone"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

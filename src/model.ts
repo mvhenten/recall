@@ -1,4 +1,4 @@
-import { MAX_CHUNK_BYTES } from "./transcripts";
+import { isStretchName, MAX_CHUNK_BYTES } from "./transcripts";
 
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
 export const modes = ["hybrid", "vector", "text"] as const;
@@ -572,6 +572,31 @@ export const parseChunkOffset = (value: string | null): Parsed<number> => {
   return value !== null && value !== "" && isInteger(offset, 0, Number.MAX_SAFE_INTEGER)
     ? { ok: true, value: offset }
     : fail("offset must be a whole number of bytes into the file");
+};
+
+// Which stretch of a file a reader is asking for, named the way the archive stores it. It is the
+// name and never a place in the archive: where a redacted stretch sits there is the sizes of the
+// stretches in front of it, which the manifest the reader is reading against already said.
+export const parseStretchName = (value: string | null): Parsed<string> =>
+  value !== null && isStretchName(value)
+    ? { ok: true, value }
+    : fail("at must name a stretch, as <start> or <start>.<end> in sixteen digits each");
+
+// Which stretch of a file an append is offering: where it begins in the file on disk, and where it
+// ends there. A host that names only `offset` is one from before a redacted stretch could run to
+// another length than the file it was read from, and means a place in the archive by it; its
+// stretches are stored and read back on those terms.
+export type StretchSpan = { kind: "source"; from: number; through: number } | { kind: "archive"; from: number };
+
+export const parseStretchSpan = (params: URLSearchParams): Parsed<StretchSpan> => {
+  const offset = parseChunkOffset(params.get("offset"));
+  if (!offset.ok) return offset;
+  const asked = params.get("through");
+  if (asked === null) return { ok: true, value: { kind: "archive", from: offset.value } };
+  const through = Number(asked);
+  return isInteger(through, offset.value + 1, offset.value + MAX_CHUNK_BYTES)
+    ? { ok: true, value: { kind: "source", from: offset.value, through } }
+    : fail(`through must be past offset, by at most ${MAX_CHUNK_BYTES} bytes`);
 };
 
 const BYTE_RANGE = /^bytes=([0-9]{1,16})-([0-9]{1,16})$/;

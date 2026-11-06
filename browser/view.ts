@@ -80,7 +80,7 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
   const reads: PlannedRead[] = [];
   plan.runs.forEach((run, index) => {
     for (const read of run.reads) {
-      reads.push({ run: index, offset: read.offset, skip: read.skip, bytes: read.bytes });
+      reads.push({ run: index, at: read.at, offset: read.offset, skip: read.skip, bytes: read.bytes });
     }
   });
 
@@ -120,7 +120,7 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
     note.textContent = text;
   };
 
-  const answered = async (response: Response, where: number): Promise<Got> => {
+  const answered = async (response: Response, where: string): Promise<Got> => {
     if (response.type === "opaqueredirect" || response.status === 401 || response.status === 403) {
       return {
         ok: false,
@@ -145,7 +145,7 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
     return { ok: true, text: await response.text() };
   };
 
-  const asked = (url: string, headers: HeadersInit, where: number): Promise<Got> =>
+  const asked = (url: string, headers: HeadersInit, where: string): Promise<Got> =>
     fetch(url, { headers, credentials: "same-origin", redirect: "manual" })
       .then((response) => answered(response, where))
       .catch((error: unknown) => ({
@@ -156,9 +156,9 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
 
   const grab = (read: PlannedRead): Promise<Got> =>
     asked(
-      `${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.offset}`,
+      `${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.at}`,
       { range: `bytes=${read.skip}-${read.skip + read.bytes - 1}` },
-      read.offset,
+      read.at,
     );
 
   const noteFor = (dry: number): string =>
@@ -300,7 +300,7 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
   const follow = async (): Promise<void> => {
     if (following === null || chasing || adrift) return;
     chasing = true;
-    const got = await asked(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}`, {}, at);
+    const got = await asked(`${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}`, {}, String(at));
     if (!got.ok) {
       chasing = false;
       missed(got.why, got.signedOut);

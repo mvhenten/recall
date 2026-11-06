@@ -3,6 +3,7 @@ import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Message, type NewsFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
 import { SESSION_TTL_MS } from "../src/model";
 import { followedBatch, type Plan, type Reach, type Read } from "../src/transcript-plan";
+import { stretchName } from "../src/transcripts";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -94,10 +95,19 @@ const archivedBody = async (h: Harness, client: Client, sessionId: string, body:
   return at + bytes.byteLength;
 };
 
+// A file archived by a host from before redaction, whose keys name one place in the archive and in
+// the file at once. A stretch sent past the end of what the archive holds leaves a run of bytes in
+// no object at all, and only those keys can say where it is.
+const archivedBefore = async (h: Harness, client: Client, sessionId: string, body: string, at = 0): Promise<void> => {
+  const now = h.now();
+  expect((await client.sync(sessionId, { startedAt: now - 600_000, lastActivityAt: now })).status).toBe(204);
+  expect((await client.archiveLegacy(sessionId, "main", at, new TextEncoder().encode(body))).status).toBe(200);
+};
+
 // One stretch, fetched the way the browser fetches it: the manifest names the object and the span
 // of it to take, and the range header is what asks for that span.
 const bytesOf = (h: Harness, plan: Plan, read: Read, assertion: string, span?: string): Promise<Response> =>
-  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.offset}`, {
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.at}`, {
     headers: {
       "cf-access-jwt-assertion": assertion,
       range: span ?? `bytes=${read.skip}-${read.skip + read.bytes - 1}`,
@@ -267,8 +277,8 @@ describe("the transcript manifest", () => {
     const you = await owner(h);
     const head = transcriptOf(4);
     const tail = transcriptOf(6);
-    await archivedBody(h, you.laptop, "cafe0004", head, 0);
-    await archivedBody(h, you.laptop, "cafe0004", tail, 50_000);
+    await archivedBefore(h, you.laptop, "cafe0004", head, 0);
+    await archivedBefore(h, you.laptop, "cafe0004", tail, 50_000);
 
     const html = await read(h, "/dashboard/sessions/cafe0004", you.assertion);
     expect(html).toContain(`The archive never got ${50_000 - head.length} bytes of this file, in 1 place.`);
@@ -290,7 +300,7 @@ describe("the transcript manifest", () => {
     const h = await harness();
     const you = await owner(h);
     const tail = transcriptOf(3);
-    await archivedBody(h, you.laptop, "cafe0005", tail, 9_000);
+    await archivedBefore(h, you.laptop, "cafe0005", tail, 9_000);
 
     const html = await read(h, "/dashboard/sessions/cafe0005", you.assertion);
     expect(html).toContain("The archive never got 9000 bytes of this file, in 1 place.");
@@ -337,13 +347,15 @@ describe("the transcript bytes", () => {
     const plan = planOf(await read(h, "/dashboard/sessions/beef0002", you.assertion));
     const here = plan.runs[0]?.reads[0];
     if (here === undefined) throw new Error("the manifest names no stretch");
-    const gone: Read = { offset: 90_000, skip: 0, bytes: 10 };
+    const gone: Read = { at: stretchName(90_000, 90_010), offset: 90_000, skip: 0, bytes: 10 };
 
     expect((await bytesOf(h, plan, here, you.assertion, "bytes=0-")).status).toBe(416);
     expect((await bytesOf(h, plan, here, you.assertion, `bytes=0-${body.length}`)).status).toBe(416);
     expect((await bytesOf(h, plan, gone, you.assertion)).status).toBe(404);
     expect((await bytesOf(h, plan, here, await h.assertionFor("stranger@example.com"))).status).toBe(403);
-    expect((await h.send(`${plan.path}?file=main&at=0`, { headers: { range: "bytes=0-9" } })).status).toBe(401);
+    expect(
+      (await h.send(`${plan.path}?file=main&at=0000000000000000`, { headers: { range: "bytes=0-9" } })).status,
+    ).toBe(401);
 
     // The key is built from the user the assertion resolved to and the file is a single segment,
     // so a name that tries to climb out of the prefix is refused rather than joined into a key.
@@ -351,7 +363,7 @@ describe("the transcript bytes", () => {
     expect(climb.status).toBe(400);
     expect((await bytesOf(h, { ...plan, file: ".hidden" }, here, you.assertion)).status).toBe(400);
     // A malformed address is a malformed address, whichever part of it is malformed.
-    const named = `/dashboard/sessions/two%20words/transcript?file=main&at=0`;
+    const named = `/dashboard/sessions/two%20words/transcript?file=main&at=0000000000000000`;
     expect(
       (await h.send(named, { headers: { "cf-access-jwt-assertion": you.assertion, range: "bytes=0-9" } })).status,
     ).toBe(400);
