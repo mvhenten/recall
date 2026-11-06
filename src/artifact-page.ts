@@ -38,6 +38,11 @@ a{color:var(--accent)}
 .brand{margin:0;display:flex;align-items:center;font:600 .95rem/1 var(--mono);letter-spacing:.02em}
 .brand i{flex:none;width:.55rem;height:.55rem;border-radius:2px;background:var(--accent);margin-right:.45rem}
 .badge{font:600 .64rem/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;color:var(--dim);border:1px solid var(--line2);border-radius:4px;padding:.3rem .45rem}
+.band{display:flex;align-items:center;justify-content:space-between;gap:1rem;min-height:2.25rem;padding:.5rem 1.1rem;border-bottom:1px solid var(--line);background:var(--surface2)}
+.band p{margin:0;font-size:.85rem;color:var(--dim);overflow-wrap:anywhere}
+.band a{flex:none;font:600 .82rem/1 var(--sans);text-decoration:none}
+.band a::after{content:" \\2197"}
+.band a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .wrap{max-width:52rem;margin:0 auto;padding:1.4rem 1.1rem 3rem;display:grid;gap:.9rem;align-content:start}
 .wrap h1{margin:0;font-size:1.3rem;letter-spacing:-.01em;overflow-wrap:anywhere}
 .adesc{margin:0;font-size:.95rem;color:var(--dim);max-width:70ch}
@@ -148,6 +153,29 @@ const entryOf = (record: ArtifactRecord): ArtifactFile => {
 
 const moment = (at: number): string => new Date(at).toISOString().slice(0, 16).replace("T", " ");
 
+// A share's unit is the day, so an expiry is drawn as a date and never as a timestamp.
+const day = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
+// One full-width block directly under the top bar, with one tenant: the owner's bar, a recipient's
+// line, or nothing at all. It pushes the content column down by its own height and moves nothing
+// sideways, and it is first in the document, so the owner's one control is the first tab stop.
+const band = (audience: Audience): string => {
+  if (audience.kind === "account") return "";
+  if (audience.kind === "recipient") {
+    return `<div class="band"><p>${escapeHtml(
+      `This artifact was shared with you. The share stops working on ${day(audience.expiresAt)}.`,
+    )}</p></div>`;
+  }
+  const { shares } = audience;
+  const line =
+    shares === 0
+      ? "This artifact is shared with nobody."
+      : `This artifact has ${shares} ${shares === 1 ? "share" : "shares"}.`;
+  return `<div class="band"><p>${escapeHtml(line)}</p><a href="${escapeHtml(audience.sharesUrl)}" target="_blank" rel="noreferrer">${
+    shares === 0 ? "Share it" : "Manage sharing"
+  }</a></div>`;
+};
+
 const heading = (record: ArtifactRecord, meta: string): string =>
   `<h1>${escapeHtml(record.title)}</h1>${
     record.description === "" ? "" : `<p class="adesc">${escapeHtml(record.description)}</p>`
@@ -186,7 +214,7 @@ export const documentPage = (record: ArtifactRecord, chrome: ArtifactChrome, ren
   return page({
     title: record.title,
     badge: record.type,
-    band: "",
+    band: band(audience),
     main: `${heading(record, documentMeta(record, audience))}${views(chrome.base, false, true)}${main}${footer(record, audience)}`,
     status: 200,
     csp: ARTIFACT_PAGE_CSP,
@@ -225,7 +253,7 @@ export const rawDocumentPage = (
   return page({
     title: record.title,
     badge: record.type,
-    band: "",
+    band: band(audience),
     main: `${heading(record, documentMeta(record, audience))}${views(chrome.base, true, !over)}${notice}${cut}<pre class="src">${escapeHtml(
       source,
     )}</pre>${footer(record, audience)}`,
@@ -288,7 +316,7 @@ export const playerPage = (record: ArtifactRecord, chrome: ArtifactChrome, missi
   return page({
     title: record.title,
     badge: record.type,
-    band: "",
+    band: band(audience),
     main: `${heading(record, meta)}
 <ol class="tracks" role="list">${rows}</ol>
 <audio id="paudio" preload="metadata"></audio>
@@ -368,8 +396,48 @@ export const artifactNotice = (refusal: ArtifactRefusal, dashboard: string): Res
   });
 };
 
-// Everything recall answers a recipient with that is not a page. Each one names no artifact, no
-// owner and no address, so a reader learns only that the address does not work.
+const SHARE_NOTICES: Record<ShareRefusal["kind"], { status: number; title: string }> = {
+  gone: { status: 404, title: "Share no longer available" },
+  elsewhere: { status: 403, title: "Shared with another address" },
+  method: { status: 405, title: "Not allowed" },
+};
+
+// Cloudflare's logout is host-wide: there is no prefix-scoped one, so the control ends every
+// sign-in the reader holds to this hostname and the copy says so rather than promising less.
+const LOGOUT_REACH = "Signing in again ends the sign-in to every page on this host.";
+
+const shareRefusalBody = (refusal: ShareRefusal): string => {
+  if (refusal.kind === "elsewhere") {
+    return `<div class="notice"><b>${escapeHtml("This artifact was shared with another address.")}</b><p>${escapeHtml(
+      "You proved a different one, so this share does not open for you. If you have a second address, sign in again and give the one the share was sent to.",
+    )}</p></div><p class="views"><a href="${escapeHtml(refusal.signInAgain)}" autofocus>Sign in as another address</a></p>
+<p class="ameta">${escapeHtml(LOGOUT_REACH)}</p>`;
+  }
+  if (refusal.kind === "method") {
+    return `<div class="notice"><b>${escapeHtml("This address only answers a GET.")}</b><p>${escapeHtml(
+      "A shared artifact is read and nothing else. Open the address in a browser to read it.",
+    )}</p></div>`;
+  }
+  return `<div class="empty"><b>${escapeHtml("This share is no longer available.")}</b><p>${escapeHtml(
+    "Ask whoever sent you this address for a new one.",
+  )}</p></div>`;
+};
+
+// Everything recall answers a recipient with that is not a page. An unknown address, a changed
+// token, a revoked share and an expired share are one answer, because a page that told them apart
+// would tell an unknown holder that the artifact exists. None of the three names an artifact, an
+// owner, an address or the dashboard: a recipient holds no account there.
 export const shareNotice = (refusal: ShareRefusal): Response => {
-  throw new Error(`the share refusal ${refusal.kind} is not built yet`);
+  const { status, title } = SHARE_NOTICES[refusal.kind];
+  return page({
+    title,
+    badge: "",
+    band: "",
+    main: shareRefusalBody(refusal),
+    status,
+    csp: ARTIFACT_PAGE_CSP,
+    column: "",
+    pinned: "",
+    referrer: "no-referrer",
+  });
 };

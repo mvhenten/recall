@@ -53,7 +53,7 @@ import {
   usageMonth,
 } from "./model";
 import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE, sizeText, TOKENS } from "./page";
-import type { ShareView } from "./shares";
+import { MAX_EMAIL_SHARES, SHARE_DAYS, type ShareView, shareTimeLeft } from "./shares";
 import { type Follow, gapsIn, listedRuns, type Plan, type Run, type Listing as RunListing } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
 import { MAIN_FILE } from "./transcripts";
@@ -246,7 +246,33 @@ svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .send textarea:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 .send button{justify-self:start;font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
 .flash{margin:0;padding:.6rem .8rem;border:1px solid var(--line2);border-left:3px solid var(--good);border-radius:6px;background:var(--surface2);font-size:.85rem}
-.flash.bad{border-left-color:var(--bad)}
+.flash.bad{border-left-color:var(--bad);border-left-style:dashed}
+.sopen{margin:0}
+.sopen a{font:600 .8rem/1 var(--sans);text-decoration:none}
+.sopen a::after{content:" \\2197"}
+.minted{display:grid;gap:.5rem;margin:0;padding:.9rem 1rem;background:var(--surface);border:1px solid var(--line2);border-left:3px solid var(--good);border-radius:8px}
+.minted b{font-size:.92rem}
+.minted p{margin:0;font-size:.85rem;color:var(--dim)}
+.maddr{padding:.65rem .75rem;background:var(--surface2);border-radius:6px;font:400 .82rem/1.65 var(--mono);color:var(--ink);overflow-wrap:anywhere;user-select:all}
+.scre{display:grid;gap:.5rem;margin:0}
+.scre h2{margin:0;font-size:.92rem}
+.scre input{width:100%;min-width:0;font:inherit;font-size:.9rem;padding:.5rem .75rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--ink)}
+.scre input::placeholder{color:var(--faint)}
+.scre input:focus-visible,.sgo:focus-visible,.sctl:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sgo{justify-self:start;font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
+.sgo[aria-disabled=true]{background:none;color:var(--faint);border:1px dashed var(--line2);cursor:default}
+.sctl{display:inline-block;font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--accent);text-decoration:none;cursor:pointer}
+.sctl[aria-disabled=true]{border-style:dashed;color:var(--faint);cursor:default}
+.slinks{display:flex;flex-wrap:wrap;gap:.5rem;margin:0}
+.ask{border-left-color:var(--bad)}
+.ask p{margin:0;font-size:.85rem;color:var(--dim)}
+.sacts{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}
+.sacts form{margin:0}
+.shrow .smode{font:400 .72rem/1.4 var(--mono);color:var(--faint)}
+.shrow .sleft{display:block;font:400 .72rem/1.4 var(--mono);color:var(--warn)}
+.shrow .srev{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-top:.2rem}
+.shrow .srev .sctl{flex:1;text-align:center}
+.smark{font:600 .64rem/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--dim)}
 .noticewrap{max-width:34rem;margin:0 auto;padding:3rem 1.25rem;display:grid;gap:1.1rem}
 .notice{display:grid;gap:.45rem;padding:1rem 1.1rem;background:var(--surface);border:1px solid var(--line2);border-left:3px solid var(--warn);border-radius:8px}
 .notice h1,.notice b{margin:0;font-size:.92rem}
@@ -306,10 +332,21 @@ main{padding:1.1rem 1.5rem 1.5rem;gap:.9rem}
 .arow .at{grid-area:1/4/3/5}
 .arow .ard{grid-area:1/5}
 .arow .awr{grid-area:2/5}
-.arow .alw{grid-area:1/6/3/7;text-align:left}
+.arow .alw{grid-area:1/6;text-align:left}
+.arow .ash{grid-area:2/6;font:400 .78rem/1.35 var(--mono);text-align:left}
 .arow .aty,.arow .afc,.arow .ard,.arow .awr,.arow .alw{font:400 .78rem/1.35 var(--mono);color:var(--dim);overflow-wrap:anywhere}
 .arow .afc,.arow .awr{color:var(--faint)}
 .arow.lhead{align-items:center}
+.shrow{grid-template-columns:minmax(0,1fr) 7rem 8rem 7rem 4.5rem 7rem;align-items:start}
+.shrow .h{grid-area:1/1;display:grid;gap:.1rem;align-content:start}
+.shrow .h b{font-size:.84rem}
+.shrow .scr{grid-area:1/2}
+.shrow .sex{grid-area:1/3}
+.shrow .slo{grid-area:1/4}
+.shrow .sus{grid-area:1/5;text-align:right}
+.shrow .scr,.shrow .sex,.shrow .slo,.shrow .sus{font:400 .78rem/1.35 var(--mono);color:var(--dim);font-variant-numeric:tabular-nums}
+.shrow .srev{grid-area:1/6;margin-top:0;justify-content:flex-end}
+.shrow .srev .sctl{flex:none;font-size:.78rem;padding:.35rem .7rem}
 .memories{grid-template-columns:repeat(auto-fill,minmax(18rem,1fr));gap:1rem}
 .chips{flex-wrap:wrap;overflow-x:visible}
 .kpis{grid-template-columns:repeat(5,1fr);gap:1rem}
@@ -1639,13 +1676,24 @@ const fileCount = (artifact: ArtifactView): string => {
   return `${artifact.fileCount} ${artifact.type === "audio" ? "tracks" : "files"}`;
 };
 
+// The count of live shares is itself the control that opens the share page, so a reader reads what
+// is shared and reaches it in one place. It carries the artifact's name in its accessible name, or
+// twenty rows read as twenty links all called `3 shares`.
+const shareCell = (artifact: ArtifactView): string => {
+  const { shareCount, name } = artifact;
+  const text = shareCount === 0 ? "Share" : `${shareCount} ${shareCount === 1 ? "share" : "shares"}`;
+  const label = shareCount === 0 ? `Share ${name}` : `${text} on ${name}`;
+  return `<span class="ash"><a href="${escapeHtml(sharesPath(name))}" aria-label="${escapeHtml(label)}">${escapeHtml(text)}</a></span>`;
+};
+
 // An artifact answers on the artifact hostname, behind its own Access application, so the name
-// opens in a tab of its own rather than taking the dashboard's. It is the row's only link.
+// opens in a tab of its own rather than taking the dashboard's. The share link stays in this tab:
+// the share page is a dashboard page and no sign-in is crossed.
 const artifactRow = (artifact: ArtifactView): string => {
   const title = artifact.title === artifact.name ? "" : `<span class="atitle">${escapeHtml(artifact.title)}</span>`;
   const count = fileCount(artifact);
   return `<li class="srow arow"><p class="h"><b><a href="${escapeHtml(artifact.url)}" target="_blank" rel="noreferrer">${escapeHtml(artifact.name)}</a></b>${title}</p>
-<p class="smeta"><span class="aty">${escapeHtml(artifact.type)}</span>${count === "" ? "" : `<span class="afc">${escapeHtml(count)}</span>`}<span class="ab">${escapeHtml(sizeText(artifact.bytes))}</span><span class="at">${escapeHtml(moment(artifact.updatedAt))}</span><span class="ard">${escapeHtml(`r ${artifact.read}`)}</span><span class="awr">${escapeHtml(`w ${artifact.write}`)}</span><span class="alw">${escapeHtml(artifact.lastWriter)}</span></p></li>`;
+<p class="smeta"><span class="aty">${escapeHtml(artifact.type)}</span>${count === "" ? "" : `<span class="afc">${escapeHtml(count)}</span>`}<span class="ab">${escapeHtml(sizeText(artifact.bytes))}</span><span class="at">${escapeHtml(moment(artifact.updatedAt))}</span><span class="ard">${escapeHtml(`r ${artifact.read}`)}</span><span class="awr">${escapeHtml(`w ${artifact.write}`)}</span><span class="alw">${escapeHtml(artifact.lastWriter)}</span>${shareCell(artifact)}</p></li>`;
 };
 
 const artifactEmpty = (query: string, type: string): { headline: string; hint: string } => {
@@ -1769,9 +1817,301 @@ export interface SharePage {
 // typed and nothing else about it.
 export type Shares = { kind: "off" } | { kind: "foreign" } | { kind: "page"; page: SharePage };
 
-export const sharesPage = (email: string, live: Live, url: URL, shares: Shares): Response => {
-  throw new Error(`the share page is not built yet: ${shares.kind} at ${url.pathname} for ${email} ${live.sessions}`);
+// The name the reader asked for, as the address holds it. A share page is only reached at
+// `<artifacts>/<name>/shares`, and the segment is printed rather than decoded so that a state
+// drawn for no artifact — W34's and W35's — echoes the address unrewritten.
+const askedName = (url: URL): string => {
+  const segments = url.pathname.replace(/\/$/, "").split("/");
+  return segments[segments.length - 2] ?? "";
 };
+
+// A share's unit is the day, so created and expires are dates. Last opened is a relative age, the
+// way a session row prints one.
+const day = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
+const shareTally = (count: number): string =>
+  count === 0 ? "no shares" : `${count} ${count === 1 ? "share" : "shares"}`;
+
+const backToArtifacts = `<p class="more"><a href="${ARTIFACTS_TAB.path}">Back to the artifacts</a></p>`;
+
+const SHARE_HEAD =
+  '<li class="srow shrow lhead" aria-hidden="true"><span>Recipient</span><span>Created</span><span>Expires</span><span>Last opened</span><span class="r">Opens</span><span></span></li>';
+
+const recipientOf = (share: ShareView): string => (share.mode === "link" ? "Anyone with the link" : share.address);
+
+const revokeName = (share: ShareView): string =>
+  share.mode === "link" ? "Revoke the link share" : `Revoke the share with ${share.address}`;
+
+const lastOpened = (share: ShareView, now: number): string =>
+  share.uses === 0 ? "never opened" : `${age(share.lastUsedAt, now)} ago`;
+
+// An inert control keeps its place in the tab order and loses only its action, and it carries the
+// question as its description: a control that drops out hides the reason from the reader who most
+// needs it.
+const revokeControl = (share: ShareView, path: string, inert: boolean): string => {
+  const label = escapeHtml(revokeName(share));
+  if (inert) {
+    return `<span class="sctl" tabindex="0" role="link" aria-disabled="true" aria-label="${label}" aria-describedby="askwhy">Revoke</span>`;
+  }
+  return `<a class="sctl" href="${escapeHtml(`${path}?revoke=${encodeURIComponent(share.shareId)}`)}" aria-label="${label}">Revoke</a>`;
+};
+
+// Six fields and one control. The header row is aria-hidden, so a screen reader reads the rows and
+// not the labels, and each field names itself at phone width where the header is gone.
+const shareRow = (share: ShareView, path: string, now: number, ask: ShareAsk | null): string => {
+  const asking = ask !== null;
+  const going = ask?.kind === "revoke-all" || (ask?.kind === "revoke" && ask.share.shareId === share.shareId);
+  const questioned = ask?.kind === "revoke" && ask.share.shareId === share.shareId;
+  const mark = ask === null || ask.kind === "relink" ? "" : going ? "going" : "kept";
+  const left = shareTimeLeft(share.expiresAt, now);
+  return `<li class="srow shrow"><p class="h"><b>${escapeHtml(recipientOf(share))}</b><span class="smode">${escapeHtml(
+    questioned ? `${share.mode} · the one in question` : share.mode,
+  )}</span></p>
+<p class="smeta"><span class="scr"><span class="unit">created </span>${escapeHtml(day(share.createdAt))}</span><span class="sex"><span class="unit">expires </span>${escapeHtml(
+    day(share.expiresAt),
+  )}${left === "" ? "" : `<span class="sleft">${escapeHtml(left)}</span>`}</span></p>
+<p class="smeta"><span class="slo">${escapeHtml(lastOpened(share, now))}</span><span class="sus">${share.uses}<span class="unit"> ${
+    share.uses === 1 ? "open" : "opens"
+  }</span></span></p>
+<p class="srev">${revokeControl(share, path, asking)}${mark === "" ? "" : `<span class="smark">${mark}</span>`}</p></li>`;
+};
+
+const csrfField = (csrf: string): string => `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">`;
+
+// The primary control: one named address, proven by a one-time PIN and revocable by name. It is
+// drawn first, its submit is the filled one, and its field holds focus when nothing else claims it.
+// The judge of an address is the server, so the field takes no type the browser validates itself —
+// a refusal the page never serves is a refusal the owner cannot read.
+const emailForm = (page: SharePage, path: string, focused: boolean): string => {
+  const described = page.emailFull
+    ? ' aria-describedby="sfull"'
+    : page.flash?.tone === "refused"
+      ? ' aria-describedby="sflash"'
+      : "";
+  const submit = page.emailFull
+    ? '<button class="sgo" type="button" aria-disabled="true" aria-describedby="sfull">Share by email</button>'
+    : '<button class="sgo" type="submit" name="do" value="email">Share by email</button>';
+  return `<form class="scre" method="post" action="${escapeHtml(path)}">${csrfField(page.csrf)}
+<h2>Share with one address</h2>
+<input name="address" inputmode="email" autocomplete="off" maxlength="254" value="${escapeHtml(
+    page.emailDraft,
+  )}" placeholder="reader@example.com" aria-label="Address to share with"${described}${focused ? " autofocus" : ""}>
+${submit}</form>`;
+};
+
+// The deliberate second choice: a link is a secret address that works for whoever ends up holding
+// it. Replacing is a question first, because the address in use dies the moment the new one is
+// made; extending keeps the address and the token and moves only the expiry.
+const linkForm = (page: SharePage, path: string, link: ShareView | undefined): string => {
+  const controls =
+    link === undefined
+      ? '<button class="sctl" type="submit" name="do" value="link">Create a link</button>'
+      : `<a class="sctl" href="${escapeHtml(`${path}?relink=1`)}">Replace the link</a><button class="sctl" type="submit" name="do" value="extend">Extend by ${SHARE_DAYS} days</button>`;
+  return `<form class="scre" method="post" action="${escapeHtml(path)}">${csrfField(page.csrf)}
+<h2>Share with a link</h2>
+<p class="slinks">${controls}</p></form>`;
+};
+
+// The one response the address exists on. It is printed whole and wrapped onto as many lines as it
+// takes: an address with a piece missing cannot be copied, and for a link there is no second
+// chance to read it.
+const mintedBlock = (minted: Minted, now: number): string => {
+  const days = Math.max(1, Math.round((minted.expiresAt - now) / DAY_MS));
+  const stops = `It stops working on ${day(minted.expiresAt)}, ${days} ${days === 1 ? "day" : "days"} from now.`;
+  const head =
+    minted.mode === "link"
+      ? "The link is made. This is the only time this address is shown."
+      : `The share with ${minted.recipient} is made. Send them this address.`;
+  const tail =
+    minted.mode === "link"
+      ? `${stops} Revoking it, or making a second link, retires it the moment you do.`
+      : `${stops} Only ${minted.recipient} opens it, after proving that address with a one-time code.`;
+  return `<div class="minted"><b id="sminted" tabindex="-1" autofocus>${escapeHtml(head)}</b>
+<p class="maddr">${escapeHtml(minted.address)}</p>
+<p>${escapeHtml(tail)}</p></div>`;
+};
+
+interface Question {
+  head: string;
+  why: string;
+  confirm: string;
+  action: string;
+  share: string;
+}
+
+const questionOf = (ask: ShareAsk, name: string): Question => {
+  if (ask.kind === "relink") {
+    return {
+      head: "Replace the link share?",
+      why: "The address in use stops working the moment the new one is made. Anyone holding it gets the page that says the share is no longer available, and there is no way to hand the old address back.",
+      confirm: "Replace the link",
+      action: "relink",
+      share: "",
+    };
+  }
+  if (ask.kind === "revoke-all") {
+    const { count } = ask;
+    return {
+      head: `Revoke all ${count} ${count === 1 ? "share" : "shares"} on ${name}?`,
+      why: "Every address and every link stops reading it. The page then says the artifact is shared with nobody and keeps both create controls. There is no undo and no way to hand an address back.",
+      confirm: `Revoke all ${count}`,
+      action: "revoke-all",
+      share: "",
+    };
+  }
+  const { share } = ask;
+  if (share.mode === "link") {
+    return {
+      head: "Revoke the link share?",
+      why: "The address stops working. Its next open answers the page that says the share is no longer available, and there is no way to hand it back. Creating a link again makes a new address, with a new 30 days.",
+      confirm: "Revoke the link",
+      action: "revoke",
+      share: share.shareId,
+    };
+  }
+  return {
+    head: `Revoke the share with ${share.address}?`,
+    why: `That address stops reading this artifact. Its next open answers the page that says the share is no longer available. Sharing with ${share.address} again makes a new share, with a new ${SHARE_DAYS} days.`,
+    confirm: "Revoke the share",
+    action: "revoke",
+    share: share.shareId,
+  };
+};
+
+// A question is a page state named in the query, not an overlay: it is bookmarkable, it reloads to
+// the same question, and Back dismisses it. Nothing is layered over the page, so there is no
+// click-outside and no Esc to trap.
+const askBlock = (ask: ShareAsk, page: SharePage, path: string): string => {
+  const question = questionOf(ask, page.artifact.name);
+  const share = question.share === "" ? "" : `<input type="hidden" name="share" value="${escapeHtml(question.share)}">`;
+  return `<div class="notice ask"><b id="sask" tabindex="-1" autofocus>${escapeHtml(question.head)}</b>
+<p id="askwhy">${escapeHtml(question.why)}</p>
+<div class="sacts"><form method="post" action="${escapeHtml(path)}">${csrfField(page.csrf)}${share}
+<button class="sgo" type="submit" name="do" value="${question.action}">${escapeHtml(question.confirm)}</button></form><a class="sctl" href="${escapeHtml(path)}">Keep it</a></div></div>`;
+};
+
+const flashBlock = (flash: ShareFlash, focused: boolean): string =>
+  `<p class="flash${flash.tone === "refused" ? " bad" : ""}" id="sflash"${focused ? ' tabindex="-1" autofocus' : ""}>${escapeHtml(
+    flash.text,
+  )}</p>`;
+
+// A full artifact says so above the form, and the card names the scope: an owner who reads "twenty
+// shares" with no scope assumes the whole deployment has stopped sharing.
+const fullCard = `<div class="notice" id="sfull"><b>${escapeHtml(
+  `This artifact holds ${MAX_EMAIL_SHARES} email shares, the most one takes.`,
+)}</b><p>${escapeHtml(
+  "Revoke one and the form takes another address. The limit is per artifact, so another artifact still shares. A link share does not count against it.",
+)}</p></div>`;
+
+const identity = (artifact: ArtifactView): string =>
+  `<p class="lede">${escapeHtml(artifact.title)}</p>
+<p class="smeta"><span>${escapeHtml(artifact.type)}</span><span>${escapeHtml(sizeText(artifact.bytes))}</span><span>${escapeHtml(
+    `published ${moment(artifact.updatedAt)}`,
+  )}</span><span>${escapeHtml(`r ${artifact.read}`)}</span><span>${escapeHtml(`w ${artifact.write}`)}</span></p>
+<p class="sopen"><a href="${escapeHtml(artifact.url)}" target="_blank" rel="noreferrer">Open the artifact</a></p>`;
+
+// Drawn only when the artifact is read private, so an owner does not conclude a private artifact
+// cannot be shared.
+const permissionLine = (artifact: ArtifactView): string =>
+  artifact.read === "private"
+    ? `<p class="callout">${escapeHtml(
+        "A share works whatever the read permission says. This artifact is read private and a reader holding a share still reads it.",
+      )}</p>`
+    : "";
+
+// Exactly one element on the page carries autofocus. A question outranks everything, a minted
+// address outranks the rest, and a refused address hands focus back to the field it came from with
+// the flash as its description. Nothing else moves focus, because no script runs on any of it.
+type Focused = "ask" | "minted" | "flash" | "field";
+
+const focusedOn = (page: SharePage): Focused => {
+  if (page.ask !== null) return "ask";
+  if (page.minted !== null) return "minted";
+  if (page.flash === null) return "field";
+  return page.flash.tone === "refused" && page.emailDraft !== "" ? "field" : "flash";
+};
+
+const sharesMain = (page: SharePage, path: string): string => {
+  const { artifact, shares, ask, now } = page;
+  const focus = focusedOn(page);
+  const link = shares.find((share) => share.mode === "link");
+  const minted = page.minted === null ? "" : mintedBlock(page.minted, now);
+  const flash = page.flash === null ? "" : flashBlock(page.flash, focus === "flash");
+  const question = ask === null ? "" : askBlock(ask, page, path);
+  const controls = ask === null ? `${emailForm(page, path, focus === "field")}${linkForm(page, path, link)}` : "";
+  const full = ask === null && page.emailFull ? fullCard : "";
+  const list =
+    shares.length === 0
+      ? emptyState(
+          `${artifact.name} is shared with nobody.`,
+          `Share it with one address, or create a link anyone holding it opens. Every share expires ${SHARE_DAYS} days after it is made.`,
+        )
+      : `<ol class="sessions" role="list">${SHARE_HEAD}${shares.map((share) => shareRow(share, path, now, ask)).join("")}</ol>`;
+  const all =
+    ask === null && shares.length > 1
+      ? `<p class="slinks"><a class="sctl" href="${escapeHtml(`${path}?revoke=all`)}" aria-label="${escapeHtml(
+          `Revoke every share on ${artifact.name}`,
+        )}">Revoke every share</a></p>`
+      : "";
+  return `${identity(artifact)}${permissionLine(artifact)}${minted}${flash}${full}${question}${controls}${list}${all}${backToArtifacts}`;
+};
+
+// One page per artifact, reached from that artifact's row in the Artifacts tab and from the owner's
+// bar on the artifact itself, with Artifacts current in the nav throughout. No script runs on any
+// state of it: every question is a GET that redraws this page and every mutation is a POST to it.
+export const sharesPage = (email: string, live: Live, url: URL, shares: Shares, status = 200): Response => {
+  if (shares.kind === "off") {
+    return sharesShell(
+      email,
+      live,
+      askedName(url),
+      "not enabled",
+      `<div class="notice"><b>${escapeHtml("Sharing is not configured for this deployment.")}</b><p>${escapeHtml(
+        "It binds no audience for the share Access application, so there is no second sign-in to prove a recipient with, and a share address has nothing to answer with. Naming ARTIFACT_SHARE_ACCESS_AUD and deploying turns sharing on.",
+      )}</p></div>${backToArtifacts}`,
+      status,
+    );
+  }
+  if (shares.kind === "foreign") {
+    return sharesShell(
+      email,
+      live,
+      askedName(url),
+      "not yours",
+      `<div class="notice"><b>${escapeHtml("Only an artifact's owner shares it.")}</b><p>${escapeHtml(
+        "This name belongs to another account in this recall. Its owner shares it, and the page draws no control here.",
+      )}</p></div>${backToArtifacts}`,
+      status === 200 ? 403 : status,
+    );
+  }
+  const { page } = shares;
+  const path = sharesPath(page.artifact.name);
+  const meta =
+    page.ask?.kind === "relink" ? "replacing the link" : `${page.artifact.type} · ${shareTally(page.shares.length)}`;
+  return sharesShell(email, live, page.artifact.name, meta, sharesMain(page, path), status, page.csrf);
+};
+
+const sharesShell = (
+  email: string,
+  live: Live,
+  heading: string,
+  meta: string,
+  main: string,
+  status: number,
+  csrf = "",
+): Response =>
+  shell(
+    email,
+    ARTIFACTS_TAB,
+    live,
+    heading,
+    meta,
+    main,
+    csrf === ""
+      ? {}
+      : { "set-cookie": `${CSRF_COOKIE}=${csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict` },
+    status,
+  );
 
 const labelRows = (kind: LabelKind, values: string[], names: Map<string, string>): string =>
   `<ul class="lrows" role="list">${values
