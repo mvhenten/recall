@@ -171,16 +171,14 @@ describe("a link share", () => {
   it("costs an unknown token no write at all", async () => {
     const o = await owner();
     await document(o.alice, "quarterly-plan");
-    await share(o.alice, "quarterly-plan");
+    const made = await share(o.alice, "quarterly-plan");
 
     const guessed = await o.h.sendToSharePrefix(`${SHARE_LINK_PREFIX}/${newShareToken()}`, null);
     expect(guessed.status).toBe(404);
-    const after = await env.DB.prepare("SELECT COUNT(*) AS n FROM artifact_shares").first<{ n: number }>();
     expect(await (await o.h.sendToSharePrefix(`${SHARE_LINK_PREFIX}/${newShareToken()}`, null)).text()).toContain(
       "This share is no longer available.",
     );
-    const again = await env.DB.prepare("SELECT COUNT(*) AS n FROM artifact_shares").first<{ n: number }>();
-    expect(again?.n).toBe(after?.n);
+    expect(await rowOf(made.share.shareId)).toMatchObject({ uses: 0 });
   });
 
   it("answers an unknown, a revoked and an expired share with one page", async () => {

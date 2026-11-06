@@ -2017,8 +2017,6 @@ export const createApp = (deps: Deps): App => {
       await bucket.delete(legacy.key);
       return new Response(null, { status: 204 });
     }
-    // An unpublish takes every share on the name with it, so no share outlives the artifact it
-    // grants read access to and a later publish of the same name cannot revive one.
     await deleteArtifactWithShares(db, target.ownerUserId, name);
     await deleteArtifactFiles(bucket, target.ownerUserId, name);
     return new Response(null, { status: 204 });

@@ -502,14 +502,14 @@ describe("a page a recipient reaches", () => {
     expect(await track.text()).toBe("one");
   });
 
-  it("tells a recipient of an empty document to ask the sender, never to republish it", async () => {
+  it("tells a recipient of an empty document to read the raw view, never to republish it", async () => {
     const o = await owner();
     await o.alice.publishArtifact("empty-plan", { type: "document", files: [{ path: "empty.md", body: "" }] });
     const base = basePath((await mint(o.alice, "empty-plan")).address);
 
     const html = await (await read(o, base)).text();
     expect(html).toContain("empty-plan holds no text.");
-    expect(html).toContain("ask whoever sent you this address about it");
+    expect(html).toContain("Read the raw view to see the file as it was published.");
     expect(html).not.toContain("recall publish --replace");
   });
 

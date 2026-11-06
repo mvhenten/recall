@@ -202,9 +202,9 @@ const documentMeta = (record: ArtifactRecord, audience: Audience): string =>
 const EMPTY_WHY =
   "The markdown published under this name is empty. Republish it with recall publish --replace to fill it in, or read the raw view to see the file as it was published.";
 
-// A recipient cannot republish, so the copy names the one person who can do anything about it.
-const SHARED_EMPTY_WHY =
-  "The markdown published under this name is empty. Read the raw view to see the file as it was published, or ask whoever sent you this address about it.";
+// A non-owner reader cannot republish, so the copy names the one thing available instead: the raw view.
+const NON_OWNER_EMPTY_WHY =
+  "The markdown published under this name is empty. Read the raw view to see the file as it was published.";
 
 // A document is recall's own HTML, rendered from the publisher's markdown, so it carries no script
 // at all and reads with scripts off. A document holding no text says so and keeps both view
@@ -215,7 +215,7 @@ export const documentPage = (record: ArtifactRecord, chrome: ArtifactChrome, ren
   const main =
     rendered.trim() === ""
       ? `<div class="empty"><b>${escapeHtml(`${record.name} holds no text.`)}</b><p>${escapeHtml(
-          audience.kind === "recipient" ? SHARED_EMPTY_WHY : EMPTY_WHY,
+          audience.kind === "owner" ? EMPTY_WHY : NON_OWNER_EMPTY_WHY,
         )}</p></div>`
       : `<div class="doc">${rendered}</div>`;
   return page({
