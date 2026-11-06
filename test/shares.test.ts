@@ -1,7 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { ArtifactView } from "../src/artifacts";
-import { DEVICE_CODE_LIMITS } from "../src/device";
 import {
   hashShareToken,
   MAX_EMAIL_SHARES,
@@ -79,7 +78,7 @@ interface Owner {
 }
 
 const owner = async (sharing: "on" | "off" = "on"): Promise<Owner> => {
-  const h = await harness("up", DEVICE_CODE_LIMITS, "on", sharing);
+  const h = await harness({ sharing });
   const email = `alice-${crypto.randomUUID()}@example.com`;
   await h.invite(email);
   return {

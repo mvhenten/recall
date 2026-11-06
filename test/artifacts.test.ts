@@ -1,7 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { type ArtifactView, RAW_INLINE_BYTES } from "../src/artifacts";
-import { DEVICE_CODE_LIMITS } from "../src/device";
 import { claimRevision } from "../src/store";
 import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
 
@@ -192,6 +191,20 @@ describe("the artifact hostname", () => {
     expect((await h.sendToArtifactHost("/a/burn-up", null)).status).toBe(401);
     expect((await h.sendToArtifactHost("/a/burn-up", await h.assertionFor(email))).status).toBe(401);
     expect((await h.sendToArtifactHost("/a/burn-up", assertion)).status).toBe(200);
+  });
+
+  it("refuses an assertion that names a service token and no email", async () => {
+    const { h, alice } = await publisher();
+    await alice.publish("burn-up", PAGE);
+
+    const response = await h.sendToArtifactHost(
+      "/a/burn-up",
+      await h.serviceAssertionFor("robot.access", ARTIFACT_AUDIENCE),
+    );
+    expect(response.status).toBe(401);
+    const html = await response.text();
+    expect(html).toContain("carries no email");
+    expect(html).not.toContain("Burn-up");
   });
 
   it("names the email it has not invited", async () => {
@@ -423,7 +436,7 @@ describe("the artifacts tab", () => {
     expect(empty).toContain("No artifact is published yet.");
     expect(empty).not.toContain("This deployment publishes no artifacts.");
 
-    const off = await harness("up", DEVICE_CODE_LIMITS, "off");
+    const off = await harness({ artifacts: "off" });
     const elsewhere = `alice-${crypto.randomUUID()}@example.com`;
     await off.invite(elsewhere);
     const disabled = await artifactsTab(off, await off.assertionFor(elsewhere));

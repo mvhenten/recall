@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { dayWindow, USAGE_CHART_DAYS } from "../src/model";
-import { type Client, harness } from "./harness";
+import { type Client, DASHBOARD_AUDIENCE, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -82,6 +82,15 @@ describe("the dashboard", () => {
     const response = await open(h, "/dashboard", null);
     expect(response.status).toBe(401);
     expect(await response.text()).toContain('<a href="/dashboard">Sign in again</a>');
+  });
+
+  it("refuses an assertion that names a service token and no email", async () => {
+    const h = await harness();
+    const response = await open(h, "/dashboard", await h.serviceAssertionFor("robot.access", DASHBOARD_AUDIENCE));
+    expect(response.status).toBe(401);
+    const html = await response.text();
+    expect(html).toContain("carries no email");
+    expect(html).toContain('<a href="/dashboard">Sign in again</a>');
   });
 
   it("refuses a verified email that is not invited", async () => {

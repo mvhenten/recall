@@ -12,11 +12,12 @@ import {
   type Session,
 } from "./model";
 
-// The surface cli/src/mcp.rs serves, named and described the same way, so a session reaching recall
-// over the connector and a session reaching it over stdio call one tool set. The connector runs in
-// no repository, so where the stdio server would read a repo tag there is none and the scope falls
-// back to global alone. The tools that take a path on disk are not here for the same reason: this
-// end holds no working copy to read one from.
+// The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
+// its own from #[tool] macros, so the two sets are maintained separately and the wording differs
+// where this end has no repo tag to read: a search or a listing that names no tags covers global
+// here and the current repo as well there, and a project or reference save is refused here rather
+// than tagged. A tool added to one side is therefore a known gap on the other until it is added
+// there too. The tools that take a path on disk are not here at all: this end holds no working copy.
 
 export interface SearchArgs {
   query: string;

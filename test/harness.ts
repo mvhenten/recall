@@ -9,8 +9,10 @@ import { DIMENSIONS, normalize } from "../src/rank";
 import { SHARE_EMAIL_PREFIX, SHARE_LINK_PREFIX } from "../src/shares";
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
-const AUDIENCE = "recall-test-aud";
 const ORIGIN = "https://recall.test";
+
+// The dashboard's own Access application, which every other audience here is not.
+export const DASHBOARD_AUDIENCE = "recall-test-aud";
 export const ARTIFACT_HOSTNAME = "artifact.recall.test";
 export const ARTIFACT_AUDIENCE = "recall-test-artifact-aud";
 
@@ -124,15 +126,23 @@ const USAGE_DELTA: Record<string, unknown> = {
   at: 1_700_000_060_000,
 };
 
-export const harness = async (
-  keys: "up" | "down" = "up",
-  deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS,
-  artifacts: "on" | "off" = "on",
+export interface HarnessOptions {
+  keys?: "up" | "down";
+  deviceCodeLimits?: DeviceCodeLimits;
+  artifacts?: "on" | "off";
   // Sharing is the one binding of the artifact host's group that is independently optional: a
   // deployment publishes artifacts and shares none by naming no share audience.
-  sharing: "on" | "off" = "on",
-  mcpConnector: "on" | "off" = "on",
-) => {
+  sharing?: "on" | "off";
+  mcpConnector?: "on" | "off";
+}
+
+export const harness = async ({
+  keys = "up",
+  deviceCodeLimits = DEVICE_CODE_LIMITS,
+  artifacts = "on",
+  sharing = "on",
+  mcpConnector = "on",
+}: HarnessOptions = {}) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
   const { n, e } = await exportJWK(publicKey);
   if (!n || !e) throw new Error("the generated key has no RSA modulus");
@@ -145,7 +155,7 @@ export const harness = async (
   const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
   const serviceClients = new Map<string, string>();
   const app = createApp({
-    verify: accessVerifier(source, ISSUER, AUDIENCE),
+    verify: accessVerifier(source, ISSUER, DASHBOARD_AUDIENCE),
     artifactHost:
       artifacts === "off"
         ? null
@@ -171,8 +181,11 @@ export const harness = async (
       .setExpirationTime(expiresAt)
       .sign(privateKey);
 
-  const assertionFor = (email: string, audience = AUDIENCE, expiresAt: string | number = "5m"): Promise<string> =>
-    signed({ email }, audience, expiresAt);
+  const assertionFor = (
+    email: string,
+    audience = DASHBOARD_AUDIENCE,
+    expiresAt: string | number = "5m",
+  ): Promise<string> => signed({ email }, audience, expiresAt);
 
   // What Access mints for a service token: a common name derived from the client id, and no email.
   const serviceAssertionFor = (commonName: string, audience = MCP_AUDIENCE): Promise<string> =>

@@ -4,9 +4,9 @@ import { TOOLS } from "./tools";
 // The remote MCP endpoint, on streamable HTTP. It answers both eras of the transport: a client that
 // opens with initialize is served the handshake revisions, and one that declares its version in
 // _meta on every request is served the per-request revision. An answer rides the POST that asked
-// for it, as a JSON body or, for a client of the older era that takes only a stream, as the one SSE
-// event that stream carries. Nothing is ever sent unasked, so there is no session to keep and no
-// standalone stream to open: a GET is refused the way the spec has a server decline one.
+// for it, as a JSON body or, for a client that takes only a stream, as the one SSE event that stream carries.
+// Nothing is ever sent unasked, so there is no session to keep and no standalone stream to open: a GET is
+// refused the way the spec has a server decline one.
 
 export const MCP_PATH = "/mcp";
 
@@ -21,7 +21,7 @@ const BASE64_SENTINEL = /^=\?base64\?(.*)\?=$/;
 const SERVER_INFO = { name: "recall", version: manifest.version };
 
 const INSTRUCTIONS =
-  "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. This connector runs in no repository, so memories scope to global unless a call names tags.";
+  "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. This connector runs in no repository, so a call that names no tags covers global memories; name tags, or any, to look wider.";
 
 const PARSE_ERROR = -32700;
 const INVALID_REQUEST = -32600;
@@ -40,8 +40,6 @@ export type ToolResult = { ok: true; text: string } | { ok: false; error: string
 
 export type RunTool = (call: ToolCall) => Promise<ToolResult>;
 
-// Who may call, resolved once the endpoint knows the request is one it answers at all, so a client
-// probing with a GET is told the shape is wrong rather than that its credentials are.
 export type Authorize = () => Promise<RunTool | Response>;
 
 type Id = string | number | null;
@@ -62,18 +60,19 @@ const refuse = (id: Id, code: number, message: string, status: number, data?: un
 // message tells the user which one the endpoint actually saw.
 export const mcpRefusal = (status: number, message: string): Response => refuse(null, UNAUTHORIZED, message, status);
 
-// A client of the older transport era reads its answer off a stream rather than out of a JSON body,
-// and says so by accepting text/event-stream and nothing else. The message is the same either way,
-// so the stream carries the one event and closes.
+// A client that accepts text/event-stream and nothing else, which no published revision describes
+// but the desktop app sends: it reads its answer off a stream rather than out of a JSON body. The
+// message is the same either way, so the stream carries the one event and closes — and every
+// answer is framed, refusals included, since a client that takes no JSON cannot read one.
 const takesEventStream = (request: Request): boolean => {
   const accept = request.headers.get("accept") ?? "";
   return accept.includes("text/event-stream") && !accept.includes("application/json") && !accept.includes("*/*");
 };
 
 const asEventStream = async (answer: Response): Promise<Response> => {
-  if (answer.status !== 200 || answer.body === null) return answer;
+  if (answer.body === null) return answer;
   return new Response(`event: message\ndata: ${await answer.text()}\n\n`, {
-    status: 200,
+    status: answer.status,
     headers: {
       "content-type": "text/event-stream",
       "cache-control": "no-store",
@@ -124,7 +123,7 @@ const initializeResult = (params: unknown): unknown => {
 
 const discoverResult = (): unknown => ({
   resultType: "complete",
-  supportedVersions: [MODERN_VERSION],
+  supportedVersions: SUPPORTED_VERSIONS,
   capabilities: { tools: {} },
   _meta: { [META_SERVER_INFO]: SERVER_INFO },
   instructions: INSTRUCTIONS,
@@ -199,9 +198,13 @@ const answer = async (request: Request, authorize: Authorize): Promise<Response>
   if (!isRecord(body) || body.jsonrpc !== "2.0" || typeof body.method !== "string") {
     return refuse(null, INVALID_REQUEST, 'a message must be {"jsonrpc": "2.0", "method": ...}', 400);
   }
-  const { method, params } = body;
-  const id = typeof body.id === "string" || typeof body.id === "number" ? body.id : null;
-  if (body.id === undefined) return new Response(null, { status: 202 });
+  const { method, params, id } = body;
+  // A notification names no id, whether by leaving the member out or by sending it null, and is
+  // answered with nothing at all.
+  if (id === undefined || id === null) return new Response(null, { status: 202 });
+  if (typeof id !== "string" && typeof id !== "number") {
+    return refuse(null, INVALID_REQUEST, "a message id is a string or a number", 400);
+  }
   const declared = declaredVersion(params);
   return declared === null
     ? legacy(request, id, method, params, run)

@@ -235,6 +235,7 @@ import {
   shareCount,
   shareCountsFor,
   sharesFor,
+  startCursor,
   textCandidates,
   vectorCandidates,
   writeChunks,
@@ -2339,8 +2340,6 @@ export const createApp = (deps: Deps): App => {
     return json(await searched(db, userId, parsed.value));
   };
 
-  // Which identity the endpoint saw, and which user it acts for. Each refusal names the scheme it
-  // tried, so a connector that will not connect says why rather than only that it did not.
   const mcpCaller = async (request: Request, env: AppEnv, host: McpHost): Promise<Caller | Response> => {
     const assertion = request.headers.get("cf-access-jwt-assertion");
     const sentServiceHeaders = request.headers.get("cf-access-client-id") !== null;
@@ -2359,6 +2358,16 @@ export const createApp = (deps: Deps): App => {
         `Cloudflare Access ${sentServiceHeaders ? "service token" : "sign-in"} rejected: ${verified.reason}`,
       );
     }
+    // Origin validation is a MUST on every incoming connection, whichever scheme proved the caller,
+    // so it runs before either branch rather than inside the browser one.
+    const origin = request.headers.get("origin");
+    const own = new URL(request.url).origin;
+    if (origin !== null && origin !== own) {
+      return mcpRefusal(
+        403,
+        `${MCP_PATH} answers ${own} alone and this request declared the origin ${origin}; a client that is not a browser sends no Origin header`,
+      );
+    }
     const { principal } = verified;
     if (principal.kind === "serviceToken") {
       const owner = host.serviceClients.get(principal.commonName);
@@ -2370,14 +2379,6 @@ export const createApp = (deps: Deps): App => {
       }
       return connectorDevice(env.DB, owner, deps.now());
     }
-    const origin = request.headers.get("origin");
-    const own = new URL(request.url).origin;
-    if (origin !== null && origin !== own) {
-      return mcpRefusal(
-        403,
-        `the Access sign-in scheme answers ${own} alone and this request came from ${origin}; use the CF-Access-Client-Id and CF-Access-Client-Secret service token scheme instead`,
-      );
-    }
     const userId = await userForEmail(env.DB, principal.email);
     if (userId === null) {
       return mcpRefusal(403, `${principal.email} is not invited to this recall; ask its owner to add it`);
@@ -2385,9 +2386,6 @@ export const createApp = (deps: Deps): App => {
     return connectorDevice(env.DB, userId, deps.now());
   };
 
-  // One tool call, against the same store the API serves. Every scope the stdio server reads off a
-  // working copy is global here, which is settled in parseSearchArgs and its siblings rather than
-  // again in each branch.
   const runTool = (env: AppEnv, caller: Caller): RunTool => {
     const db = env.DB;
     const { userId } = caller;
@@ -2423,10 +2421,13 @@ export const createApp = (deps: Deps): App => {
       if (call.name === "recall_list") {
         const input = parseListArgs(args.value);
         if (!input.ok) return refused(input.error);
-        const sort = MEMORY_SORTS[0]?.key ?? "newest";
-        const cursor = decodeCursor("", memoryCursorDirection(sort));
-        if (!cursor) return refused("the listing cursor is malformed");
-        const page = await listMemories(db, userId, { ...input.value, types: [], cursor: "", sort }, cursor);
+        const sort = "newest";
+        const page = await listMemories(
+          db,
+          userId,
+          { ...input.value, types: [], cursor: "", sort },
+          startCursor(memoryCursorDirection(sort)),
+        );
         return document(page.memories);
       }
       if (call.name === "recall_save") {
