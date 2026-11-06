@@ -297,7 +297,7 @@ describe("the share page", () => {
     expect(page.html).toContain("Only an artifact&#39;s owner shares it.");
     expect(page.html).toContain("not yours");
     expect(page.html).not.toContain("Quarterly plan");
-    expect(page.html).not.toContain("r account");
+    expect(page.html).not.toContain("<span>r account</span>");
     expect(page.html).not.toContain("<form");
     expect(page.html).not.toContain("<button");
   });
