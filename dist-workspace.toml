@@ -9,3 +9,6 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-d
 install-path = "CARGO_HOME"
 hosting = "github"
 install-updater = true
+
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
