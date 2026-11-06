@@ -569,7 +569,9 @@ fn refresh(scope: &Scope, session_id: &str, stored: &Value) -> Result<Option<Ado
 fn usage_marks(transcript: &Path) -> Value {
     let marks: serde_json::Map<String, Value> = transcripts::sources(transcript)
         .unwrap_or_default()
+        .found
         .into_iter()
+        .filter(|source| source.holds == transcripts::Holds::Turns)
         .map(|source| (source.file, json!({ "offset": source.size, "messageId": "" })))
         .collect();
     Value::Object(marks)

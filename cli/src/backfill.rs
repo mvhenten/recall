@@ -8,7 +8,7 @@ use crate::adopt::{self, Reading};
 use crate::api::SessionBody;
 use crate::repo;
 use crate::sessions::Focus;
-use crate::transcripts::{self, MAIN, Source};
+use crate::transcripts::{self, MAIN, Pass, Source};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -303,12 +303,18 @@ fn events(spans: &[(String, Counted)], account: &str, prompts: i64, block: i64) 
         .collect()
 }
 
-/// The transcript files one past session is made of.
+/// The transcript files one past session is made of. A file this host has no name for stops the
+/// run that found it: a backfill sends each session once and nothing comes back to it, so a
+/// session sent without one of its files is one archived without it for good.
 fn parts(transcript: &Path) -> Result<Vec<Part>> {
-    Ok(transcripts::sources(transcript)?
-        .into_iter()
-        .map(|source| Part { source })
-        .collect())
+    let sources = transcripts::sources(transcript)?;
+    if let Some(path) = sources.unsendable.first() {
+        bail!(
+            "{} is named what this host cannot send a transcript file under",
+            path.display()
+        );
+    }
+    Ok(sources.found.into_iter().map(|source| Part { source }).collect())
 }
 
 /// One past session read out of its transcript, or nothing for a transcript that holds neither a
@@ -415,15 +421,20 @@ pub struct Sent {
 /// would answer only knows a session already on record, and nothing it could say would change the
 /// answer. A session it has owes only the delegated turns it has not counted. Its own transcript
 /// is never read again, whatever the service says — the hooks counted that one as the session
-/// ran, or a run before this did, and a transcript cannot say which.
+/// ran, or a run before this did, and a transcript cannot say which. A persisted tool output is
+/// read for nothing: it holds no turn, so no token was ever spent on it.
 fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<(Vec<&'a Part>, transcripts::Held)> {
+    let turns = || {
+        session
+            .parts
+            .iter()
+            .filter(|part| part.source.holds == transcripts::Holds::Turns)
+    };
     if !session.on_record {
-        return Ok((session.parts.iter().collect(), transcripts::Held::default()));
+        return Ok((turns().collect(), transcripts::Held::default()));
     }
     let held = service.held(&session.session_id)?;
-    let owed = session
-        .parts
-        .iter()
+    let owed = turns()
         .filter(|part| part.source.file != MAIN && !held.counted.contains(&part.source.file))
         .collect();
     Ok((owed, held))
@@ -460,10 +471,13 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
         }
         // The files this session was found to have, and not whatever is on disk by now: the set
         // the archive writes is then the set the tokens were decided over, and the two cannot
-        // drift apart under a run.
+        // drift apart under a run. `past()` leaves every session the registry still names to
+        // adoption, so one here wrote the last of its files long ago and the end of each of them
+        // is the end for good.
         for part in &session.parts {
             let at = held.bytes.get(&part.source.file).copied().unwrap_or(0);
-            done.bytes += transcripts::send_file(service, id, &part.source, at)?.bytes;
+            let from = transcripts::placed(&part.source, at)?;
+            done.bytes += transcripts::send_from(service, id, &part.source, from, Pass::Final)?.bytes;
         }
         sent(id, done);
     }

@@ -544,7 +544,7 @@ struct SessionHits {
     hits: Vec<SessionHit>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionBody<'a> {
     pub host: &'a str,
@@ -900,10 +900,19 @@ impl Client {
         Ok(std::io::copy(&mut body.as_reader(), into)?)
     }
 
+    /// The focus line is the session's first prompt and its latest, which the host reads straight
+    /// out of what the user typed. A key pasted into a prompt would otherwise reach the service
+    /// and the dashboard in the clear, so it goes through the same reading every stretch of every
+    /// transcript goes through. Both the hooks' sync and the backfill's send the record this way,
+    /// so neither route carries one up.
     pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<()> {
+        let focus = crate::sessions::Focus {
+            first: crate::redact::text(&body.focus.first),
+            latest: crate::redact::text(&body.focus.latest),
+        };
         let response = self
             .authed(self.agent.put(self.url(&Self::session_path(session_id))))
-            .send_json(body)?;
+            .send_json(SessionBody { focus: &focus, ..*body })?;
         check(response, &format!("syncing session {session_id}"))?;
         Ok(())
     }
