@@ -33,6 +33,35 @@ const queued = (userId: string, toDeviceId: string, now: number): Promise<Messag
 const alarmAt = (userId: string): Promise<number | null> =>
   runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) => state.storage.getAlarm());
 
+// The rows a device has, read past everything the mailbox decides, so a test can tell a row that
+// is still there from one a read declined to hand over.
+const rowIds = (userId: string, toDeviceId: string): Promise<string[]> =>
+  runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) =>
+    state.storage.sql
+      .exec<{ message_id: string }>("SELECT message_id FROM messages WHERE to_device_id = ?", toDeviceId)
+      .toArray()
+      .map((row) => row.message_id),
+  );
+
+// An order as the three day queue left it: sent two days ago, and carrying an expiry that is still
+// a day out.
+const leaveStaleOrder = async (userId: string, toDeviceId: string, now: number): Promise<string> => {
+  const messageId = crypto.randomUUID();
+  const day = 86_400_000;
+  await runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) => {
+    state.storage.sql.exec(
+      `INSERT INTO messages
+         (message_id, kind, to_device_id, to_session_id, from_device_id, from_host, from_name, body, created_at, expires_at)
+         VALUES (?, 'order', ?, '', 'd-sender', 'laptop', '', 'rerun the migration', ?, ?)`,
+      messageId,
+      toDeviceId,
+      now - 2 * day,
+      now + day,
+    );
+  });
+  return messageId;
+};
+
 const deviceId = async (client: Client, name: string): Promise<string> => {
   const response = await client.request("GET", "/v1/devices");
   expect(response.status).toBe(200);
@@ -245,6 +274,26 @@ describe("orders", () => {
       expect((await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body })).status).toBe(201);
       expect(await alarmAt(userId)).toBe(due);
     }
+  });
+
+  // Every read decides the TTL for itself, which is what makes the backlog of a three day queue go
+  // away rather than keep landing: the row's own expiry is still a day out and counts for nothing.
+  // A receipt is the read with no delete in front of it, so it is where that has to hold.
+  it("hands nothing past the TTL on a receipt, whatever expiry the queued row carries", async () => {
+    const { h, userId, laptop, desktopToken, desktopId } = await bus();
+    const holder = await listen(h, desktopToken, "");
+    const news = await outcome(
+      await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "the build is green" }),
+    );
+    await eventually(() => holder.received.length === 1, "the news reaching the host");
+    const stale = await leaveStaleOrder(userId, desktopId, h.now());
+
+    ack(holder, news.message.messageId);
+
+    await eventually(async () => (await rowIds(userId, desktopId)).join() === stale, "the receipt for the news");
+    expect(ids(holder.received)).toEqual([news.message.messageId]);
+    expect(await queued(userId, desktopId, h.now())).toEqual([]);
+    expect(await rowIds(userId, desktopId)).toEqual([]);
   });
 
   it("refuses a receipt that does not quote the lease the order went out under", async () => {

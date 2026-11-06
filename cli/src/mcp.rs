@@ -472,7 +472,7 @@ impl Recall {
 
     #[tool(
         name = "recall_order",
-        description = "Give one Claude Code session on another host an instruction to carry out, and learn which session took it. Unlike recall_send, which every session on the host reads, an order is held by the one session that takes it, so a fleet instruction is run once per host instead of once per session. Name a host as recall devices shows it, or by its label. An order no session takes is an error saying so. A listening host that takes one back leaves nothing behind, but an order to a host that is not listening stays queued for a session that attaches within the next ten minutes, so sending it again before then can have it run twice."
+        description = "Give one Claude Code session on another host an instruction to carry out, and learn which session took it. Unlike recall_send, which every session on the host reads, an order is held by the one session that takes it, so a fleet instruction is run once per host instead of once per session. Name a host as recall devices shows it, or by its label. An order no session takes is an error saying so. A listening host that takes one back leaves nothing behind, but an order to a host that is not listening stays queued for a session that attaches within the next ten seconds, so sending it again before then can have it run twice."
     )]
     async fn order(&self, Parameters(params): Parameters<OrderParams>) -> Result<String, String> {
         blocking(move || {

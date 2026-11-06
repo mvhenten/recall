@@ -539,7 +539,7 @@ pub fn order_refusal(sent: &api::Sent, to: &str) -> String {
 /// An order is worth nothing to the sender who cannot tell whether anyone picked it up, so one
 /// nobody took ends the command with the reason the service gave rather than a line that reads
 /// like success. A host that is listening and names no session loses the order; one that is not
-/// listening keeps it for a session that attaches within the ten minutes of the grace.
+/// listening keeps it for the ten seconds the service leaves it queued.
 fn report_order(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
     let Some(api::Outcome::Taken { session_id }) = &sent.outcome else {
         bail!("{}", order_refusal(sent, to));

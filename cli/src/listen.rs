@@ -232,7 +232,8 @@ async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) -> Rep
 async fn news(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) -> Reply {
     let (target, fanout) = if message.to_session_id.is_empty() {
         let now = Timestamp::now().as_millisecond();
-        let Some(fanout) = sessions::to_host(sessions_dir, body, message.created_at, now).await else {
+        let Some(fanout) = sessions::to_host(sessions_dir, body, message.created_at, message.expires_at, now).await
+        else {
             seen.record(&message.message_id);
             log(&format!("message:retired:{}", message.message_id), started.elapsed());
             return Reply::Ack;
@@ -258,7 +259,7 @@ async fn news(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &st
 async fn order(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) -> Reply {
     let placed = if message.to_session_id.is_empty() {
         let now = Timestamp::now().as_millisecond();
-        sessions::to_one(sessions_dir, body, message.created_at, now).await
+        sessions::to_one(sessions_dir, body, message.created_at, message.expires_at, now).await
     } else {
         sessions::to_one_session(sessions_dir, &message.to_session_id, body).await
     };

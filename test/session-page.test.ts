@@ -566,6 +566,7 @@ describe("the send box", () => {
     expect(idle).toContain("</textarea>");
     const reached = await post(h, path, you.assertion, { csrf, cookie, body: "still there?" });
     expect(reached.status).toBe(303);
+    expect(await queued(you.userId, laptopId, h.now())).toHaveLength(1);
 
     h.tick(25 * 3_600_000);
     const over = await read(h, path, you.assertion);
@@ -575,6 +576,6 @@ describe("the send box", () => {
     const refused = await post(h, path, you.assertion, { csrf, cookie, body: "anyone there" });
     expect(refused.status).toBe(400);
     expect(await refused.text()).toContain("No host is running this session any more, so the bus has nowhere");
-    expect(await queued(you.userId, laptopId, h.now())).toHaveLength(1);
+    expect(await queued(you.userId, laptopId, h.now())).toEqual([]);
   });
 });

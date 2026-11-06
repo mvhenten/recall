@@ -2,15 +2,19 @@ import { DurableObject } from "cloudflare:workers";
 import { listDevices } from "./device";
 import { type Parsed, parseSessionId } from "./model";
 
-export const MESSAGE_TTL_MS = 259_200_000;
+// The whole life of a queued message. A message is only worth reading by a session that exists
+// roughly now: one written into a session that started long after it was sent arrives with no idea
+// what it refers to, which is the flood a three day queue produced. Ten seconds is the window a
+// host reconnecting or sitting between sessions still catches.
+export const MESSAGE_TTL_MS = 10_000;
 export const MAX_QUEUED_MESSAGES = 1_000;
 export const MAX_BODY_BYTES = 32_768;
 export const SWEEP_INTERVAL_MS = 900_000;
 
-// How long one session holds an order before the mailbox hands it to whoever is listening next. A
-// minute is ten of the five second timeouts the daemon allows itself to write into a session, and
-// the ceiling of its reconnect backoff, past which a host that died holding an order cannot be
-// the one to hand it back.
+// How long one socket holds an order to itself, so no other connection sees it while that one is
+// writing it into a session. A minute is ten of the five second timeouts the daemon allows itself
+// for that write. It outlives the message, so an order its holder never reported on is expired
+// rather than offered again.
 export const LEASE_MS = 60_000;
 
 // How long a send waits for the host to name the session that took an order, and the whole life of
@@ -31,7 +35,7 @@ export const CLOSE_BAD_FRAME = 4000;
 export const CLOSE_REVOKED = 4001;
 
 export const NOTHING_LISTENING =
-  "no host is listening as that device, so nothing can take the order; one attaching within ten minutes still runs it";
+  "no host is listening as that device, so nothing can take the order; one attaching within ten seconds still runs it";
 export const NOT_TAKEN = "the host is listening but no session took the order, so it was dropped";
 export const NO_SESSION_TOOK_IT = "the host took the order back: it has no session that can act on it";
 
@@ -132,6 +136,14 @@ interface Attachment {
 
 const COLUMNS =
   "message_id, kind, to_device_id, to_session_id, from_device_id, from_host, from_name, body, created_at, expires_at";
+
+// Every read of the queue decides the TTL for itself, so what is handed to a host is bounded by
+// how old the message is and by nothing else: a row written when the TTL was longer, and one the
+// sweep has not reached yet, are both already gone to every read past this cutoff. The stored
+// `expires_at` is what the receiver is told, never what the mailbox believes.
+const LIVE = "created_at > ?";
+
+const liveSince = (now: number): number => now - MESSAGE_TTL_MS;
 
 const toMessage = (row: MessageRow): Message => ({
   messageId: row.message_id,
@@ -313,12 +325,12 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     pair[1].serializeAttachment({ deviceId, orders } satisfies Attachment);
     this.expire(now);
     this.release(now);
-    for (const message of this.rows("WHERE to_device_id = ? AND kind = 'news'", deviceId)) {
+    for (const message of this.rows("AND kind = 'news'", deviceId, now)) {
       pair[1].send(messageFrame(message, crypto.randomUUID()));
     }
     // One order on top of the news: the oldest no session is holding. The host's other orders wait
     // for the receipt on this one, since it writes them into its sessions one at a time.
-    const next = this.nextOrder(deviceId);
+    const next = this.nextOrder(deviceId, now);
     if (next !== null) this.hand(next, now);
     await this.scheduleAlarm();
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -334,10 +346,11 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       );
       return;
     }
+    const now = Date.now();
     if (this.remove(deviceId, receipt.messageId, receipt.token)) {
       this.settle(receipt);
-      const next = this.nextOrder(deviceId);
-      if (next !== null) this.hand(next, Date.now());
+      const next = this.nextOrder(deviceId, now);
+      if (next !== null) this.hand(next, now);
     }
     await this.scheduleAlarm();
   }
@@ -384,7 +397,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
 
   list(toDeviceId: string, now: number): Message[] {
     this.expire(now);
-    return this.rows("WHERE to_device_id = ?", toDeviceId);
+    return this.rows("", toDeviceId, now);
   }
 
   // News is handed out and nothing is waited on. An order goes to one socket, and the sender waits
@@ -401,23 +414,30 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     return outcome;
   }
 
-  // The one order a device may be handed next: the oldest under no lease. A second lease started
-  // now would run out while the host was still writing the first order into a session.
-  private nextOrder(toDeviceId: string): Message | null {
+  // The one order a device may be handed next: the oldest still inside its TTL and under no lease.
+  // A second lease started now would run out while the host was still writing the first order into
+  // a session.
+  private nextOrder(toDeviceId: string, now: number): Message | null {
     const [row] = this.sql
       .exec<MessageRow>(
         `SELECT ${COLUMNS} FROM messages
-           WHERE to_device_id = ? AND kind = 'order' AND message_id NOT IN (SELECT message_id FROM leases)
+           WHERE to_device_id = ? AND ${LIVE} AND kind = 'order'
+             AND message_id NOT IN (SELECT message_id FROM leases)
            ORDER BY created_at, rowid LIMIT 1`,
         toDeviceId,
+        liveSince(now),
       )
       .toArray();
     return row === undefined ? null : toMessage(row);
   }
 
-  private rows(where: string, toDeviceId: string): Message[] {
+  private rows(filter: string, toDeviceId: string, now: number): Message[] {
     return this.sql
-      .exec<MessageRow>(`SELECT ${COLUMNS} FROM messages ${where} ORDER BY created_at, rowid`, toDeviceId)
+      .exec<MessageRow>(
+        `SELECT ${COLUMNS} FROM messages WHERE to_device_id = ? AND ${LIVE} ${filter} ORDER BY created_at, rowid`,
+        toDeviceId,
+        liveSince(now),
+      )
       .toArray()
       .map(toMessage);
   }
@@ -490,7 +510,8 @@ export class Mailbox extends DurableObject<MailboxEnv> {
   }
 
   // The devices whose lease has run out, each offered one order again. A host that is gone takes
-  // nothing and its orders wait, under no lease, for the next socket to attach.
+  // nothing and its orders wait, under no lease, for the next socket to attach — for as long as
+  // the TTL leaves them anything to offer.
   private handBack(now: number): void {
     const devices = this.sql
       .exec<{ to_device_id: string }>(
@@ -501,7 +522,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       .toArray();
     this.release(now);
     for (const device of devices) {
-      const next = this.nextOrder(device.to_device_id);
+      const next = this.nextOrder(device.to_device_id, now);
       if (next !== null) this.hand(next, now);
     }
   }
@@ -581,11 +602,15 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     return now + SWEEP_INTERVAL_MS;
   }
 
+  // Takes out the rows the reads have already stopped handing over. It is the same cutoff, so a
+  // mailbox nothing has touched since the TTL changed holds rows no read will return and this
+  // clears them on the next thing that happens to it.
   private expire(now: number): void {
+    const since = liveSince(now);
     this.sql.exec(
-      "DELETE FROM leases WHERE message_id IN (SELECT message_id FROM messages WHERE expires_at <= ?)",
-      now,
+      "DELETE FROM leases WHERE message_id IN (SELECT message_id FROM messages WHERE created_at <= ?)",
+      since,
     );
-    this.sql.exec("DELETE FROM messages WHERE expires_at <= ?", now);
+    this.sql.exec("DELETE FROM messages WHERE created_at <= ?", since);
   }
 }
