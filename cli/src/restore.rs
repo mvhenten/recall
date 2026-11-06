@@ -20,7 +20,7 @@
 //! turns go on naming the directory the session ran in.
 
 use crate::api::{Client, HeldFile, PastSession};
-use crate::transcripts::{MAIN, TOOL_RESULT};
+use crate::transcripts::{self, MAIN, TOOL_RESULT};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -66,9 +66,15 @@ pub struct Restored {
 /// the archive does is the live one, or one archived from a run that has not finished going up,
 /// and overwriting it would throw lines away; one it holds less of is a part the archive has the
 /// whole of.
+///
+/// The two are weighed in the archive's own length and never the file's size on disk. What the
+/// archive holds is the file redacted, and a placeholder is not the length of the secret it stands
+/// in: one access key id is twenty bytes on disk and twenty-eight in the archive, so a complete
+/// transcript weighed by its size reads as a part of the archive and is written over — on the host
+/// that ran the session, over the transcript it is still writing.
 fn stale(path: &Path, archived: i64) -> Result<bool> {
     match std::fs::metadata(path) {
-        Ok(metadata) => Ok((metadata.len() as i64) < archived),
+        Ok(_) => Ok(transcripts::archived_len(path)? < archived),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
@@ -189,6 +195,24 @@ mod tests {
         assert!(
             !stale(&path, 2).unwrap(),
             "and one holding more than the archive is the live transcript, which is never truncated"
+        );
+
+        // One access key id is twenty bytes on disk and twenty-eight in the archive, so this
+        // complete transcript is the shorter of the two by size and the longer by what it holds.
+        let text = "{\"text\":\"AKIAZZ7EXAMPLE9QTVB2\"}\n";
+        std::fs::write(&path, text).unwrap();
+        let archived = transcripts::archived_len(&path).unwrap();
+        assert!(
+            archived > text.len() as i64,
+            "the archive of this one runs longer than the file"
+        );
+        assert!(
+            !stale(&path, archived).unwrap(),
+            "a complete transcript is left alone, however its size on disk compares"
+        );
+        assert!(
+            stale(&path, archived + 1).unwrap(),
+            "and one the archive holds more of than this is a part"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

@@ -143,9 +143,12 @@ function size(file) {
 
 export const MAIN = "main";
 
-// Mirrors sources() in cli/src/transcripts.rs: a session's own transcript, and the file Claude
-// Code writes for each delegated turn under `<session id>/subagents/`. The delegated turns carry
-// most of what a session spends, so reading the one file counts a fraction of the tokens.
+// The files a session spends tokens in: its own transcript, and the file Claude Code writes for
+// each delegated turn under `<session id>/subagents/`. The delegated turns carry most of what a
+// session spends, so reading the one file counts a fraction of the tokens. It is deliberately
+// short of sources() in cli/src/transcripts.rs, which also sends the outputs a session persisted
+// under `<session id>/tool-results/`: those are bytes a turn pointed at, and no token was ever
+// spent on one.
 export function transcriptFiles(transcriptPath) {
   const own = { file: MAIN, path: transcriptPath };
   const dir = path.join(path.dirname(transcriptPath), path.basename(transcriptPath, ".jsonl"), "subagents");

@@ -8,7 +8,7 @@ use crate::adopt::{self, Reading};
 use crate::api::SessionBody;
 use crate::repo;
 use crate::sessions::Focus;
-use crate::transcripts::{self, MAIN, Source};
+use crate::transcripts::{self, MAIN, Pass, Source};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -465,10 +465,13 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
         }
         // The files this session was found to have, and not whatever is on disk by now: the set
         // the archive writes is then the set the tokens were decided over, and the two cannot
-        // drift apart under a run.
+        // drift apart under a run. `past()` leaves every session the registry still names to
+        // adoption, so one here wrote the last of its files long ago and the end of each of them
+        // is the end for good.
         for part in &session.parts {
             let at = held.bytes.get(&part.source.file).copied().unwrap_or(0);
-            done.bytes += transcripts::send_file(service, id, &part.source, at)?.bytes;
+            let from = transcripts::placed(&part.source, at)?;
+            done.bytes += transcripts::send_from(service, id, &part.source, from, Pass::Final)?.bytes;
         }
         sent(id, done);
     }

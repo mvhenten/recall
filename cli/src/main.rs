@@ -23,6 +23,7 @@ use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+use transcripts::Pass;
 
 #[derive(Parser)]
 #[command(
@@ -612,7 +613,9 @@ fn sync_session(session_id: &str) -> Result<()> {
         sessions::commit_usage(&dir, session_id, pending)?;
         println!("sent {sent} usage deltas for {session_id}");
     }
-    let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path)?;
+    // A sync says nothing about the session being over, so the record half written at the end of
+    // a file waits for the pass that holds the whole of it.
+    let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path, Pass::Open)?;
     if archived > 0 {
         println!("archived {archived} transcript bytes for {session_id}");
     }
@@ -631,7 +634,10 @@ fn end_session(session_id: &str) -> Result<()> {
             let sent = client.post_usage(session_id, &record.host, &record.repo, &read(pending), &pending.events)?;
             println!("sent {sent} usage deltas for {session_id}");
         }
-        let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path)?;
+        // The session is over, so the end of each of its files is the end for good and the last
+        // record of each goes up whether or not the line it sits on was finished.
+        let archived =
+            transcripts::Archive::default().send(&client, session_id, &record.transcript_path, Pass::Final)?;
         if archived > 0 {
             println!("archived {archived} transcript bytes for {session_id}");
         }

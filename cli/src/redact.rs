@@ -16,6 +16,12 @@
 //! marker that may yet become one, reaching the end of a stretch that is not the end of the file
 //! holds the cut back to where it began, and the stretch ends short of it. One that runs past a
 //! whole stretch holds the file where it is, which sends nothing rather than half a secret.
+//!
+//! A stretch is a run of bytes out of the middle of a file, so what reads here as its first byte
+//! is a first byte of nothing: the caller hands over the byte in front of it as well, which is
+//! what says whether a marker sitting there opens a word or runs on out of one. Reading offset
+//! zero of a stretch as a word break would redact `xsk-...` wherever the cut fell on the `s`,
+//! writing a placeholder into a record that a restore and a search both read back.
 
 /// What one pass over a stretch wrote, and how many of the bytes it was given that accounts for.
 /// The two part company where a match reaches the end of the stretch: those bytes are left to the
@@ -40,9 +46,10 @@ enum Piece<'a> {
     Hidden(&'static str, usize),
 }
 
-/// The stretch, redacted, and how much of it that accounts for.
-pub fn redact(input: &[u8], whole: bool) -> Redacted {
-    let (pieces, source) = pieces(input, whole);
+/// The stretch, redacted, and how much of it that accounts for. `before` is the byte of the file
+/// just in front of the stretch, and nothing for a stretch that starts at the file's first byte.
+pub fn redact(input: &[u8], before: Option<u8>, whole: bool) -> Redacted {
+    let (pieces, source) = pieces(input, before, whole);
     let mut bytes = Vec::with_capacity(source);
     for piece in pieces {
         match piece {
@@ -57,11 +64,18 @@ pub fn redact(input: &[u8], whole: bool) -> Redacted {
     Redacted { bytes, source }
 }
 
+/// One line of a session's own prose, redacted. A prompt is a whole line in hand rather than a
+/// stretch of a file, so there is nothing in front of it and nothing left to arrive: a secret
+/// pasted into one is written out as a placeholder like any other.
+pub fn text(line: &str) -> String {
+    String::from_utf8_lossy(&redact(line.as_bytes(), None, true).bytes).into_owned()
+}
+
 /// Where in the file the archive's end falls, for an end that lands inside a stretch rather than
 /// on the cut some pass made. A position inside a placeholder is no position in the file: the
 /// bytes it stands for were never sent, so there is nothing to count off.
-pub fn source_of(input: &[u8], whole: bool, archive: usize) -> Option<usize> {
-    let (pieces, _) = pieces(input, whole);
+pub fn source_of(input: &[u8], before: Option<u8>, whole: bool, archive: usize) -> Option<usize> {
+    let (pieces, _) = pieces(input, before, whole);
     let mut at = 0;
     let mut out = 0;
     for piece in pieces {
@@ -86,12 +100,12 @@ pub fn source_of(input: &[u8], whole: bool, archive: usize) -> Option<usize> {
 }
 
 /// The run of a stretch that is written out, piece by piece, and where it is cut.
-fn pieces(input: &[u8], whole: bool) -> (Vec<Piece<'_>>, usize) {
+fn pieces(input: &[u8], before: Option<u8>, whole: bool) -> (Vec<Piece<'_>>, usize) {
     let mut found = Vec::new();
     let mut kept = 0;
     let mut at = 0;
     while at < input.len() {
-        match look(input, at, whole) {
+        match look(input, at, before, whole) {
             Look::Miss => at += 1,
             Look::Unfinished => {
                 found.push(Piece::Kept(&input[kept..at]));
@@ -178,6 +192,10 @@ fn upper(byte: u8) -> bool {
     byte.is_ascii_uppercase() || byte.is_ascii_digit()
 }
 
+fn plain(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
 fn word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -254,11 +272,23 @@ const SHAPES: &[Shape] = &[
         kind: "anthropic-api-key",
     },
     Shape {
-        markers: &[b"sk-"],
+        markers: &[b"sk-proj-", b"sk-svcacct-", b"sk-admin-"],
         folded: false,
         marked: true,
         held: dashed,
         least: 20,
+        kind: "openai-api-key",
+    },
+    // What OpenAI issued before it gave its keys a prefix each: `sk-` and then nothing but
+    // letters and digits, forty of them at the least. The dashed run the prefixed keys take would
+    // swallow the rest of any base64url payload holding `-sk-` or `_sk-`, which is a JWT's
+    // signature as often as not, and corruption of a record is not repairable from the archive.
+    Shape {
+        markers: &[b"sk-"],
+        folded: false,
+        marked: true,
+        held: plain,
+        least: 40,
         kind: "openai-api-key",
     },
     Shape {
@@ -416,13 +446,16 @@ fn private_key(input: &[u8], at: usize, whole: bool) -> Look {
 }
 
 /// Whether a marker may open here. A secret is a word of its own, so one found running on out of
-/// another word is part of that word.
-fn boundary(input: &[u8], at: usize) -> bool {
-    at == 0 || !input[at - 1].is_ascii_alphanumeric()
+/// another word is part of that word. The first byte of a stretch has the byte in front of it out
+/// in the file rather than in hand, and a stretch of the middle of a file that read its own first
+/// byte as a word break would redact wherever the cut happened to fall.
+fn boundary(input: &[u8], at: usize, before: Option<u8>) -> bool {
+    let prior = if at == 0 { before } else { Some(input[at - 1]) };
+    !prior.is_some_and(|byte| byte.is_ascii_alphanumeric())
 }
 
-fn look(input: &[u8], at: usize, whole: bool) -> Look {
-    if !boundary(input, at) {
+fn look(input: &[u8], at: usize, before: Option<u8>, whole: bool) -> Look {
+    if !boundary(input, at, before) {
         return Look::Miss;
     }
     for shape in SHAPES {
@@ -445,7 +478,7 @@ mod tests {
     use super::*;
 
     fn stripped(text: &str) -> String {
-        String::from_utf8(redact(text.as_bytes(), true).bytes).unwrap()
+        String::from_utf8(redact(text.as_bytes(), None, true).bytes).unwrap()
     }
 
     #[test]
@@ -508,6 +541,15 @@ mod tests {
         );
     }
 
+    /// A marker running on out of a word, with a run behind it long enough to clear every floor
+    /// a shape sets. Each of these redacts the moment the word break in front of the marker is
+    /// read wrong, so the rule is what keeps them whole and never their length.
+    const WORDS: &[(&str, &str)] = &[
+        ("git switch task-7AKIAZZ7EXAMPLE9QTVB2-rebased\n", "AKIAZZ7"),
+        ("the file myghp_3kQ9fakeTOKENvalue0000000000000000.json\n", "ghp_3kQ9"),
+        ("xsk-abcdefghijklmnopqrstuvwxyz0123456789abcdef\n", "sk-abcdef"),
+    ];
+
     #[test]
     fn what_a_session_writes_about_its_own_work_is_left_alone() {
         for prose in [
@@ -522,19 +564,69 @@ mod tests {
         ] {
             assert_eq!(stripped(prose), prose, "prose a session wrote about secrets is not one");
         }
+        for (prose, _) in WORDS {
+            assert_eq!(
+                stripped(prose),
+                *prose,
+                "a marker running on out of a word is part of that word, however long the run behind it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_at_the_head_of_a_stretch_is_read_against_the_byte_in_front_of_it() {
+        for (prose, marker) in WORDS {
+            let bytes = prose.as_bytes();
+            let at = prose.find(marker).expect("every one of these holds its marker");
+            let tail = &bytes[at..];
+            let before = bytes[at - 1];
+
+            assert_eq!(
+                String::from_utf8(redact(tail, Some(before), true).bytes).unwrap(),
+                String::from_utf8_lossy(tail),
+                "a stretch cut at {at} opens inside a word, which the byte in front of it says"
+            );
+            assert_ne!(
+                String::from_utf8(redact(tail, None, true).bytes).unwrap(),
+                String::from_utf8_lossy(tail),
+                "and the same bytes read as the start of a file are a secret, which is why the byte is passed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_base64url_payload_holding_sk_is_left_alone_rather_than_eaten_from_there_on() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.aGVsbG8-sk-9zdGVyZWRfYnl0ZXNfaGVyZQ.c2lnbmF0dXJl";
+
+        assert_eq!(
+            stripped(jwt),
+            jwt,
+            "a JWT is not an OpenAI key, and taking the rest of one is corruption no reader can repair"
+        );
+        assert_eq!(
+            stripped("sk-proj-fake000000000000000000000"),
+            "[redacted:openai-api-key]",
+            "the prefixes OpenAI issues are still read"
+        );
+        assert_eq!(
+            stripped("sk-FAKE0000000000000000000000000000000000fake"),
+            "[redacted:openai-api-key]",
+            "and so is the unprefixed shape, at the forty bytes it runs to"
+        );
     }
 
     #[test]
     fn a_secret_across_the_cut_between_two_stretches_holds_the_cut_back_to_where_it_began() {
         let line = b"before ghp_3kQ9fakeTOKENvalue0000000000000000 after";
-        for cut in 8..line.len() {
-            let head = redact(&line[..cut], false);
-            let whole = redact(line, true);
+        let whole = String::from_utf8(redact(line, None, true).bytes).unwrap();
+        for cut in 1..line.len() {
+            let head = redact(&line[..cut], None, false);
+            let before = head.source.checked_sub(1).map(|at| line[at]);
             let mut sent = head.bytes.clone();
-            sent.extend_from_slice(&redact(&line[head.source..], true).bytes);
+            sent.extend_from_slice(&redact(&line[head.source..], before, true).bytes);
             assert_eq!(
                 String::from_utf8(sent).unwrap(),
-                String::from_utf8(whole.bytes).unwrap(),
+                whole,
                 "a stretch cut at {cut} and the rest of the line read after it"
             );
             assert!(
@@ -545,13 +637,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stretch_the_file_ends_in_writes_out_everything_it_holds() {
+        let line = b"before ghp_3kQ9fakeTOKENvalue0000000000000000 after";
+        for cut in 1..=line.len() {
+            let head = redact(&line[..cut], None, true);
+            assert_eq!(
+                head.source, cut,
+                "a pass told the file ends here holds nothing back, at a cut at {cut}"
+            );
+        }
+        assert_eq!(
+            stripped("before ghp_3kQ9fakeTOKEN"),
+            "before ghp_3kQ9fakeTOKEN",
+            "and a marker with too short a run behind it is prose, which is what a file ending there holds"
+        );
+    }
+
+    #[test]
     fn a_pem_block_across_the_cut_waits_for_the_line_that_closes_it() {
         let block = b"-----BEGIN RSA PRIVATE KEY-----\nZmFrZQ==\nZmFrZQ==\n-----END RSA PRIVATE KEY-----\n";
-        let head = redact(&block[..60], false);
+        let head = redact(&block[..60], None, false);
 
         assert_eq!(head.source, 0, "a block with no end line yet sends none of itself");
         assert_eq!(
-            String::from_utf8(redact(block, false).bytes).unwrap(),
+            String::from_utf8(redact(block, None, false).bytes).unwrap(),
             "[redacted:private-key]\n",
             "and the pass that holds the whole block writes it out as one"
         );
@@ -560,25 +669,34 @@ mod tests {
     #[test]
     fn where_the_archive_ends_is_a_place_in_the_file_unless_it_falls_inside_a_secret() {
         let line = b"id AKIAZZ7EXAMPLE9QTVB2 end\n";
-        let archive = redact(line, true).bytes;
+        let archive = redact(line, None, true).bytes;
 
-        assert_eq!(source_of(line, true, 0), Some(0));
+        assert_eq!(source_of(line, None, true, 0), Some(0));
         assert_eq!(
-            source_of(line, true, 3),
+            source_of(line, None, true, 3),
             Some(3),
             "a byte sent as it was read is its own place"
         );
         assert_eq!(
-            source_of(line, true, 3 + hidden("aws-access-key-id")),
+            source_of(line, None, true, 3 + hidden("aws-access-key-id")),
             Some(3 + "AKIAZZ7EXAMPLE9QTVB2".len()),
             "the end of a placeholder is the end of what it stood in"
         );
         assert_eq!(
-            source_of(line, true, 3 + hidden("aws-access-key-id") - 1),
+            source_of(line, None, true, 3 + hidden("aws-access-key-id") - 1),
             None,
             "and a place inside one is no place in the file at all"
         );
-        assert_eq!(source_of(line, true, archive.len()), Some(line.len()));
-        assert_eq!(source_of(line, true, archive.len() + 1), None);
+        assert_eq!(source_of(line, None, true, archive.len()), Some(line.len()));
+        assert_eq!(source_of(line, None, true, archive.len() + 1), None);
+    }
+
+    #[test]
+    fn a_prompt_a_key_was_pasted_into_carries_a_placeholder_rather_than_the_key() {
+        assert_eq!(
+            text("use ghp_3kQ9fakeTOKENvalue0000000000000000 for the push"),
+            "use [redacted:github-token] for the push"
+        );
+        assert_eq!(text("find the redaction bug"), "find the redaction bug");
     }
 }

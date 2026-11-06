@@ -18,8 +18,8 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const BASE_DELAY: Duration = Duration::from_secs(1);
@@ -307,11 +307,12 @@ async fn reconnect_loop(url: &str, token: &str, sessions_dir: &Path, seen: &mut 
 /// merely quiet, and the delta its record still carried would go with the record. The tick that
 /// unlinks it sends both, on a blocking thread so the calls cannot stall message delivery; a delta
 /// the service refuses is reported and dropped, since the record it came from is already gone.
-fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
+fn report_ended(client: &Arc<Client>, places: &Arc<Mutex<transcripts::Archive>>, ended: Vec<sessions::Ended>) {
     if ended.is_empty() {
         return;
     }
     let client = Arc::clone(client);
+    let held_at = Arc::clone(places);
     tokio::task::spawn_blocking(move || {
         for session in ended {
             let id = &session.session_id;
@@ -324,11 +325,16 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
                 };
                 log(&outcome, started.elapsed());
             }
+            // The run's own place in every file, so a session ending costs the writes it owes and
+            // not a listing and a reading of the whole transcript to find where it had got to.
+            // This is the last pass over these files, so the record at the end of each goes up
+            // whether or not the line it sits on was finished.
             archive(
-                &mut transcripts::Archive::default(),
+                &mut held(&held_at),
                 &client,
                 id,
                 &session.transcript_path,
+                transcripts::Pass::Final,
             );
             let started = Instant::now();
             let outcome = match client.end_session(id) {
@@ -341,11 +347,25 @@ fn report_ended(client: &Arc<Client>, ended: Vec<sessions::Ended>) {
     });
 }
 
+/// Where this run has got to in every file of every session it has archived. One place is shared
+/// by the beat and the session ends, so neither pays for the reading the other already did. A
+/// place left behind by a pass that panicked is still a place, so a poisoned lock is taken as it
+/// stands rather than taking the daemon down with it.
+fn held(archive: &Arc<Mutex<transcripts::Archive>>) -> std::sync::MutexGuard<'_, transcripts::Archive> {
+    archive.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// One session's transcript files, caught up with the service. A failure is reported and the pass
 /// carries on: what is not sent now is sent by the next pass, or by `recall backfill` long after.
-fn archive(archive: &mut transcripts::Archive, client: &Client, session_id: &str, transcript: &Path) {
+fn archive(
+    archive: &mut transcripts::Archive,
+    client: &Client,
+    session_id: &str,
+    transcript: &Path,
+    pass: transcripts::Pass,
+) {
     let started = Instant::now();
-    match archive.send(client, session_id, transcript) {
+    match archive.send(client, session_id, transcript, pass) {
         Ok(0) => {}
         Ok(bytes) => log(&format!("sessions:archived:{session_id}:{bytes}"), started.elapsed()),
         Err(error) => log(
@@ -364,23 +384,32 @@ fn archive(archive: &mut transcripts::Archive, client: &Client, session_id: &str
 /// hurry. The registry is read and never swept here, since a second sweeper would unlink the dead
 /// records before the tick that owes the service their notice had seen them. One pass runs at a
 /// time: the next beat waits on the one before it rather than piling up behind it.
-async fn archive_loop(client: Arc<Client>, sessions_dir: PathBuf, every: Duration) {
+async fn archive_loop(
+    client: Arc<Client>,
+    held_at: Arc<Mutex<transcripts::Archive>>,
+    sessions_dir: PathBuf,
+    every: Duration,
+) {
     let mut beat = tokio::time::interval(every);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut pass = transcripts::Archive::default();
     loop {
         beat.tick().await;
         let live = sessions::transcript_paths(&sessions_dir);
         let client = Arc::clone(&client);
-        pass = tokio::task::spawn_blocking(move || {
+        let held_at = Arc::clone(&held_at);
+        let beaten = tokio::task::spawn_blocking(move || {
+            let mut pass = held(&held_at);
             pass.retain(&live.iter().map(|(session_id, _)| session_id.as_str()).collect());
             for (session_id, path) in &live {
-                archive(&mut pass, &client, session_id, path);
+                // Every session here is still running, so a record half written at the end of one
+                // of its files waits for the beat that holds the whole of it.
+                archive(&mut pass, &client, session_id, path, transcripts::Pass::Open);
             }
-            pass
         })
-        .await
-        .unwrap_or_default();
+        .await;
+        if let Err(error) = beaten {
+            log(&format!("sessions:archive-failed:{error}"), Duration::ZERO);
+        }
     }
 }
 
@@ -439,6 +468,7 @@ async fn serve(archive_every: Duration) -> Result<()> {
         log(&format!("sessions:adopt-failed:{error:#}"), Duration::ZERO);
     }
     let adopting = Arc::new(AtomicBool::new(false));
+    let held_at = Arc::new(Mutex::new(transcripts::Archive::default()));
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -447,9 +477,9 @@ async fn serve(archive_every: Duration) -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
-        _ = archive_loop(Arc::clone(&client), sessions_dir.clone(), archive_every) => Ok(()),
+        _ = archive_loop(Arc::clone(&client), Arc::clone(&held_at), sessions_dir.clone(), archive_every) => Ok(()),
         _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
-            report_ended(&client, ended);
+            report_ended(&client, &held_at, ended);
             if let Ok(scope) = scope.as_ref() {
                 adopt_running(&client, scope, &adopting);
             }
