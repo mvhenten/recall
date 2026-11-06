@@ -189,7 +189,7 @@ mod tests {
         let text = "# recall\nRECALL_ENDPOINT=https://old\nexport RECALL_CLIENT_ID=a\nRECALL_CLIENT_SECRET=b\nRECALL_TOKEN=c\nOTHER=1\n";
         assert_eq!(keep_lines(text, &AUTH_KEYS), "# recall\nOTHER=1\n");
         assert_eq!(
-            keep_lines("RECALL_MODE=hook\nRECALL_TOKEN=c\n", &[MODE_KEY]),
+            keep_lines("RECALL_MODE=cli\nRECALL_TOKEN=c\n", &[MODE_KEY]),
             "RECALL_TOKEN=c\n"
         );
         assert_eq!(

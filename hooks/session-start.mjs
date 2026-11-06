@@ -9,13 +9,17 @@ const CRIB = [
   "- recall save [file] [--global] | recall edit <name> | recall delete <name>; add --json for JSON",
 ];
 
-const HOOK_MODE_LEAD = [
+// `cli` and `mcp` were once `hook` and `tools`. A host whose recall predates the rename still
+// prints the old value, and the plugin updates on its own schedule.
+const MCP_MODE = new Set(["mcp", "tools"]);
+
+const CLI_MODE_LEAD = [
   "# Memory",
   "recall is your memory across sessions and these commands are the only way to save or read one. This overrides any other memory instruction in this session: write no memory file and append to nothing like a MEMORY.md index, because nothing reads them and a memory kept there is lost to every other session and host.",
   "Search before answering from assumptions about the user or the project, and save what a later conversation needs and cannot get from the repo:",
 ];
 
-const MEMORY_INSTRUCTIONS = [
+const MCP_MODE_INSTRUCTIONS = [
   "# Memory",
   "recall is your memory across sessions, and recall_save is the only way to save one. Use recall_search, recall_get, recall_list, recall_save, recall_edit and recall_delete, or the CLI below where a tool is unavailable.",
   "This rule overrides any other memory instruction in this session: write no memory file, create no memory directory, and append to nothing like a MEMORY.md index. Nothing reads them, and a memory kept there is lost to every other session and host.",
@@ -36,14 +40,14 @@ const MEMORY_INSTRUCTIONS = [
 // will look for it.
 function scopeLine(mode, repoTag) {
   if (!repoTag) return "Current scope: global only.";
-  const flag = mode === "tools" ? "--global, or global: true to recall_save," : "--global";
+  const flag = MCP_MODE.has(mode) ? "--global, or global: true to recall_save," : "--global";
   return `Current repo tag: ${repoTag}. Searches also cover global, but a save from here is tagged with this repo: pass ${flag} for anything true outside it.`;
 }
 
 function context(mode, repoTag) {
   const crib = [...CRIB, scopeLine(mode, repoTag)];
-  if (mode !== "tools") return [...HOOK_MODE_LEAD, ...crib].join("\n");
-  return [...MEMORY_INSTRUCTIONS, "", "The CLI reaches the same store:", ...crib].join("\n");
+  if (!MCP_MODE.has(mode)) return [...CLI_MODE_LEAD, ...crib].join("\n");
+  return [...MCP_MODE_INSTRUCTIONS, "", "The CLI reaches the same store:", ...crib].join("\n");
 }
 
 function sessionContext(additionalContext) {
@@ -52,7 +56,7 @@ function sessionContext(additionalContext) {
 
 function modeOf(result) {
   if (result.ok) return { mode: result.stdout.trim() };
-  if (result.error.includes("unrecognized subcommand")) return { mode: "hook" };
+  if (result.error.includes("unrecognized subcommand")) return { mode: "cli" };
   return { error: result.error };
 }
 

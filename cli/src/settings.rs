@@ -6,12 +6,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
+// `cli` and `mcp` were once `hook` and `tools`. Both spellings are read, because hosts hold the
+// old one and a mode a host cannot read is a mode it cannot change either; every write normalises
+// to the current spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[value(rename_all = "lowercase")]
 pub enum Mode {
-    Hook,
-    Tools,
+    #[serde(alias = "hook")]
+    #[value(alias = "hook")]
+    Cli,
+    #[serde(alias = "tools")]
+    #[value(alias = "tools")]
+    Mcp,
 }
 
 pub const MESSAGING_ENABLED_KEY: &str = "RECALL_MESSAGING_ENABLED";
@@ -52,7 +59,7 @@ fn deserialize_archive_interval<'de, D: serde::Deserializer<'de>>(deserializer: 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    /// Whether the plugin teaches Claude through hook context or the recall_* MCP tools.
+    /// Whether the plugin teaches Claude the recall CLI or the recall_* MCP tools.
     #[arg(long, value_enum, value_name = "MODE", env = config::MODE_KEY)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
@@ -72,7 +79,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn mode(&self) -> Mode {
-        self.mode.unwrap_or(Mode::Hook)
+        self.mode.unwrap_or(Mode::Cli)
     }
 
     pub fn messaging_enabled(&self) -> bool {
@@ -145,7 +152,7 @@ fn migrated_mode() -> Result<Map<String, Value>> {
     };
     let mode = serde_json::from_value(Value::String(value.trim().to_string())).with_context(|| {
         format!(
-            "unknown mode {value:?} from {} in {}; run recall config set mode hook|tools",
+            "unknown mode {value:?} from {} in {}; run recall config set mode cli|mcp",
             config::MODE_KEY,
             config::env_file().display()
         )
@@ -294,17 +301,17 @@ mod tests {
         let sandbox = Sandbox::new("precedence");
         assert_eq!(load(&sandbox.flags(&[])).unwrap(), Settings::defaults());
 
-        sandbox.write_config("{\"mode\": \"tools\", \"messaging_enabled\": true}");
+        sandbox.write_config("{\"mode\": \"mcp\", \"messaging_enabled\": true}");
         let from_file = load(&sandbox.flags(&[])).unwrap();
-        assert_eq!(from_file.mode(), Mode::Tools);
+        assert_eq!(from_file.mode(), Mode::Mcp);
         assert!(from_file.messaging_enabled());
 
-        unsafe { std::env::set_var(config::MODE_KEY, "hook") };
-        assert_eq!(load(&sandbox.flags(&[])).unwrap().mode(), Mode::Hook);
+        unsafe { std::env::set_var(config::MODE_KEY, "cli") };
+        assert_eq!(load(&sandbox.flags(&[])).unwrap().mode(), Mode::Cli);
 
-        let flags = sandbox.flags(&["--mode", "tools", "--messaging-enabled", "false"]);
+        let flags = sandbox.flags(&["--mode", "mcp", "--messaging-enabled", "false"]);
         let merged = load(&flags).unwrap();
-        assert_eq!(merged.mode(), Mode::Tools);
+        assert_eq!(merged.mode(), Mode::Mcp);
         assert!(!merged.messaging_enabled());
     }
 
@@ -325,28 +332,28 @@ mod tests {
     #[test]
     fn a_setting_cannot_be_cleared_back_to_null() {
         let sandbox = Sandbox::new("null");
-        sandbox.write_env("RECALL_MODE=tools\n");
-        sandbox.write_config("{\"mode\": \"hook\"}");
+        sandbox.write_env("RECALL_MODE=mcp\n");
+        sandbox.write_config("{\"mode\": \"cli\"}");
         let error = format!("{:#}", set("mode", "null").unwrap_err());
         assert!(error.contains("mode cannot be set to null"), "{error}");
-        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Hook);
+        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Cli);
     }
 
     #[test]
     fn a_dotted_path_addresses_the_same_key_as_the_flag() {
         let sandbox = Sandbox::new("paths");
-        sandbox.write_config("{\"mode\": \"tools\"}");
+        sandbox.write_config("{\"mode\": \"mcp\"}");
         let (path, settings) = set("messaging.enabled", "true").unwrap();
         assert_eq!(path, config_file());
-        assert_eq!(settings.mode(), Mode::Tools);
+        assert_eq!(settings.mode(), Mode::Mcp);
         assert!(settings.messaging_enabled());
 
         let resolved = resolved(&Settings::default()).unwrap();
-        assert_eq!(scalar(get(&resolved, "mode").unwrap()), "tools");
+        assert_eq!(scalar(get(&resolved, "mode").unwrap()), "mcp");
         assert_eq!(scalar(get(&resolved, "messaging.enabled").unwrap()), "true");
         assert_eq!(
             lines(&resolved),
-            vec!["archive.interval.seconds=10", "messaging.enabled=true", "mode=tools"]
+            vec!["archive.interval.seconds=10", "messaging.enabled=true", "mode=mcp"]
         );
         assert!(get(&resolved, "listening").is_err());
     }
@@ -354,21 +361,47 @@ mod tests {
     #[test]
     fn the_mode_falls_back_to_the_env_file_until_the_config_file_sets_it() {
         let sandbox = Sandbox::new("migration");
-        sandbox.write_env("RECALL_ENDPOINT=https://example.test\nRECALL_MODE=tools\n");
-        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Tools);
+        sandbox.write_env("RECALL_ENDPOINT=https://example.test\nRECALL_MODE=mcp\n");
+        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Mcp);
 
-        let (_, stored) = set("mode", "hook").unwrap();
-        assert_eq!(stored.mode(), Mode::Hook);
+        let (_, stored) = set("mode", "cli").unwrap();
+        assert_eq!(stored.mode(), Mode::Cli);
         assert_eq!(
             std::fs::read_to_string(config::env_file()).unwrap(),
             "RECALL_ENDPOINT=https://example.test\n"
         );
-        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Hook);
+        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Cli);
 
         sandbox.write_env("RECALL_MODE=sideways\n");
         std::fs::remove_file(config_file()).unwrap();
         let error = format!("{:#}", load(&Settings::default()).unwrap_err());
         assert!(error.contains("unknown mode \"sideways\""), "{error}");
+    }
+
+    #[test]
+    fn a_host_holding_the_old_mode_names_still_reads_them_and_can_be_set_to_the_new_ones() {
+        let sandbox = Sandbox::new("rename");
+        sandbox.write_config("{\"mode\": \"tools\", \"messaging_enabled\": true}");
+        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Mcp);
+        assert_eq!(
+            scalar(get(&resolved(&Settings::default()).unwrap(), "mode").unwrap()),
+            "mcp"
+        );
+
+        let (_, stored) = set("mode", "cli").unwrap();
+        assert_eq!(stored.mode(), Mode::Cli);
+        assert!(stored.messaging_enabled());
+        assert!(
+            std::fs::read_to_string(config_file()).unwrap().contains("\"cli\""),
+            "the write normalises the stored spelling"
+        );
+
+        sandbox.write_config("{\"mode\": \"hook\"}");
+        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Cli);
+        sandbox.write_env("RECALL_MODE=tools\n");
+        std::fs::remove_file(config_file()).unwrap();
+        assert_eq!(load(&Settings::default()).unwrap().mode(), Mode::Mcp);
+        assert_eq!(load(&sandbox.flags(&["--mode", "hook"])).unwrap().mode(), Mode::Cli);
     }
 
     #[test]

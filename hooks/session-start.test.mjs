@@ -37,26 +37,31 @@ function sessionStart(mode, repo = REPO) {
   return JSON.parse(stdout).hookSpecificOutput.additionalContext;
 }
 
-test("hook mode names the CLI as the memory path and no local store", () => {
-  const context = sessionStart("hook");
+test("cli mode names the CLI as the memory path and no local store", () => {
+  const context = sessionStart("cli");
 
   for (const command of ["recall search", "recall get", "recall list", "recall save", "recall edit", "recall delete"]) {
     assert.ok(context.includes(command), `${command} in ${context}`);
   }
   assert.match(context, /write no memory file and append to nothing like a MEMORY\.md index/);
   assert.match(context, /pass --global for anything true outside it/);
-  assert.doesNotMatch(context, /recall_/, "hook mode has no tools to name");
+  assert.doesNotMatch(context, /recall_/, "cli mode has no tools to name");
 });
 
-test("tools mode keeps naming the tools, with the CLI beside them", () => {
-  const context = sessionStart("tools");
+test("mcp mode keeps naming the tools, with the CLI beside them", () => {
+  const context = sessionStart("mcp");
   assert.match(context, /recall_save is the only way to save one/);
   assert.match(context, /pass --global, or global: true to recall_save, for anything/);
   assert.ok(context.includes("- recall save [file] [--global]"), context);
 });
 
+test("a recall that predates the rename still picks the right context", () => {
+  assert.equal(sessionStart("hook"), sessionStart("cli"));
+  assert.equal(sessionStart("tools"), sessionStart("mcp"));
+});
+
 test("outside a repo the scope is global", () => {
-  assert.match(sessionStart("hook", ""), /Current scope: global only\./);
+  assert.match(sessionStart("cli", ""), /Current scope: global only\./);
 });
 
 test("the plugin registers no mcp server", () => {

@@ -1,7 +1,7 @@
 {
   "$defs": {
     "Mode": {
-      "enum": ["hook", "tools"],
+      "enum": ["cli", "mcp"],
       "type": "string"
     }
   },
@@ -29,7 +29,7 @@
           "type": "null"
         }
       ],
-      "description": "Whether the plugin teaches Claude through hook context or the recall_* MCP tools."
+      "description": "Whether the plugin teaches Claude the recall CLI or the recall_* MCP tools."
     }
   },
   "title": "Settings",

@@ -57,10 +57,10 @@ test("messaging stays off until the config file turns it on", () => {
 
   const configDir = path.join(env.XDG_CONFIG_HOME, "recall");
   mkdirSync(configDir, { recursive: true });
-  writeFileSync(path.join(configDir, "config.json"), '{"mode":"hook"}\n');
+  writeFileSync(path.join(configDir, "config.json"), '{"mode":"cli"}\n');
   assert.equal(messagingEnabled(env), false);
 
-  writeFileSync(path.join(configDir, "config.json"), '{"mode":"hook","messaging_enabled":true}\n');
+  writeFileSync(path.join(configDir, "config.json"), '{"mode":"cli","messaging_enabled":true}\n');
   assert.equal(messagingEnabled(env), true);
 
   writeFileSync(path.join(configDir, "config.json"), "not json\n");

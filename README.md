@@ -92,15 +92,15 @@ The plugin is five hooks and registers no MCP server. A Claude Code session has 
 - After a `Write` or `Edit` to an auto-memory file (under `autoMemoryDirectory`, or `~/.claude/projects/*/memory/` when that is unset; `MEMORY.md` excluded), it runs `recall save` under the same slug of the file name. `user` and `feedback` memories are saved as global; `project` and `reference` memories get the repo tag of the session's directory, or `global` outside a repo. When the save fails, a message says the memory was saved locally but not synced.
 - On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. Up to three matches from other scopes follow under "In other scopes:", each with its tags. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
 - On every prompt, including the ones too short to search on, it rewrites the moving half of the session's record — focus, prompt count, last activity, branch, last commit and permission mode — and starts a sync it does not wait for, at most one every thirty seconds, so `recall sessions` shows from any host what this session is working on.
-- At session start, it adds a short block: recall is the memory across sessions and no local memory file or `MEMORY.md` index holds anything, the CLI commands that reach it, and the session directory's repo tag (or "global only") with the reminder that a save from a repo needs `--global` to be filed anywhere else. In `tools` mode it first adds the longer memory instructions: what to save, what not to, to update rather than duplicate, and to delete what turns out wrong. When `recall` is missing, it adds an install hint instead.
+- At session start, it adds a short block: recall is the memory across sessions and no local memory file or `MEMORY.md` index holds anything, the CLI commands that reach it, and the session directory's repo tag (or "global only") with the reminder that a save from a repo needs `--global` to be filed anywhere else. In `mcp` mode it first adds the longer memory instructions: what to save, what not to, to update rather than duplicate, and to delete what turns out wrong. When `recall` is missing, it adds an install hint instead.
 - Every hook run appends one line to `${XDG_STATE_HOME:-~/.local/state}/recall/hooks.log`: time, session id, outcome (`hits=<n>`, `no-hits`, `skipped:<reason>`, each followed by `focus:<state>`, plus `crib:<mode>:repo:messaging:<state>`, `crib:<mode>:global:messaging:<state>`, `messaging:<state>`, `not-installed`, `timeout`, `saved:<name>`, `redirect:saved:<name>`, `redirect:fallback:<error>`, `redirect:index`, `redirect:edit`, `error:<message>`) and duration. `recall sessions --sync` and `--end`, which the hooks start detached, add their own `sessions:…` lines, and the listener adds `listen:…`, `message:…`, the `sessions:ended:…` and `sessions:usage:…` of the sessions its tick found gone, and the `sessions:adopted:…` and `sessions:refreshed:…` of the ones it took on. Prompts, focus lines and memory bodies are never logged.
 
 ### Modes
 
-The plugin works in one of two modes, set per host with `recall config set mode hook|tools` and stored in `~/.config/recall/config.json`.
+The plugin works in one of two modes, set per host with `recall config set mode cli|mcp` and stored in `~/.config/recall/config.json`.
 
-- `hook` (the default) leaves Claude Code's built-in auto-memory on as a backstop: session start names the CLI commands as the only save path and says no memory file and no `MEMORY.md` index is written whatever else the session is told, and the redirect hook blocks each memory file write and saves it to recall instead.
-- `tools` replaces auto-memory with recall. Session start says the same, naming the `recall_*` tools for a harness that has them and the CLI where it does not. Turn auto-memory off yourself too, since a plugin cannot change your settings: add `"autoMemoryEnabled": false` to `~/.claude/settings.json`, or set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. `recall` says so on every `config set` until you do.
+- `cli` (the default) leaves Claude Code's built-in auto-memory on as a backstop: session start names the CLI commands as the only save path and says no memory file and no `MEMORY.md` index is written whatever else the session is told, and the redirect hook blocks each memory file write and saves it to recall instead.
+- `mcp` replaces auto-memory with recall. Session start says the same, naming the `recall_*` tools for a harness that has them and the CLI where it does not. Turn auto-memory off yourself too, since a plugin cannot change your settings: add `"autoMemoryEnabled": false` to `~/.claude/settings.json`, or set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. `recall` says so on every `config set` until you do.
 
 Both modes add matching memories to each prompt.
 
@@ -121,13 +121,15 @@ recall config schema                      # the JSON Schema of the file
 
 | Setting                    | Default | Environment                       | Flag                                |
 | -------------------------- | ------- | --------------------------------- | ----------------------------------- |
-| `mode`                     | `hook`  | `RECALL_MODE`                     | `--mode hook\|tools`                |
+| `mode`                     | `cli`   | `RECALL_MODE`                     | `--mode cli\|mcp`                   |
 | `messaging.enabled`        | `false` | `RECALL_MESSAGING_ENABLED`        | `--messaging-enabled <BOOL>`        |
 | `archive.interval.seconds` | `10`    | `RECALL_ARCHIVE_INTERVAL_SECONDS` | `--archive-interval-seconds <SECS>` |
 
 `archive.interval.seconds` is how often the listener carries a running session's newest [transcript](#the-transcript-archive) lines up, from 2 seconds to an hour. A pass over a session that has not written since the one before costs no call, so only sessions actually writing generate traffic; the floor is there because below it the calls cost more than the lines are worth. It moves nothing else: the registry sweep that ends dead sessions and runs adoption keeps its own thirty second beat.
 
-A flag goes before the subcommand: `recall --mode tools mcp`. The dotted name is the display name; `messaging.enabled` on the command line is `messaging_enabled` in the file. An unknown key or a value of the wrong type is rejected and the message names the key. A `RECALL_MODE` left in `~/.config/recall/env` still sets the mode until `recall config set mode` writes one, which also takes it out of the env file.
+A flag goes before the subcommand: `recall --mode mcp config get mode`. The dotted name is the display name; `messaging.enabled` on the command line is `messaging_enabled` in the file. An unknown key or a value of the wrong type is rejected and the message names the key. A `RECALL_MODE` left in `~/.config/recall/env` still sets the mode until `recall config set mode` writes one, which also takes it out of the env file.
+
+`cli` and `mcp` were once `hook` and `tools`. Both spellings are still read — from the file, the environment and the flag — so a host that has not been changed over keeps working, and the next `recall config set` writes the current spelling back.
 
 ## Memories, tags and scope
 

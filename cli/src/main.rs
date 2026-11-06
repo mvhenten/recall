@@ -369,7 +369,7 @@ enum ConfigAction {
         #[arg(value_name = "KEY")]
         key: String,
     },
-    #[command(about = "Change one setting: recall config set mode hook|tools")]
+    #[command(about = "Change one setting: recall config set mode cli|mcp")]
     Set {
         #[arg(value_name = "KEY")]
         key: String,
@@ -501,7 +501,7 @@ fn adopt_after_update() {
 
 fn print_mode_hint(mode: Mode) {
     let disable_env = std::env::var("CLAUDE_CODE_DISABLE_AUTO_MEMORY").ok();
-    if mode == Mode::Tools && config::auto_memory_enabled(&config::claude_settings_file(), disable_env.as_deref()) {
+    if mode == Mode::Mcp && config::auto_memory_enabled(&config::claude_settings_file(), disable_env.as_deref()) {
         eprintln!("recall: {}", config::AUTO_MEMORY_OFF);
     }
 }
