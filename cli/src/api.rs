@@ -75,6 +75,69 @@ pub struct Artifact {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_writer: String,
+    #[serde(default)]
+    pub share_count: i64,
+    /// The artifact's live shares, present only where the listing was asked for them. It is what
+    /// `recall shares` with no name reads, so sharing needs no collection of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<Share>,
+}
+
+/// Who one share admits, read straight off the `mode` the service discriminates its union on. A
+/// link share carries no address: the token is printed once by the call that mints it and the
+/// service holds only its hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum Audience {
+    Link,
+    Email { address: String },
+}
+
+/// One grant of read access to one artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Share {
+    #[serde(flatten)]
+    pub audience: Audience,
+    pub share_id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub last_used_at: i64,
+    pub uses: i64,
+}
+
+/// What one share answers. `address` is the whole address a recipient opens, printed on this one
+/// response; `replaced` says a link share was already there and its token is now dead, and
+/// `renewed` says the address already held a live share and its expiry moved instead.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Shared {
+    pub share: Share,
+    pub address: String,
+    #[serde(default)]
+    pub replaced: bool,
+    #[serde(default)]
+    pub renewed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Shares {
+    pub shares: Vec<Share>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Revoked {
+    pub revoked: i64,
+    pub shares: Vec<Share>,
+}
+
+/// Which shares a revoke names, which is exactly one of the three.
+#[derive(Debug)]
+pub enum Unshare {
+    Link,
+    Email(String),
+    All,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,6 +175,10 @@ pub struct ArtifactQuery {
     pub kind: String,
     pub sort: String,
     pub limit: Option<u32>,
+    pub cursor: String,
+    /// Returns each row's shares instead of its count, which is what `recall shares` with no name
+    /// walks cursor to cursor.
+    pub shares: bool,
 }
 
 /// What one publish answers. `owned_by_another` says the name belongs to another account of this
@@ -170,6 +237,10 @@ fn encode(value: &str) -> String {
 }
 
 const MAX_NAME_LENGTH: usize = 100;
+
+/// The cursor the service sends is what ends the walk through every share, so the walk is bounded
+/// rather than trusting it to empty.
+const MAX_SHARE_PAGES: usize = 100;
 
 /// The service names an artifact by a kebab-case slug of at most 100 characters: lower case, every run
 /// of anything else a single dash.
@@ -1013,6 +1084,12 @@ impl Client {
         if let Some(limit) = query.limit {
             params.push(format!("limit={limit}"));
         }
+        if !query.cursor.is_empty() {
+            params.push(format!("cursor={}", encode(&query.cursor)));
+        }
+        if query.shares {
+            params.push("shares=true".to_string());
+        }
         let suffix = if params.is_empty() {
             String::new()
         } else {
@@ -1045,6 +1122,77 @@ impl Client {
             .send_empty()?;
         let adopted: Adopted = check(response, "adopting artifacts")?.body_mut().read_json()?;
         Ok(adopted.adopted)
+    }
+
+    /// Shares one artifact. `address` names an email share and its absence a link share, whose
+    /// token the answer prints once and no later call reads back.
+    pub fn share(&self, name: &str, address: Option<&str>) -> Result<Shared> {
+        let body = match address {
+            Some(address) => serde_json::json!({ "mode": "email", "address": address }),
+            None => serde_json::json!({ "mode": "link" }),
+        };
+        let response = self
+            .authed(
+                self.agent
+                    .post(self.url(&format!("/v1/artifacts/{}/shares", encode(name)))),
+            )
+            .send_json(&body)?;
+        Ok(check(response, &format!("sharing {name}"))?.body_mut().read_json()?)
+    }
+
+    pub fn shares(&self, name: &str) -> Result<Vec<Share>> {
+        let response = self
+            .authed(
+                self.agent
+                    .get(self.url(&format!("/v1/artifacts/{}/shares", encode(name)))),
+            )
+            .call()?;
+        let held: Shares = check(response, &format!("reading the shares on {name}"))?
+            .body_mut()
+            .read_json()?;
+        Ok(held.shares)
+    }
+
+    /// Every share the account holds, grouped by artifact. The listing is walked cursor to cursor,
+    /// so the whole of it prints and not only the first page.
+    pub fn every_share(&self) -> Result<Vec<Artifact>> {
+        let mut shared: Vec<Artifact> = Vec::new();
+        let mut cursor = String::new();
+        for _ in 0..MAX_SHARE_PAGES {
+            let page = self.artifacts(&ArtifactQuery {
+                sort: "name".to_string(),
+                shares: true,
+                cursor: cursor.clone(),
+                ..ArtifactQuery::default()
+            })?;
+            shared.extend(
+                page.artifacts
+                    .into_iter()
+                    .filter(|artifact| !artifact.shares.is_empty()),
+            );
+            if page.next_cursor.is_empty() {
+                return Ok(shared);
+            }
+            cursor = page.next_cursor;
+        }
+        bail!("listing every share did not reach its last page in {MAX_SHARE_PAGES} reads");
+    }
+
+    pub fn unshare(&self, name: &str, scope: &Unshare) -> Result<Revoked> {
+        let selector = match scope {
+            Unshare::Link => "link".to_string(),
+            Unshare::Email(address) => format!("email={}", encode(address)),
+            Unshare::All => "all=true".to_string(),
+        };
+        let response = self
+            .authed(
+                self.agent
+                    .delete(self.url(&format!("/v1/artifacts/{}/shares?{selector}", encode(name)))),
+            )
+            .call()?;
+        Ok(check(response, &format!("revoking the shares on {name}"))?
+            .body_mut()
+            .read_json()?)
     }
 }
 
@@ -1136,6 +1284,22 @@ fn multipart(boundary: &str, manifest: &str, files: &[PublishFile]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_share_off_the_mode_the_service_discriminates_on() {
+        let listed: Shares = serde_json::from_str(
+            r#"{"shares":[
+                {"mode":"link","shareId":"sh_one","name":"release-notes","createdAt":1,"expiresAt":2,"lastUsedAt":1,"uses":0},
+                {"mode":"email","shareId":"sh_two","name":"release-notes","address":"jo@example.org","createdAt":1,"expiresAt":2,"lastUsedAt":1,"uses":3}
+            ]}"#,
+        )
+        .expect("the share listing");
+        let modes: Vec<&Audience> = listed.shares.iter().map(|share| &share.audience).collect();
+        assert!(
+            matches!(modes.as_slice(), [Audience::Link, Audience::Email { address }] if address == "jo@example.org")
+        );
+        assert_eq!(listed.shares[1].uses, 3);
+    }
 
     fn device(device_id: &str, name: &str) -> Device {
         Device {

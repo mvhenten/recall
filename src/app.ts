@@ -1,13 +1,16 @@
 import {
+  type ArtifactChrome,
   type ArtifactRefusal,
+  type Audience,
   artifactNotice,
   documentPage,
-  PLAYER_SCRIPT_PATH,
   playerPage,
   playerScript,
   RAW_VIEW,
   RENDER_CEILING_BYTES,
   rawDocumentPage,
+  type ShareRefusal,
+  shareNotice,
 } from "./artifact-page";
 import {
   type ArtifactFile,
@@ -41,15 +44,22 @@ import {
   LABELS_TAB,
   labelsPage,
   MEMORY_TAB,
+  type Minted,
   memoriesPage,
   memoryBodyPage,
   memorySearchPage,
   SESSIONS_PATH,
   type SessionView,
+  SHARES_SEGMENT,
+  type ShareAsk,
+  type ShareFlash,
+  type SharePage,
   STATS_TAB,
   sessionPage,
   sessionPath,
   sessionsPage,
+  sharesPage,
+  sharesPath,
   statsPage,
   TRANSCRIPT_SCRIPT_PATH,
   TRANSCRIPT_SEGMENT,
@@ -94,10 +104,12 @@ import {
   dayWindow,
   type Embedder,
   FRESH_WINDOW_MS,
+  fail,
   isRecord,
   type Live,
   type MemoryHit,
   type MemoryType,
+  type Parsed,
   parseByteRange,
   parseChunkOffset,
   parseHistory,
@@ -135,10 +147,28 @@ import {
 } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
 import {
+  ARTIFACT_PREFIX,
+  FILE_SEGMENT,
+  hashShareToken,
+  MAX_EMAIL_SHARES,
+  newShareId,
+  newShareToken,
+  PLAYER_SEGMENT,
+  parseShareAddress,
+  SHARE_EMAIL_PREFIX,
+  SHARE_LINK_PREFIX,
+  SHARE_WINDOW_MS,
+  type ShareMode,
+  type ShareRecord,
+  type ShareView,
+} from "./shares";
+import {
+  type ArtifactCounts,
   accountReadableElsewhere,
   adoptArtifacts,
   artifactCounts,
   artifactCursorDirection,
+  artifactShares,
   type ChunkCandidate,
   type ChunkMatch,
   type Cursor,
@@ -148,12 +178,17 @@ import {
   claimRevision,
   countedFiles,
   createArtifact,
+  createEmailShare,
+  createLinkShare,
   decodeCursor,
-  deleteArtifactRow,
+  deleteArtifactWithShares,
+  deleteDeadEmailShare,
+  deleteExpiredShare,
   deleteMemory,
   describeMemories,
   describeSessions,
   endSession,
+  extendLinkShare,
   findSession,
   getArtifact,
   getMemory,
@@ -173,13 +208,17 @@ import {
   memoryCursorDirection,
   nameSession,
   putSession,
+  type RevokeScope,
   readInsights,
   readLabels,
   readStats,
   recall,
+  recordShareUse,
   recordUsage,
   replaceArtifact,
+  replaceLinkShare,
   resolveArtifact,
+  revokeShares,
   saveMemory,
   searchArtifacts,
   searchSessionHistory,
@@ -187,6 +226,11 @@ import {
   sessionOnDevice,
   sessionOnRecord,
   sessionSpend,
+  shareById,
+  shareByToken,
+  shareCount,
+  shareCountsFor,
+  sharesFor,
   textCandidates,
   vectorCandidates,
   writeChunks,
@@ -216,6 +260,10 @@ export interface ArtifactHost {
   // Where an artifact page's footer points. The artifact hostname answers artifacts and nothing
   // else, so the dashboard is a second host and this is the only place its address is known.
   dashboard: string;
+  // One binding gates both share modes. `verify` is bound to the email share application's
+  // audience and no other, so an assertion minted for the host's own application opens no share;
+  // the link lane mints no assertion at all and its credential is the token in the address.
+  sharing: { verify: Verify } | null;
 }
 
 export interface Deps {
@@ -294,9 +342,13 @@ interface Rankings {
 // at most fifty paths, so a body past this is not a manifest.
 const MANIFEST_BYTES = 64 * 1024;
 
-const viewOf = (host: ArtifactHost, record: ArtifactRecord): ArtifactView => ({
+// Every artifact address begins with the artifact prefix, which is the one place that address is
+// built and the reason a name can never collide with a route on that hostname.
+const artifactBase = (name: string): string => `${ARTIFACT_PREFIX}/${encodeURIComponent(name)}`;
+
+const viewOf = (host: ArtifactHost, record: ArtifactRecord, shares: number): ArtifactView => ({
   name: record.name,
-  url: `https://${host.hostname}/${encodeURIComponent(record.name)}`,
+  url: `https://${host.hostname}${artifactBase(record.name)}`,
   type: record.type,
   title: record.title,
   description: record.description,
@@ -307,7 +359,32 @@ const viewOf = (host: ArtifactHost, record: ArtifactRecord): ArtifactView => ({
   createdAt: record.createdAt,
   updatedAt: record.updatedAt,
   lastWriter: record.lastWriter,
+  shareCount: shares,
 });
+
+// What crosses to a page and to the CLI. A link share carries no address field, so neither can
+// print one for it by accident, and the token's hash never leaves storage.
+const shareViewOf = (share: ShareRecord): ShareView =>
+  share.mode === "link"
+    ? {
+        mode: "link",
+        shareId: share.shareId,
+        name: share.name,
+        createdAt: share.createdAt,
+        expiresAt: share.expiresAt,
+        lastUsedAt: share.lastUsedAt,
+        uses: share.uses,
+      }
+    : {
+        mode: "email",
+        shareId: share.shareId,
+        name: share.name,
+        address: share.subject,
+        createdAt: share.createdAt,
+        expiresAt: share.expiresAt,
+        lastUsedAt: share.lastUsedAt,
+        uses: share.uses,
+      };
 
 const jsonOrNull = (text: string): unknown => {
   try {
@@ -791,32 +868,70 @@ export const createApp = (deps: Deps): App => {
   // The rendered view, the raw view, and the redirect that stands in for a render too long to
   // spend the CPU on. Both views are recall's own HTML off the publisher's markdown, so neither
   // carries a script and the renderer escapes every character it prints.
-  const documentView = async (url: URL, host: ArtifactHost, record: ArtifactRecord): Promise<Response> => {
+  const documentView = async (
+    url: URL,
+    host: ArtifactHost,
+    record: ArtifactRecord,
+    chrome: ArtifactChrome,
+  ): Promise<Response> => {
     const entry = record.files[0];
     if (entry === undefined) throw new Error(`artifact ${record.name} names no file`);
     if (url.searchParams.get("view") === RAW_VIEW) {
       const source = await entryHead(host.bucket, record, RAW_INLINE_BYTES);
-      return rawDocumentPage(record, host.dashboard, source, entry.bytes > RAW_INLINE_BYTES);
+      return rawDocumentPage(record, chrome, source, entry.bytes > RAW_INLINE_BYTES);
     }
     if (entry.bytes > RENDER_CEILING_BYTES) {
       return new Response(null, {
         status: 302,
-        headers: { location: `/${encodeURIComponent(record.name)}?view=${RAW_VIEW}`, "cache-control": "no-store" },
+        headers: { location: `${chrome.base}?view=${RAW_VIEW}`, "cache-control": "no-store" },
       });
     }
     const source = await (await entryBody(host.bucket, record)).text();
-    return documentPage(record, host.dashboard, render(source, record.name));
+    return documentPage(record, chrome, render(source, chrome.base));
   };
 
   // The player, with every entry the manifest names checked against storage as the page is drawn:
   // a track whose file is gone keeps its row and its mark rather than failing silently when a
   // reader presses play.
-  const playerView = async (host: ArtifactHost, record: ArtifactRecord): Promise<Response> => {
+  const playerView = async (host: ArtifactHost, record: ArtifactRecord, chrome: ArtifactChrome): Promise<Response> => {
     const held = await Promise.all(
       record.files.map((file) => headArtifactFile(host.bucket, record.ownerUserId, record.name, record.rev, file.path)),
     );
     const missing = record.files.filter((_file, index) => held[index] === null).map((file) => file.path);
-    return playerPage(record, host.dashboard, missing);
+    return playerPage(record, chrome, missing);
+  };
+
+  // Which of the three routes under a base the tail names. An empty tail and one empty segment are
+  // both the page, because recipients copy addresses with a trailing slash; the script answers
+  // directly under the base and a file under the file segment, so no file path and no name can
+  // reach either position.
+  type UnderBase = { kind: "page" } | { kind: "script" } | { kind: "file"; path: string } | { kind: "elsewhere" };
+
+  const underBase = (tail: readonly string[]): UnderBase => {
+    if (tail.length === 0 || (tail.length === 1 && tail[0] === "")) return { kind: "page" };
+    if (tail.length === 1 && tail[0] === PLAYER_SEGMENT) return { kind: "script" };
+    if (tail.length > 1 && tail[0] === FILE_SEGMENT) return { kind: "file", path: tail.slice(1).join("/") };
+    return { kind: "elsewhere" };
+  };
+
+  // The one place a record is turned into a page. The chrome says what address space the page sits
+  // in and who is reading it, and every address the page draws is built from its base, which is
+  // what keeps a shared page inside its share without a check anywhere.
+  const artifactView = (
+    request: Request,
+    url: URL,
+    host: ArtifactHost,
+    record: ArtifactRecord,
+    chrome: ArtifactChrome,
+    route: UnderBase,
+    lost: () => Response,
+  ): Promise<Response> | Response => {
+    if (route.kind === "elsewhere") return lost();
+    if (route.kind === "script") return playerScript();
+    if (route.kind === "file") return artifactFile(request, host.bucket, record, route.path, lost);
+    if (record.type === "document") return documentView(url, host, record, chrome);
+    if (record.type === "audio") return playerView(host, record, chrome);
+    return entryBody(host.bucket, record).then((object) => artifactPage(object.body));
   };
 
   // An artifact published before a row carried its type. Its bytes are at the bare key and no row
@@ -826,8 +941,32 @@ export const createApp = (deps: Deps): App => {
     return object === null ? null : artifactPage(object.body);
   };
 
+  // Who the reader is, which is what the band draws and what decides whether the share count is
+  // read at all. The bar is the artifact's owner's, on recall's own page for a document or an
+  // audio artifact, in a deployment that has turned sharing on; everything else is an account
+  // reading somebody's artifact and gets an empty slot.
+  const audienceFor = async (
+    db: D1Database,
+    host: ArtifactHost,
+    record: ArtifactRecord,
+    userId: string,
+    now: number,
+  ): Promise<Audience> => {
+    const owned = host.sharing !== null && record.ownerUserId === userId;
+    if (!owned || (record.type !== "document" && record.type !== "audio")) {
+      return { kind: "account", dashboard: host.dashboard };
+    }
+    return {
+      kind: "owner",
+      shares: await shareCount(db, userId, record.name, now),
+      sharesUrl: new URL(sharesPath(record.name), host.dashboard).toString(),
+      dashboard: host.dashboard,
+    };
+  };
+
   const artifactSite = async (request: Request, url: URL, db: D1Database, host: ArtifactHost): Promise<Response> => {
     const notice = (refusal: ArtifactRefusal): Response => artifactNotice(refusal, host.dashboard);
+    const lost = (): Response => notice({ kind: "lost" });
     if (request.method !== "GET") return notice({ kind: "method" });
     const address = `${url.pathname}${url.search}`;
     const assertion = request.headers.get("cf-access-jwt-assertion");
@@ -838,24 +977,110 @@ export const createApp = (deps: Deps): App => {
     if (!verified.ok) return notice({ kind: "unauthorized", reason: verified.reason, address });
     const userId = await userForEmail(db, verified.email);
     if (userId === null) return notice({ kind: "forbidden", email: verified.email });
-    // A name is a kebab-case slug and cannot hold a dot, so the player's script answers here
-    // without standing in front of any artifact's address.
-    if (url.pathname === PLAYER_SCRIPT_PATH) return playerScript();
-    const [rawName, ...rest] = url.pathname.slice(1).split("/");
-    const name = parseName(decodeSegment(rawName ?? "") ?? "");
-    if (!name.ok) return notice({ kind: "lost" });
+    // Every artifact address begins with the artifact prefix, so no name occupies the hostname's
+    // first segment and no path a publisher controls can name a route.
+    const [prefix, rawName, ...tail] = url.pathname.slice(1).split("/");
+    if (prefix !== ARTIFACT_PREFIX.slice(1) || rawName === undefined) return lost();
+    const name = parseName(decodeSegment(rawName) ?? "");
+    if (!name.ok) return lost();
+    const route = underBase(tail);
+    if (route.kind === "elsewhere") return lost();
     const record = await resolveArtifact(db, userId, name.value);
     if (record === null) {
-      return rest.length > 0
-        ? notice({ kind: "lost" })
-        : ((await legacySite(host, userId, name.value)) ?? notice({ kind: "lost" }));
+      return route.kind === "page" ? ((await legacySite(host, userId, name.value)) ?? lost()) : lost();
     }
-    if (rest.length > 0) {
-      return artifactFile(request, host.bucket, record, rest.join("/"), () => notice({ kind: "lost" }));
+    const audience = await audienceFor(db, host, record, userId, deps.now());
+    return artifactView(request, url, host, record, { base: artifactBase(name.value), audience }, route, lost);
+  };
+
+  const SHARE_PREFIXES: ReadonlyArray<readonly [ShareMode, string]> = [
+    ["link", SHARE_LINK_PREFIX],
+    ["email", SHARE_EMAIL_PREFIX],
+  ];
+
+  const underSharePrefix = (pathname: string): boolean =>
+    SHARE_PREFIXES.some(([, prefix]) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+
+  // Which share lane an address sits in, and the credential it carries. A prefix with nothing
+  // under it carries no credential at all and answers the share's own 404.
+  const shareLane = (
+    pathname: string,
+  ): { mode: ShareMode; base: string; credential: string; tail: string[] } | null => {
+    for (const [mode, prefix] of SHARE_PREFIXES) {
+      if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue;
+      const [credential, ...tail] = pathname.slice(prefix.length + 1).split("/");
+      if (credential === undefined || credential === "") return null;
+      return { mode, base: `${prefix}/${credential}`, credential, tail };
     }
-    if (record.type === "document") return documentView(url, host, record);
-    if (record.type === "audio") return playerView(host, record);
-    return artifactPage((await entryBody(host.bucket, record)).body);
+    return null;
+  };
+
+  // Cloudflare serves the logout at the edge and the Worker never sees it. It is host-wide, so the
+  // copy beside the control says so; there is no prefix-scoped logout to ask for.
+  const signInAgainAt = (url: URL): string =>
+    `https://${url.hostname}/cdn-cgi/access/logout?returnTo=${encodeURIComponent(url.toString())}`;
+
+  // The share a credential resolves to, or the refusal a recipient sees instead. Every dead end is
+  // the same 404, because a page that told an unknown token from a revoked one would tell its
+  // holder the artifact exists. An unknown credential costs one read and no write.
+  const shareFor = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    sharing: { verify: Verify },
+    lane: { mode: ShareMode; credential: string },
+    now: number,
+  ): Promise<{ ok: true; share: ShareRecord } | { ok: false; refusal: ShareRefusal }> => {
+    const gone = { ok: false as const, refusal: { kind: "gone" as const } };
+    const live = async (share: ShareRecord | null): Promise<ShareRecord | null> => {
+      if (share === null) return null;
+      if (share.expiresAt > now) return share;
+      await deleteExpiredShare(db, share.shareId, now);
+      return null;
+    };
+    if (lane.mode === "link") {
+      const share = await live(await shareByToken(db, await hashShareToken(lane.credential)));
+      return share === null ? gone : { ok: true, share };
+    }
+    const assertion = request.headers.get("cf-access-jwt-assertion");
+    if (!assertion) return gone;
+    const verified = await sharing.verify(assertion);
+    if (!verified.ok) return gone;
+    const share = await live(await shareById(db, lane.credential));
+    if (share === null) return gone;
+    // The proven address and the one the share names, compared and neither printed: one is on the
+    // reader's own screen and naming the other would say who the artifact was shared with.
+    if (share.subject !== verified.email) {
+      return { ok: false, refusal: { kind: "elsewhere", signInAgain: signInAgainAt(url) } };
+    }
+    return { ok: true, share };
+  };
+
+  // Both share lanes, which differ only in how a credential is proven. From the artifact row on
+  // they are one path: a share names its owner and the row is read directly rather than through
+  // the account-readable fallback, so a share can never reach another account's artifact of the
+  // same name.
+  const sharedSite = async (request: Request, url: URL, db: D1Database, host: ArtifactHost): Promise<Response> => {
+    const gone = (): Response => shareNotice({ kind: "gone" });
+    if (request.method !== "GET") return shareNotice({ kind: "method" });
+    const { sharing } = host;
+    if (sharing === null) return gone();
+    const lane = shareLane(url.pathname);
+    if (lane === null) return gone();
+    const route = underBase(lane.tail);
+    if (route.kind === "elsewhere") return gone();
+    const now = deps.now();
+    const resolved = await shareFor(request, url, db, sharing, lane, now);
+    if (!resolved.ok) return shareNotice(resolved.refusal);
+    const { share } = resolved;
+    const record = await getArtifact(db, share.userId, share.name);
+    if (record === null) return gone();
+    const chrome: ArtifactChrome = {
+      base: lane.base,
+      audience: { kind: "recipient", expiresAt: share.expiresAt },
+    };
+    if (route.kind === "page") await recordShareUse(db, share.shareId, now);
+    return artifactView(request, url, host, record, chrome, route, gone);
   };
 
   const dashboard = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
@@ -869,13 +1094,15 @@ export const createApp = (deps: Deps): App => {
     const segments = url.pathname.startsWith(sessionPrefix) ? url.pathname.slice(sessionPrefix.length).split("/") : [];
     const rawSessionId = segments[0] ?? "";
     const bytes = segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT;
+    const shareName = sharedArtifactName(url.pathname);
     const saving = request.method === "POST" && tab?.path === LABELS_TAB.path;
     const sending = request.method === "POST" && segments.length === 1;
-    if (request.method !== "GET" && !saving && !sending) {
+    const sharing = request.method === "POST" && shareName !== null;
+    if (request.method !== "GET" && !saving && !sending && !sharing) {
       return lost(
         405,
         "Not allowed",
-        "The dashboard only answers a GET, the Labels tab its own POST, and a session page the message it sends.",
+        "The dashboard only answers a GET, the Labels tab its own POST, an artifact's share page its own POST, and a session page the message it sends.",
       );
     }
     const email = await approver(request, deps.verify, signIn);
@@ -895,6 +1122,11 @@ export const createApp = (deps: Deps): App => {
     }
     const now = deps.now();
     const live = await liveTally(db, userId, now);
+    if (shareName !== null) {
+      return request.method === "POST"
+        ? sharesPost(request, url, db, userId, email, live, shareName, now, lost)
+        : sharesTab(request, url, db, userId, email, live, shareName, now, lost);
+    }
     if (tab === null) {
       if (segments.length === 1) {
         return sessionDetail(request, url, env, userId, email, live, rawSessionId, lost);
@@ -929,6 +1161,268 @@ export const createApp = (deps: Deps): App => {
     const trusted =
       request.headers.get("origin") === url.origin && cookie !== null && sameSecret(cookie, form.get("csrf") ?? "");
     return { form, trusted };
+  };
+
+  // The artifact a share page is about, as the address holds it, and null where the address is no
+  // share page at all. The segment is not decoded here: a state drawn for no artifact echoes the
+  // address unrewritten, which is the page's to do.
+  const sharedArtifactName = (pathname: string): string | null => {
+    const segments = pathname.replace(/\/$/, "").split("/");
+    if (segments.length !== 5 || segments[4] !== SHARES_SEGMENT) return null;
+    return `/${segments[1]}/${segments[2]}` === ARTIFACTS_TAB.path ? (segments[3] ?? null) : null;
+  };
+
+  // The whole address a share answers on, built in one place. For a link it exists on the one
+  // response that mints it and nowhere else, because storage holds only the token's hash.
+  const shareAddress = (host: ArtifactHost, mode: ShareMode, credential: string): string =>
+    `https://${host.hostname}${mode === "link" ? SHARE_LINK_PREFIX : SHARE_EMAIL_PREFIX}/${credential}`;
+
+  const dayOf = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
+  const GONE_FLASH: ShareFlash = { tone: "refused", text: "That share is already gone." };
+
+  const UNTRUSTED_FLASH: ShareFlash = {
+    tone: "refused",
+    text: "This form did not come from this page, so nothing was created, extended or revoked; reload the page and try again.",
+  };
+
+  // Where a row the mutation just wrote belongs in the list the page already read: the link first,
+  // then the addresses oldest first, which is the order the index supplies. The list is rebuilt
+  // rather than read again, so a POST costs the page's two reads and its one write and no more.
+  const sameSubject = (left: ShareView, right: ShareView): boolean => {
+    if (left.shareId === right.shareId) return true;
+    if (left.mode === "link" && right.mode === "link") return true;
+    return left.mode === "email" && right.mode === "email" && left.address === right.address;
+  };
+
+  const relisted = (shares: readonly ShareView[], written: ShareView): ShareView[] => {
+    const others = shares.filter((one) => !sameSubject(one, written));
+    const link = written.mode === "link" ? written : others.find((one) => one.mode === "link");
+    const addresses = [...(written.mode === "email" ? [written] : []), ...others.filter((one) => one.mode === "email")];
+    addresses.sort((left, right) => left.createdAt - right.createdAt);
+    return [...(link === undefined ? [] : [link]), ...addresses];
+  };
+
+  // The artifact a share page draws, or the state it draws instead of one, off one read. A name
+  // this account does not own answers the 403 the API answers, and a name it holds no artifact
+  // under is the dashboard's own notice; a private artifact of another account resolves to
+  // neither, so the reader learns nothing about it.
+  const shareTarget = async (
+    db: D1Database,
+    url: URL,
+    userId: string,
+    email: string,
+    live: Live,
+    rawName: string,
+    lost: Refusal,
+  ): Promise<ArtifactRecord | Response> => {
+    const name = parseName(decodeSegment(rawName) ?? "");
+    const record = name.ok ? await resolveArtifact(db, userId, name.value) : null;
+    if (record === null) {
+      return lost(404, "No such artifact", "This recall publishes no artifact under this name.");
+    }
+    if (record.ownerUserId !== userId) return sharesPage(email, live, url, { kind: "foreign" });
+    return record;
+  };
+
+  // The question the query asks, against the shares the page holds. An id naming no live share is
+  // not a question at all: the page says so and lists what remains.
+  const askFor = (url: URL, shares: readonly ShareView[]): { ask: ShareAsk | null; flash: ShareFlash | null } => {
+    if (url.searchParams.get("relink") === "1") {
+      return shares.some((share) => share.mode === "link")
+        ? { ask: { kind: "relink" }, flash: null }
+        : { ask: null, flash: GONE_FLASH };
+    }
+    const revoke = url.searchParams.get("revoke");
+    if (revoke === null) return { ask: null, flash: null };
+    if (revoke === "all") {
+      return shares.length === 0
+        ? { ask: null, flash: GONE_FLASH }
+        : { ask: { kind: "revoke-all", count: shares.length }, flash: null };
+    }
+    const share = shares.find((one) => one.shareId === revoke);
+    return share === undefined ? { ask: null, flash: GONE_FLASH } : { ask: { kind: "revoke", share }, flash: null };
+  };
+
+  interface ShareState {
+    shares: ShareView[];
+    flash: ShareFlash | null;
+    minted: Minted | null;
+    ask: ShareAsk | null;
+    emailDraft: string;
+  }
+
+  const sharePageOf = (
+    host: ArtifactHost,
+    record: ArtifactRecord,
+    state: ShareState,
+    csrf: string,
+    now: number,
+  ): SharePage => ({
+    artifact: viewOf(host, record, state.shares.length),
+    shares: state.shares,
+    csrf,
+    flash: state.flash,
+    minted: state.minted,
+    ask: state.ask,
+    emailDraft: state.emailDraft,
+    emailFull: state.shares.filter((share) => share.mode === "email").length >= MAX_EMAIL_SHARES,
+    now,
+  });
+
+  const sharesTab = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    rawName: string,
+    now: number,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const host = deps.artifactHost;
+    if (host === null || host.sharing === null) return sharesPage(email, live, url, { kind: "off" });
+    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
+    if (target instanceof Response) return target;
+    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
+    const { ask, flash } = askFor(url, shares);
+    const state: ShareState = { shares, flash, minted: null, ask, emailDraft: "" };
+    const page = sharePageOf(host, target, state, pageToken(request), now);
+    return sharesPage(email, live, url, { kind: "page", page });
+  };
+
+  // Every mutation the page posts, each one write against the artifact's own shares. Nothing is a
+  // redirect: the response carries the page, because a minted address exists on that one response
+  // and nowhere else.
+  const shareMutation = async (
+    db: D1Database,
+    host: ArtifactHost,
+    record: ArtifactRecord,
+    shares: ShareView[],
+    form: URLSearchParams,
+    now: number,
+  ): Promise<ShareState> => {
+    const { ownerUserId: userId, name } = record;
+    const expiresAt = now + SHARE_WINDOW_MS;
+    const kept = (extra: Partial<ShareState>): ShareState => ({
+      shares,
+      flash: null,
+      minted: null,
+      ask: null,
+      emailDraft: "",
+      ...extra,
+    });
+    const mintedLink = async (replacing: boolean): Promise<ShareState> => {
+      const token = newShareToken();
+      const input = { shareId: newShareId(), userId, name, subject: await hashShareToken(token), at: now, expiresAt };
+      const made = replacing ? await replaceLinkShare(db, input) : await createLinkShare(db, input);
+      // A live link refused the write, which is the one reload worth catching: the page asks
+      // whether to retire the address already in use rather than minting a second one.
+      if (made === null) return kept({ ask: { kind: "relink" } });
+      return kept({
+        shares: relisted(shares, shareViewOf(made)),
+        minted: { mode: "link", address: shareAddress(host, "link", token), expiresAt: made.expiresAt },
+      });
+    };
+    const todo = form.get("do") ?? "";
+    if (todo === "email") {
+      const typed = form.get("address") ?? "";
+      const address = parseShareAddress(typed);
+      if (!address.ok) return kept({ flash: { tone: "refused", text: address.error }, emailDraft: typed });
+      const addresses = shares.filter((share) => share.mode === "email");
+      const renewing = addresses.some((share) => share.mode === "email" && share.address === address.value);
+      if (!renewing && addresses.length >= MAX_EMAIL_SHARES) {
+        return kept({
+          flash: {
+            tone: "refused",
+            text: `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes, so ${address.value} was not shared.`,
+          },
+          emailDraft: typed,
+        });
+      }
+      await deleteDeadEmailShare(db, userId, name, address.value, now);
+      const made = await createEmailShare(db, {
+        shareId: newShareId(),
+        userId,
+        name,
+        subject: address.value,
+        at: now,
+        expiresAt,
+      });
+      return kept({
+        shares: relisted(shares, shareViewOf(made.share)),
+        flash: made.renewed
+          ? { tone: "done", text: `${address.value} already held a share, so its expiry moved instead.` }
+          : null,
+        minted: {
+          mode: "email",
+          address: shareAddress(host, "email", made.share.shareId),
+          recipient: address.value,
+          expiresAt: made.share.expiresAt,
+        },
+      });
+    }
+    if (todo === "link") return mintedLink(false);
+    if (todo === "relink") return mintedLink(true);
+    if (todo === "extend") {
+      const extended = await extendLinkShare(db, userId, name, now, expiresAt);
+      if (extended === null) return kept({ flash: GONE_FLASH });
+      return kept({
+        shares: relisted(shares, shareViewOf(extended)),
+        flash: { tone: "done", text: `The link share now stops working on ${dayOf(extended.expiresAt)}.` },
+      });
+    }
+    if (todo === "revoke") {
+      const shareId = form.get("share") ?? "";
+      const going = shares.find((share) => share.shareId === shareId);
+      if (going === undefined) return kept({ flash: GONE_FLASH });
+      const revoked = await revokeShares(db, userId, name, { kind: "one", shareId });
+      if (revoked === 0) return kept({ flash: GONE_FLASH });
+      return kept({
+        shares: shares.filter((share) => share.shareId !== shareId),
+        flash: {
+          tone: "done",
+          text: going.mode === "link" ? "The link share is revoked." : `The share with ${going.address} is revoked.`,
+        },
+      });
+    }
+    if (todo === "revoke-all") {
+      const revoked = await revokeShares(db, userId, name, { kind: "all" });
+      return kept({
+        shares: [],
+        flash: revoked === 0 ? GONE_FLASH : { tone: "done", text: `Every share on ${name} is revoked.` },
+      });
+    }
+    return kept({});
+  };
+
+  const sharesPost = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    rawName: string,
+    now: number,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const host = deps.artifactHost;
+    if (host === null || host.sharing === null) return sharesPage(email, live, url, { kind: "off" });
+    const posted = await formPost(request, url);
+    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
+    if (target instanceof Response) return target;
+    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
+    const csrf = pageToken(request);
+    // Nothing is created, extended or revoked for a post that did not come from this page, and the
+    // refusal says nothing the page does not already draw.
+    if (!posted.trusted) {
+      const state: ShareState = { shares, flash: UNTRUSTED_FLASH, minted: null, ask: null, emailDraft: "" };
+      return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) }, 403);
+    }
+    const state = await shareMutation(db, host, target, shares, posted.form, now);
+    return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) });
   };
 
   const labelsTab = async (
@@ -1216,15 +1710,14 @@ export const createApp = (deps: Deps): App => {
     return memoryBodyPage(email, live, memory, deps.now());
   };
 
-  // One page of the shelf: one indexed read of the artifact rows, and one read of the counts the
-  // chips and the heading print. No bytes are read and the bucket is not listed.
-  const shelfFor = async (
+  // One page of the shelf's rows and the counts the chips and the heading print. No bytes are read
+  // and the bucket is not listed.
+  const artifactRows = async (
     db: D1Database,
-    host: ArtifactHost,
     userId: string,
     input: ArtifactListInput,
     cursor: Cursor,
-  ): Promise<ArtifactShelf> => {
+  ): Promise<{ artifacts: ArtifactRecord[]; counts: ArtifactCounts; nextCursor: string; cut: boolean }> => {
     const match = input.query === "" ? null : ftsQuery(input.query);
     const [counts, page] = await Promise.all([
       artifactCounts(db, userId),
@@ -1237,9 +1730,33 @@ export const createApp = (deps: Deps): App => {
               nextCursor: "",
             })),
     ]);
+    return { artifacts: page.artifacts, counts, nextCursor: page.nextCursor, cut: page.cut };
+  };
+
+  // The shelf, with the third read: the live share counts for the artifacts on this page, grouped
+  // by name rather than read per row, so the read is bounded by the page and not by the account.
+  // Where sharing is off it does not run at all and every count is zero.
+  const shelfFor = async (
+    db: D1Database,
+    host: ArtifactHost,
+    userId: string,
+    input: ArtifactListInput,
+    cursor: Cursor,
+    now: number,
+  ): Promise<ArtifactShelf> => {
+    const page = await artifactRows(db, userId, input, cursor);
+    const counted =
+      host.sharing === null
+        ? new Map<string, number>()
+        : await shareCountsFor(
+            db,
+            userId,
+            page.artifacts.map((record) => record.name),
+            now,
+          );
     return {
-      artifacts: page.artifacts.map((record) => viewOf(host, record)),
-      counts,
+      artifacts: page.artifacts.map((record) => viewOf(host, record, counted.get(record.name) ?? 0)),
+      counts: page.counts,
       nextCursor: page.nextCursor,
       cut: page.cut,
     };
@@ -1262,7 +1779,7 @@ export const createApp = (deps: Deps): App => {
     const input = parseArtifactList(url.searchParams, chosen.sort);
     if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
     const cursor = pageCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
-    const shelf = await shelfFor(db, host, userId, input.value, cursor);
+    const shelf = await shelfFor(db, host, userId, input.value, cursor, deps.now());
     return artifactsPage(email, live, url, { kind: "shelf", shelf });
   };
 
@@ -1485,7 +2002,8 @@ export const createApp = (deps: Deps): App => {
     const saved = await getArtifact(db, owner, name);
     if (saved === null) throw new Error(`artifact ${name} vanished right after it was published`);
     if (target !== null) await collect(host.bucket, owner, name, target.rev);
-    return json({ artifact: viewOf(host, saved), ownedByAnother: owner !== caller.userId });
+    const shares = await sharesHeld(db, host, saved, caller.userId, deps.now());
+    return json({ artifact: viewOf(host, saved, shares), ownedByAnother: owner !== caller.userId });
   };
 
   const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
@@ -1499,23 +2017,145 @@ export const createApp = (deps: Deps): App => {
       await bucket.delete(legacy.key);
       return new Response(null, { status: 204 });
     }
-    await deleteArtifactRow(db, target.ownerUserId, name);
+    await deleteArtifactWithShares(db, target.ownerUserId, name);
     await deleteArtifactFiles(bucket, target.ownerUserId, name);
     return new Response(null, { status: 204 });
   };
 
-  const artifactsListing = async (url: URL, db: D1Database, host: ArtifactHost, userId: string): Promise<Response> => {
+  const artifactsListing = async (
+    url: URL,
+    db: D1Database,
+    host: ArtifactHost,
+    userId: string,
+    now: number,
+  ): Promise<Response> => {
     const chosen = sortInForce(url, ARTIFACT_SORTS);
     const input = parseArtifactList(url.searchParams, chosen.sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
     if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
-    const shelf = await shelfFor(db, host, userId, input.value, cursor);
+    // One optional param turns the page's third read from the counts into the rows themselves,
+    // which is what `recall shares` with no name walks instead of a collection of its own.
+    const wanted = url.searchParams.get("shares") === "true" && host.sharing !== null;
+    const page = await artifactRows(db, userId, input.value, cursor);
+    const names = page.artifacts.map((record) => record.name);
+    const held = wanted ? await sharesFor(db, userId, names, now) : new Map<string, ShareRecord[]>();
+    const counted =
+      wanted || host.sharing === null ? new Map<string, number>() : await shareCountsFor(db, userId, names, now);
+    const artifacts = page.artifacts.map((record) => {
+      const shares = held.get(record.name) ?? [];
+      const view = viewOf(host, record, wanted ? shares.length : (counted.get(record.name) ?? 0));
+      return wanted ? { ...view, shares: shares.map(shareViewOf) } : view;
+    });
+    return json({ artifacts, nextCursor: page.nextCursor, total: page.counts.total, cut: page.cut });
+  };
+
+  // How many live shares one artifact holds, read for its owner alone: an account reading somebody
+  // else's account-readable artifact learns nothing about who else holds a share on it.
+  const sharesHeld = async (
+    db: D1Database,
+    host: ArtifactHost,
+    record: ArtifactRecord,
+    userId: string,
+    now: number,
+  ): Promise<number> => {
+    if (host.sharing === null || record.ownerUserId !== userId) return 0;
+    return shareCount(db, userId, record.name, now);
+  };
+
+  // What a `DELETE` on the collection names, which is exactly one of three. Naming none or more
+  // than one is refused by naming the three rather than picking one.
+  const revokeSelector = (url: URL): Parsed<RevokeScope> => {
+    const asked: RevokeScope[] = [];
+    if (url.searchParams.has("link")) asked.push({ kind: "link" });
+    if (url.searchParams.has("email")) {
+      const address = parseShareAddress(url.searchParams.get("email"));
+      if (!address.ok) return address;
+      asked.push({ kind: "email", address: address.value });
+    }
+    if (url.searchParams.get("all") === "true") asked.push({ kind: "all" });
+    const [scope] = asked;
+    if (asked.length !== 1 || scope === undefined) {
+      return fail("a revoke names exactly one of link, email=<address> and all=true");
+    }
+    return { ok: true, value: scope };
+  };
+
+  // The shares of one artifact, nested under the artifact that owns them: a share is meaningless
+  // without it, and the ownership check that answers the 403 falls out of the lookup the path
+  // already requires.
+  const artifactShareRoutes = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    host: ArtifactHost,
+    userId: string,
+    name: string,
+    rawShareId: string | undefined,
+    now: number,
+  ): Promise<Response> => {
+    if (host.sharing === null) {
+      return error(404, "this recall shares no artifacts; its deployment binds no share audience");
+    }
+    const record = await resolveArtifact(db, userId, name);
+    if (record === null) return error(404, `no artifact named ${name}`);
+    if (record.ownerUserId !== userId) return error(403, "only an artifact's owner shares it");
+    const remaining = async (): Promise<ShareView[]> => (await artifactShares(db, userId, name, now)).map(shareViewOf);
+    if (rawShareId !== undefined) {
+      if (request.method !== "DELETE") return error(405, "method not allowed");
+      const revoked = await revokeShares(db, userId, name, { kind: "one", shareId: rawShareId });
+      if (revoked === 0) return error(404, `no share ${rawShareId} on ${name}`);
+      return json({ revoked, shares: await remaining() });
+    }
+    if (request.method === "GET") return json({ shares: await remaining() });
+    if (request.method === "DELETE") {
+      const scope = revokeSelector(url);
+      if (!scope.ok) return error(400, scope.error);
+      const revoked = await revokeShares(db, userId, name, scope.value);
+      return json({ revoked, shares: await remaining() });
+    }
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const body = await readJson(request);
+    if (!isRecord(body)) return error(400, "a share names a mode of link or email");
+    const expiresAt = now + SHARE_WINDOW_MS;
+    if (body.mode === "link") {
+      const shares = await artifactShares(db, userId, name, now);
+      const token = newShareToken();
+      const share = await replaceLinkShare(db, {
+        shareId: newShareId(),
+        userId,
+        name,
+        subject: await hashShareToken(token),
+        at: now,
+        expiresAt,
+      });
+      return json({
+        share: shareViewOf(share),
+        address: shareAddress(host, "link", token),
+        replaced: shares.some((one) => one.mode === "link"),
+      });
+    }
+    if (body.mode !== "email") return error(400, "a share names a mode of link or email");
+    const address = parseShareAddress(body.address);
+    if (!address.ok) return error(400, address.error);
+    const shares = await artifactShares(db, userId, name, now);
+    const addresses = shares.filter((one) => one.mode === "email");
+    if (!addresses.some((one) => one.subject === address.value) && addresses.length >= MAX_EMAIL_SHARES) {
+      return error(409, `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes`);
+    }
+    await deleteDeadEmailShare(db, userId, name, address.value, now);
+    const made = await createEmailShare(db, {
+      shareId: newShareId(),
+      userId,
+      name,
+      subject: address.value,
+      at: now,
+      expiresAt,
+    });
     return json({
-      artifacts: shelf.artifacts,
-      nextCursor: shelf.nextCursor,
-      total: shelf.counts.total,
-      cut: shelf.cut,
+      share: shareViewOf(made.share),
+      address: shareAddress(host, "email", made.share.shareId),
+      renewed: made.renewed,
     });
   };
 
@@ -1525,7 +2165,7 @@ export const createApp = (deps: Deps): App => {
     db: D1Database,
     caller: Caller,
     rawName: string | undefined,
-    subpath: string,
+    rest: readonly string[],
   ): Promise<Response> => {
     const host = deps.artifactHost;
     if (host === null) {
@@ -1533,24 +2173,36 @@ export const createApp = (deps: Deps): App => {
     }
     const { bucket } = host;
     const { userId } = caller;
+    const now = deps.now();
     if (rawName === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
-      return artifactsListing(url, db, host, userId);
+      return artifactsListing(url, db, host, userId, now);
     }
     // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
     // shadowed by an artifact named adopt.
-    if (rawName === "adopt" && subpath === "" && request.method === "POST") {
+    if (rawName === "adopt" && rest.length === 0 && request.method === "POST") {
       return json({ adopted: await adoptArtifacts(db, bucket, userId) });
     }
     const name = parseName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
-    if (subpath !== "") {
+    // Under a name the next segment is a route word and nothing else, which is what frees `shares`
+    // beside `files` and is the same rule the artifact hostname holds: no position where a name or
+    // a file path meets a route.
+    const [word, ...tail] = rest;
+    if (word === SHARES_SEGMENT) {
+      if (tail.length > 1) return error(404, "not found");
+      return artifactShareRoutes(request, url, db, host, userId, name.value, tail[0], now);
+    }
+    if (word === "files") {
       if (request.method !== "GET") return error(405, "method not allowed");
-      const record = await resolveArtifact(db, userId, name.value);
+      const subpath = tail.join("/");
       const lost = (): Response => error(404, `no file ${subpath} in artifact ${name.value}`);
+      if (subpath === "") return lost();
+      const record = await resolveArtifact(db, userId, name.value);
       if (record === null) return lost();
       return artifactFile(request, bucket, record, subpath, lost);
     }
+    if (word !== undefined) return error(404, "not found");
     if (request.method === "PUT") return publish(request, url, db, host, caller, name.value);
     if (request.method === "DELETE") return unpublish(db, bucket, caller, name.value);
     if (request.method !== "GET") return error(405, "method not allowed");
@@ -1558,7 +2210,7 @@ export const createApp = (deps: Deps): App => {
     // files over the API while refusing to say anything about itself.
     const record = await resolveArtifact(db, userId, name.value);
     if (record === null) return error(404, `no artifact named ${name.value}`);
-    return json({ artifact: viewOf(host, record) });
+    return json({ artifact: viewOf(host, record, await sharesHeld(db, host, record, userId, now)) });
   };
 
   const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
@@ -1655,7 +2307,11 @@ export const createApp = (deps: Deps): App => {
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
     const url = new URL(request.url);
     const host = deps.artifactHost;
-    if (host !== null && url.hostname === host.hostname) return artifactSite(request, url, env.DB, host);
+    if (host !== null && url.hostname === host.hostname) {
+      return underSharePrefix(url.pathname)
+        ? sharedSite(request, url, env.DB, host)
+        : artifactSite(request, url, env.DB, host);
+    }
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
     if (url.pathname === TRANSCRIPT_SCRIPT_PATH) return transcriptScript();
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {
@@ -1699,7 +2355,7 @@ export const createApp = (deps: Deps): App => {
       return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
     }
     const { userId } = caller;
-    if (collection === "artifacts") return artifacts(request, url, env.DB, caller, rawName, rest.join("/"));
+    if (collection === "artifacts") return artifacts(request, url, env.DB, caller, rawName, rest);
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");
     }

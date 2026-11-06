@@ -1,4 +1,4 @@
-use crate::api::{Artifact, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit};
+use crate::api::{Artifact, Audience, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit, Share};
 use crate::sessions;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -146,12 +146,20 @@ pub fn size(bytes: i64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
+fn shared(count: i64) -> String {
+    match count {
+        0 => String::new(),
+        1 => " `1 share`".to_string(),
+        many => format!(" `{many} shares`"),
+    }
+}
+
 pub fn render_artifacts(artifacts: &[Artifact]) -> String {
     artifacts
         .iter()
         .map(|artifact| {
             format!(
-                "- **{}** ({}) {} {} {} `r {} w {}`\n  {}\n",
+                "- **{}** ({}) {} {} {} `r {} w {}`{}\n  {}\n",
                 artifact.name,
                 artifact.kind,
                 artifact.title,
@@ -159,9 +167,51 @@ pub fn render_artifacts(artifacts: &[Artifact]) -> String {
                 iso(artifact.updated_at),
                 artifact.read,
                 artifact.write,
+                shared(artifact.share_count),
                 artifact.url
             )
         })
+        .collect()
+}
+
+/// A share's mode and its recipient: one named address, or the whole of who a link share admits.
+fn admits(share: &Share) -> (&'static str, &str) {
+    match &share.audience {
+        Audience::Link => ("link", "anyone with the link"),
+        Audience::Email { address } => ("email", address),
+    }
+}
+
+/// The fields one share row carries. `never opened` comes off the use count rather than off a
+/// comparison of two timestamps.
+pub fn render_shares(shares: &[Share]) -> String {
+    shares
+        .iter()
+        .map(|share| {
+            let opened = if share.uses == 0 {
+                "never opened".to_string()
+            } else {
+                format!("{} opens, last {}", share.uses, iso(share.last_used_at))
+            };
+            let (mode, recipient) = admits(share);
+            format!(
+                "- **{}** ({}) created {} expires {} {}\n",
+                recipient,
+                mode,
+                iso(share.created_at),
+                iso(share.expires_at),
+                opened
+            )
+        })
+        .collect()
+}
+
+/// Every share the account holds, grouped per artifact. The grouping is the listing's own
+/// ordering, so this prints what it was given and sorts nothing.
+pub fn render_every_share(artifacts: &[Artifact]) -> String {
+    artifacts
+        .iter()
+        .map(|artifact| format!("## {}\n\n{}\n", artifact.name, render_shares(&artifact.shares)))
         .collect()
 }
 
@@ -322,6 +372,97 @@ pub fn render_elsewhere(entries: &[Elsewhere]) -> String {
 mod tests {
     use super::*;
 
+    fn link_share(name: &str, uses: i64) -> Share {
+        Share {
+            audience: Audience::Link,
+            share_id: "sh_one".into(),
+            name: name.into(),
+            created_at: 1_762_000_000_000,
+            expires_at: 1_764_592_000_000,
+            last_used_at: 1_762_000_000_000,
+            uses,
+        }
+    }
+
+    fn email_share(name: &str, address: &str) -> Share {
+        Share {
+            audience: Audience::Email {
+                address: address.into(),
+            },
+            share_id: "sh_two".into(),
+            ..link_share(name, 0)
+        }
+    }
+
+    #[test]
+    fn names_a_link_share_without_an_address_and_a_fresh_share_as_never_opened() {
+        let rendered = render_shares(&[
+            link_share("release-notes", 0),
+            email_share("release-notes", "jo@example.org"),
+        ]);
+        assert!(rendered.contains("**anyone with the link** (link)"));
+        assert!(rendered.contains("**jo@example.org** (email)"));
+        assert_eq!(rendered.matches("never opened").count(), 2);
+        assert!(!rendered.contains("sh_one"));
+    }
+
+    #[test]
+    fn counts_the_opens_of_a_share_somebody_has_read() {
+        let read = render_shares(&[link_share("release-notes", 3)]);
+        assert!(read.contains("3 opens, last 2025-11-01T12:26:40Z"));
+        assert!(!read.contains("never opened"));
+    }
+
+    #[test]
+    fn groups_every_share_under_the_artifact_that_holds_it() {
+        let artifact = |name: &str, shares: Vec<Share>| Artifact {
+            name: name.into(),
+            url: format!("https://artifact.example.com/a/{name}"),
+            kind: "document".into(),
+            title: name.into(),
+            description: String::new(),
+            read: "private".into(),
+            write: "owner".into(),
+            file_count: 1,
+            bytes: 10,
+            created_at: 0,
+            updated_at: 0,
+            last_writer: "alice@example.com".into(),
+            share_count: shares.len() as i64,
+            shares,
+        };
+        let grouped = render_every_share(&[
+            artifact("quarterly-plan", vec![email_share("quarterly-plan", "jo@example.org")]),
+            artifact("release-notes", vec![link_share("release-notes", 0)]),
+        ]);
+        assert!(grouped.starts_with("## quarterly-plan\n"));
+        assert!(grouped.contains("## release-notes\n"));
+        assert!(grouped.find("jo@example.org") < grouped.find("anyone with the link"));
+    }
+
+    #[test]
+    fn carries_the_share_count_on_an_artifact_row_and_nothing_where_none_is_held() {
+        let row = |count: i64| Artifact {
+            name: "release-notes".into(),
+            url: "https://artifact.example.com/a/release-notes".into(),
+            kind: "site".into(),
+            title: "Release notes".into(),
+            description: String::new(),
+            read: "private".into(),
+            write: "owner".into(),
+            file_count: 1,
+            bytes: 14,
+            created_at: 0,
+            updated_at: 0,
+            last_writer: "alice@example.com".into(),
+            share_count: count,
+            shares: Vec::new(),
+        };
+        assert!(render_artifacts(&[row(0)]).contains("`r private w owner`\n"));
+        assert!(render_artifacts(&[row(1)]).contains("`1 share`"));
+        assert!(render_artifacts(&[row(4)]).contains("`4 shares`"));
+    }
+
     #[test]
     fn lists_other_scopes_after_the_hits() {
         let entries = [Elsewhere {
@@ -424,7 +565,7 @@ mod tests {
     fn prints_a_row_per_artifact_with_its_type_size_time_and_permissions() {
         let artifacts = [Artifact {
             name: "panel-episode-12".into(),
-            url: "https://artifact.recall.test/panel-episode-12".into(),
+            url: "https://artifact.recall.test/a/panel-episode-12".into(),
             kind: "audio".into(),
             title: "Episode 12".into(),
             description: "the panel on rollout".into(),
@@ -435,10 +576,12 @@ mod tests {
             created_at: 1_761_744_000_000,
             updated_at: 1_761_744_000_000,
             last_writer: "you@example.com".into(),
+            share_count: 0,
+            shares: Vec::new(),
         }];
         assert_eq!(
             render_artifacts(&artifacts),
-            "- **panel-episode-12** (audio) Episode 12 41.2 MB 2025-10-29T13:20:00Z `r account w owner`\n  https://artifact.recall.test/panel-episode-12\n"
+            "- **panel-episode-12** (audio) Episode 12 41.2 MB 2025-10-29T13:20:00Z `r account w owner`\n  https://artifact.recall.test/a/panel-episode-12\n"
         );
         assert_eq!(render_artifacts(&[]), "");
     }

@@ -37,3 +37,9 @@ output "artifact_access_aud" {
 output "access_team_domain" {
   value = data.cloudflare_zero_trust_organization.this.auth_domain
 }
+
+# Only the email application's audience is bound. The link application mints no JWT, so there is no
+# audience to verify on that lane and binding one would suggest otherwise.
+output "artifact_share_access_aud" {
+  value = var.artifact_hostname == "" ? "" : one(cloudflare_zero_trust_access_application.share_emails[*].aud)
+}

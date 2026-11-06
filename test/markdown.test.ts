@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { render } from "../src/markdown";
 
-const rendered = (markdown: string): string => render(markdown, "spec");
+const BASE = "/a/spec";
+
+const rendered = (markdown: string): string => render(markdown, BASE);
 
 describe("the markdown renderer", () => {
   it("prints markup in the source as characters", () => {
@@ -58,9 +60,16 @@ describe("the markdown renderer", () => {
 
   it("resolves a relative link and an image under the artifact's own address", () => {
     const html = rendered("[notes](notes.md) ![chart](img/chart.png) [deep](./a/b.txt)\n");
-    expect(html).toContain('href="/spec/notes.md"');
-    expect(html).toContain('src="/spec/img/chart.png"');
-    expect(html).toContain('href="/spec/a/b.txt"');
+    expect(html).toContain(`href="${BASE}/f/notes.md"`);
+    expect(html).toContain(`src="${BASE}/f/img/chart.png"`);
+    expect(html).toContain(`href="${BASE}/f/a/b.txt"`);
+  });
+
+  it("rebases an absolute same-origin path under the base rather than leaving the artifact", () => {
+    const html = rendered("[other](/other-artifact) ![cover](/cover.png) [deep](/sub/dir/x.md)\n");
+    expect(html).toContain(`href="${BASE}/f/other-artifact"`);
+    expect(html).toContain(`src="${BASE}/f/cover.png"`);
+    expect(html).toContain(`href="${BASE}/f/sub/dir/x.md"`);
   });
 
   it("leaves an absolute address, a fragment and a mail link alone, and refuses any other scheme", () => {
@@ -85,7 +94,7 @@ describe("the markdown renderer", () => {
 
   it("keeps a relative link inside the artifact and refuses a protocol-relative one", () => {
     const climbed = rendered("[up](../../other/secret.md)\n");
-    expect(climbed).toContain('href="/spec/other/secret.md"');
+    expect(climbed).toContain(`href="${BASE}/f/other/secret.md"`);
     expect(climbed).not.toContain("..");
     const host = rendered("[out](//evil.example.com/x)\n");
     expect(host).not.toContain("href");

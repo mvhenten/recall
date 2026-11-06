@@ -236,6 +236,7 @@ const deployConfig = {
       : {
           ARTIFACT_HOSTNAME: artifactHostname,
           ARTIFACT_ACCESS_AUD: output("artifact_access_aud"),
+          ARTIFACT_SHARE_ACCESS_AUD: output("artifact_share_access_aud"),
           DASHBOARD_HOSTNAME: hostname,
         }),
   },

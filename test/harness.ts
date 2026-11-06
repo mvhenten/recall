@@ -5,12 +5,18 @@ import { createApp, type Delivered } from "../src/app";
 import { DEVICE_CODE_LIMITS, type DeviceCodeLimits } from "../src/device";
 import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
+import { SHARE_EMAIL_PREFIX, SHARE_LINK_PREFIX } from "../src/shares";
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const AUDIENCE = "recall-test-aud";
 const ORIGIN = "https://recall.test";
 export const ARTIFACT_HOSTNAME = "artifact.recall.test";
 export const ARTIFACT_AUDIENCE = "recall-test-artifact-aud";
+
+// The email share application's audience, which is not the artifact host's: an assertion minted by
+// the host's own application must not open a share, and a test proves that by signing for the
+// wrong one of these two.
+export const ARTIFACT_SHARE_AUDIENCE = "recall-test-share-aud";
 
 export interface DeviceStart {
   device_code: string;
@@ -117,6 +123,9 @@ export const harness = async (
   keys: "up" | "down" = "up",
   deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS,
   artifacts: "on" | "off" = "on",
+  // Sharing is the one binding of the artifact host's group that is independently optional: a
+  // deployment publishes artifacts and shares none by naming no share audience.
+  sharing: "on" | "off" = "on",
 ) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
   const { n, e } = await exportJWK(publicKey);
@@ -138,6 +147,7 @@ export const harness = async (
             verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
             bucket: env.ARTIFACTS,
             dashboard: `${ORIGIN}/dashboard`,
+            sharing: sharing === "off" ? null : { verify: accessVerifier(source, ISSUER, ARTIFACT_SHARE_AUDIENCE) },
           },
     embedder: wordEmbedder,
     deviceCodeLimits,
@@ -164,6 +174,19 @@ export const harness = async (
       }),
       env,
     );
+
+  // Both share lanes answer on the artifact hostname under one of two prefixes, and the guard is
+  // what keeps a test from reaching the host's own addresses through this helper by mistake. The
+  // link lane takes no assertion at all, which is the whole of its credential being the token.
+  const sendToSharePrefix = (path: string, assertion: string | null, init: RequestInit = {}): Promise<Response> => {
+    if (!path.startsWith(`${SHARE_LINK_PREFIX}/`) && !path.startsWith(`${SHARE_EMAIL_PREFIX}/`)) {
+      throw new Error(`${path} sits under neither ${SHARE_LINK_PREFIX} nor ${SHARE_EMAIL_PREFIX}`);
+    }
+    return sendToArtifactHost(path, assertion, init);
+  };
+
+  const shareAssertionFor = (email: string, expiresAt: string | number = "5m"): Promise<string> =>
+    assertionFor(email, ARTIFACT_SHARE_AUDIENCE, expiresAt);
 
   const requestDevice = (deviceName: string, clientIp: string): Promise<Response> =>
     send("/v1/device/code", {
@@ -341,6 +364,8 @@ export const harness = async (
     requestDevice,
     send,
     sendToArtifactHost,
+    sendToSharePrefix,
+    shareAssertionFor,
     login,
     startDevice,
     poll,

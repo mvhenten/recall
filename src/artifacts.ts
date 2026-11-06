@@ -46,6 +46,10 @@ export interface ArtifactView {
   createdAt: number;
   updatedAt: number;
   lastWriter: string;
+  // How many live shares the artifact holds, and zero where the deployment shares nothing, so the
+  // row, the owner's bar and an agent reading a listing all say what is shared from one field and
+  // none of them can change it.
+  shareCount: number;
 }
 
 export const MAX_FILE_BYTES = 32 * 1024 * 1024;

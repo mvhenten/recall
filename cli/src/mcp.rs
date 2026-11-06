@@ -539,6 +539,7 @@ impl Recall {
                     None => String::new(),
                 },
                 limit: params.limit,
+                ..api::ArtifactQuery::default()
             })?;
             to_json(&page)
         })
@@ -669,6 +670,17 @@ mod tests {
                 "recall_unpublish"
             ]
         );
+    }
+
+    // Sharing stays on the CLI and the dashboard. A tool that minted a bypassed public address for
+    // any artifact would give a prompt-injected session a way out, so the rule is a test and not a
+    // convention; `recall_artifacts` carries each artifact's share count instead, which lets an
+    // agent read what is shared and change none of it.
+    #[test]
+    fn serves_no_tool_that_shares_or_unshares_an_artifact() {
+        for served in [names(false), names(true)] {
+            assert!(!served.iter().any(|name| name.contains("share")), "{served:?}");
+        }
     }
 
     #[test]
