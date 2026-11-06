@@ -81,9 +81,7 @@ import { ARTIFACT_SORTS, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortIn
 import {
   DEVICE_HEADER,
   MAX_BODY_BYTES,
-  MAX_QUEUED_MESSAGES,
   type Mailbox,
-  NOW_HEADER,
   ORDERS_HEADER,
   parseSend,
   type Sender,
@@ -693,9 +691,7 @@ export const createApp = (deps: Deps): App => {
       return error(404, `no session ${toSessionId} on device ${toDeviceId}`);
     }
     const sender = await senderOf(env.DB, caller, fromSessionId, now);
-    const sent = await mailboxFor(env, caller.userId).enqueue(input.value, sender, now);
-    if (sent === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
-    return json(sent, 201);
+    return json(await mailboxFor(env, caller.userId).enqueue(input.value, sender, now), 201);
   };
 
   const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
@@ -703,7 +699,6 @@ export const createApp = (deps: Deps): App => {
       headers: {
         upgrade: "websocket",
         [DEVICE_HEADER]: caller.deviceId,
-        [NOW_HEADER]: String(deps.now()),
         [ORDERS_HEADER]: request.headers.get(ORDERS_HEADER) ?? "",
       },
     });
@@ -1128,16 +1123,7 @@ export const createApp = (deps: Deps): App => {
     }
     const sender: Sender = { deviceId: DASHBOARD_DEVICE, host: DASHBOARD_DEVICE, name: email };
     const input: SendInput = { kind: "news", toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
-    const sent = await mailboxFor(env, userId).enqueue(input, sender, deps.now());
-    if (sent === null) {
-      return refuse(`This account already holds ${MAX_QUEUED_MESSAGES} queued messages, so the bus took nothing.`, 400);
-    }
-    if (sent.outcome.state === "untaken") {
-      return refuse(
-        "The host that ran this session is not listening, so nobody read it. Nothing is kept for a session that starts later; send it again once that host is back.",
-        400,
-      );
-    }
+    await mailboxFor(env, userId).enqueue(input, sender, deps.now());
     return new Response(null, {
       status: 303,
       headers: {

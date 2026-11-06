@@ -439,27 +439,28 @@ pub async fn to_host(dir: &Path, body: &str) -> Fanout {
     write_all(addressable(dir), body).await
 }
 
-/// What became of an order on this host. `Refused` is a session that would not take the write;
-/// `Retired` is a host with no session that can act on it at all. Neither leaves anything behind
-/// for a later session, so the sender is told the order reached nobody.
+/// What became of an order on this host. `Retired` is a host with no session that took it, which
+/// leaves nothing behind for a later session, so the sender is told the order reached nobody.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Placed {
     Taken(String),
-    Refused,
     Retired,
 }
 
 /// Delivers an order to the one session that should act on it: the newest registered now, by the
-/// same rule `to_host` picks its sessions by.
+/// same rule `to_host` picks its sessions by. A session that will not take the write loses its
+/// registration and the next one is offered the order, since no other connection will ever see it.
 pub async fn to_one(dir: &Path, body: &str) -> Placed {
-    match addressable(dir).first() {
-        Some(newest) => place(newest, body).await,
-        None => Placed::Retired,
+    for registered in addressable(dir) {
+        if place(&registered, body).await {
+            return Placed::Taken(registered.session_id);
+        }
     }
+    Placed::Retired
 }
 
-/// Delivers an order to the one session it names. A session this host cannot address is the end of
-/// it: no other session was addressed, so there is nothing to hand the order to.
+/// Delivers an order to the one session it names. A session this host cannot address, or one that
+/// will not take the write, is the end of it: no other session was addressed.
 pub async fn to_one_session(dir: &Path, session_id: &str, body: &str) -> Placed {
     let Some(registered) = addressable(dir)
         .into_iter()
@@ -467,16 +468,16 @@ pub async fn to_one_session(dir: &Path, session_id: &str, body: &str) -> Placed 
     else {
         return Placed::Retired;
     };
-    place(&registered, body).await
+    if place(&registered, body).await {
+        return Placed::Taken(registered.session_id);
+    }
+    Placed::Retired
 }
 
-async fn place(registered: &Registered, body: &str) -> Placed {
+async fn place(registered: &Registered, body: &str) -> bool {
     let mut fanout = Fanout::default();
     write_or_prune(registered, body, &mut fanout).await;
-    if fanout.delivered == 0 {
-        return Placed::Refused;
-    }
-    Placed::Taken(registered.session_id.clone())
+    fanout.delivered == 1
 }
 
 /// Delivers a message body to the one session named, so a handle reaches that session and nothing
@@ -797,21 +798,32 @@ mod tests {
         );
     }
 
+    /// The session the order is offered first has a socket nothing is reading, which is what a
+    /// session whose Claude died leaves behind. Nothing else will ever see the order, so this host
+    /// is the only chance it gets and the next session here has to be offered it.
     #[tokio::test]
-    async fn an_order_a_dead_session_will_not_take_is_refused_rather_than_swallowed() {
-        let sandbox = Sandbox::new("order-refused");
-        let socket = sandbox.dir.join("inbox.sock");
-        drop(UnixListener::bind(&socket).unwrap());
-        sandbox.register("s-dead", &socket, std::process::id() as i32);
+    async fn an_order_a_dead_session_will_not_take_goes_to_the_next_one_that_will() {
+        let sandbox = Sandbox::new("order-walks-on");
+        let mine = std::process::id() as i32;
+        let dead = sandbox.dir.join("dead.sock");
+        let live = sandbox.dir.join("live.sock");
+        drop(UnixListener::bind(&dead).unwrap());
+        let listening = UnixListener::bind(&live).unwrap();
+        sandbox.register("s-live", &live, mine);
+        sandbox.register("s-dead", &dead, mine);
 
+        let accepting = tokio::spawn(async move { read_frames(&listening).await });
+        let placed = to_one(&sandbox.sessions(), "rerun the migration").await;
+
+        assert_eq!(placed, Placed::Taken("s-live".to_string()));
         assert_eq!(
-            to_one_session(&sandbox.sessions(), "s-dead", "rerun the migration").await,
-            Placed::Refused
+            accepting.await.unwrap()[1]["message"],
+            serde_json::json!({ "role": "user", "content": "rerun the migration" })
         );
         assert_eq!(
             to_one_session(&sandbox.sessions(), "s-dead", "rerun the migration").await,
             Placed::Retired,
-            "the refusal took the registration with it, so there is nothing left to try"
+            "the session that would not take it lost its registration"
         );
     }
 

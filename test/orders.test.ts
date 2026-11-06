@@ -10,11 +10,12 @@ import {
   NOTHING_LISTENING,
   ORDERS,
   ORDERS_HEADER,
+  type Receipt,
   type SendInput,
   type Sent,
   TAKER_WINDOW_MS,
 } from "../src/mailbox";
-import { type Client, harness, mailboxRows } from "./harness";
+import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -23,6 +24,19 @@ interface Listener {
   received: Message[];
   tokens: Map<string, string>;
 }
+
+// What a listener writes back about each order it is handed, standing in for the daemon writing it
+// into one of its own sessions: the session that took it, that it has none that could, or nothing
+// at all, which is what a host whose chosen session wedged does. News is never answered.
+type Answer = (frame: MessageFrame) => Receipt | null;
+
+const takenBy =
+  (sessionId: string): Answer =>
+  (frame) => ({ type: "took", messageId: frame.message.messageId, sessionId, token: frame.token });
+
+const noTaker: Answer = (frame) => ({ type: "none", messageId: frame.message.messageId, token: frame.token });
+
+const saysNothing: Answer = () => null;
 
 const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
@@ -38,10 +52,9 @@ const deviceId = async (client: Client, name: string): Promise<string> => {
   return device.deviceId;
 };
 
-// A row is written on the clock the send runs on and read by the alarm, which has only the wall
-// clock, so the two have to agree before the first order goes out: a row stamped on the harness
-// clock alone is years past the TTL to the alarm. Signing a device in advances the harness clock,
-// so the two are squared up last.
+// The mailbox arms its sweep on the wall clock and the harness sends on one of its own, so the two
+// have to agree before anything is sent. Signing a device in advances the harness clock, so they
+// are squared up last.
 const bus = async () => {
   const h = await harness();
   const userId = `user-${crypto.randomUUID()}`;
@@ -53,11 +66,9 @@ const bus = async () => {
   return { h, userId, laptop, desktopToken, desktopId };
 };
 
-// `takes` is the session the listener reports, standing in for the daemon picking one of its own
-// sessions; a listener that takes nothing says nothing back, which is what a host whose chosen
-// session died does. `declares` is whether the upgrade says this daemon reads the kind of a
-// message, which a daemon from before orders does not.
-const listen = async (h: Harness, token: string, takes: string, declares = true): Promise<Listener> => {
+// `declares` is whether the upgrade says this daemon reads the kind of a message, which a daemon
+// from before orders does not.
+const listen = async (h: Harness, token: string, answer: Answer, declares = true): Promise<Listener> => {
   const response = await h.send("/v1/messages/listen", {
     headers: {
       authorization: `Bearer ${token}`,
@@ -74,18 +85,11 @@ const listen = async (h: Harness, token: string, takes: string, declares = true)
     const frame: MessageFrame = JSON.parse(String(event.data));
     listener.received.push(frame.message);
     listener.tokens.set(frame.message.messageId, frame.token);
-    if (takes === "") return;
-    socket.send(
-      JSON.stringify({ type: "took", messageId: frame.message.messageId, sessionId: takes, token: frame.token }),
-    );
+    if (frame.message.kind !== "order") return;
+    const reply = answer(frame);
+    if (reply !== null) socket.send(JSON.stringify(reply));
   });
   return listener;
-};
-
-const ack = (listener: Listener, messageId: string, token?: string): void => {
-  listener.socket.send(
-    JSON.stringify({ type: "ack", messageId, token: token ?? listener.tokens.get(messageId) ?? "" }),
-  );
 };
 
 const order = (client: Client, toDeviceId: string, body: string): Promise<Response> =>
@@ -96,14 +100,14 @@ const outcome = async (response: Response): Promise<Sent> => {
   return await response.json();
 };
 
-const sendNow = (userId: string, input: SendInput, now: number): Promise<Sent | null> =>
+const sendNow = (userId: string, input: SendInput, now: number): Promise<Sent> =>
   runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) =>
     mailbox.enqueue(input, { deviceId: "d-sender", host: "laptop", name: "" }, now),
   );
 
-const eventually = async (ready: () => boolean | Promise<boolean>, what: string): Promise<void> => {
+const eventually = async (ready: () => boolean, what: string): Promise<void> => {
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    if (await ready()) return;
+    if (ready()) return;
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`${what} never happened`);
@@ -113,9 +117,9 @@ const ids = (messages: Message[]): string[] => messages.map((message) => message
 
 describe("orders", () => {
   it("hands one order to one listener and tells the sender which session took it", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
-    const first = await listen(h, desktopToken, "desktop-aaaa");
-    const second = await listen(h, desktopToken, "desktop-bbbb");
+    const { h, laptop, desktopToken, desktopId } = await bus();
+    const first = await listen(h, desktopToken, takenBy("desktop-aaaa"));
+    const second = await listen(h, desktopToken, takenBy("desktop-bbbb"));
 
     const sent = await outcome(await order(laptop, desktopId, "rerun the migration"));
 
@@ -125,41 +129,36 @@ describe("orders", () => {
       sessionId: first.received.length === 1 ? "desktop-aaaa" : "desktop-bbbb",
     });
     expect(first.received.length + second.received.length).toBe(1);
-    await eventually(async () => (await mailboxRows(userId, desktopId)).length === 0, "the order being released");
   });
 
   it("tells the sender loudly when the host is not listening, and keeps nothing for one that attaches later", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
+    const { h, laptop, desktopToken, desktopId } = await bus();
 
-    const sent = await outcome(await order(laptop, desktopId, "rerun the migration"));
+    const missed = await outcome(await order(laptop, desktopId, "rerun the migration"));
+    expect(missed.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
 
-    expect(sent.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
-    expect(await mailboxRows(userId, desktopId)).toEqual([]);
+    const late = await listen(h, desktopToken, takenBy("desktop-aaaa"));
+    const second = await outcome(await order(laptop, desktopId, "restart the worker"));
 
-    const late = await listen(h, desktopToken, "desktop-aaaa");
-    await eventually(async () => (await mailboxRows(userId, desktopId)).length === 0, "the late socket attaching");
-    expect(late.received).toEqual([]);
+    expect(second.outcome).toEqual({ state: "taken", sessionId: "desktop-aaaa" });
+    expect(ids(late.received)).toEqual([second.message.messageId]);
   });
 
   it("tells the sender when the host took the order back because no session could act on it", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
-    const desktop = await listen(h, desktopToken, "");
-    desktop.socket.addEventListener("message", (event) => {
-      const frame: MessageFrame = JSON.parse(String(event.data));
-      ack(desktop, frame.message.messageId, frame.token);
-    });
+    const { h, laptop, desktopToken, desktopId } = await bus();
+    const desktop = await listen(h, desktopToken, noTaker);
 
     const sent = await outcome(await order(laptop, desktopId, "rerun the migration"));
 
     expect(sent.outcome).toEqual({ state: "untaken", reason: NO_SESSION_TOOK_IT });
-    expect(await mailboxRows(userId, desktopId)).toEqual([]);
+    expect(ids(desktop.received)).toEqual([sent.message.messageId]);
   });
 
   it("drops an order its listening host never answered for, so the failure the sender reports is true", {
     timeout: 4 * TAKER_WINDOW_MS,
   }, async () => {
     const { h, userId, desktopToken, desktopId } = await bus();
-    const holder = await listen(h, desktopToken, "");
+    const holder = await listen(h, desktopToken, saysNothing);
 
     const sent = await sendNow(
       userId,
@@ -167,18 +166,16 @@ describe("orders", () => {
       h.now(),
     );
 
-    if (sent === null) throw new Error("the mailbox refused the order it had room for");
     expect(sent.outcome).toEqual({ state: "untaken", reason: NOT_TAKEN });
-    await eventually(() => holder.received.length === 1, "the order reaching the host that says nothing");
-    expect(await mailboxRows(userId, desktopId)).toEqual([]);
+    expect(ids(holder.received)).toEqual([sent.message.messageId]);
   });
 
   it("hands no order to a daemon too old to read a kind, and says nobody is listening", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
+    const { h, laptop, desktopToken, desktopId } = await bus();
     const first = await outcome(await order(laptop, desktopId, "rerun the migration"));
     expect(first.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
 
-    const old = await listen(h, desktopToken, "", false);
+    const old = await listen(h, desktopToken, noTaker, false);
     const news = await outcome(
       await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "the build is green" }),
     );
@@ -187,14 +184,13 @@ describe("orders", () => {
 
     expect(second.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
     expect(ids(old.received)).toEqual([news.message.messageId]);
-    expect(await mailboxRows(userId, desktopId)).toEqual([news.message.messageId]);
   });
 
   // The sweep is the only thing that closes the socket of a revoked device, so a mailbox busy
-  // enough to reschedule its alarm on every send must not keep pushing that pass out of reach.
+  // enough to be sending and reconnecting must not keep pushing that pass out of reach.
   it("keeps the sweep due where the last one left it, however much traffic arrives", async () => {
     const { h, laptop, userId, desktopToken, desktopId } = await bus();
-    await listen(h, desktopToken, "desktop-aaaa");
+    await listen(h, desktopToken, takenBy("desktop-aaaa"));
     const due = await alarmAt(userId);
     if (due === null) throw new Error("a mailbox with a socket attached owes an alarm");
 
@@ -202,26 +198,40 @@ describe("orders", () => {
       expect((await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body })).status).toBe(201);
       expect(await alarmAt(userId)).toBe(due);
     }
+
+    await listen(h, desktopToken, takenBy("desktop-bbbb"));
+    expect(await alarmAt(userId)).toBe(due);
   });
 
-  it("refuses a receipt that does not quote the token the order went out under", {
+  // The claim is what ties a receipt to the order it answers. Without it a daemon quoting an id it
+  // has seen before could settle an order it was never handed, and the sender would be told a
+  // session took it that never saw it.
+  it("ignores a receipt that does not quote the token the order went out under", {
     timeout: 4 * TAKER_WINDOW_MS,
   }, async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
-    const holder = await listen(h, desktopToken, "");
+    const { h, laptop, desktopToken, desktopId } = await bus();
+    const holder = await listen(h, desktopToken, saysNothing);
     const placing = order(laptop, desktopId, "rerun the migration");
     await eventually(() => holder.received.length === 1, "the order reaching the host");
     const pushed = holder.received[0];
-    if (!pushed) throw new Error("the order never arrived");
+    if (pushed === undefined) throw new Error("the order never arrived");
 
-    ack(holder, pushed.messageId, crypto.randomUUID());
-    const news = await outcome(
-      await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "the build is green" }),
+    const quoting = (token: string): string =>
+      JSON.stringify({
+        type: "took",
+        messageId: pushed.messageId,
+        sessionId: "desktop-aaaa",
+        token,
+      } satisfies Receipt);
+    holder.socket.send(quoting(crypto.randomUUID()));
+    holder.socket.send(
+      JSON.stringify({
+        type: "none",
+        messageId: pushed.messageId,
+        token: holder.tokens.get(pushed.messageId) ?? "",
+      } satisfies Receipt),
     );
-    await eventually(() => holder.received.length === 2, "the news that follows the refused receipt");
-    expect(await mailboxRows(userId, desktopId)).toEqual([pushed.messageId, news.message.messageId]);
 
-    ack(holder, pushed.messageId);
     expect((await outcome(await placing)).outcome).toEqual({ state: "untaken", reason: NO_SESSION_TOOK_IT });
   });
 });

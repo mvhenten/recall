@@ -1,25 +1,10 @@
-import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { accessVerifier, type KeySource, localKeys } from "../src/access";
 import { createApp, type Delivered } from "../src/app";
 import { DEVICE_CODE_LIMITS, type DeviceCodeLimits } from "../src/device";
-import type { Mailbox } from "../src/mailbox";
 import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
-
-// What a device still has a row for. Nothing is ever delivered out of a row, so this says only
-// what the mailbox is holding on to and never what a session is going to read.
-export const mailboxRows = (userId: string, toDeviceId: string): Promise<string[]> =>
-  runInDurableObject(env.MAILBOX.get(env.MAILBOX.idFromName(userId)), (_mailbox: Mailbox, state: DurableObjectState) =>
-    state.storage.sql
-      .exec<{ message_id: string }>(
-        "SELECT message_id FROM messages WHERE to_device_id = ? ORDER BY created_at, rowid",
-        toDeviceId,
-      )
-      .toArray()
-      .map((row) => row.message_id),
-  );
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const AUDIENCE = "recall-test-aud";

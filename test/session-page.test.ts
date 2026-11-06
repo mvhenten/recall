@@ -3,7 +3,7 @@ import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Message, type MessageFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
 import { SESSION_TTL_MS } from "../src/model";
 import { followedBatch, type Plan, type Reach, type Read } from "../src/transcript-plan";
-import { type Client, harness, mailboxRows } from "./harness";
+import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -25,7 +25,7 @@ const owner = async (h: Harness): Promise<Owner> => {
 };
 
 // A send from the dashboard reaches a session the same way one from another host does: through a
-// socket the host has open. With nothing attached there is nobody to read it, and the box says so.
+// socket the host has open. News answers nothing back, so this only has to be attached.
 const attach = async (h: Harness, token: string): Promise<WebSocket> => {
   const response = await h.send("/v1/messages/listen", {
     headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
@@ -518,7 +518,6 @@ describe("the send box", () => {
   it("keeps the token a page arrived with, so a second page does not break the first", async () => {
     const h = await harness();
     const you = await owner(h);
-    const laptopId = await deviceId(you.laptop);
     expect((await you.laptop.sync("9f8a1b2c")).status).toBe(204);
     expect((await you.laptop.sync("beefbeef")).status).toBe(204);
     const first = await form(h, "/dashboard/sessions/9f8a1b2c", you.assertion);
@@ -532,13 +531,11 @@ describe("the send box", () => {
 
     const sent = await post(h, "/dashboard/sessions/9f8a1b2c", you.assertion, { ...first, body: "still works" });
     expect(sent.status).toBe(303);
-    expect(await mailboxRows(you.userId, laptopId)).toHaveLength(1);
   });
 
   it("says what went wrong and keeps the typing, rather than clearing the box on a refusal", async () => {
     const h = await harness();
     const you = await owner(h);
-    const laptopId = await deviceId(you.laptop);
     expect((await you.laptop.sync("9f8a1b2c")).status).toBe(204);
     const path = "/dashboard/sessions/9f8a1b2c";
 
@@ -570,8 +567,6 @@ describe("the send box", () => {
         })
       ).status,
     ).toBe(403);
-
-    expect(await mailboxRows(you.userId, laptopId)).toEqual([]);
   });
 
   // The bus reaches a session for as long as its host holds it, which is a day after its last
@@ -580,7 +575,6 @@ describe("the send box", () => {
   it("offers the box while the host holds the session, and refuses once it has let it go", async () => {
     const h = await harness();
     const you = await owner(h);
-    const laptopId = await deviceId(you.laptop);
     expect((await you.laptop.sync("deadbeef")).status).toBe(204);
     const path = "/dashboard/sessions/deadbeef";
     const { csrf, cookie } = await form(h, path, you.assertion);
@@ -592,7 +586,6 @@ describe("the send box", () => {
     expect(idle).toContain("</textarea>");
     const reached = await post(h, path, you.assertion, { csrf, cookie, body: "still there?" });
     expect(reached.status).toBe(303);
-    expect(await mailboxRows(you.userId, laptopId)).toHaveLength(1);
 
     h.tick(25 * 3_600_000);
     const over = await read(h, path, you.assertion);
@@ -602,24 +595,5 @@ describe("the send box", () => {
     const refused = await post(h, path, you.assertion, { csrf, cookie, body: "anyone there" });
     expect(refused.status).toBe(400);
     expect(await refused.text()).toContain("No host is running this session any more, so the bus has nowhere");
-    expect(await mailboxRows(you.userId, laptopId)).toHaveLength(1);
-  });
-
-  // A dead button is the worst outcome: the bus keeps nothing for a host that is not listening, so
-  // the box says nobody read it rather than redirecting as though it had landed.
-  it("refuses a send when the host is not listening, rather than reporting it as delivered", async () => {
-    const h = await harness();
-    const you = await owner(h);
-    const laptopId = await deviceId(you.laptop);
-    expect((await you.laptop.sync("9f8a1b2c")).status).toBe(204);
-    const path = "/dashboard/sessions/9f8a1b2c";
-
-    const missed = await send(h, path, you.assertion, "anyone there?");
-
-    expect(missed.status).toBe(400);
-    const refused = await missed.text();
-    expect(refused).toContain("is not listening, so nobody read it");
-    expect(refused).toContain("anyone there?");
-    expect(await mailboxRows(you.userId, laptopId)).toEqual([]);
   });
 });

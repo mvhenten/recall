@@ -454,7 +454,7 @@ impl Recall {
 
     #[tool(
         name = "recall_send",
-        description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named by its label or as recall devices shows it. The message arrives as a user turn there. This is the only route to a session on another machine: Claude Code's own SendMessage and ListAgents see only sessions on this one, so answering a message from another host through them reaches a local session instead. A message is a ping that is relevant now, not a board a session reads when it starts: it reaches the hosts listening the moment it is sent, and one sent where nothing is listening is an error saying nobody got it rather than something a later session picks up."
+        description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named by its label or as recall devices shows it. The message arrives as a user turn there. This is the only route to a session on another machine: Claude Code's own SendMessage and ListAgents see only sessions on this one, so answering a message from another host through them reaches a local session instead. A message is a ping that is relevant now, not a board a session reads when it starts: it is published to the hosts listening the moment it is sent and expires unread where none are, so nothing is kept for a session that starts later. Use recall_order instead where you need to know which session took the work."
     )]
     async fn send(&self, Parameters(params): Parameters<SendParams>) -> Result<String, String> {
         blocking(move || {

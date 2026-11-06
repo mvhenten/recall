@@ -550,20 +550,6 @@ fn report_order(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// News is a ping that is relevant now, so one that reached no host is a failure and not a quiet
-/// success: the bus keeps nothing for a session that starts later, and a sender shown a line that
-/// reads like success would never know to send it again.
-fn report_send(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
-    let id = &sent.message.message_id;
-    if let Some(api::Outcome::Untaken { reason }) = &sent.outcome {
-        bail!("message {id} reached nobody on {to}: {reason}");
-    }
-    if !json {
-        println!("sent {id} to {to}");
-    }
-    Ok(())
-}
-
 /// One sync carries both halves of what a host knows about a session: the document, and the usage
 /// delta the hooks fixed since the last one. Nothing here reads the transcript.
 /// The record, then the delta it carries, then the transcript itself. The archive goes last so
@@ -942,9 +928,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let target = api::resolve_target(&client.devices()?, || client.sessions(), &to)?;
             let sent = client.send(&target, api::Kind::News, &sending_session(), &body)?;
             if cli.json {
-                print_json(&sent.message)?;
+                print_json(&sent)?;
+            } else {
+                println!("sent {} to {to}", sent.message.message_id);
             }
-            report_send(&sent, &to, cli.json)?;
         }
         Command::Order { to, message } => {
             require_messaging(&settings::load(&cli.settings)?)?;
