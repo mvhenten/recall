@@ -4,8 +4,8 @@ Per-user semantic memory for coding agents. recall keeps the notes an agent lear
 
 - A command-line client, `recall`, saves, lists, searches and edits memories from any shell or agent.
 - A Cloudflare Worker stores each user's memories in D1, with an embedding per memory and a full-text index, and answers searches with both.
-- `recall mcp` serves the same operations as MCP tools over stdio, for any harness that speaks MCP.
-- A Claude Code plugin gives Claude the recall tools, adds matching memories to each prompt, and either syncs Claude's auto-memory files to recall or replaces auto-memory outright.
+- `recall mcp` serves the same operations as MCP tools over stdio, for a harness that speaks MCP and has no shell of its own.
+- A Claude Code plugin names the CLI as the memory path, adds matching memories to each prompt, and either syncs Claude's auto-memory files to recall or replaces auto-memory outright.
 - A remote MCP connector at `<hostname>/mcp` serves the same tools to a client with no CLI and no working copy, behind its own Cloudflare Access application.
 - An opt-in add-on carries messages between the Claude Code sessions on the hosts signed in as you: news every session there reads, or an order one of them carries out.
 - A dashboard in the browser reads the same store: live sessions, the session history, one session's transcript, the memories and what the tokens cost, and it sends a session a message.
@@ -86,24 +86,27 @@ In Claude Code:
 /plugin install recall@recall
 ```
 
-The plugin starts `recall mcp` as an MCP server and adds four hooks. The hooks need `node` 22 or later; the hooks and the server find `recall` on `PATH` or in `~/.cargo/bin`.
+The plugin is five hooks and registers no MCP server. A Claude Code session has a shell, so it reaches recall through the CLI, and a tool set would load its schemas into that session whether it saves a memory or not. A client with no shell and no working copy — the desktop app, the browser — uses the [connector](#desktop-connector) instead. The hooks need `node` 22 or later and find `recall` on `PATH` or in `~/.cargo/bin`.
 
-- The MCP server offers `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`, plus `recall_send` and `recall_order` while messaging is on. They scope and tag like the CLI, from the directory Claude Code runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`.
 - Before a `Write` to an auto-memory file, it saves the content to recall under the file name as a kebab-case slug (`agent_dispatch.md` becomes `agent-dispatch`), with the same tag rules as below, and blocks the write so the local memory folder stops growing; Claude is told the memory is in recall and how to read or change it. When the save fails or takes over 5 seconds, the write goes ahead locally as a fallback and a message shows the first error line. An `Edit` or `MultiEdit` to a memory file is blocked with a pointer to `recall edit <name>`, and any write to `MEMORY.md` is blocked because recall finds memories by search, not by index.
 - After a `Write` or `Edit` to an auto-memory file (under `autoMemoryDirectory`, or `~/.claude/projects/*/memory/` when that is unset; `MEMORY.md` excluded), it runs `recall save` under the same slug of the file name. `user` and `feedback` memories are saved as global; `project` and `reference` memories get the repo tag of the session's directory, or `global` outside a repo. When the save fails, a message says the memory was saved locally but not synced.
 - On each prompt of three words or more that is not a slash command, it runs `recall search` in the session's directory and adds the top five hits to the prompt as context, bodies truncated and the block capped at 4 KB. Up to three matches from other scopes follow under "In other scopes:", each with its tags. When recall fails, a one-line `recall unavailable: …` message shows and the prompt goes through unchanged.
 - On every prompt, including the ones too short to search on, it rewrites the moving half of the session's record — focus, prompt count, last activity, branch, last commit and permission mode — and starts a sync it does not wait for, at most one every thirty seconds, so `recall sessions` shows from any host what this session is working on.
-- At session start, it adds a short block saying recall is the durable store, listing the CLI commands and the session directory's repo tag (or "global only"). In `tools` mode it first adds memory instructions: what to save, what not to, to update rather than duplicate, and to delete what turns out wrong. When `recall` is missing, it adds an install hint instead.
+- At session start, it adds a short block: recall is the memory across sessions and no local memory file or `MEMORY.md` index holds anything, the CLI commands that reach it, and the session directory's repo tag (or "global only") with the reminder that a save from a repo needs `--global` to be filed anywhere else. In `tools` mode it first adds the longer memory instructions: what to save, what not to, to update rather than duplicate, and to delete what turns out wrong. When `recall` is missing, it adds an install hint instead.
 - Every hook run appends one line to `${XDG_STATE_HOME:-~/.local/state}/recall/hooks.log`: time, session id, outcome (`hits=<n>`, `no-hits`, `skipped:<reason>`, each followed by `focus:<state>`, plus `crib:<mode>:repo:messaging:<state>`, `crib:<mode>:global:messaging:<state>`, `messaging:<state>`, `not-installed`, `timeout`, `saved:<name>`, `redirect:saved:<name>`, `redirect:fallback:<error>`, `redirect:index`, `redirect:edit`, `error:<message>`) and duration. `recall sessions --sync` and `--end`, which the hooks start detached, add their own `sessions:…` lines, and the listener adds `listen:…`, `message:…`, the `sessions:ended:…` and `sessions:usage:…` of the sessions its tick found gone, and the `sessions:adopted:…` and `sessions:refreshed:…` of the ones it took on. Prompts, focus lines and memory bodies are never logged.
 
 ### Modes
 
 The plugin works in one of two modes, set per host with `recall config set mode hook|tools` and stored in `~/.config/recall/config.json`.
 
-- `hook` (the default) leaves Claude Code's built-in auto-memory on. Claude saves memories its usual way and the plugin redirects each memory file write into recall.
-- `tools` replaces auto-memory with recall. Session start tells Claude what to remember, that `recall_save` is the only save path, and that no memory file or `MEMORY.md` index is written whatever else the session is told. Turn auto-memory off yourself too, since a plugin cannot change your settings: add `"autoMemoryEnabled": false` to `~/.claude/settings.json`, or set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. `recall` says so on every `config set` until you do.
+- `hook` (the default) leaves Claude Code's built-in auto-memory on as a backstop: session start names the CLI commands as the only save path and says no memory file and no `MEMORY.md` index is written whatever else the session is told, and the redirect hook blocks each memory file write and saves it to recall instead.
+- `tools` replaces auto-memory with recall. Session start says the same, naming the `recall_*` tools for a harness that has them and the CLI where it does not. Turn auto-memory off yourself too, since a plugin cannot change your settings: add `"autoMemoryEnabled": false` to `~/.claude/settings.json`, or set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. `recall` says so on every `config set` until you do.
 
-Both modes serve the tools and add matching memories to each prompt.
+Both modes add matching memories to each prompt.
+
+### MCP over stdio
+
+`recall mcp` serves the operations as MCP tools for a harness that speaks MCP and has no shell of its own: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`, plus `recall_send` and `recall_order` while messaging is on. They scope and tag like the CLI, from the directory the harness runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`. Register it where you want it; the Claude Code plugin does not.
 
 ## Settings
 
@@ -406,7 +409,7 @@ The Claude Code desktop app reaches recall as a custom connector, without the CL
 https://recall.example.com/mcp
 ```
 
-Paste that URL into Settings → Connectors → Add custom connector. It serves seven of the tools `recall mcp` serves on stdio, under the same names: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete` and `recall_send`. The publishing tools stay on stdio, because a publish names files on disk and this end holds no working copy. The stdio lane is untouched; a host with a device token keeps using it.
+Paste that URL into Settings → Connectors → Add custom connector. It serves seven of the tools `recall mcp` serves on stdio, under the same names: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete` and `recall_send`. The publishing tools stay on stdio, because a publish names files on disk and this end holds no working copy. This is the lane for a client with no shell; a host that has one uses the CLI.
 
 The missing working copy is also why the connector runs in no repository: with no repo tag to read, global is the default a call falls back to. It is a default and not a boundary — a search or a listing names `tags` to cover others, a search names `any` to cover every memory, `recall_get`, `recall_edit` and `recall_delete` reach any memory of the account by name, and `recall_save` needs `global` or `tags` for a `project` or `reference` memory. Every one of those paths is keyed by the user the assertion names, so a call reaches that user's memories and no one else's.
 
