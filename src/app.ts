@@ -31,12 +31,18 @@ import {
   RAW_INLINE_BYTES,
   readArtifactFile,
 } from "./artifacts";
+import { addressOf, type BoardAddress, type BoardTaker, parsePost } from "./board";
 import { chunkTurns } from "./chunks";
 import {
   ARTIFACTS_TAB,
   type ArtifactShelf,
   artifactsPage,
+  BOARD_TAB,
+  type BoardOption,
+  type BoardPoster,
+  boardPage,
   dashboardNotice,
+  FLEET_OPTION,
   type Flash,
   HISTORY_TAB,
   historyPage,
@@ -89,7 +95,7 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
-import { ARTIFACT_SORTS, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortInForce } from "./listing";
+import { ARTIFACT_SORTS, CURSOR_PARAM, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortInForce } from "./listing";
 import {
   DEVICE_HEADER,
   MAX_BODY_BYTES,
@@ -179,6 +185,7 @@ import {
   chunkExcerpts,
   chunkMatches,
   chunkVectors,
+  claimBoardMessages,
   claimRevision,
   countedFiles,
   createArtifact,
@@ -202,6 +209,7 @@ import {
   indexMark,
   labelTargets,
   listArtifactPage,
+  listBoard,
   listMemories,
   listSessionHistory,
   listSessionHistoryIds,
@@ -211,6 +219,7 @@ import {
   memoryCounts,
   memoryCursorDirection,
   nameSession,
+  postBoardMessage,
   putSession,
   type RevokeScope,
   readInsights,
@@ -341,6 +350,10 @@ const ELSEWHERE_LIMIT = 3;
 // the name it carries is the Access email that signed in. Device ids are UUIDs, so no device of
 // the account can be mistaken for the sender of something it did not send.
 const DASHBOARD_DEVICE = "dashboard";
+
+// How many board messages one page of the listing holds, for the dashboard and `recall board`
+// alike. The window is a week, so a board a fleet actually works from fits in one or two.
+const BOARD_PAGE = 50;
 
 // How much of one file an indexing pass reads. A stretch is at most a megabyte, so a session
 // keeping up with its own events is caught up in one pass per event; a session far behind — one
@@ -801,6 +814,87 @@ export const createApp = (deps: Deps): App => {
     return json(await mailboxFor(env, caller.userId).publish(input.value, sender, now), 201);
   };
 
+  // The board, which is the bus's opposite. A message posted here is held until a session picks it
+  // up, and the address is the one `recall send` already resolves: the fleet, a host, or a session.
+  const board = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    caller: Caller,
+    segment: string | undefined,
+  ): Promise<Response> => {
+    if (segment === "pickup") {
+      return request.method === "POST" ? pickUpBoard(request, env, caller) : error(405, "method not allowed");
+    }
+    if (segment !== undefined) return error(404, "not found");
+    if (request.method === "GET") return readBoard(url, env.DB, caller.userId);
+    return request.method === "POST" ? postToBoard(request, env, caller) : error(405, "method not allowed");
+  };
+
+  const readBoard = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+    const cursor = decodeCursor(url.searchParams.get("cursor") ?? "", "desc");
+    if (cursor === null) return error(400, "cursor must be one this listing issued");
+    return json(await listBoard(db, userId, BOARD_PAGE, cursor, deps.now()));
+  };
+
+  // A post names an address the account holds, and is refused outright where it does not: a message
+  // waiting on a device or a session that is not this account's would sit on the board for a week
+  // with nobody who could ever take it.
+  const addressFor = async (
+    db: D1Database,
+    userId: string,
+    address: BoardAddress,
+  ): Promise<BoardAddress | Response> => {
+    if (address.scope === "host" && !(await hasDevice(db, userId, address.target))) {
+      return error(404, `no device ${address.target}`);
+    }
+    if (address.scope === "session" && !(await sessionOnRecord(db, userId, address.target))) {
+      return error(404, `no session ${address.target}`);
+    }
+    return address;
+  };
+
+  const postToBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+    const input = parsePost(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
+      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
+    }
+    const now = deps.now();
+    const address = await addressFor(env.DB, caller.userId, addressOf(input.value.address, caller.userId));
+    if (address instanceof Response) return address;
+    const from = await senderOf(env.DB, caller, input.value.fromSessionId, now);
+    return json(
+      await postBoardMessage(env.DB, {
+        userId: caller.userId,
+        messageId: crypto.randomUUID(),
+        address,
+        fromDeviceId: from.deviceId,
+        fromHost: from.host,
+        fromName: from.name,
+        body: input.value.body,
+        createdAt: now,
+      }),
+      201,
+    );
+  };
+
+  const pickUpBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+    const body = await readJson(request);
+    const asked = isRecord(body) ? body.sessionId : undefined;
+    if (typeof asked !== "string") return error(400, "sessionId must be the id of the session taking the messages");
+    const sessionId = parseSessionId(asked);
+    if (!sessionId.ok) return error(400, sessionId.error);
+    const now = deps.now();
+    const taker: BoardTaker = {
+      sessionId: sessionId.value,
+      deviceId: caller.deviceId,
+      host: caller.host,
+      pickedUpAt: now,
+    };
+    return json({ messages: await claimBoardMessages(env.DB, caller.userId, taker, now) });
+  };
+
   const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
     const upgrade = new Request(request.url, {
       headers: {
@@ -1129,13 +1223,14 @@ export const createApp = (deps: Deps): App => {
     const bytes = segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT;
     const shareName = sharedArtifactName(url.pathname);
     const saving = request.method === "POST" && tab?.path === LABELS_TAB.path;
+    const posting = request.method === "POST" && tab?.path === BOARD_TAB.path;
     const sending = request.method === "POST" && segments.length === 1;
     const sharing = request.method === "POST" && shareName !== null;
-    if (request.method !== "GET" && !saving && !sending && !sharing) {
+    if (request.method !== "GET" && !saving && !posting && !sending && !sharing) {
       return lost(
         405,
         "Not allowed",
-        "The dashboard only answers a GET, the Labels tab its own POST, an artifact's share page its own POST, and a session page the message it sends.",
+        "The dashboard only answers a GET, the Labels and Board tabs their own POST, an artifact's share page its own POST, and a session page the message it sends.",
       );
     }
     const email = await approver(request, deps.verify, signIn);
@@ -1170,6 +1265,7 @@ export const createApp = (deps: Deps): App => {
       }
       return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
     }
+    if (tab.path === BOARD_TAB.path) return boardTab(request, url, db, userId, email, live, now);
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
     if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(url, db, userId, email, live, lost);
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
@@ -1456,6 +1552,112 @@ export const createApp = (deps: Deps): App => {
     }
     const state = await shareMutation(db, host, target, shares, posted.form, now);
     return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) });
+  };
+
+  // The addresses the form offers, which are the pairs the board stores rather than strings a
+  // second resolver would have to read: the fleet, every host signed in, and every live session.
+  const boardOptions = async (db: D1Database, userId: string, now: number): Promise<BoardOption[]> => {
+    const [hosts, live, labels] = await Promise.all([
+      listDevices(db, userId),
+      listSessions(db, userId, now),
+      readLabels(db, userId),
+    ]);
+    return [
+      { value: FLEET_OPTION, label: "The fleet — the first session anywhere that reads it" },
+      ...hosts.map((host) => ({
+        value: `host:${host.deviceId}`,
+        label: `${labels.hosts.get(host.host) ?? host.host} — the first session on that host`,
+      })),
+      ...live.map((session) => ({ value: `session:${session.sessionId}`, label: `${session.name} — that session` })),
+    ];
+  };
+
+  const askedAddress = (to: string, userId: string): BoardAddress | null => {
+    if (to === FLEET_OPTION) return { scope: "fleet", target: userId };
+    const colon = to.indexOf(":");
+    if (colon < 1) return null;
+    const scope = to.slice(0, colon);
+    const target = to.slice(colon + 1);
+    if (target === "") return null;
+    if (scope === "host") return { scope: "host", target };
+    return scope === "session" ? { scope: "session", target } : null;
+  };
+
+  const boardTab = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    now: number,
+  ): Promise<Response> => {
+    const csrf = pageToken(request);
+    const options = await boardOptions(db, userId, now);
+    const render = async (post: BoardPoster, status: number): Promise<Response> => {
+      const cursor = pageCursor(url.searchParams.get(CURSOR_PARAM) ?? "", "desc");
+      const listed = await listBoard(db, userId, BOARD_PAGE, cursor, now);
+      return boardPage(email, live, url, { ...listed, post }, now, status);
+    };
+    if (request.method === "GET") {
+      const posted = readCookie(request.headers.get("cookie"), SENT_COOKIE) === BOARD_TAB.path;
+      return render({ csrf, to: FLEET_OPTION, draft: "", flash: posted ? { tone: "posted" } : null, options }, 200);
+    }
+    return postFromDashboard(request, url, db, userId, email, now, csrf, options, render);
+  };
+
+  // The dashboard's own post, which is the Labels tab's post shape pointed at the board. A browser
+  // carries no device token, so it cannot reach `POST /v1/board`; what it shares with it is the
+  // table. Every refusal re-renders with the typing still in the box and says what went wrong.
+  const postFromDashboard = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    now: number,
+    csrf: string,
+    options: BoardOption[],
+    render: (post: BoardPoster, status: number) => Promise<Response>,
+  ): Promise<Response> => {
+    const posted = await formPost(request, url);
+    const body = posted.form.get("body") ?? "";
+    const to = posted.form.get("to") ?? FLEET_OPTION;
+    const refuse = (text: string, status: number): Promise<Response> =>
+      render({ csrf, to, draft: body, flash: { tone: "refused", text }, options }, status);
+    if (!posted.trusted) {
+      return refuse("The form did not come from this page, so nothing was posted. Post it again from here.", 403);
+    }
+    if (body.trim() === "") return refuse("The message was empty, so nothing was posted.", 400);
+    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
+      return refuse(
+        `A message holds at most ${MAX_BODY_BYTES} bytes, and this one is longer. Nothing was posted.`,
+        400,
+      );
+    }
+    const asked = askedAddress(to, userId);
+    if (asked === null) return refuse("That is not an address this page offers, so nothing was posted.", 400);
+    const address = await addressFor(db, userId, asked);
+    if (address instanceof Response) {
+      return refuse("That host or session is no longer on this account, so nothing was posted.", 400);
+    }
+    await postBoardMessage(db, {
+      userId,
+      messageId: crypto.randomUUID(),
+      address,
+      fromDeviceId: DASHBOARD_DEVICE,
+      fromHost: DASHBOARD_DEVICE,
+      fromName: email,
+      body,
+      createdAt: now,
+    });
+    return new Response(null, {
+      status: 303,
+      headers: {
+        location: BOARD_TAB.path,
+        "set-cookie": `${SENT_COOKIE}=${BOARD_TAB.path}; Path=/; Max-Age=30; Secure; HttpOnly; SameSite=Strict`,
+      },
+    });
   };
 
   const labelsTab = async (
@@ -2531,6 +2733,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env, caller, rawName);
+    if (collection === "board") return board(request, url, env, caller, rawName);
     if (collection === "sessions") return sessions(request, url, env, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {

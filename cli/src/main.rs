@@ -298,6 +298,31 @@ enum Command {
         )]
         message: Vec<String>,
     },
+    #[command(about = "Put a message on the board, which the first session to pick it up takes and nobody else reads")]
+    Post {
+        #[arg(
+            value_name = "TO",
+            help = "fleet for every host signed in as you, a host from recall devices — its label, its name or its id — for the first session on that host, or a session handle from recall sessions for that one session"
+        )]
+        to: String,
+        #[arg(
+            value_name = "MESSAGE",
+            num_args = 1..,
+            help = "The message; stdin when omitted or -"
+        )]
+        message: Vec<String>,
+    },
+    #[command(about = "Print what is on the board, and which session took each message")]
+    Board,
+    #[command(about = "Take the board messages addressed to this session; the session-start hook runs this")]
+    Pickup {
+        #[arg(
+            long,
+            value_name = "SESSION",
+            help = "The session taking them; defaults to the session this command is running inside"
+        )]
+        session: Option<String>,
+    },
     #[command(about = "Hold the connection that carries messages from your other hosts to this one")]
     Listen {
         #[arg(
@@ -981,6 +1006,46 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 print_json(&sent)?;
             }
             report_order(&sent, &to, cli.json)?;
+        }
+        Command::Post { to, message } => {
+            require_messaging(&settings::load(&cli.settings)?)?;
+            let body = message_body(&message)?;
+            let client = client()?;
+            let target = api::resolve_board_target(&client.devices()?, || client.sessions(), &to)?;
+            let posted = client.post_board(&target, &sending_session(), &body)?;
+            if cli.json {
+                print_json(&posted)?;
+            } else {
+                println!("posted {} to {to}", posted.message_id);
+            }
+        }
+        Command::Board => {
+            let entries = client()?.board()?;
+            if cli.json {
+                print_json(&entries)?;
+            } else if entries.is_empty() {
+                println!("the board is empty");
+            } else {
+                print!(
+                    "{}",
+                    markdown::render_board(&entries, Timestamp::now().as_millisecond())
+                );
+            }
+        }
+        // Nothing to print is the ordinary case: a session starts with an empty board far more
+        // often than not, and the hook injects what this prints verbatim.
+        Command::Pickup { session } => {
+            require_messaging(&settings::load(&cli.settings)?)?;
+            let session_id = session.unwrap_or_else(sending_session);
+            if session_id.is_empty() {
+                bail!("pass --session, or run this inside the session taking the messages");
+            }
+            let taken = client()?.pickup(&session_id)?;
+            if cli.json {
+                print_json(&taken)?;
+            } else if !taken.is_empty() {
+                print!("{}", markdown::render_pickup(&taken, Timestamp::now().as_millisecond()));
+            }
         }
         Command::Logout => {
             match client()?.revoke_device("current") {

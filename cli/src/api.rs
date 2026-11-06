@@ -449,6 +449,91 @@ pub struct Sent {
     pub outcome: Option<Outcome>,
 }
 
+/// What `recall post` resolves an address to. The vocabulary is `recall send`'s, with the one word
+/// the bus has no use for: the fleet, which is every host signed in as this user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Board {
+    Fleet,
+    Host(String),
+    Session(String),
+}
+
+/// The word that addresses every host on the account. It is read before the device listing, so a
+/// host that answers to `fleet` is posted to by its label or its device id.
+pub const FLEET: &str = "fleet";
+
+/// `to` is read exactly as `recall send` reads it — a device id, a host's name or its label, or a
+/// session handle — with `fleet` naming the whole account. A fleet post costs no listing at all.
+pub fn resolve_board_target(
+    devices: &[Device],
+    sessions: impl FnOnce() -> Result<Vec<Session>>,
+    to: &str,
+) -> Result<Board> {
+    if to == FLEET {
+        return Ok(Board::Fleet);
+    }
+    let target = resolve_target(devices, sessions, to)?;
+    if target.session_id.is_empty() {
+        return Ok(Board::Host(target.device_id));
+    }
+    Ok(Board::Session(target.session_id))
+}
+
+/// One message on the board. `from_host` and `from_name` are resolved where it was posted and ride
+/// with it, exactly as a bus message's do, so a session reading one looks nothing up.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardMessage {
+    pub message_id: String,
+    pub scope: String,
+    pub target: String,
+    pub from_device_id: String,
+    pub from_host: String,
+    pub from_name: String,
+    pub body: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardTaker {
+    pub session_id: String,
+    pub device_id: String,
+    pub host: String,
+    pub picked_up_at: i64,
+}
+
+/// A message as the board shows it. One still waiting carries no taker at all, so nothing can print
+/// an empty session as the one that took it.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum BoardEntry {
+    Waiting {
+        message: BoardMessage,
+    },
+    #[serde(rename_all = "camelCase")]
+    Taken {
+        message: BoardMessage,
+        taken_by: BoardTaker,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BoardPage {
+    entries: Vec<BoardEntry>,
+    next_cursor: String,
+}
+
+#[derive(Deserialize)]
+struct PickedUp {
+    messages: Vec<BoardMessage>,
+}
+
+/// How many pages of the board one listing walks.
+const MAX_BOARD_PAGES: usize = 20;
+
 /// One Claude Code session on one of the hosts signed in as this user, as the service holds it.
 /// `name` is the handle `recall send` takes to reach this one session, so the listing doubles as
 /// an address book.
@@ -1030,6 +1115,57 @@ impl Client {
             .body_mut()
             .read_json()?;
         Ok(sent)
+    }
+
+    /// Puts one message on the board, where it waits for the first session that picks it up rather
+    /// than for whoever is attached. `from_session_id` names the session posting it, as a send's
+    /// does, and is empty where the posting process cannot say which session asked.
+    pub fn post_board(&self, target: &Board, from_session_id: &str, body: &str) -> Result<BoardMessage> {
+        let mut posted = serde_json::json!({ "fromSessionId": from_session_id, "body": body });
+        match target {
+            Board::Fleet => posted["scope"] = "fleet".into(),
+            Board::Host(device_id) => {
+                posted["scope"] = "host".into();
+                posted["deviceId"] = device_id.clone().into();
+            }
+            Board::Session(session_id) => {
+                posted["scope"] = "session".into();
+                posted["sessionId"] = session_id.clone().into();
+            }
+        }
+        let response = self.authed(self.agent.post(self.url("/v1/board"))).send_json(&posted)?;
+        Ok(check(response, "posting to the board")?.body_mut().read_json()?)
+    }
+
+    /// The whole board, walked page to page so the listing prints all of it.
+    pub fn board(&self) -> Result<Vec<BoardEntry>> {
+        let mut entries: Vec<BoardEntry> = Vec::new();
+        let mut cursor = String::new();
+        for _ in 0..MAX_BOARD_PAGES {
+            let query = if cursor.is_empty() {
+                "/v1/board".to_string()
+            } else {
+                format!("/v1/board?cursor={}", encode(&cursor))
+            };
+            let response = self.authed(self.agent.get(self.url(&query))).call()?;
+            let page: BoardPage = check(response, "reading the board")?.body_mut().read_json()?;
+            entries.extend(page.entries);
+            if page.next_cursor.is_empty() {
+                return Ok(entries);
+            }
+            cursor = page.next_cursor;
+        }
+        bail!("reading the board did not reach its last page in {MAX_BOARD_PAGES} reads");
+    }
+
+    /// Takes this session's board messages, which is the acknowledgement: what comes back is what
+    /// this session's own claim won, and no other session will ever be handed it.
+    pub fn pickup(&self, session_id: &str) -> Result<Vec<BoardMessage>> {
+        let response = self
+            .authed(self.agent.post(self.url("/v1/board/pickup")))
+            .send_json(serde_json::json!({ "sessionId": session_id }))?;
+        let picked: PickedUp = check(response, "picking up the board")?.body_mut().read_json()?;
+        Ok(picked.messages)
     }
 
     /// Publishes the files on disk, so their bytes travel from the file to the service without

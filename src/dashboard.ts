@@ -1,4 +1,5 @@
 import { type ArtifactType, type ArtifactView, artifactTypes } from "./artifacts";
+import { addressText, BOARD_DAYS, type BoardEntry, posterOf } from "./board";
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
 import {
   ARTIFACT_SORTS,
@@ -71,8 +72,10 @@ const BARS = '<path d="M5.5 16V10.5M10 16V5.5M14.5 16V8.5M3.5 16h13"/>';
 const SPARK = '<path d="M10 3l1.7 5.1L17 10l-5.3 1.9L10 17l-1.7-5.1L3 10l5.3-1.9z"/>';
 const TAG = '<path d="M3.3 10.6 10.6 3.3h6.1v6.1L9.4 16.7z"/><circle cx="13.4" cy="6.6" r="1.2"/>';
 const SHEET = '<path d="M5.5 3.5h5.9l3.1 3.1v9.9h-9z"/><path d="M11.2 3.5v3.4h3.3"/>';
+const NOTE = '<path d="M3.5 4.5h13v8H9.5l-3.4 3v-3H3.5z"/>';
 
 export const SESSIONS_TAB: Tab = { path: "/dashboard", label: "Sessions", icon: DISC };
+export const BOARD_TAB: Tab = { path: "/dashboard/board", label: "Board", icon: NOTE };
 export const HISTORY_TAB: Tab = { path: "/dashboard/history", label: "History", icon: CLOCK };
 export const MEMORY_TAB: Tab = { path: "/dashboard/memory", label: "Memory", icon: BOOKMARK };
 export const ARTIFACTS_TAB: Tab = { path: "/dashboard/artifacts", label: "Artifacts", icon: SHEET };
@@ -81,7 +84,16 @@ export const STATS_TAB: Tab = { path: "/dashboard/stats", label: "Stats", icon: 
 export const INSIGHTS_TAB: Tab = { path: "/dashboard/insights", label: "Insights", icon: SPARK };
 export const LABELS_TAB: Tab = { path: "/dashboard/labels", label: "Labels", icon: TAG };
 
-export const TABS: Tab[] = [SESSIONS_TAB, HISTORY_TAB, MEMORY_TAB, ARTIFACTS_TAB, STATS_TAB, INSIGHTS_TAB, LABELS_TAB];
+export const TABS: Tab[] = [
+  SESSIONS_TAB,
+  BOARD_TAB,
+  HISTORY_TAB,
+  MEMORY_TAB,
+  ARTIFACTS_TAB,
+  STATS_TAB,
+  INSIGHTS_TAB,
+  LABELS_TAB,
+];
 
 const FOCUS_FIRST_CHARS = 80;
 
@@ -98,7 +110,7 @@ a{color:var(--accent)}
 .brand i{flex:none;width:.55rem;height:.55rem;border-radius:2px;background:var(--accent);margin-right:.45rem}
 .swho{margin:0;font:400 .72rem/1.4 var(--mono);color:var(--faint);overflow-wrap:anywhere}
 .ssum{display:none}
-.snav{position:fixed;inset:auto 0 0 0;z-index:1;display:grid;grid-template-columns:repeat(7,1fr);border-top:1px solid var(--line);background:var(--surface)}
+.snav{position:fixed;inset:auto 0 0 0;z-index:1;display:grid;grid-template-columns:repeat(8,1fr);border-top:1px solid var(--line);background:var(--surface)}
 .snav a{display:grid;gap:.18rem;justify-items:center;padding:.5rem .15rem .55rem;font-size:.62rem;letter-spacing:.02em;color:var(--dim);text-decoration:none}
 .snav a svg{width:1.25rem;height:1.25rem;stroke:currentcolor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 .snav a[aria-current]{color:var(--accent);font-weight:600}
@@ -247,6 +259,10 @@ svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .send button{justify-self:start;font:600 .85rem/1 var(--sans);padding:.55rem 1.1rem;border:0;border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
 .flash{margin:0;padding:.6rem .8rem;border:1px solid var(--line2);border-left:3px solid var(--good);border-radius:6px;background:var(--surface2);font-size:.85rem}
 .flash.bad{border-left-color:var(--bad);border-left-style:dashed}
+.send select{font:inherit;font-size:.9rem;padding:.5rem .6rem;border:1px solid var(--line2);border-radius:6px;background:var(--surface);color:var(--ink)}
+.bbody{margin:0;font:400 .88rem/1.5 var(--sans);white-space:pre-wrap;overflow-wrap:anywhere}
+.bwait{color:var(--good)}
+.btook{color:var(--faint)}
 .sopen{margin:0}
 .sopen a{font:600 .8rem/1 var(--sans);text-decoration:none}
 .sopen a::after{content:" \\2197"}
@@ -2147,6 +2163,103 @@ ${labelCard("Accounts", "account", targets.accounts, labels.accounts)}
   return shell(email, LABELS_TAB, live, LABELS_TAB.label, "display only", main, {
     "set-cookie": `${CSRF_COOKIE}=${csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict`,
   });
+};
+
+// One address the post form offers. The value is the resolved pair the service stores, so the page
+// hands over an address rather than a string somebody has to resolve a second time.
+export interface BoardOption {
+  value: string;
+  label: string;
+}
+
+export type BoardFlash = { tone: "posted" } | { tone: "refused"; text: string };
+
+export interface BoardPoster {
+  csrf: string;
+  to: string;
+  draft: string;
+  flash: BoardFlash | null;
+  options: BoardOption[];
+}
+
+export interface BoardView {
+  entries: BoardEntry[];
+  nextCursor: string;
+  post: BoardPoster;
+}
+
+export const FLEET_OPTION = "fleet";
+
+const boardFlashHtml = (flash: BoardFlash | null): string => {
+  if (flash === null) return "";
+  if (flash.tone === "refused") return `<p class="flash bad">${escapeHtml(flash.text)}</p>`;
+  return `<p class="flash">Posted. The first session that picks it up takes it, and nobody else reads it.</p>`;
+};
+
+const boardForm = (post: BoardPoster): string =>
+  `${boardFlashHtml(post.flash)}<form class="send" method="post" action="${BOARD_TAB.path}">
+<input type="hidden" name="csrf" value="${escapeHtml(post.csrf)}">
+<select name="to" aria-label="Who takes this message">${post.options
+    .map(
+      (option) =>
+        `<option value="${escapeHtml(option.value)}"${option.value === post.to ? " selected" : ""}>${escapeHtml(option.label)}</option>`,
+    )
+    .join("")}</select>
+<textarea name="body" rows="4" required placeholder="What should the first session to read this do?" aria-label="Message to the board">${escapeHtml(post.draft)}</textarea>
+<button type="submit">Post</button></form>`;
+
+const boardRow = (entry: BoardEntry, now: number): string => {
+  const { message } = entry;
+  const state =
+    entry.state === "waiting"
+      ? '<span class="bwait">waiting</span>'
+      : `<span class="btook">${escapeHtml(`taken ${age(entry.takenBy.pickedUpAt, now)} ago by ${entry.takenBy.host}/${entry.takenBy.sessionId}`)}</span>`;
+  return `<li class="srow"><p class="bbody">${escapeHtml(message.body)}</p>
+<p class="smeta"><span>${escapeHtml(addressText(message))}</span><span>${escapeHtml(`from ${posterOf(message)}`)}</span><span>${escapeHtml(`${age(message.createdAt, now)} ago`)}</span>${state}</p></li>`;
+};
+
+export const boardPage = (
+  email: string,
+  live: Live,
+  url: URL,
+  view: BoardView,
+  now: number,
+  status = 200,
+): Response => {
+  const listing: Listing = {
+    tab: BOARD_TAB,
+    noun: { one: "message", many: "messages" },
+    params: [CURSOR_PARAM],
+    search: null,
+    filters: [],
+    sorts: [],
+    sort: "",
+    unknownSort: "",
+    rows:
+      view.entries.length === 0
+        ? ""
+        : `<ol class="sessions" role="list">${view.entries.map((entry) => boardRow(entry, now)).join("")}</ol>`,
+    empty: {
+      headline: "The board is empty.",
+      hint: "Post a message here or with recall post, and the first session that picks it up takes it.",
+    },
+    nextCursor: view.nextCursor,
+    cut: false,
+  };
+  const cookies = [`${CSRF_COOKIE}=${view.post.csrf}; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict`];
+  if (view.post.flash?.tone === "posted") {
+    cookies.push(`${SENT_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict`);
+  }
+  return shell(
+    email,
+    BOARD_TAB,
+    live,
+    BOARD_TAB.label,
+    `expires in ${BOARD_DAYS} days`,
+    `${boardForm(view.post)}${listingMain(url, listing)}`,
+    { "set-cookie": cookies },
+    status,
+  );
 };
 
 export const dashboardNotice = (status: number, title: string, text: string, action: string): Response =>
