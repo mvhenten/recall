@@ -33,7 +33,7 @@ describe("publishing", () => {
     const { h, alice, assertion } = await publisher();
     expect((await alice.publish("burn-up", PAGE)).status).toBe(200);
 
-    const response = await h.sendToArtifactHost("/burn-up", assertion);
+    const response = await h.sendToArtifactHost("/a/burn-up", assertion);
     expect(response.status).toBe(200);
     expect(await response.text()).toBe(PAGE);
     expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
@@ -65,7 +65,7 @@ describe("publishing", () => {
       read: "account",
       write: "account",
       fileCount: 1,
-      url: `https://${ARTIFACT_HOSTNAME}/q3-notes`,
+      url: `https://${ARTIFACT_HOSTNAME}/a/q3-notes`,
     });
 
     const read = await alice.request("GET", "/v1/artifacts/q3-notes");
@@ -102,21 +102,21 @@ describe("publishing", () => {
     expect(refused.error).toContain("burn-up already holds a site artifact");
     expect(refused.error).toContain("--replace");
     expect(refused.artifact.bytes).toBe(PAGE.length);
-    expect(await (await h.sendToArtifactHost("/burn-up", assertion)).text()).toBe(PAGE);
+    expect(await (await h.sendToArtifactHost("/a/burn-up", assertion)).text()).toBe(PAGE);
 
     const replaced = await alice.publishArtifact("burn-up", {
       replace: true,
       files: [{ path: "index.html", body: "<p>redrawn</p>" }],
     });
     expect(replaced.status).toBe(200);
-    expect(await (await h.sendToArtifactHost("/burn-up", assertion)).text()).toBe("<p>redrawn</p>");
+    expect(await (await h.sendToArtifactHost("/a/burn-up", assertion)).text()).toBe("<p>redrawn</p>");
 
     const page = await listed(alice);
     expect(page.artifacts).toHaveLength(1);
     expect(page.artifacts[0]?.bytes).toBe("<p>redrawn</p>".length);
 
     expect((await alice.request("DELETE", "/v1/artifacts/burn-up")).status).toBe(204);
-    expect((await h.sendToArtifactHost("/burn-up", assertion)).status).toBe(404);
+    expect((await h.sendToArtifactHost("/a/burn-up", assertion)).status).toBe(404);
     expect((await alice.request("DELETE", "/v1/artifacts/burn-up")).status).toBe(404);
   });
 
@@ -140,8 +140,8 @@ describe("publishing", () => {
     });
     expect(replaced.status).toBe(200);
 
-    expect(await (await h.sendToArtifactHost("/deck", assertion)).text()).toContain("<h1>two</h1>");
-    expect((await h.sendToArtifactHost("/deck/style.css", assertion)).status).toBe(404);
+    expect(await (await h.sendToArtifactHost("/a/deck", assertion)).text()).toContain("<h1>two</h1>");
+    expect((await h.sendToArtifactHost("/a/deck/f/style.css", assertion)).status).toBe(404);
     const page = await listed(alice);
     expect(page.artifacts[0]?.fileCount).toBe(1);
   });
@@ -182,23 +182,23 @@ describe("the artifact hostname", () => {
       const response = await h.sendToArtifactHost(path, assertion);
       expect([path, response.status]).toEqual([path, 404]);
     }
-    expect((await h.sendToArtifactHost("/burn-up", assertion, { method: "DELETE" })).status).toBe(405);
+    expect((await h.sendToArtifactHost("/a/burn-up", assertion, { method: "DELETE" })).status).toBe(405);
   });
 
   it("takes an Access sign-in for its own application alone", async () => {
     const { h, email, alice, assertion } = await publisher();
     await alice.publish("burn-up", PAGE);
 
-    expect((await h.sendToArtifactHost("/burn-up", null)).status).toBe(401);
-    expect((await h.sendToArtifactHost("/burn-up", await h.assertionFor(email))).status).toBe(401);
-    expect((await h.sendToArtifactHost("/burn-up", assertion)).status).toBe(200);
+    expect((await h.sendToArtifactHost("/a/burn-up", null)).status).toBe(401);
+    expect((await h.sendToArtifactHost("/a/burn-up", await h.assertionFor(email))).status).toBe(401);
+    expect((await h.sendToArtifactHost("/a/burn-up", assertion)).status).toBe(200);
   });
 
   it("names the email it has not invited", async () => {
     const { h, alice } = await publisher();
     await alice.publish("burn-up", PAGE);
     const stranger = `nobody-${crypto.randomUUID()}@example.com`;
-    const response = await h.sendToArtifactHost("/burn-up", await h.assertionFor(stranger, ARTIFACT_AUDIENCE));
+    const response = await h.sendToArtifactHost("/a/burn-up", await h.assertionFor(stranger, ARTIFACT_AUDIENCE));
     expect(response.status).toBe(403);
     expect(await response.text()).toContain(stranger);
   });
@@ -210,11 +210,11 @@ describe("the artifact hostname", () => {
     await h.invite(bob);
     const theirs = await h.assertionFor(bob, ARTIFACT_AUDIENCE);
 
-    const refused = await h.sendToArtifactHost("/burn-up", theirs);
-    const missing = await h.sendToArtifactHost("/no-such-thing", theirs);
+    const refused = await h.sendToArtifactHost("/a/burn-up", theirs);
+    const missing = await h.sendToArtifactHost("/a/no-such-thing", theirs);
     expect(refused.status).toBe(404);
     expect(await refused.text()).toBe(await missing.text());
-    expect((await h.sendToArtifactHost("/burn-up", assertion)).status).toBe(200);
+    expect((await h.sendToArtifactHost("/a/burn-up", assertion)).status).toBe(200);
   });
 
   it("serves an account-readable artifact to another invited reader", async () => {
@@ -225,7 +225,7 @@ describe("the artifact hostname", () => {
     });
     const bob = `bob-${crypto.randomUUID()}@example.com`;
     await h.invite(bob);
-    const response = await h.sendToArtifactHost("/shared-notes", await h.assertionFor(bob, ARTIFACT_AUDIENCE));
+    const response = await h.sendToArtifactHost("/a/shared-notes", await h.assertionFor(bob, ARTIFACT_AUDIENCE));
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("<p>shared</p>");
   });
@@ -242,11 +242,11 @@ describe("the artifact hostname", () => {
       ],
     });
 
-    const rendered = await h.sendToArtifactHost("/spec", assertion);
+    const rendered = await h.sendToArtifactHost("/a/spec", assertion);
     expect(rendered.status).toBe(200);
     const html = await rendered.text();
     expect(html).toContain("<h1>Heading</h1>");
-    expect(html).toContain('href="/spec/notes.md"');
+    expect(html).toContain('href="/a/spec/f/notes.md"');
     expect(html).toContain("&lt;b&gt;markup&lt;/b&gt;");
     expect(html).toContain("The spec");
     expect(html).toContain("what it does");
@@ -256,10 +256,10 @@ describe("the artifact hostname", () => {
     expect(csp).toContain("img-src 'self'");
     expect(csp).not.toContain("sandbox");
 
-    const raw = await h.sendToArtifactHost("/spec?view=raw", assertion);
+    const raw = await h.sendToArtifactHost("/a/spec?view=raw", assertion);
     expect(await raw.text()).toContain("# Heading");
 
-    const file = await h.sendToArtifactHost("/spec/notes.md", assertion);
+    const file = await h.sendToArtifactHost("/a/spec/f/notes.md", assertion);
     expect(file.status).toBe(200);
     expect(file.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
     expect(file.headers.get("x-content-type-options")).toBe("nosniff");
@@ -280,18 +280,20 @@ describe("the artifact hostname", () => {
       ],
     });
 
-    const player = await h.sendToArtifactHost("/episode-12", assertion);
+    const player = await h.sendToArtifactHost("/a/episode-12", assertion);
     expect(player.status).toBe(200);
     const html = await player.text();
     expect(html.indexOf("track-01.mp3")).toBeLessThan(html.indexOf("track-02.mp3"));
     expect(html).toContain("2 tracks");
 
-    const whole = await h.sendToArtifactHost("/episode-12/track-01.mp3", assertion);
+    const whole = await h.sendToArtifactHost("/a/episode-12/f/track-01.mp3", assertion);
     expect(whole.status).toBe(200);
     expect(whole.headers.get("content-type")).toBe("audio/mpeg");
     expect(whole.headers.get("accept-ranges")).toBe("bytes");
 
-    const part = await h.sendToArtifactHost("/episode-12/track-01.mp3", assertion, { headers: { range: "bytes=0-4" } });
+    const part = await h.sendToArtifactHost("/a/episode-12/f/track-01.mp3", assertion, {
+      headers: { range: "bytes=0-4" },
+    });
     expect(part.status).toBe(206);
     expect(part.headers.get("content-range")).toBe("bytes 0-4/17");
     expect(await part.text()).toBe("first");
@@ -305,11 +307,11 @@ describe("the artifact hostname", () => {
       files: [{ path: "long.md", body: long }],
     });
 
-    const bare = await h.sendToArtifactHost("/long-doc", assertion);
+    const bare = await h.sendToArtifactHost("/a/long-doc", assertion);
     expect(bare.status).toBe(302);
-    expect(bare.headers.get("location")).toBe("/long-doc?view=raw");
+    expect(bare.headers.get("location")).toBe("/a/long-doc?view=raw");
 
-    const raw = await h.sendToArtifactHost("/long-doc?view=raw", assertion);
+    const raw = await h.sendToArtifactHost("/a/long-doc?view=raw", assertion);
     expect(raw.status).toBe(200);
     const html = await raw.text();
     expect(html).toContain("too long to render");
@@ -321,12 +323,12 @@ describe("the artifact hostname", () => {
     const source = `# Long\n\n${"x".repeat(RAW_INLINE_BYTES)}the-very-end`;
     await alice.publishArtifact("capped-doc", { type: "document", files: [{ path: "capped.md", body: source }] });
 
-    const html = await (await h.sendToArtifactHost("/capped-doc?view=raw", assertion)).text();
+    const html = await (await h.sendToArtifactHost("/a/capped-doc?view=raw", assertion)).text();
     expect(html).toContain("This view shows the start of the file.");
-    expect(html).toContain('href="/capped-doc/capped.md"');
+    expect(html).toContain('href="/a/capped-doc/f/capped.md"');
     expect(html).not.toContain("the-very-end");
 
-    const whole = await h.sendToArtifactHost("/capped-doc/capped.md", assertion);
+    const whole = await h.sendToArtifactHost("/a/capped-doc/f/capped.md", assertion);
     expect(whole.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
     expect(await whole.text()).toBe(source);
   });
@@ -334,7 +336,7 @@ describe("the artifact hostname", () => {
   it("says when a document holds no text, and keeps both views", async () => {
     const { h, alice, assertion } = await publisher();
     await alice.publishArtifact("empty-doc", { type: "document", files: [{ path: "empty.md", body: "" }] });
-    const html = await (await h.sendToArtifactHost("/empty-doc", assertion)).text();
+    const html = await (await h.sendToArtifactHost("/a/empty-doc", assertion)).text();
     expect(html).toContain("empty-doc holds no text.");
     expect(html).toContain("?view=raw");
     expect(html).toContain(">Rendered<");
@@ -351,34 +353,40 @@ describe("the artifact hostname", () => {
     });
     await h.dropArtifactFile(await h.userIdFor(email), "gone-episode", 1, "track-02.mp3");
 
-    const html = await (await h.sendToArtifactHost("/gone-episode", assertion)).text();
+    const html = await (await h.sendToArtifactHost("/a/gone-episode", assertion)).text();
     expect(html).toContain("UNAVAILABLE");
     expect(html).toContain("track-02.mp3. Storage holds no file at this path");
-    expect((await h.sendToArtifactHost("/gone-episode/track-02.mp3", assertion)).status).toBe(404);
+    expect((await h.sendToArtifactHost("/a/gone-episode/f/track-02.mp3", assertion)).status).toBe(404);
   });
 
   it("carries one link to the dashboard on the 404 and none on the 401", async () => {
     const { h } = await publisher();
     const owner = `alice-${crypto.randomUUID()}@example.com`;
     await h.invite(owner);
-    const missing = await h.sendToArtifactHost("/no-such-thing", await h.assertionFor(owner, ARTIFACT_AUDIENCE));
+    const missing = await h.sendToArtifactHost("/a/no-such-thing", await h.assertionFor(owner, ARTIFACT_AUDIENCE));
     expect(missing.status).toBe(404);
     const page = await missing.text();
     expect(page).toContain("/dashboard");
     expect(page).toContain('target="_blank"');
 
-    const signedOut = await h.sendToArtifactHost("/no-such-thing", null);
+    const signedOut = await h.sendToArtifactHost("/a/no-such-thing", null);
     expect(signedOut.status).toBe(401);
     const refused = await signedOut.text();
     expect(refused).not.toContain("/dashboard");
     expect(refused).toContain("Reload this page");
   });
 
-  it("serves the player's script at one address no artifact can hold", async () => {
-    const { h, assertion } = await publisher();
-    const response = await h.sendToArtifactHost("/player.js", assertion);
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+  it("serves the player's script under the base, in a position no file can reach", async () => {
+    const { h, alice, assertion } = await publisher();
+    await alice.publishArtifact("episode-13", {
+      type: "audio",
+      files: [{ path: "player.js.mp3", body: "bytes" }],
+    });
+
+    const script = await h.sendToArtifactHost("/a/episode-13/player.js", assertion);
+    expect(script.status).toBe(200);
+    expect(script.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+    expect((await h.sendToArtifactHost("/player.js", assertion)).status).toBe(404);
   });
 });
 
@@ -400,8 +408,8 @@ describe("the artifacts tab", () => {
     await h.clientWithToken(await h.login(bob)).publish("bobs-ledger", PAGE);
 
     const html = await artifactsTab(h, await h.assertionFor(email));
-    expect(html).toContain(`href="https://${ARTIFACT_HOSTNAME}/burn-up"`);
-    expect(html).toContain(`href="https://${ARTIFACT_HOSTNAME}/q3-report"`);
+    expect(html).toContain(`href="https://${ARTIFACT_HOSTNAME}/a/burn-up"`);
+    expect(html).toContain(`href="https://${ARTIFACT_HOSTNAME}/a/q3-report"`);
     expect(html).toContain("14 B");
     expect(html).not.toContain("bobs-ledger");
   });
@@ -500,7 +508,7 @@ describe("a write permission", () => {
     });
     const mine = await bob.publishArtifact("notes", { files: [{ path: "index.html", body: "<p>bob</p>" }] });
     expect(mine.status).toBe(200);
-    expect(await (await h.sendToArtifactHost("/notes", assertion)).text()).toBe("<p>alice</p>");
+    expect(await (await h.sendToArtifactHost("/a/notes", assertion)).text()).toBe("<p>alice</p>");
 
     const bobEmail = (await bob.request("GET", "/v1/artifacts/notes")).json() as Promise<{ artifact: ArtifactView }>;
     expect((await bobEmail).artifact.bytes).toBe("<p>bob</p>".length);
@@ -514,7 +522,7 @@ describe("a write permission", () => {
       files: [{ path: "index.html", body: "<p>shared</p>" }],
     });
     const metadata = await bob.request("GET", "/v1/artifacts/shared-spec");
-    const file = await bob.request("GET", "/v1/artifacts/shared-spec/index.html");
+    const file = await bob.request("GET", "/v1/artifacts/shared-spec/files/index.html");
     expect([metadata.status, file.status]).toEqual([200, 200]);
     const { artifact }: { artifact: ArtifactView } = await metadata.json();
     expect(artifact.read).toBe("account");
@@ -553,7 +561,7 @@ describe("a write permission", () => {
       files: [{ path: "index.html", body: "<p>theirs</p>" }],
     });
     expect(replaced.status).toBe(200);
-    expect(await (await h.sendToArtifactHost("/shared-ledger", assertion)).text()).toBe("<p>theirs</p>");
+    expect(await (await h.sendToArtifactHost("/a/shared-ledger", assertion)).text()).toBe("<p>theirs</p>");
   });
 });
 
@@ -569,7 +577,7 @@ describe("the main hostname", () => {
     const dashboard = await h.send("/dashboard", { headers: { "cf-access-jwt-assertion": assertion } });
     expect(dashboard.status).toBe(401);
 
-    const file = await alice.request("GET", "/v1/artifacts/burn-up/index.html");
+    const file = await alice.request("GET", "/v1/artifacts/burn-up/files/index.html");
     expect(await file.text()).toBe(PAGE);
     expect(file.headers.get("content-type")).toBe("text/html; charset=utf-8");
   });
@@ -580,7 +588,7 @@ describe("adopting what was published before a row carried a type", () => {
     const { h, email, alice, assertion } = await publisher();
     await h.writeLegacyArtifact(await h.userIdFor(email), "old-page", "<p>from before</p>");
 
-    const served = await h.sendToArtifactHost("/old-page", assertion);
+    const served = await h.sendToArtifactHost("/a/old-page", assertion);
     expect(served.status).toBe(200);
     expect(await served.text()).toBe("<p>from before</p>");
     expect((await listed(alice)).artifacts).toHaveLength(0);
@@ -592,7 +600,7 @@ describe("adopting what was published before a row carried a type", () => {
     const page = await listed(alice);
     expect(page.artifacts.map((one) => one.name)).toEqual(["old-page"]);
     expect(page.artifacts[0]?.type).toBe("site");
-    expect(await (await h.sendToArtifactHost("/old-page", assertion)).text()).toBe("<p>from before</p>");
+    expect(await (await h.sendToArtifactHost("/a/old-page", assertion)).text()).toBe("<p>from before</p>");
 
     const again = await alice.request("POST", "/v1/artifacts/adopt");
     expect(await again.json()).toEqual({ adopted: 0 });

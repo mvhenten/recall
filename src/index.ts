@@ -23,6 +23,10 @@ export interface Env {
   ARTIFACT_ACCESS_AUD?: string;
   DASHBOARD_HOSTNAME?: string;
   ARTIFACTS?: R2Bucket;
+  // The fifth of the group, and the one that is independently optional: a deployment can publish
+  // artifacts and share none. It is the email share application's audience, and binding it is what
+  // turns both share modes on.
+  ARTIFACT_SHARE_ACCESS_AUD?: string;
 }
 
 const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
@@ -51,6 +55,7 @@ const artifactHost = (env: Env, keys: KeySource, issuer: string): ArtifactHost |
     ARTIFACT_ACCESS_AUD: audience,
     DASHBOARD_HOSTNAME: dashboard,
     ARTIFACTS: bucket,
+    ARTIFACT_SHARE_ACCESS_AUD: shareAudience,
   } = env;
   if (!hostname || !audience || !dashboard || !bucket) return null;
   return {
@@ -58,6 +63,7 @@ const artifactHost = (env: Env, keys: KeySource, issuer: string): ArtifactHost |
     verify: accessVerifier(keys, issuer, audience),
     bucket,
     dashboard: `https://${dashboard}/dashboard`,
+    sharing: shareAudience ? { verify: accessVerifier(keys, issuer, shareAudience) } : null,
   };
 };
 

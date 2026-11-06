@@ -123,6 +123,9 @@ export const harness = async (
   keys: "up" | "down" = "up",
   deviceCodeLimits: DeviceCodeLimits = DEVICE_CODE_LIMITS,
   artifacts: "on" | "off" = "on",
+  // Sharing is the one binding of the artifact host's group that is independently optional: a
+  // deployment publishes artifacts and shares none by naming no share audience.
+  sharing: "on" | "off" = "on",
 ) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
   const { n, e } = await exportJWK(publicKey);
@@ -144,6 +147,7 @@ export const harness = async (
             verify: accessVerifier(source, ISSUER, ARTIFACT_AUDIENCE),
             bucket: env.ARTIFACTS,
             dashboard: `${ORIGIN}/dashboard`,
+            sharing: sharing === "off" ? null : { verify: accessVerifier(source, ISSUER, ARTIFACT_SHARE_AUDIENCE) },
           },
     embedder: wordEmbedder,
     deviceCodeLimits,

@@ -46,6 +46,7 @@ import {
   usageDay,
   usageDayStart,
 } from "./model";
+import type { ShareMode, ShareRecord } from "./shares";
 
 interface MemoryRow {
   memory_id: string;
@@ -1516,6 +1517,288 @@ export const accountReadableElsewhere = async (db: D1Database, userId: string, n
     .bind(userId, name)
     .first<{ user_id: string }>();
   return row !== null;
+};
+
+interface ShareRow {
+  share_id: string;
+  user_id: string;
+  name: string;
+  mode: ShareMode;
+  subject: string;
+  created_at: number;
+  expires_at: number;
+  last_used_at: number;
+  uses: number;
+}
+
+const SHARE_FIELDS = "share_id, user_id, name, mode, subject, created_at, expires_at, last_used_at, uses";
+
+const SHARE_COLUMNS = `${SHARE_FIELDS} FROM artifact_shares`;
+
+const toShare = (row: ShareRow): ShareRecord => ({
+  shareId: row.share_id,
+  userId: row.user_id,
+  name: row.name,
+  mode: row.mode,
+  subject: row.subject,
+  createdAt: row.created_at,
+  expiresAt: row.expires_at,
+  lastUsedAt: row.last_used_at,
+  uses: row.uses,
+});
+
+// What one create or one replacement writes. The expiry is the caller's, so the window the share
+// opens is named in one place rather than once per statement here.
+export interface ShareInput {
+  shareId: string;
+  userId: string;
+  name: string;
+  subject: string;
+  at: number;
+  expiresAt: number;
+}
+
+// One placeholder per name, numbered from `from`. A listing page holds at most a hundred rows, so
+// the read is bounded by the page rather than by the account.
+const placeholders = (count: number, from: number): string =>
+  Array.from({ length: count }, (_one, index) => `?${from + index}`).join(", ");
+
+// The two reads that resolve a credential, and the only two that do not filter on the expiry: a
+// read of a share's own address is what finds it dead and deletes it, so the row has to come back
+// before the window is compared. Both are one read by a unique key, which is what keeps a guess at
+// an unauthenticated address to one read and no write.
+export const shareByToken = async (db: D1Database, hash: string): Promise<ShareRecord | null> => {
+  const row = await db
+    .prepare(`SELECT ${SHARE_COLUMNS} WHERE mode = 'link' AND subject = ?1`)
+    .bind(hash)
+    .first<ShareRow>();
+  return row === null ? null : toShare(row);
+};
+
+export const shareById = async (db: D1Database, shareId: string): Promise<ShareRecord | null> => {
+  const row = await db
+    .prepare(`SELECT ${SHARE_COLUMNS} WHERE share_id = ?1 AND mode = 'email'`)
+    .bind(shareId)
+    .first<ShareRow>();
+  return row === null ? null : toShare(row);
+};
+
+// One artifact's live shares, link row first. `'link'` sorts after `'email'`, so the descending
+// mode puts it there and artifact_shares_by_artifact supplies the order; nothing is sorted here.
+export const artifactShares = async (
+  db: D1Database,
+  userId: string,
+  name: string,
+  now: number,
+): Promise<ShareRecord[]> => {
+  const { results } = await db
+    .prepare(
+      `SELECT ${SHARE_COLUMNS}
+       WHERE user_id = ?1 AND name = ?2 AND expires_at > ?3
+       ORDER BY mode DESC, created_at`,
+    )
+    .bind(userId, name, now)
+    .all<ShareRow>();
+  return results.map(toShare);
+};
+
+// The live shares of the artifacts on one page of a listing, grouped rather than read per row.
+export const sharesFor = async (
+  db: D1Database,
+  userId: string,
+  names: readonly string[],
+  now: number,
+): Promise<Map<string, ShareRecord[]>> => {
+  const held = new Map<string, ShareRecord[]>();
+  if (names.length === 0) return held;
+  const { results } = await db
+    .prepare(
+      `SELECT ${SHARE_COLUMNS}
+       WHERE user_id = ?1 AND expires_at > ?2 AND name IN (${placeholders(names.length, 3)})
+       ORDER BY name, mode DESC, created_at`,
+    )
+    .bind(userId, now, ...names)
+    .all<ShareRow>();
+  for (const row of results) {
+    const share = toShare(row);
+    const already = held.get(share.name);
+    if (already === undefined) held.set(share.name, [share]);
+    else already.push(share);
+  }
+  return held;
+};
+
+// The same read with the counts returned instead of the rows, which is what the Artifacts tab's
+// third read costs and what the owner's bar prints.
+export const shareCountsFor = async (
+  db: D1Database,
+  userId: string,
+  names: readonly string[],
+  now: number,
+): Promise<Map<string, number>> => {
+  if (names.length === 0) return new Map();
+  const { results } = await db
+    .prepare(
+      `SELECT name, COUNT(*) AS n FROM artifact_shares
+       WHERE user_id = ?1 AND expires_at > ?2 AND name IN (${placeholders(names.length, 3)})
+       GROUP BY name`,
+    )
+    .bind(userId, now, ...names)
+    .all<{ name: string; n: number }>();
+  return new Map(results.map((row) => [row.name, row.n]));
+};
+
+export const shareCount = async (db: D1Database, userId: string, name: string, now: number): Promise<number> => {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM artifact_shares WHERE user_id = ?1 AND name = ?2 AND expires_at > ?3")
+    .bind(userId, name, now)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+};
+
+// The one write a page view under a share prefix costs. A file read and the player's script cost
+// none, so a reader seeking through a track does not write a row per range request.
+export const recordShareUse = async (db: D1Database, shareId: string, at: number): Promise<void> => {
+  await db
+    .prepare("UPDATE artifact_shares SET uses = uses + 1, last_used_at = ?2 WHERE share_id = ?1")
+    .bind(shareId, at)
+    .run();
+};
+
+// The row a read of its own address found past its expiry, named by its primary key. It is the
+// request the reader made that deletes it, and the window is compared again in the statement so a
+// renewal that landed in between is not thrown away.
+export const deleteExpiredShare = async (db: D1Database, shareId: string, at: number): Promise<void> => {
+  await db.prepare("DELETE FROM artifact_shares WHERE share_id = ?1 AND expires_at <= ?2").bind(shareId, at).run();
+};
+
+export const deleteArtifactShares = async (db: D1Database, userId: string, name: string): Promise<number> => {
+  const result = await db
+    .prepare("DELETE FROM artifact_shares WHERE user_id = ?1 AND name = ?2")
+    .bind(userId, name)
+    .run();
+  return result.meta.changes;
+};
+
+// A dead share for the address about to be shared again, named by its full key. Without it the
+// upsert below would revive the dead row and carry its use count into the new share.
+export const deleteDeadEmailShare = async (
+  db: D1Database,
+  userId: string,
+  name: string,
+  address: string,
+  at: number,
+): Promise<void> => {
+  await db
+    .prepare(
+      `DELETE FROM artifact_shares
+       WHERE user_id = ?1 AND name = ?2 AND mode = 'email' AND subject = ?3 AND expires_at <= ?4`,
+    )
+    .bind(userId, name, address, at)
+    .run();
+};
+
+// One statement for a first share and a renewal both: the returned id differing from the one
+// generated is what says the address already held a live share and its expiry moved instead.
+export const createEmailShare = async (
+  db: D1Database,
+  input: ShareInput,
+): Promise<{ share: ShareRecord; renewed: boolean }> => {
+  const row = await db
+    .prepare(
+      `INSERT INTO artifact_shares (share_id, user_id, name, mode, subject, created_at, expires_at, last_used_at, uses)
+       VALUES (?1, ?2, ?3, 'email', ?4, ?5, ?6, ?5, 0)
+       ON CONFLICT (user_id, name, mode, subject) DO UPDATE SET expires_at = excluded.expires_at
+       RETURNING ${SHARE_FIELDS}`,
+    )
+    .bind(input.shareId, input.userId, input.name, input.subject, input.at, input.expiresAt)
+    .first<ShareRow>();
+  if (row === null) throw new Error(`sharing ${input.name} with an address wrote no row`);
+  return { share: toShare(row), renewed: row.share_id !== input.shareId };
+};
+
+const LINK_UPSERT = `INSERT INTO artifact_shares (share_id, user_id, name, mode, subject, created_at, expires_at, last_used_at, uses)
+   VALUES (?1, ?2, ?3, 'link', ?4, ?5, ?6, ?5, 0)
+   ON CONFLICT (user_id, name) WHERE mode = 'link'
+   DO UPDATE SET share_id = excluded.share_id, subject = excluded.subject, created_at = excluded.created_at,
+     expires_at = excluded.expires_at, last_used_at = excluded.last_used_at, uses = 0`;
+
+const LINK_RETURNING = `RETURNING ${SHARE_FIELDS}`;
+
+// The first link share on an artifact. artifact_shares_one_link is what makes a second one
+// impossible even under a race: a live row refuses the update and no row comes back, which is the
+// answer that asks the owner whether to replace the address already in use. A dead row is
+// overwritten, because it opens nothing.
+export const createLinkShare = async (db: D1Database, input: ShareInput): Promise<ShareRecord | null> => {
+  const row = await db
+    .prepare(`${LINK_UPSERT} WHERE artifact_shares.expires_at <= excluded.created_at ${LINK_RETURNING}`)
+    .bind(input.shareId, input.userId, input.name, input.subject, input.at, input.expiresAt)
+    .first<ShareRow>();
+  return row === null ? null : toShare(row);
+};
+
+// The replacement the owner asked for. It retires the old token the moment the new hash lands,
+// because one row holds both and the hash is the credential.
+export const replaceLinkShare = async (db: D1Database, input: ShareInput): Promise<ShareRecord> => {
+  const row = await db
+    .prepare(`${LINK_UPSERT} ${LINK_RETURNING}`)
+    .bind(input.shareId, input.userId, input.name, input.subject, input.at, input.expiresAt)
+    .first<ShareRow>();
+  if (row === null) throw new Error(`replacing the link share on ${input.name} wrote no row`);
+  return toShare(row);
+};
+
+// The window moved forward on a live link share. A row that is already gone changes nothing and
+// answers null, which the page draws as the share having been revoked by another request.
+export const extendLinkShare = async (
+  db: D1Database,
+  userId: string,
+  name: string,
+  now: number,
+  expiresAt: number,
+): Promise<ShareRecord | null> => {
+  const row = await db
+    .prepare(
+      `UPDATE artifact_shares SET expires_at = ?4
+       WHERE user_id = ?1 AND name = ?2 AND mode = 'link' AND expires_at > ?3
+       ${LINK_RETURNING}`,
+    )
+    .bind(userId, name, now, expiresAt)
+    .first<ShareRow>();
+  return row === null ? null : toShare(row);
+};
+
+// What a revoke names. Every member is scoped to the owner and the artifact, so a share id from
+// another artifact deletes nothing even where a caller names one.
+export type RevokeScope =
+  | { kind: "one"; shareId: string }
+  | { kind: "link" }
+  | { kind: "email"; address: string }
+  | { kind: "all" };
+
+export const revokeShares = async (
+  db: D1Database,
+  userId: string,
+  name: string,
+  scope: RevokeScope,
+): Promise<number> => {
+  const where =
+    scope.kind === "one"
+      ? "AND share_id = ?3"
+      : scope.kind === "link"
+        ? "AND mode = 'link'"
+        : scope.kind === "email"
+          ? "AND mode = 'email' AND subject = ?3"
+          : "";
+  const statement = db.prepare(`DELETE FROM artifact_shares WHERE user_id = ?1 AND name = ?2 ${where}`);
+  const bound =
+    scope.kind === "one"
+      ? statement.bind(userId, name, scope.shareId)
+      : scope.kind === "email"
+        ? statement.bind(userId, name, scope.address)
+        : statement.bind(userId, name);
+  const result = await bound.run();
+  return result.meta.changes;
 };
 
 const LEGACY_PAGE = 1_000;

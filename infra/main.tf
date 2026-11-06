@@ -1,5 +1,12 @@
 locals {
   emails = distinct(flatten([for user in var.users : [for email in user.emails : lower(email)]]))
+
+  # The two prefixes a share answers under. Access matches the most specific application — the
+  # longest path — before the hostname-wide one, so each prefix carries its own policy and the
+  # application covering the host is unchanged. Neither can collide with an artifact, because every
+  # artifact address begins /a/; that holds structurally and not by the name grammar.
+  share_link_prefix  = "/link"
+  share_email_prefix = "/email"
 }
 
 data "cloudflare_zero_trust_organization" "this" {
@@ -137,6 +144,73 @@ resource "cloudflare_zero_trust_access_application" "device" {
   policies = [
     {
       id         = cloudflare_zero_trust_access_policy.approvers.id
+      precedence = 1
+    }
+  ]
+}
+
+# The link prefix takes no sign-in at all: the token in the address is the only credential, and the
+# Worker hashes it to find one share. The bypass is scoped to this path and goes nowhere near the
+# application covering the hostname.
+resource "cloudflare_zero_trust_access_policy" "share_link_bypass" {
+  count      = var.artifact_hostname == "" ? 0 : 1
+  account_id = var.account_id
+  name       = "recall artifact link shares"
+  decision   = "bypass"
+  include    = [{ everyone = {} }]
+}
+
+# Any address Cloudflare's one-time PIN proves gets through. The policy proves an address and
+# decides nothing else; which artifact that address reaches is the share row's to say. `allow` plus
+# `everyone` is not `bypass`: it demands an identity and accepts whichever one completes the PIN.
+resource "cloudflare_zero_trust_access_policy" "share_readers" {
+  count      = var.artifact_hostname == "" ? 0 : 1
+  account_id = var.account_id
+  name       = "recall artifact share readers"
+  decision   = "allow"
+  include    = [{ everyone = {} }]
+}
+
+resource "cloudflare_zero_trust_access_application" "share_links" {
+  count                     = var.artifact_hostname == "" ? 0 : 1
+  account_id                = var.account_id
+  name                      = "recall artifact link shares"
+  type                      = "self_hosted"
+  session_duration          = "24h"
+  app_launcher_visible      = false
+  service_auth_401_redirect = true
+  destinations = [
+    {
+      type = "public"
+      uri  = "${var.artifact_hostname}${local.share_link_prefix}"
+    }
+  ]
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.share_link_bypass[0].id
+      precedence = 1
+    }
+  ]
+}
+
+resource "cloudflare_zero_trust_access_application" "share_emails" {
+  count                     = var.artifact_hostname == "" ? 0 : 1
+  account_id                = var.account_id
+  name                      = "recall artifact email shares"
+  type                      = "self_hosted"
+  session_duration          = "24h"
+  app_launcher_visible      = false
+  allowed_idps              = [var.otp_idp_id]
+  auto_redirect_to_identity = true
+  destinations = [
+    {
+      type = "public"
+      uri  = "${var.artifact_hostname}${local.share_email_prefix}"
+    }
+  ]
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.share_readers[0].id
       precedence = 1
     }
   ]

@@ -15,7 +15,7 @@ mod ws;
 
 use anyhow::{Context, Result, bail};
 use api::{Client, Memory, SaveBody};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use jiff::Timestamp;
 use settings::{Mode, Settings};
 use std::io::{IsTerminal, Read};
@@ -158,6 +158,44 @@ enum Command {
     },
     #[command(about = "Remove a published artifact and every one of its files")]
     Unpublish { name: String },
+    #[command(about = "Share one artifact and print the address it answers on")]
+    Share {
+        name: String,
+        #[arg(
+            long,
+            value_name = "ADDRESS",
+            help = "Share with one address, proven by a one-time code; without it, a link anyone holding it opens"
+        )]
+        email: Option<String>,
+    },
+    #[command(about = "List the shares on one artifact, or every share this account holds")]
+    Shares {
+        #[arg(
+            value_name = "NAME",
+            help = "One artifact; without it, every artifact that holds a share"
+        )]
+        name: Option<String>,
+    },
+    // Exactly one of the three, as a clap group, so naming none exits non-zero and names all three
+    // without a round trip to the service.
+    #[command(
+        about = "Revoke shares on one artifact",
+        group(ArgGroup::new("which").required(true).multiple(false))
+    )]
+    Unshare {
+        name: String,
+        #[arg(
+            long,
+            value_name = "ADDRESS",
+            group = "which",
+            help = "Revoke the share with this address"
+        )]
+        email: Option<String>,
+        #[arg(long, group = "which", help = "Revoke the link share")]
+        link: bool,
+        #[arg(long, group = "which", help = "Revoke every share on the artifact")]
+        all: bool,
+    },
     #[command(about = "Print the repo tag of the current directory")]
     Repo,
     #[command(about = "Sign this host in through the browser and store its device token")]
@@ -1192,6 +1230,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 kind: kind.unwrap_or_default(),
                 sort: sort.unwrap_or_default(),
                 limit,
+                ..api::ArtifactQuery::default()
             })?;
             if cli.json {
                 print_json(&page)?;
@@ -1213,6 +1252,65 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("unpublished {name}");
             }
         }
+        Command::Share { name, email } => {
+            let shared = client()?.share(&name, email.as_deref())?;
+            if cli.json {
+                print_json(&shared)?;
+            } else {
+                if shared.replaced {
+                    eprintln!("recall: {name} already held a link share; the address it was using is now dead");
+                }
+                if shared.renewed {
+                    eprintln!("recall: that address already held a share, so its expiry moved instead");
+                }
+                // A link token is printed here and nowhere else: the service holds only its hash.
+                println!("{}", shared.address);
+                println!("expires {}", markdown::iso(shared.share.expires_at));
+            }
+        }
+        Command::Shares { name } => {
+            let client = client()?;
+            match name {
+                Some(name) => {
+                    let shares = client.shares(&name)?;
+                    if cli.json {
+                        print_json(&shares)?;
+                    } else if shares.is_empty() {
+                        println!("{name} is shared with nobody");
+                    } else {
+                        print!("{}", markdown::render_shares(&shares));
+                    }
+                }
+                None => {
+                    let shared = client.every_share()?;
+                    if cli.json {
+                        print_json(&shared)?;
+                    } else if shared.is_empty() {
+                        println!("nothing is shared");
+                    } else {
+                        print!("{}", markdown::render_every_share(&shared));
+                    }
+                }
+            }
+        }
+        Command::Unshare { name, email, link, all } => {
+            let scope = match (email, link, all) {
+                (Some(address), _, _) => api::Unshare::Email(address),
+                (None, true, _) => api::Unshare::Link,
+                _ => api::Unshare::All,
+            };
+            let revoked = client()?.unshare(&name, &scope)?;
+            if cli.json {
+                print_json(&revoked)?;
+            } else {
+                println!(
+                    "revoked {} {} on {name}, {} left",
+                    revoked.revoked,
+                    if revoked.revoked == 1 { "share" } else { "shares" },
+                    revoked.shares.len()
+                );
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1224,6 +1322,67 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("recall: {error:#}");
             ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("recall").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn the_cli_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_share_takes_an_address_or_mints_a_link() {
+        let link = parse(&["share", "release-notes"]).expect("a link share");
+        assert!(matches!(link.command, Command::Share { email: None, .. }));
+        let addressed = parse(&["share", "release-notes", "--email", "jo@example.org"]).expect("an email share");
+        let Command::Share { name, email } = addressed.command else {
+            panic!("not a share");
+        };
+        assert_eq!(
+            (name.as_str(), email.as_deref()),
+            ("release-notes", Some("jo@example.org"))
+        );
+    }
+
+    #[test]
+    fn shares_takes_one_artifact_or_the_whole_account() {
+        assert!(matches!(
+            parse(&["shares"]).expect("every share").command,
+            Command::Shares { name: None }
+        ));
+        assert!(matches!(
+            parse(&["shares", "release-notes"]).expect("one artifact").command,
+            Command::Shares { name: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn an_unshare_naming_none_of_the_three_is_refused_without_a_round_trip() {
+        let Err(refused) = parse(&["unshare", "release-notes"]) else {
+            panic!("an unshare naming none of the three was taken");
+        };
+        let said = refused.to_string();
+        for named in ["--email", "--link", "--all"] {
+            assert!(said.contains(named), "{said}");
+        }
+        assert!(parse(&["unshare", "release-notes", "--link", "--all"]).is_err());
+        assert!(parse(&["unshare", "release-notes", "--email", "jo@example.org", "--link"]).is_err());
+        for named in [
+            vec!["unshare", "release-notes", "--link"],
+            vec!["unshare", "release-notes", "--all"],
+            vec!["unshare", "release-notes", "--email", "jo@example.org"],
+        ] {
+            assert!(parse(&named).is_ok(), "{named:?}");
         }
     }
 }
