@@ -415,15 +415,20 @@ pub struct Sent {
 /// would answer only knows a session already on record, and nothing it could say would change the
 /// answer. A session it has owes only the delegated turns it has not counted. Its own transcript
 /// is never read again, whatever the service says — the hooks counted that one as the session
-/// ran, or a run before this did, and a transcript cannot say which.
+/// ran, or a run before this did, and a transcript cannot say which. A persisted tool output is
+/// read for nothing: it holds no turn, so no token was ever spent on it.
 fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<(Vec<&'a Part>, transcripts::Held)> {
+    let turns = || {
+        session
+            .parts
+            .iter()
+            .filter(|part| part.source.holds == transcripts::Holds::Turns)
+    };
     if !session.on_record {
-        return Ok((session.parts.iter().collect(), transcripts::Held::default()));
+        return Ok((turns().collect(), transcripts::Held::default()));
     }
     let held = service.held(&session.session_id)?;
-    let owed = session
-        .parts
-        .iter()
+    let owed = turns()
         .filter(|part| part.source.file != MAIN && !held.counted.contains(&part.source.file))
         .collect();
     Ok((owed, held))

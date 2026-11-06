@@ -570,6 +570,7 @@ fn usage_marks(transcript: &Path) -> Value {
     let marks: serde_json::Map<String, Value> = transcripts::sources(transcript)
         .unwrap_or_default()
         .into_iter()
+        .filter(|source| source.holds == transcripts::Holds::Turns)
         .map(|source| (source.file, json!({ "offset": source.size, "messageId": "" })))
         .collect();
     Value::Object(marks)

@@ -5,6 +5,7 @@ mod config;
 mod listen;
 mod markdown;
 mod mcp;
+mod redact;
 mod repo;
 mod restore;
 mod seen;

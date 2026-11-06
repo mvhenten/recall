@@ -9,9 +9,18 @@
 //! digit written as a dash, which is how Claude Code names them: `/home/you/.dotfiles` is
 //! `-home-you--dotfiles`. A session is restored under the directory it ran in unless the caller
 //! names another, so the paths its transcript talks about still mean what they said.
+//!
+//! A turn that persisted a tool output points at it by absolute path, which Claude Code writes as
+//! `<home>/.claude/projects/<project directory>/<session id>/tool-results/<name>.txt`. Every part
+//! of that but the home directory is reproduced here — the project directory off the working
+//! directory the session ran in, the session id off the session, the name off the archive — so a
+//! turn's path opens the output it names on any host where this account's home is in the same
+//! place. That is the trade `--cwd` already makes for every other path a transcript talks about:
+//! restored under another directory, the outputs go where that directory's project is and the
+//! turns go on naming the directory the session ran in.
 
 use crate::api::{Client, HeldFile, PastSession};
-use crate::transcripts::MAIN;
+use crate::transcripts::{MAIN, TOOL_RESULT};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -24,12 +33,16 @@ pub fn project_dir(projects: &Path, cwd: &str) -> PathBuf {
     projects.join(named)
 }
 
-/// Where one of a session's transcript files goes: its own beside the project directory, and every
-/// delegated turn under the directory named for the session, as Claude Code writes them.
+/// Where one of a session's files goes: its own transcript beside the project directory, and every
+/// delegated turn and persisted tool output under the directory named for the session, as Claude
+/// Code writes them.
 pub fn file_path(projects: &Path, cwd: &str, session_id: &str, file: &str) -> PathBuf {
     let dir = project_dir(projects, cwd);
     if file == MAIN {
         return dir.join(format!("{session_id}.jsonl"));
+    }
+    if let Some(name) = file.strip_prefix(TOOL_RESULT) {
+        return dir.join(session_id).join("tool-results").join(format!("{name}.txt"));
     }
     dir.join(session_id).join("subagents").join(format!("{file}.jsonl"))
 }
@@ -67,7 +80,12 @@ fn stale(path: &Path, archived: i64) -> Result<bool> {
 fn download(client: &Client, session_id: &str, file: &str, path: &Path) -> Result<u64> {
     let dir = path.parent().context("a transcript path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let partial = path.with_extension("jsonl.part");
+    let mut partial = path
+        .file_name()
+        .context("a transcript path has no name")?
+        .to_os_string();
+    partial.push(".part");
+    let partial = path.with_file_name(partial);
     let bytes = {
         let mut into = std::fs::File::create(&partial).with_context(|| format!("writing {}", partial.display()))?;
         client.read_transcript(session_id, file, &mut into).inspect_err(|_| {
@@ -143,6 +161,15 @@ mod tests {
                 .join("subagents")
                 .join("agent-7f21.jsonl"),
             "a delegated turn goes where Claude Code writes it, under the session's own directory"
+        );
+        assert_eq!(
+            file_path(projects, "/home/you/src/recall", "s-1", "tool-results.b374nf1qv"),
+            projects
+                .join("-home-you-src-recall")
+                .join("s-1")
+                .join("tool-results")
+                .join("b374nf1qv.txt"),
+            "and a persisted output goes under the path the turn pointing at it names"
         );
     }
 
