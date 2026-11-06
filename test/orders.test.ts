@@ -4,12 +4,13 @@ import { describe, expect, it } from "vitest";
 import {
   type Mailbox,
   type Message,
-  type MessageFrame,
+  type NewsFrame,
   NO_SESSION_TOOK_IT,
   NOT_TAKEN,
   NOTHING_LISTENING,
   ORDERS,
   ORDERS_HEADER,
+  type OrderFrame,
   type Receipt,
   type SendInput,
   type Sent,
@@ -28,7 +29,7 @@ interface Listener {
 // What a listener writes back about each order it is handed, standing in for the daemon writing it
 // into one of its own sessions: the session that took it, that it has none that could, or nothing
 // at all, which is what a host whose chosen session wedged does. News is never answered.
-type Answer = (frame: MessageFrame) => Receipt | null;
+type Answer = (frame: OrderFrame) => Receipt | null;
 
 const takenBy =
   (sessionId: string): Answer =>
@@ -40,9 +41,6 @@ const saysNothing: Answer = () => null;
 
 const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
-const alarmAt = (userId: string): Promise<number | null> =>
-  runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) => state.storage.getAlarm());
-
 const deviceId = async (client: Client, name: string): Promise<string> => {
   const response = await client.request("GET", "/v1/devices");
   expect(response.status).toBe(200);
@@ -52,29 +50,20 @@ const deviceId = async (client: Client, name: string): Promise<string> => {
   return device.deviceId;
 };
 
-// The mailbox arms its sweep on the wall clock and the harness sends on one of its own, so the two
-// have to agree before anything is sent. Signing a device in advances the harness clock, so they
-// are squared up last.
 const bus = async () => {
   const h = await harness();
   const userId = `user-${crypto.randomUUID()}`;
   const email = await h.invite(`${userId}@example.com`, userId);
   const laptop = h.clientWithToken(await h.login(email, "laptop"));
   const desktopToken = await h.login(email, "desktop");
-  const desktopId = await deviceId(laptop, "desktop");
-  h.tick(Date.now() - h.now());
-  return { h, userId, laptop, desktopToken, desktopId };
+  return { h, userId, laptop, desktopToken, desktopId: await deviceId(laptop, "desktop") };
 };
 
-// `declares` is whether the upgrade says this daemon reads the kind of a message, which a daemon
-// from before orders does not.
-const listen = async (h: Harness, token: string, answer: Answer, declares = true): Promise<Listener> => {
+// The upgrade declares that this daemon reads the kind of a message, which is what the mailbox
+// hands an order to.
+const listen = async (h: Harness, token: string, answer: Answer): Promise<Listener> => {
   const response = await h.send("/v1/messages/listen", {
-    headers: {
-      authorization: `Bearer ${token}`,
-      upgrade: "websocket",
-      ...(declares ? { [ORDERS_HEADER]: ORDERS } : {}),
-    },
+    headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
   expect(response.status).toBe(101);
   const socket = response.webSocket;
@@ -82,14 +71,48 @@ const listen = async (h: Harness, token: string, answer: Answer, declares = true
   socket.accept();
   const listener: Listener = { socket, received: [], tokens: new Map() };
   socket.addEventListener("message", (event) => {
-    const frame: MessageFrame = JSON.parse(String(event.data));
+    const frame: NewsFrame | OrderFrame = JSON.parse(String(event.data));
     listener.received.push(frame.message);
+    if (frame.type !== "order") return;
     listener.tokens.set(frame.message.messageId, frame.token);
-    if (frame.message.kind !== "order") return;
     const reply = answer(frame);
     if (reply !== null) socket.send(JSON.stringify(reply));
   });
   return listener;
+};
+
+// What a daemon released before orders does with what it is pushed: it refuses outright a frame
+// whose message carries no `expiresAt`, it declares nothing about kinds on the upgrade, and it
+// answers news with an ack rather than a receipt. `refused` and `closed` are what a break against
+// such a host looks like — a frame it cannot parse, or a socket closed over its ack.
+interface Released {
+  read: Message[];
+  refused: string[];
+  closed: number[];
+}
+
+const released = async (h: Harness, token: string): Promise<Released> => {
+  const response = await h.send("/v1/messages/listen", {
+    headers: { authorization: `Bearer ${token}`, upgrade: "websocket" },
+  });
+  expect(response.status).toBe(101);
+  const socket = response.webSocket;
+  if (!socket) throw new Error("the listen upgrade carried no socket");
+  socket.accept();
+  const daemon: Released = { read: [], refused: [], closed: [] };
+  socket.addEventListener("message", (event) => {
+    const raw = String(event.data);
+    const frame: NewsFrame = JSON.parse(raw);
+    if (frame.type !== "message") return;
+    if (typeof frame.message.expiresAt !== "number") {
+      daemon.refused.push(raw);
+      return;
+    }
+    daemon.read.push(frame.message);
+    socket.send(JSON.stringify({ type: "ack", messageId: frame.message.messageId, token: "" }));
+  });
+  socket.addEventListener("close", (event) => daemon.closed.push(event.code));
+  return daemon;
 };
 
 const order = (client: Client, toDeviceId: string, body: string): Promise<Response> =>
@@ -102,7 +125,7 @@ const outcome = async (response: Response): Promise<Sent> => {
 
 const sendNow = (userId: string, input: SendInput, now: number): Promise<Sent> =>
   runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) =>
-    mailbox.enqueue(input, { deviceId: "d-sender", host: "laptop", name: "" }, now),
+    mailbox.publish(input, { deviceId: "d-sender", host: "laptop", name: "" }, now),
   );
 
 const eventually = async (ready: () => boolean, what: string): Promise<void> => {
@@ -170,37 +193,29 @@ describe("orders", () => {
     expect(ids(holder.received)).toEqual([sent.message.messageId]);
   });
 
-  it("hands no order to a daemon too old to read a kind, and says nobody is listening", async () => {
+  // Every host in the field runs a daemon released before this change, and the news path is what
+  // it is pushed on every send. A frame it cannot parse, or a socket closed over the ack it writes
+  // back, puts it in a reconnect loop while the sender is told the send worked.
+  it("keeps pushing news a released daemon can read and ignores the ack, and hands it no order", async () => {
     const { h, laptop, desktopToken, desktopId } = await bus();
     const first = await outcome(await order(laptop, desktopId, "rerun the migration"));
     expect(first.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
 
-    const old = await listen(h, desktopToken, noTaker, false);
-    const news = await outcome(
+    const old = await released(h, desktopToken);
+    const green = await outcome(
       await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "the build is green" }),
     );
-    await eventually(() => old.received.length === 1, "the news an old daemon still reads");
+    await eventually(() => old.read.length === 1, "the news a released daemon still reads");
     const second = await outcome(await order(laptop, desktopId, "restart the worker"));
+    const red = await outcome(
+      await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "main is red" }),
+    );
+    await eventually(() => old.read.length === 2, "the news that follows the ack it wrote back");
 
     expect(second.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
-    expect(ids(old.received)).toEqual([news.message.messageId]);
-  });
-
-  // The sweep is the only thing that closes the socket of a revoked device, so a mailbox busy
-  // enough to be sending and reconnecting must not keep pushing that pass out of reach.
-  it("keeps the sweep due where the last one left it, however much traffic arrives", async () => {
-    const { h, laptop, userId, desktopToken, desktopId } = await bus();
-    await listen(h, desktopToken, takenBy("desktop-aaaa"));
-    const due = await alarmAt(userId);
-    if (due === null) throw new Error("a mailbox with a socket attached owes an alarm");
-
-    for (const body of ["the build is green", "the deploy is out", "main is red"]) {
-      expect((await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body })).status).toBe(201);
-      expect(await alarmAt(userId)).toBe(due);
-    }
-
-    await listen(h, desktopToken, takenBy("desktop-bbbb"));
-    expect(await alarmAt(userId)).toBe(due);
+    expect(ids(old.read)).toEqual([green.message.messageId, red.message.messageId]);
+    expect(old.refused).toEqual([]);
+    expect(old.closed).toEqual([]);
   });
 
   // The claim is what ties a receipt to the order it answers. Without it a daemon quoting an id it

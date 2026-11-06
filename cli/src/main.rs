@@ -928,7 +928,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let target = api::resolve_target(&client.devices()?, || client.sessions(), &to)?;
             let sent = client.send(&target, api::Kind::News, &sending_session(), &body)?;
             if cli.json {
-                print_json(&sent)?;
+                print_json(&sent.message)?;
             } else {
                 println!("sent {} to {to}", sent.message.message_id);
             }

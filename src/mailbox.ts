@@ -1,5 +1,4 @@
 import { DurableObject } from "cloudflare:workers";
-import { listDevices } from "./device";
 import { type Parsed, parseSessionId } from "./model";
 
 // A message is a ping that is relevant now. It goes to the sockets attached when it is sent and to
@@ -7,11 +6,15 @@ import { type Parsed, parseSessionId } from "./model";
 // never sees it. Nothing is stored anywhere, and the only thing a send ever waits on is the one
 // session that takes an order, which lives in this isolate until its host names it.
 export const MAX_BODY_BYTES = 32_768;
-export const SWEEP_INTERVAL_MS = 900_000;
 
 // How long a send waits for the host to name the session that took an order: a host that is
 // listening and has said nothing by then loses the order, since a sender told the order failed
 // must not leave one behind for a session to run later.
+//
+// The host's walk over its own sessions is cut to fit inside this window: `ORDER_WALK` in
+// cli/src/sessions.rs is this window less the one write timeout the host allows itself, so the
+// receipt is written while the send is still waiting. A host that walked past it would have a
+// session take an order the sender had already been told nobody took.
 export const TAKER_WINDOW_MS = 10_000;
 
 export const DEVICE_HEADER = "x-recall-device-id";
@@ -22,7 +25,6 @@ export const DEVICE_HEADER = "x-recall-device-id";
 export const ORDERS_HEADER = "x-recall-orders";
 export const ORDERS = "1";
 
-export const CLOSE_BAD_FRAME = 4000;
 export const CLOSE_REVOKED = 4001;
 
 export const NOTHING_LISTENING =
@@ -78,11 +80,23 @@ export interface Sent {
   outcome: Outcome;
 }
 
-// `token` is the claim this frame hands the socket, which the receipt has to quote. Only an order
-// carries one, since news answers nothing; a news frame carries it empty.
-export interface MessageFrame {
+// A message on the wire. `expiresAt` is dead weight this release carries: every daemon released
+// before it refuses a frame that has no such field, and none of them reads anything out of it. It
+// goes once no host is still running one of those.
+interface Pushed extends Message {
+  expiresAt: number;
+}
+
+// News is published and answered with nothing, so its frame carries no claim. An order's does:
+// `token` is what the receipt has to quote for the mailbox to settle the send waiting on it.
+export interface NewsFrame {
   type: "message";
-  message: Message;
+  message: Pushed;
+}
+
+export interface OrderFrame {
+  type: "order";
+  message: Pushed;
   token: string;
 }
 
@@ -103,13 +117,6 @@ export interface NoTakerFrame {
 // is never answered, so these are the only frames a socket ever writes back. A host that writes
 // neither leaves the send to give up when its window closes.
 export type Receipt = TookFrame | NoTakerFrame;
-
-const RECEIPT_SHAPE =
-  '{"type":"took","messageId":"<id>","sessionId":"<id>","token":"<token>"} or {"type":"none","messageId":"<id>","token":"<token>"}';
-
-export interface MailboxEnv {
-  DB: D1Database;
-}
 
 // `orders` is what the socket declared on the upgrade: whether the daemon behind it reads the kind
 // of a message. A socket attached before the mailbox asked declares nothing and gets no order.
@@ -208,8 +215,13 @@ const attached = (socket: WebSocket): Attachment | null => {
 
 const deviceOf = (socket: WebSocket): string | null => attached(socket)?.deviceId ?? null;
 
-const messageFrame = (message: Message, token: string): string =>
-  JSON.stringify({ type: "message", message, token } satisfies MessageFrame);
+const pushed = (message: Message): Pushed => ({ ...message, expiresAt: message.createdAt });
+
+const newsFrame = (message: Message): string =>
+  JSON.stringify({ type: "message", message: pushed(message) } satisfies NewsFrame);
+
+const orderFrame = (message: Message, token: string): string =>
+  JSON.stringify({ type: "order", message: pushed(message), token } satisfies OrderFrame);
 
 // A socket Cloudflare has not reaped yet is still handed back by `getWebSockets`, and an order
 // sent to it reaches nobody, so the caller tries the next socket the device has open.
@@ -223,12 +235,11 @@ const deliver = (socket: WebSocket, frame: string): boolean => {
   }
 };
 
-// Where the mailbox last made its quarter-hourly pass.
-export const SWEPT_AT = "sweptAt";
-
-export class Mailbox extends DurableObject<MailboxEnv> {
+export class Mailbox extends DurableObject {
   private readonly waiting = new Map<string, Pending>();
 
+  // A socket attaching is handed nothing. A message is a ping that was relevant when it was sent,
+  // and this socket was not there for it.
   async fetch(request: Request): Promise<Response> {
     const deviceId = request.headers.get(DEVICE_HEADER) ?? "";
     if (deviceId === "") return new Response("the mailbox only answers the listen upgrade", { status: 400 });
@@ -236,27 +247,29 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
     pair[1].serializeAttachment({ deviceId, orders } satisfies Attachment);
-    // A socket attaching is handed nothing. A message is a ping that was relevant when it was
-    // sent, and this socket was not there for it.
-    await this.scheduleAlarm();
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  async webSocketMessage(socket: WebSocket, received: string | ArrayBuffer): Promise<void> {
+  // Only a receipt is read, and only by the send it quotes. A frame that is not one is ignored
+  // exactly as one quoting a claim no send is waiting on is: a daemon from before orders answers
+  // news with an ack, and a socket closed over that would reconnect into the same ack forever.
+  async webSocketMessage(_socket: WebSocket, received: string | ArrayBuffer): Promise<void> {
     const receipt = typeof received === "string" ? parseReceipt(received) : null;
-    if (deviceOf(socket) === null || receipt === null) {
-      socket.close(CLOSE_BAD_FRAME, `every frame must be ${RECEIPT_SHAPE}`);
-      return;
-    }
+    if (receipt === null) return;
     this.settle(receipt);
   }
 
-  async alarm(): Promise<void> {
-    await this.sweep(Date.now());
-    await this.scheduleAlarm();
+  // Closes the sockets of a device that is no longer signed in, which the revocation itself calls
+  // so the device stops reading news the moment it loses its login.
+  async revoke(deviceId: string): Promise<void> {
+    for (const socket of this.ctx.getWebSockets()) {
+      if (deviceOf(socket) === deviceId) {
+        socket.close(CLOSE_REVOKED, "this device is no longer signed in; run recall login");
+      }
+    }
   }
 
-  async enqueue(input: SendInput, from: Sender, now: number): Promise<Sent> {
+  async publish(input: SendInput, from: Sender, now: number): Promise<Sent> {
     const message: Message = {
       messageId: crypto.randomUUID(),
       kind: input.kind,
@@ -285,8 +298,9 @@ export class Mailbox extends DurableObject<MailboxEnv> {
   }
 
   private broadcast(message: Message): void {
+    const frame = newsFrame(message);
     for (const socket of this.ctx.getWebSockets()) {
-      if (deviceOf(socket) === message.toDeviceId) deliver(socket, messageFrame(message, ""));
+      if (deviceOf(socket) === message.toDeviceId) deliver(socket, frame);
     }
   }
 
@@ -298,7 +312,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       const to = attached(socket);
       if (to === null || !to.orders || to.deviceId !== message.toDeviceId) continue;
       const token = crypto.randomUUID();
-      if (deliver(socket, messageFrame(message, token))) return token;
+      if (deliver(socket, orderFrame(message, token))) return token;
     }
     return null;
   }
@@ -325,42 +339,5 @@ export class Mailbox extends DurableObject<MailboxEnv> {
         ? { state: "taken", sessionId: receipt.sessionId }
         : { state: "untaken", reason: NO_SESSION_TOOK_IT },
     );
-  }
-
-  // The quarter-hourly pass, and the only thing the alarm is for: close the socket of a device
-  // that is no longer signed in. A mailbox with nothing attached owes nothing and stops waking up.
-  private async sweep(now: number): Promise<void> {
-    if (now < (await this.sweepDue())) return;
-    await this.ctx.storage.put(SWEPT_AT, now);
-    const live = await this.liveDevices();
-    for (const socket of this.ctx.getWebSockets()) {
-      const deviceId = deviceOf(socket);
-      if (deviceId === null || !live.has(deviceId)) {
-        socket.close(CLOSE_REVOKED, "this device is no longer signed in; run recall login");
-      }
-    }
-  }
-
-  private async liveDevices(): Promise<Set<string>> {
-    const userId = this.ctx.id.name;
-    if (userId === undefined) throw new Error("a mailbox is only ever addressed as idFromName(userId)");
-    const devices = await listDevices(this.env.DB, userId);
-    return new Set(devices.map((device) => device.deviceId));
-  }
-
-  private async scheduleAlarm(): Promise<void> {
-    if (this.ctx.getWebSockets().length === 0) return;
-    await this.ctx.storage.setAlarm(await this.sweepDue());
-  }
-
-  // When the next quarter-hourly pass falls due. A mailbox that has never made one dates its first
-  // from the moment it had anything to wake up for, so arming the alarm never asks for a pass in
-  // the past and a host reconnecting cannot keep pushing the next one out of reach.
-  private async sweepDue(): Promise<number> {
-    const sweptAt = await this.ctx.storage.get<number>(SWEPT_AT);
-    if (sweptAt !== undefined) return sweptAt + SWEEP_INTERVAL_MS;
-    const now = Date.now();
-    await this.ctx.storage.put(SWEPT_AT, now);
-    return now + SWEEP_INTERVAL_MS;
   }
 }

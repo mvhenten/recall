@@ -21,7 +21,7 @@ pub const ORDERS_HEADER: &str = "x-recall-orders";
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// `token` is the claim the mailbox handed this socket along with an order, and the receipt has to
-/// quote it back. News answers nothing, so it arrives under an empty claim.
+/// quote it back. News answers nothing, so its frame carries no claim and this is left empty.
 #[derive(Debug)]
 pub enum Incoming {
     Message { message: Box<Message>, token: String },
@@ -69,9 +69,12 @@ pub fn receipt(message_id: &str, token: &str, reply: &Reply) -> String {
     }
 }
 
+/// News and an order are deliberately different shapes: only an order's frame carries the claim
+/// its receipt has to quote, so the two are told apart by the frame type rather than by a field
+/// one of them leaves empty.
 pub fn parse_frame(raw: &str) -> Result<Incoming> {
     let frame: Value = serde_json::from_str(raw).context("the mailbox sent a frame that is not JSON")?;
-    if frame.get("type").and_then(Value::as_str) != Some("message") {
+    if !matches!(frame.get("type").and_then(Value::as_str), Some("message" | "order")) {
         return Ok(Incoming::Ignored);
     }
     let token = frame
@@ -155,8 +158,8 @@ mod tests {
     use crate::api::Kind;
     use tokio::net::TcpListener;
 
-    const MESSAGE: &str = r#"{"type":"message","token":"","message":{"messageId":"m-1","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"ship it","createdAt":1}}"#;
-    const ORDER: &str = r#"{"type":"message","token":"t-order","message":{"messageId":"m-2","kind":"order","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"rerun the migration","createdAt":1}}"#;
+    const MESSAGE: &str = r#"{"type":"message","message":{"messageId":"m-1","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"ship it","createdAt":1,"expiresAt":1}}"#;
+    const ORDER: &str = r#"{"type":"order","token":"t-order","message":{"messageId":"m-2","kind":"order","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"rerun the migration","createdAt":1,"expiresAt":1}}"#;
 
     #[test]
     fn the_endpoint_becomes_the_listen_url() {

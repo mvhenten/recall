@@ -1,17 +1,5 @@
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import {
-  CLOSE_REVOKED,
-  type Mailbox,
-  type Message,
-  type MessageFrame,
-  ORDERS,
-  ORDERS_HEADER,
-  type Sent,
-  SWEEP_INTERVAL_MS,
-  SWEPT_AT,
-} from "../src/mailbox";
+import { CLOSE_REVOKED, type Message, type NewsFrame, ORDERS, ORDERS_HEADER, type Sent } from "../src/mailbox";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -19,11 +7,8 @@ type Harness = Awaited<ReturnType<typeof harness>>;
 interface Listener {
   socket: WebSocket;
   received: Message[];
-  tokens: string[];
   closed: number[];
 }
-
-const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
 const deviceId = async (client: Client, name: string): Promise<string> => {
   const response = await client.request("GET", "/v1/devices");
@@ -62,11 +47,10 @@ const listen = async (h: Harness, token: string): Promise<Listener> => {
   const socket = response.webSocket;
   if (!socket) throw new Error("the listen upgrade carried no socket");
   socket.accept();
-  const listener: Listener = { socket, received: [], tokens: [], closed: [] };
+  const listener: Listener = { socket, received: [], closed: [] };
   socket.addEventListener("message", (event) => {
-    const frame: MessageFrame = JSON.parse(String(event.data));
+    const frame: NewsFrame = JSON.parse(String(event.data));
     listener.received.push(frame.message);
-    listener.tokens.push(frame.token);
   });
   socket.addEventListener("close", (event) => listener.closed.push(event.code));
   return listener;
@@ -103,22 +87,16 @@ describe("messages listen", () => {
     await eventually(() => second.received.length === 1, "the push to the second socket");
     expect(ids(second.received)).toEqual([red.message.messageId]);
     expect(ids(first.received)).toEqual([green.message.messageId, red.message.messageId]);
-    // Only an order is answered, so news goes out under no claim for a receipt to quote.
-    expect(first.tokens).toEqual(["", ""]);
   });
 
-  // The sweep is the only thing the alarm is for, and the only thing that closes the socket of a
-  // device whose login is gone.
-  it("closes the socket of a revoked device on its quarter-hourly pass", async () => {
+  // The revocation closes the sockets itself, so a device loses the bus the moment it loses its
+  // login rather than on a pass that notices later.
+  it("closes the socket of a revoked device as the login goes", async () => {
     const h = await harness();
-    const { userId, laptop, desktopToken, desktopId } = await account(h);
+    const { laptop, desktopToken, desktopId } = await account(h);
     const desktop = await listen(h, desktopToken);
 
     expect((await laptop.request("DELETE", `/v1/devices/${desktopId}`)).status).toBe(204);
-    await runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) =>
-      state.storage.put(SWEPT_AT, Date.now() - SWEEP_INTERVAL_MS - 1),
-    );
-    expect(await runDurableObjectAlarm(mailboxOf(userId))).toBe(true);
 
     await eventually(() => desktop.closed.includes(CLOSE_REVOKED), "the revoked socket closing");
   });

@@ -131,6 +131,16 @@ pub struct Registered {
 
 pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the service waits for the receipt naming the session that took an order. It mirrors
+/// `TAKER_WINDOW_MS` in src/mailbox.ts, and the two have to agree: a session that takes an order
+/// after the service has given up runs work its sender was already told nobody started.
+pub const TAKER_WINDOW: Duration = Duration::from_secs(10);
+
+/// What the walk over this host's sessions may spend: the window less one write timeout, so the
+/// receipt is written while the send is still waiting even when the last session the walk tries
+/// runs that timeout out.
+pub const ORDER_WALK: Duration = TAKER_WINDOW.saturating_sub(DELIVER_TIMEOUT);
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Fanout {
     pub delivered: usize,
@@ -387,22 +397,22 @@ async fn send(registered: &Registered, body: &str) -> Result<()> {
 /// A session that has stopped reading its socket is treated as one that refused the message.
 /// The pump awaits delivery inside the same select! that drives its heartbeat, so a wedged
 /// Claude would otherwise take the whole host's mailbox connection down with it.
-async fn write_frames(registered: &Registered, body: &str) -> Result<()> {
-    tokio::time::timeout(DELIVER_TIMEOUT, send(registered, body))
+async fn write_frames(registered: &Registered, body: &str, limit: Duration) -> Result<()> {
+    tokio::time::timeout(limit, send(registered, body))
         .await
         .with_context(|| {
             format!(
-                "{} did not take the message within {} seconds",
+                "{} did not take the message within {}ms",
                 registered.inbox.socket.display(),
-                DELIVER_TIMEOUT.as_secs()
+                limit.as_millis()
             )
         })?
 }
 
-/// A socket that refuses the write loses its registration; the message is acked either way,
-/// because the mailbox has no better host to hand it to.
-async fn write_or_prune(registered: &Registered, body: &str, fanout: &mut Fanout) {
-    match write_frames(registered, body).await {
+/// A socket that refuses the write loses its registration, since nothing else will carry the
+/// message to it.
+async fn write_or_prune(registered: &Registered, body: &str, limit: Duration, fanout: &mut Fanout) {
+    match write_frames(registered, body, limit).await {
         Ok(()) => fanout.delivered += 1,
         Err(_) => {
             let _ = std::fs::remove_file(&registered.path);
@@ -425,7 +435,7 @@ fn addressable(dir: &Path) -> Vec<Registered> {
 async fn write_all(registrations: Vec<Registered>, body: &str) -> Fanout {
     let mut fanout = Fanout::default();
     for registered in registrations {
-        write_or_prune(&registered, body, &mut fanout).await;
+        write_or_prune(&registered, body, DELIVER_TIMEOUT, &mut fanout).await;
     }
     fanout
 }
@@ -450,13 +460,30 @@ pub enum Placed {
 /// Delivers an order to the one session that should act on it: the newest registered now, by the
 /// same rule `to_host` picks its sessions by. A session that will not take the write loses its
 /// registration and the next one is offered the order, since no other connection will ever see it.
+///
+/// The walk spends at most `ORDER_WALK`, and a session is only offered the order while what is
+/// left of that budget still covers the write. Past it the order is retired here: the sender is
+/// about to be told nobody took it, and a session taking it after that would run work its sender
+/// believes never started.
 pub async fn to_one(dir: &Path, body: &str) -> Placed {
+    let deadline = Instant::now() + ORDER_WALK;
     for registered in addressable(dir) {
-        if place(&registered, body).await {
+        let Some(limit) = left(deadline) else {
+            return Placed::Retired;
+        };
+        if place(&registered, body, limit).await {
             return Placed::Taken(registered.session_id);
         }
     }
     Placed::Retired
+}
+
+/// How long is left of the walk's budget, or nothing once it is spent.
+fn left(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(DELIVER_TIMEOUT))
 }
 
 /// Delivers an order to the one session it names. A session this host cannot address, or one that
@@ -468,15 +495,15 @@ pub async fn to_one_session(dir: &Path, session_id: &str, body: &str) -> Placed 
     else {
         return Placed::Retired;
     };
-    if place(&registered, body).await {
+    if place(&registered, body, DELIVER_TIMEOUT).await {
         return Placed::Taken(registered.session_id);
     }
     Placed::Retired
 }
 
-async fn place(registered: &Registered, body: &str) -> bool {
+async fn place(registered: &Registered, body: &str, limit: Duration) -> bool {
     let mut fanout = Fanout::default();
-    write_or_prune(registered, body, &mut fanout).await;
+    write_or_prune(registered, body, limit, &mut fanout).await;
     fanout.delivered == 1
 }
 
@@ -491,7 +518,7 @@ pub async fn to_session(dir: &Path, session_id: &str, body: &str) -> Fanout {
     else {
         return fanout;
     };
-    write_or_prune(&registered, body, &mut fanout).await;
+    write_or_prune(&registered, body, DELIVER_TIMEOUT, &mut fanout).await;
     fanout
 }
 
@@ -778,6 +805,18 @@ mod tests {
             accepting.await.unwrap().len(),
             1,
             "exactly one of the three inboxes is written to"
+        );
+    }
+
+    /// The service gives up on an order `TAKER_WINDOW` after it pushed it and tells the sender
+    /// nobody took it. The walk has to be over by then, write timeout included, or a session takes
+    /// an order whose sender has already been told it failed.
+    #[test]
+    fn the_order_walk_and_the_write_it_ends_on_fit_inside_the_window_the_service_waits() {
+        assert!(!ORDER_WALK.is_zero(), "the walk has to be allowed one session");
+        assert!(
+            ORDER_WALK + DELIVER_TIMEOUT <= TAKER_WINDOW,
+            "{ORDER_WALK:?} of walking plus {DELIVER_TIMEOUT:?} of writing must fit in {TAKER_WINDOW:?}"
         );
     }
 

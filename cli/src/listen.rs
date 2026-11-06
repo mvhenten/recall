@@ -224,7 +224,7 @@ async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) -> Opt
     let started = Instant::now();
     let body = delivered_body(message);
     match message.kind {
-        Kind::Order => Some(order(message, sessions_dir, seen, &body, started).await),
+        Kind::Order => Some(order(message, sessions_dir, &body, started).await),
         Kind::News => {
             if seen.contains(&message.message_id) {
                 log(&format!("message:replayed:{}", message.message_id), started.elapsed());
@@ -255,14 +255,13 @@ async fn news(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &st
     );
 }
 
-async fn order(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) -> Reply {
+async fn order(message: &Message, sessions_dir: &Path, body: &str, started: Instant) -> Reply {
     let placed = if message.to_session_id.is_empty() {
         sessions::to_one(sessions_dir, body).await
     } else {
         sessions::to_one_session(sessions_dir, &message.to_session_id, body).await
     };
     let id = &message.message_id;
-    seen.record(id);
     let (outcome, reply) = match placed {
         sessions::Placed::Taken(session_id) => (format!("taken:{session_id}"), Reply::Took(session_id)),
         sessions::Placed::Retired => ("retired".to_string(), Reply::NoTaker),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
-import { MAX_BODY_BYTES, type Message, type MessageFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
+import { MAX_BODY_BYTES, type Message, type NewsFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
 import { SESSION_TTL_MS } from "../src/model";
 import { followedBatch, type Plan, type Reach, type Read } from "../src/transcript-plan";
 import { type Client, harness } from "./harness";
@@ -40,7 +40,7 @@ const attach = async (h: Harness, token: string): Promise<WebSocket> => {
 const framesOn = (socket: WebSocket): Message[] => {
   const received: Message[] = [];
   socket.addEventListener("message", (event) => {
-    received.push((JSON.parse(String(event.data)) as MessageFrame).message);
+    received.push((JSON.parse(String(event.data)) as NewsFrame).message);
   });
   return received;
 };
@@ -508,9 +508,9 @@ describe("the send box", () => {
     // page it lands on says it once and the reload after it does not.
     const landed = await open(h, path, you.assertion, cookieFrom(sent));
     expect(landed.status).toBe(200);
-    expect(await landed.text()).toContain("Queued for");
+    expect(await landed.text()).toContain("Sent to");
     expect(cookieFrom(landed)).not.toContain("9f8a1b2c");
-    expect(await read(h, path, you.assertion)).not.toContain("Queued for");
+    expect(await read(h, path, you.assertion)).not.toContain("Sent to");
   });
 
   // Two session pages open at once, or a Labels tab beside one, must not invalidate each other's
@@ -521,7 +521,6 @@ describe("the send box", () => {
     expect((await you.laptop.sync("9f8a1b2c")).status).toBe(204);
     expect((await you.laptop.sync("beefbeef")).status).toBe(204);
     const first = await form(h, "/dashboard/sessions/9f8a1b2c", you.assertion);
-    await attach(h, you.token);
 
     const second = await open(h, "/dashboard/sessions/beefbeef", you.assertion, first.cookie);
     expect(second.status).toBe(200);
@@ -578,7 +577,6 @@ describe("the send box", () => {
     expect((await you.laptop.sync("deadbeef")).status).toBe(204);
     const path = "/dashboard/sessions/deadbeef";
     const { csrf, cookie } = await form(h, path, you.assertion);
-    await attach(h, you.token);
 
     h.tick(7 * 3_600_000);
     const idle = await read(h, path, you.assertion);
