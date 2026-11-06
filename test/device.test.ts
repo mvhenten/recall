@@ -229,7 +229,7 @@ describe("approval page", () => {
   });
 
   it("answers 500, not 401, when the Access signing keys cannot be fetched", async () => {
-    const h = await harness("down");
+    const h = await harness({ keys: "down" });
     const started = await h.startDevice();
     const response = await h.openApproval(started.user_code, await h.assertionFor(email("alice")));
     expect(response.status).toBe(500);
@@ -333,7 +333,7 @@ describe("device code limits", () => {
   });
 
   it("caps unexpired codes overall, whatever the client address", async () => {
-    const h = await harness("up", { perClient: 5, total: 3 });
+    const h = await harness({ deviceCodeLimits: { perClient: 5, total: 3 } });
     const statuses: number[] = [];
     for (let i = 0; i < 4; i++) statuses.push((await h.requestDevice("laptop", crypto.randomUUID())).status);
     expect(statuses.filter((status) => status === 200).length).toBeLessThanOrEqual(3);

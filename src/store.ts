@@ -147,11 +147,15 @@ const readCursorJson = (cursor: string): unknown => {
   }
 };
 
-// The empty cursor is page one, which for a descending order is a value no row can be above and
-// for an ascending one a value no row can be below. The two-element shape is the one the dashboard
-// has always issued, so a bookmarked page link from before this still decodes and pages.
+// Page one: for a descending order a value no row can be above, for an ascending one a value no
+// row can be below.
+export const startCursor = (direction: "desc" | "asc"): Cursor =>
+  direction === "desc" ? [Number.MAX_SAFE_INTEGER, ""] : ["", ""];
+
+// The empty cursor is page one. The two-element shape is the one the dashboard has always issued,
+// so a bookmarked page link from before this still decodes and pages.
 export const decodeCursor = (cursor: string, direction: "desc" | "asc"): Cursor | null => {
-  if (cursor === "") return direction === "desc" ? [Number.MAX_SAFE_INTEGER, ""] : ["", ""];
+  if (cursor === "") return startCursor(direction);
   const parsed = readCursorJson(cursor);
   if (!Array.isArray(parsed) || typeof parsed[1] !== "string") return null;
   const at = parsed[0];

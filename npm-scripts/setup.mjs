@@ -6,7 +6,8 @@
 //
 // Options: --email again for more addresses, --account <id> (when the token sees
 // several), --name <worker> (default recall), --artifact-hostname
-// <pages.example.com> to publish pages on a second host, --dry-run.
+// <pages.example.com> to publish pages on a second host, --mcp-connector to
+// serve the MCP connector at <hostname>/mcp, --dry-run.
 // The token is read from the environment only and never printed.
 
 import { spawnSync } from "node:child_process";
@@ -31,6 +32,7 @@ const { values: options } = parseArgs({
   options: {
     hostname: { type: "string" },
     "artifact-hostname": { type: "string" },
+    "mcp-connector": { type: "boolean", default: false },
     user: { type: "string" },
     email: { type: "string", multiple: true, default: [] },
     account: { type: "string" },
@@ -43,6 +45,7 @@ const usage =
 const token = process.env.CLOUDFLARE_API_TOKEN || die(`CLOUDFLARE_API_TOKEN is not set\n${usage}`);
 const { hostname, user, name } = options;
 const artifactHostname = options["artifact-hostname"] ?? "";
+const mcpConnector = options["mcp-connector"];
 const emails = options.email.map((email) => email.trim().toLowerCase());
 if (!hostname || !user || emails.length === 0) die(usage);
 if (artifactHostname === hostname) die("--artifact-hostname is a second host, so it cannot be --hostname");
@@ -199,6 +202,30 @@ const approvers = await upsertPolicy(
   (existing) => (existing.include ?? []).length === approverEmails.length,
 );
 
+// One service token for this user, named for the user it acts for. Its secret is shown by
+// Cloudflare once, at creation, and is never read or printed here: rotate the token in the
+// dashboard to get a secret you can paste into the desktop app.
+const connectorTokenName = `${name}-${user}-connector`;
+const connectorToken = mcpConnector
+  ? ((await list(`${account}/access/service_tokens`)).find((entry) => entry.name === connectorTokenName) ??
+    (await create(`Access service token ${connectorTokenName}`, () =>
+      cf("POST", `${account}/access/service_tokens`, { name: connectorTokenName, duration: "forever" }),
+    )))
+  : null;
+
+const connectorPolicyName = `${name} connector tokens`;
+const connectorPolicy = connectorToken
+  ? await upsertPolicy(
+      connectorPolicyName,
+      {
+        name: connectorPolicyName,
+        decision: "non_identity",
+        include: [{ service_token: { token_id: connectorToken.id } }],
+      },
+      (existing) => (existing.include ?? []).some((rule) => rule.service_token?.token_id === connectorToken.id),
+    )
+  : null;
+
 const apps = await list(`${account}/access/apps`);
 const upsertApp = async (domain, body) => {
   const existing = apps.find((app) => app.domain === domain);
@@ -256,6 +283,23 @@ const artifactApp =
         policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
       });
 
+const mcpDomain = `${hostname}/mcp`;
+const mcpApp = mcpConnector
+  ? await upsertApp(mcpDomain, {
+      name: `${name} connector`,
+      type: "self_hosted",
+      session_duration: "24h",
+      app_launcher_visible: false,
+      allowed_idps: otp ? [otp.id] : [],
+      service_auth_401_redirect: true,
+      destinations: [{ type: "public", uri: mcpDomain }],
+      policies: [
+        ...(connectorPolicy ? [{ id: connectorPolicy.id, precedence: 1 }] : []),
+        ...(approvers ? [{ id: approvers.id, precedence: 2 }] : []),
+      ],
+    })
+  : null;
+
 if (dryRun) {
   say(`would deploy the Worker ${name} to ${hostname}`);
   process.exit(0);
@@ -311,6 +355,12 @@ const config = {
           DASHBOARD_HOSTNAME: hostname,
         }
       : {}),
+    ...(mcpApp && connectorToken
+      ? {
+          MCP_ACCESS_AUD: mcpApp.aud,
+          MCP_SERVICE_CLIENTS: JSON.stringify({ [connectorToken.client_id]: user }),
+        }
+      : {}),
   },
 };
 mkdirSync(WORK, { recursive: true });
@@ -339,8 +389,15 @@ const probe = async () => {
       redirect: "manual",
       signal: AbortSignal.timeout(15_000),
     }).catch((error) => ({ status: 0, statusText: error.message }));
-    if (response.status === 401)
+    if (response.status === 401) {
+      if (mcpApp && connectorToken) {
+        say(`connector URL: https://${hostname}/mcp, as Access service token ${connectorToken.client_id}`);
+        say(
+          `rotate ${connectorTokenName} under Zero Trust, Access, Service Auth to read its Client Secret; setup never prints it`,
+        );
+      }
       return say(`https://${hostname} answers; on each host run: recall login --endpoint https://${hostname}`);
+    }
     if (Date.now() + delay > deadline) {
       return say(
         `https://${hostname} still answers ${response.status}; Access and the certificate can take a few minutes, then run: recall login --endpoint https://${hostname}`,

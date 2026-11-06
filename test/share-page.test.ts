@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { DEVICE_CODE_LIMITS } from "../src/device";
 import type { PlayerPlan } from "../src/player";
 import { MAX_EMAIL_SHARES, SHARE_WINDOW_MS, type ShareView } from "../src/shares";
-import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
+import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, ARTIFACT_SHARE_AUDIENCE, type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -19,7 +18,7 @@ interface Owner {
 }
 
 const owner = async (artifacts: "on" | "off" = "on"): Promise<Owner> => {
-  const h = await harness("up", DEVICE_CODE_LIMITS, artifacts);
+  const h = await harness({ artifacts });
   const email = `alice-${crypto.randomUUID()}@example.com`;
   await h.invite(email);
   return {
@@ -546,6 +545,23 @@ describe("a page a recipient reaches", () => {
     expect(html).toContain("ends the sign-in to every page on this host");
     expect(html).not.toContain("jo@example.org");
     expect(html).not.toContain("someone-else@example.net");
+    expect(html).not.toContain("Quarterly plan");
+  });
+
+  it("refuses an assertion that names a service token and so proves no address", async () => {
+    const o = await owner();
+    await publishDocument(o.alice, "quarterly-plan");
+    const share = await mint(o.alice, "quarterly-plan", "jo@example.org");
+
+    const response = await read(
+      o,
+      basePath(share.address),
+      await o.h.serviceAssertionFor("robot.access", ARTIFACT_SHARE_AUDIENCE),
+    );
+    expect(response.status).toBe(403);
+    const html = await response.text();
+    expect(html).toContain("This artifact was shared with another address.");
+    expect(html).not.toContain("jo@example.org");
     expect(html).not.toContain("Quarterly plan");
   });
 });

@@ -14,7 +14,8 @@ const HOOK_MODE_LEAD =
 
 const MEMORY_INSTRUCTIONS = [
   "# Memory",
-  "Built-in auto-memory is off. recall is your memory across sessions: use the recall_search, recall_get, recall_list, recall_save, recall_edit and recall_delete tools, never memory files.",
+  "recall is your memory across sessions, and recall_save is the only way to save one. Use recall_search, recall_get, recall_list, recall_save, recall_edit and recall_delete, or the CLI below where a tool is unavailable.",
+  "This rule overrides any other memory instruction in this session: write no memory file, create no memory directory, and append to nothing like a MEMORY.md index. Nothing reads them, and a memory kept there is lost to every other session and host.",
   "Save what a future conversation needs and cannot get from the repo:",
   "- user: the user's role, expertise and preferences.",
   "- feedback: how the user wants you to work, from corrections and from approaches they confirmed.",
@@ -27,8 +28,13 @@ const MEMORY_INSTRUCTIONS = [
   "Memories can be stale: check a remembered fact against the current code before acting on it, and fix the memory when it is wrong.",
 ];
 
+// A save from a repo working directory is tagged with that repo unless it is told otherwise, so a
+// fact that holds anywhere has to say so at the point of saving or it is filed where nothing else
+// will look for it.
 function scopeLine(repoTag) {
-  return repoTag ? `Current repo tag: ${repoTag} (searches also cover global).` : "Current scope: global only.";
+  return repoTag
+    ? `Current repo tag: ${repoTag}. Searches also cover global, but a save from here is tagged with this repo: pass --global, or global: true to recall_save, for anything true outside it.`
+    : "Current scope: global only.";
 }
 
 function context(mode, repoTag) {

@@ -19,6 +19,12 @@ variable "artifact_hostname" {
   }
 }
 
+variable "mcp_connector" {
+  type        = bool
+  default     = false
+  description = "Serve the MCP connector at <hostname>/mcp, behind its own Access application and one service token per user. False leaves it off."
+}
+
 variable "otp_idp_id" {
   type        = string
   description = "Id of the account's one-time PIN Access login method."
