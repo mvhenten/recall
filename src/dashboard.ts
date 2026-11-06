@@ -53,6 +53,7 @@ import {
   usageMonth,
 } from "./model";
 import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE, sizeText, TOKENS } from "./page";
+import type { ShareView } from "./shares";
 import { type Follow, gapsIn, listedRuns, type Plan, type Run, type Listing as RunListing } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
 import { MAIN_FILE } from "./transcripts";
@@ -1728,6 +1729,48 @@ export const artifactsPage = (email: string, live: Live, url: URL, published: Pu
     artifactMeta(artifacts.length, counts, query !== "" || type !== ""),
     listingMain(url, listing),
   );
+};
+
+export const SHARES_SEGMENT = "shares";
+
+export const sharesPath = (name: string): string =>
+  `${ARTIFACTS_TAB.path}/${encodeURIComponent(name)}/${SHARES_SEGMENT}`;
+
+// What the share page has to say for itself after a mutation, and nothing when it has nothing.
+export type ShareFlash = { tone: "done"; text: string } | { tone: "refused"; text: string };
+
+// The address a mutation minted, printed on that one response. A link share's token exists here and
+// nowhere else, which is why the block carries the whole address and never a shortened one.
+export type Minted =
+  | { mode: "link"; address: string; expiresAt: number }
+  | { mode: "email"; address: string; recipient: string; expiresAt: number };
+
+// A question the page is asking. Each rides the query, so each is bookmarkable and Back dismisses
+// it; a revoke naming no live share is not an ask at all, and the page says so in its flash.
+export type ShareAsk =
+  | { kind: "relink" }
+  | { kind: "revoke"; share: ShareView }
+  | { kind: "revoke-all"; count: number };
+
+export interface SharePage {
+  artifact: ArtifactView;
+  shares: ShareView[];
+  csrf: string;
+  flash: ShareFlash | null;
+  minted: Minted | null;
+  ask: ShareAsk | null;
+  emailDraft: string;
+  emailFull: boolean;
+  now: number;
+}
+
+// Three answers the share page gives, and only the third holds an artifact: a deployment that
+// binds no share audience and an artifact another account owns both print the name the reader
+// typed and nothing else about it.
+export type Shares = { kind: "off" } | { kind: "foreign" } | { kind: "page"; page: SharePage };
+
+export const sharesPage = (email: string, live: Live, url: URL, shares: Shares): Response => {
+  throw new Error(`the share page is not built yet: ${shares.kind} at ${url.pathname} for ${email} ${live.sessions}`);
 };
 
 const labelRows = (kind: LabelKind, values: string[], names: Map<string, string>): string =>

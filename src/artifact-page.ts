@@ -2,17 +2,33 @@ import { type ArtifactFile, type ArtifactRecord, RAW_INLINE_BYTES } from "./arti
 import { ARTIFACT_PAGE_CSP, ARTIFACT_PLAYER_CSP, escapeHtml, htmlPage, sizeText, TOKENS } from "./page";
 import type { PlayerPlan } from "./player";
 import { PLAYER_SCRIPT } from "./player-view.generated";
+import { PLAYER_SEGMENT } from "./shares";
 
 // A document this long is not rendered: the bare address answers the raw view instead, and the
 // raw page names the ceiling, the document's own size and the fix. One constant, so changing the
 // number changes one string.
 export const RENDER_CEILING_BYTES = 2 * 1024 * 1024;
 
-// The script the player runs. It sits outside every artifact's address space because a name is a
-// kebab-case slug and cannot hold a dot, so no artifact can ever answer here.
-export const PLAYER_SCRIPT_PATH = "/player.js";
-
 export const RAW_VIEW = "raw";
+
+// Where the page sits and who is reading it. Every address the module draws is built from `base`:
+// an owner's page passes `/a/<name>` and a shared page passes `/link/<token>` or `/email/<id>`, so
+// the three are values of one parameter rather than three cases.
+export interface ArtifactChrome {
+  base: string;
+  audience: Audience;
+}
+
+// The band is one slot with one tenant, and the type is what makes that true: a recipient's page
+// carries no dashboard address at all, so it cannot print the link even by mistake.
+export type Audience =
+  | { kind: "owner"; shares: number; sharesUrl: string; dashboard: string }
+  | { kind: "account"; dashboard: string }
+  | { kind: "recipient"; expiresAt: number };
+
+// What a recipient can be refused with. `gone` answers every dead share alike, `elsewhere` answers
+// a proven address the share does not name, and `method` answers anything but a GET.
+export type ShareRefusal = { kind: "gone" } | { kind: "elsewhere"; signInAgain: string } | { kind: "method" };
 
 const STYLE = `${TOKENS}
 *{box-sizing:border-box}
@@ -83,11 +99,13 @@ a{color:var(--accent)}
 interface Frame {
   title: string;
   badge: string;
+  band: string;
   main: string;
   status: number;
   csp: string;
   column: string;
   pinned: string;
+  referrer: string;
 }
 
 const page = (frame: Frame): Response =>
@@ -97,17 +115,30 @@ const page = (frame: Frame): Response =>
     STYLE,
     `<header class="abar"><p class="brand"><i></i>recall</p>${
       frame.badge === "" ? "" : `<span class="badge">${escapeHtml(frame.badge)}</span>`
-    }</header><main class="wrap${frame.column}">${frame.main}</main>${frame.pinned}`,
-    { "content-security-policy": frame.csp, "cache-control": "private, no-cache" },
+    }</header>${frame.band}<main class="wrap${frame.column}">${frame.main}</main>${frame.pinned}`,
+    {
+      "content-security-policy": frame.csp,
+      "cache-control": "private, no-cache",
+      "referrer-policy": frame.referrer,
+    },
   );
+
+// A token never leaves in a header, so a page under a share prefix sends no referrer at all where
+// recall's own pages send the origin.
+const referrerFor = (audience: Audience): string => (audience.kind === "recipient" ? "no-referrer" : "same-origin");
 
 const dashboardLink = (dashboard: string): string =>
   `<p><a href="${escapeHtml(dashboard)}" target="_blank" rel="noreferrer">The recall dashboard</a></p>`;
 
-const footer = (record: ArtifactRecord, dashboard: string): string =>
-  `<footer class="afoot"><p>${escapeHtml(
+// Each of the footer's three parts — the name, both permissions and the dashboard — is forbidden on
+// a shared page, so a recipient's page ends with the body rather than carrying a stripped footer.
+// The audience carrying no dashboard address is what makes that structural.
+const footer = (record: ArtifactRecord, audience: Audience): string => {
+  if (audience.kind === "recipient") return "";
+  return `<footer class="afoot"><p>${escapeHtml(
     `${record.name} · read ${record.read} · write ${record.write}`,
-  )}</p>${dashboardLink(dashboard)}</footer>`;
+  )}</p>${dashboardLink(audience.dashboard)}</footer>`;
+};
 
 const entryOf = (record: ArtifactRecord): ArtifactFile => {
   const entry = record.files.find((file) => file.path === record.entryPath) ?? record.files[0];
@@ -122,8 +153,8 @@ const heading = (record: ArtifactRecord, meta: string): string =>
     record.description === "" ? "" : `<p class="adesc">${escapeHtml(record.description)}</p>`
   }<p class="ameta">${escapeHtml(meta)}</p>`;
 
-const views = (record: ArtifactRecord, raw: boolean, renders: boolean): string => {
-  const address = `/${encodeURIComponent(record.name)}`;
+const views = (base: string, raw: boolean, renders: boolean): string => {
+  const address = escapeHtml(base);
   const rendered = renders
     ? `<a href="${address}"${raw ? "" : ' aria-current="page"'}>Rendered</a>`
     : "<span>Rendered</span>";
@@ -132,28 +163,36 @@ const views = (record: ArtifactRecord, raw: boolean, renders: boolean): string =
   }>Raw</a></p>`;
 };
 
-const documentMeta = (record: ArtifactRecord): string =>
-  `${sizeText(entryOf(record).bytes)} · published ${moment(record.updatedAt)} · ${record.lastWriter}`;
+// The last writer is an email address, so a shared page drops it and keeps the size and the publish
+// time every page prints.
+const metaLine = (audience: Audience, record: ArtifactRecord, head: string): string =>
+  audience.kind === "recipient" ? head : `${head} · ${record.lastWriter}`;
+
+const documentMeta = (record: ArtifactRecord, audience: Audience): string =>
+  metaLine(audience, record, `${sizeText(entryOf(record).bytes)} · published ${moment(record.updatedAt)}`);
 
 // A document is recall's own HTML, rendered from the publisher's markdown, so it carries no script
 // at all and reads with scripts off. A document holding no text says so and keeps both view
 // controls, because the raw view's empty block is what proves the file was empty rather than the
 // renderer broken.
-export const documentPage = (record: ArtifactRecord, dashboard: string, rendered: string): Response => {
+export const documentPage = (record: ArtifactRecord, chrome: ArtifactChrome, rendered: string): Response => {
   const main =
     rendered.trim() === ""
       ? `<div class="empty"><b>${escapeHtml(`${record.name} holds no text.`)}</b><p>${escapeHtml(
           "The markdown published under this name is empty. Republish it with recall publish --replace to fill it in, or read the raw view to see the file as it was published.",
         )}</p></div>`
       : `<div class="doc">${rendered}</div>`;
+  const { audience } = chrome;
   return page({
     title: record.title,
     badge: record.type,
-    main: `${heading(record, documentMeta(record))}${views(record, false, true)}${main}${footer(record, dashboard)}`,
+    band: "",
+    main: `${heading(record, documentMeta(record, audience))}${views(chrome.base, false, true)}${main}${footer(record, audience)}`,
     status: 200,
     csp: ARTIFACT_PAGE_CSP,
     column: "",
     pinned: "",
+    referrer: referrerFor(audience),
   });
 };
 
@@ -164,14 +203,15 @@ export const documentPage = (record: ArtifactRecord, dashboard: string, rendered
 // notice points there rather than leaving a reader to guess the view is complete.
 export const rawDocumentPage = (
   record: ArtifactRecord,
-  dashboard: string,
+  chrome: ArtifactChrome,
   source: string,
   capped: boolean,
 ): Response => {
   const entry = entryOf(record);
+  const { audience } = chrome;
   const { bytes } = entry;
   const over = bytes > RENDER_CEILING_BYTES;
-  const address = `/${encodeURIComponent(record.name)}/${entry.path}`;
+  const address = `${chrome.base}/f/${entry.path}`;
   const notice = over
     ? `<div class="notice"><b>${escapeHtml("This document is too long to render.")}</b><p>${escapeHtml(
         `recall renders a document of up to ${sizeText(RENDER_CEILING_BYTES)} and this one is ${sizeText(bytes)}, so its address answers the raw view. Split it into smaller files and republish to read it rendered.`,
@@ -185,13 +225,15 @@ export const rawDocumentPage = (
   return page({
     title: record.title,
     badge: record.type,
-    main: `${heading(record, documentMeta(record))}${views(record, true, !over)}${notice}${cut}<pre class="src">${escapeHtml(
+    band: "",
+    main: `${heading(record, documentMeta(record, audience))}${views(chrome.base, true, !over)}${notice}${cut}<pre class="src">${escapeHtml(
       source,
-    )}</pre>${footer(record, dashboard)}`,
+    )}</pre>${footer(record, audience)}`,
     status: 200,
     csp: ARTIFACT_PAGE_CSP,
     column: "",
     pinned: "",
+    referrer: referrerFor(audience),
   });
 };
 
@@ -199,13 +241,17 @@ const GONE_TAG = "UNAVAILABLE";
 
 const GONE_WHY = "Storage holds no file at this path, so this track cannot play. Republish the artifact to restore it.";
 
+// A recipient cannot republish, so the row names the one person who can do anything about it.
+const SHARED_GONE_WHY =
+  "Storage holds no file at this path, so this track cannot play. Ask whoever sent you this address about it.";
+
 // An entry the manifest names and storage does not hold keeps a focusable control carrying
 // aria-disabled: a disabled control drops out of the tab order, which hides the broken track from
 // a reader who never sees the row.
-const trackRow = (file: ArtifactFile, index: number, gone: boolean): string =>
+const trackRow = (file: ArtifactFile, index: number, gone: boolean, shared: boolean): string =>
   `<li class="trow${gone ? " gone" : ""}" id="tr${index}">
 <span class="no">${String(index + 1).padStart(2, "0")}</span><span class="nm">${escapeHtml(file.path)}</span><span class="sz">${escapeHtml(sizeText(file.bytes))}</span><button type="button" data-track="${index}"${gone ? ' aria-disabled="true"' : ""}>Play</button>
-<span class="tg" id="tg${index}">${gone ? GONE_TAG : ""}</span><p class="why" id="wy${index}">${gone ? escapeHtml(`${file.path}. ${GONE_WHY}`) : ""}</p></li>`;
+<span class="tg" id="tg${index}">${gone ? GONE_TAG : ""}</span><p class="why" id="wy${index}">${gone ? escapeHtml(`${file.path}. ${shared ? SHARED_GONE_WHY : GONE_WHY}`) : ""}</p></li>`;
 
 // Always drawn, at rest as well as playing: a bar that appeared on the first play would shift the
 // track list down under the reader's cursor.
@@ -224,29 +270,36 @@ const planJson = (plan: PlayerPlan): string => JSON.stringify(plan).replaceAll("
 // The track bytes stream: one audio element whose src is the file's own address, so the browser
 // issues its own range requests and a seek never waits for the whole file to arrive. The page
 // carries the manifest and the state machine runs in the bundle.
-export const playerPage = (record: ArtifactRecord, dashboard: string, missing: readonly string[]): Response => {
+export const playerPage = (record: ArtifactRecord, chrome: ArtifactChrome, missing: readonly string[]): Response => {
   const gone = new Set(missing);
-  const meta = `${record.fileCount} ${record.fileCount === 1 ? "track" : "tracks"} · ${sizeText(
-    record.bytes,
-  )} · published ${moment(record.updatedAt)} · ${record.lastWriter}`;
+  const { audience } = chrome;
+  const meta = metaLine(
+    audience,
+    record,
+    `${record.fileCount} ${record.fileCount === 1 ? "track" : "tracks"} · ${sizeText(record.bytes)} · published ${moment(record.updatedAt)}`,
+  );
   const plan: PlayerPlan = {
-    base: `/${encodeURIComponent(record.name)}`,
+    base: chrome.base,
     tracks: record.files.map((file) => ({ path: file.path, gone: gone.has(file.path) })),
   };
-  const rows = record.files.map((file, index) => trackRow(file, index, gone.has(file.path))).join("");
+  const rows = record.files
+    .map((file, index) => trackRow(file, index, gone.has(file.path), audience.kind === "recipient"))
+    .join("");
   return page({
     title: record.title,
     badge: record.type,
+    band: "",
     main: `${heading(record, meta)}
 <ol class="tracks" role="list">${rows}</ol>
 <audio id="paudio" preload="metadata"></audio>
 <noscript><p class="notice">The player needs a script to run. Each track's own address streams its bytes, so a file reads with scripts off.</p></noscript>
 <script type="application/json" id="pplan">${planJson(plan)}</script>
-<script src="${PLAYER_SCRIPT_PATH}" defer></script>${footer(record, dashboard)}`,
+<script src="${escapeHtml(`${chrome.base}/${PLAYER_SEGMENT}`)}" defer></script>${footer(record, audience)}`,
     status: 200,
     csp: ARTIFACT_PLAYER_CSP,
     column: " player",
     pinned: TRANSPORT,
+    referrer: referrerFor(audience),
   });
 };
 
@@ -305,10 +358,18 @@ export const artifactNotice = (refusal: ArtifactRefusal, dashboard: string): Res
   return page({
     title,
     badge: "",
+    band: "",
     main: `${refusalBody(refusal)}${link}`,
     status,
     csp: ARTIFACT_PAGE_CSP,
     column: "",
     pinned: "",
+    referrer: "same-origin",
   });
+};
+
+// Everything recall answers a recipient with that is not a page. Each one names no artifact, no
+// owner and no address, so a reader learns only that the address does not work.
+export const shareNotice = (refusal: ShareRefusal): Response => {
+  throw new Error(`the share refusal ${refusal.kind} is not built yet`);
 };
