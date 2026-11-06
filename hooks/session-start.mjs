@@ -83,8 +83,10 @@ function registerSession(input, repoTag) {
 //
 // This is also where a session picks up its board messages: the injected context is the only hook
 // that runs at start, so what the pickup took leads the context and the memory crib follows it. A
-// pickup that failed or timed out takes nothing, and the next session's start reads the board
-// again, which is the board's whole point.
+// pickup that never reached the service takes nothing, and the next session's start reads the board
+// again. One that timed out after the service wrote the claim is read back by this same session,
+// since `SessionStart` fires again on resume and on compact and a pickup hands a session what it
+// already holds.
 async function run(input) {
   const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
   const repoTag = repo.ok ? repo.stdout.trim() : "";

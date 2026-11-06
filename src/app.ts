@@ -31,7 +31,7 @@ import {
   RAW_INLINE_BYTES,
   readArtifactFile,
 } from "./artifacts";
-import { addressOf, type BoardAddress, type BoardTaker, parsePost } from "./board";
+import { type BoardAddress, type BoardTaker, parsePost } from "./board";
 import { chunkTurns } from "./chunks";
 import {
   ARTIFACTS_TAB,
@@ -855,13 +855,13 @@ export const createApp = (deps: Deps): App => {
   };
 
   const postToBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
-    const input = parsePost(await readJson(request));
+    const input = parsePost(await readJson(request), caller.userId);
     if (!input.ok) return error(400, input.error);
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
     const now = deps.now();
-    const address = await addressFor(env.DB, caller.userId, addressOf(input.value.address, caller.userId));
+    const address = await addressFor(env.DB, caller.userId, input.value.address);
     if (address instanceof Response) return address;
     const from = await senderOf(env.DB, caller, input.value.fromSessionId, now);
     return json(
@@ -879,6 +879,10 @@ export const createApp = (deps: Deps): App => {
     );
   };
 
+  // The caller names the session taking the messages, and the claim is what settles whether that
+  // session is the caller's: a session-addressed message is only taken from the device that session
+  // runs on. The check lives in the claim rather than here because a session the hook has not
+  // synced yet must leave its message waiting instead of having the pickup refused.
   const pickUpBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
     const body = await readJson(request);
     const asked = isRecord(body) ? body.sessionId : undefined;

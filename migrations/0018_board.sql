@@ -7,12 +7,14 @@
 -- `scope` and `target` are the whole address, in the vocabulary `recall send` already resolves: a
 -- post to the fleet is addressed to the account, one to a host to its device id, one to a session
 -- to its session id. One pair rather than three columns that are each empty two thirds of the
--- time, and reading a session's board is one lookup over the three pairs it answers to.
+-- time, and reading a session's board is one lookup over the three pairs it answers to. The fleet's
+-- target is the account itself, which the CHECK holds the column to rather than leaving a fleet row
+-- that names a host representable.
 CREATE TABLE board_messages (
   user_id TEXT NOT NULL,
   message_id TEXT NOT NULL,
   scope TEXT NOT NULL CHECK (scope IN ('fleet', 'host', 'session')),
-  target TEXT NOT NULL,
+  target TEXT NOT NULL CHECK (scope <> 'fleet' OR target = user_id),
   from_device_id TEXT NOT NULL,
   from_host TEXT NOT NULL,
   from_name TEXT NOT NULL,

@@ -1,3 +1,4 @@
+import { MAX_BODY_BYTES } from "./mailbox";
 import { DAY_MS, fail, type Parsed, parseSessionId } from "./model";
 
 // How long a board message waits. Past this nobody reads it, so a post nobody ever booted into
@@ -6,10 +7,12 @@ import { DAY_MS, fail, type Parsed, parseSessionId } from "./model";
 export const BOARD_DAYS = 7;
 export const BOARD_WINDOW_MS = BOARD_DAYS * DAY_MS;
 
-// How many messages one pickup takes. A session start reads what it took as injected context, so
-// a fleet that posted all week must not land on one boot; the rest stay on the board for the next
-// session, which is the paradigm working rather than a loss.
-export const MAX_PICKUP = 10;
+// How much one pickup takes. A session start reads what it took as injected context, which then
+// rides every turn of that session, so the budget is bytes and not a count: a fleet that posted all
+// week must not lead one boot with a third of a megabyte. The rest stay on the board for the next
+// session, which is the paradigm working rather than a loss. One body's ceiling is the budget, so a
+// single message always fits.
+export const MAX_PICKUP_BYTES = MAX_BODY_BYTES;
 
 export const boardScopes = ["fleet", "host", "session"] as const;
 export type BoardScope = (typeof boardScopes)[number];
@@ -22,27 +25,14 @@ export interface BoardAddress {
   target: string;
 }
 
-// The address as a poster states it, before the service knows whose account it is. The fleet names
-// no target because the fleet is the account, which the caller's token is what settles.
-export type PostedAddress =
-  | { scope: "fleet" }
-  | { scope: "host"; deviceId: string }
-  | { scope: "session"; sessionId: string };
-
 // `fromSessionId` is the session the post is running inside, which the service turns into the
 // handle the board prints over the body. It is empty where the poster cannot say which session
 // asked, and the board then names its host alone, exactly as a bus message does.
 export interface BoardPost {
-  address: PostedAddress;
+  address: BoardAddress;
   fromSessionId: string;
   body: string;
 }
-
-export const addressOf = (posted: PostedAddress, userId: string): BoardAddress => {
-  if (posted.scope === "fleet") return { scope: "fleet", target: userId };
-  if (posted.scope === "host") return { scope: "host", target: posted.deviceId };
-  return { scope: "session", target: posted.sessionId };
-};
 
 // One row of `board_messages`. `fromHost` and `fromName` are resolved where the message is posted
 // and ride with it, exactly as a bus message's do, so a session reading one off the board looks
@@ -83,14 +73,17 @@ export interface BoardInput {
   createdAt: number;
 }
 
-const parseAddress = (input: Record<string, unknown>): Parsed<PostedAddress> => {
+// The fleet names no target because the fleet is the account, which the caller's token is what
+// settles; the other two scopes are addressed by the poster and checked against the account where
+// the post is taken.
+const parseAddress = (input: Record<string, unknown>, userId: string): Parsed<BoardAddress> => {
   const { scope, deviceId, sessionId } = input;
-  if (scope === "fleet") return { ok: true, value: { scope: "fleet" } };
+  if (scope === "fleet") return { ok: true, value: { scope: "fleet", target: userId } };
   if (scope === "host") {
     if (typeof deviceId !== "string" || deviceId.length < 1) {
       return fail("deviceId must be the id of a device on this account; see GET /v1/devices");
     }
-    return { ok: true, value: { scope: "host", deviceId } };
+    return { ok: true, value: { scope: "host", target: deviceId } };
   }
   if (scope !== "session") {
     return fail(
@@ -99,16 +92,16 @@ const parseAddress = (input: Record<string, unknown>): Parsed<PostedAddress> => 
   }
   if (typeof sessionId !== "string") return fail("sessionId must be the id of a session on this account");
   const parsed = parseSessionId(sessionId);
-  return parsed.ok ? { ok: true, value: { scope: "session", sessionId: parsed.value } } : parsed;
+  return parsed.ok ? { ok: true, value: { scope: "session", target: parsed.value } } : parsed;
 };
 
-export const parsePost = (input: unknown): Parsed<BoardPost> => {
+export const parsePost = (input: unknown, userId: string): Parsed<BoardPost> => {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return fail("body must be a JSON object");
   const fields = input as Record<string, unknown>;
   if (typeof fields.body !== "string" || fields.body.trim().length < 1) {
     return fail("body must hold at least one character");
   }
-  const address = parseAddress(fields);
+  const address = parseAddress(fields, userId);
   if (!address.ok) return address;
   const { fromSessionId } = fields;
   if (fromSessionId !== undefined && fromSessionId !== "") {
@@ -119,14 +112,3 @@ export const parsePost = (input: unknown): Parsed<BoardPost> => {
   }
   return { ok: true, value: { address: address.value, fromSessionId: "", body: fields.body } };
 };
-
-// Who the board says posted a message, in the one place that decides it. A host with a label reads
-// as its label, and a post that could not name the session it came from reads as its host alone.
-export const posterOf = (message: BoardMessage): string => {
-  const from = message.fromHost === "" ? message.fromDeviceId : message.fromHost;
-  return message.fromName === "" ? from : `${from}/${message.fromName}`;
-};
-
-// What a board message is addressed to, as a reader of the dashboard reads it.
-export const addressText = (message: BoardMessage): string =>
-  message.scope === "fleet" ? "the fleet" : `${message.scope} ${message.target}`;

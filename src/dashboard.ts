@@ -1,5 +1,5 @@
 import { type ArtifactType, type ArtifactView, artifactTypes } from "./artifacts";
-import { addressText, BOARD_DAYS, type BoardEntry, posterOf } from "./board";
+import { BOARD_DAYS, type BoardEntry, type BoardMessage } from "./board";
 import { donut, heatmap, horizontalBars, miniBars, type Series, stackedArea, stackedBars } from "./charts";
 import {
   ARTIFACT_SORTS,
@@ -2207,6 +2207,16 @@ const boardForm = (post: BoardPoster): string =>
     .join("")}</select>
 <textarea name="body" rows="4" required placeholder="What should the first session to read this do?" aria-label="Message to the board">${escapeHtml(post.draft)}</textarea>
 <button type="submit">Post</button></form>`;
+
+// Who the board says posted a message. A host with a label reads as its label, and a post that
+// could not name the session it came from reads as its host alone.
+const posterOf = (message: BoardMessage): string => {
+  const from = message.fromHost === "" ? message.fromDeviceId : message.fromHost;
+  return message.fromName === "" ? from : `${from}/${message.fromName}`;
+};
+
+const addressText = (message: BoardMessage): string =>
+  message.scope === "fleet" ? "the fleet" : `${message.scope} ${message.target}`;
 
 const boardRow = (entry: BoardEntry, now: number): string => {
   const { message } = entry;

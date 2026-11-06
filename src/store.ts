@@ -15,7 +15,7 @@ import {
   type BoardMessage,
   type BoardScope,
   type BoardTaker,
-  MAX_PICKUP,
+  MAX_PICKUP_BYTES,
 } from "./board";
 import type { Caller } from "./device";
 import {
@@ -1923,9 +1923,11 @@ const toBoardEntry = (row: BoardEntryRow): BoardEntry => {
   };
 };
 
-// What has fallen out of the window, taken out where the board is read and written rather than on a
-// schedule: nothing in this service makes a pass of its own. The pickups go first, because a row
-// there outliving its message would read as a message nobody can see having been taken.
+// What has fallen out of the window, taken out where the board is posted to rather than on a
+// schedule: nothing in this service makes a pass of its own. A read sweeps nothing, because every
+// read already filters on the window and would be spending writes on rows it is ignoring anyway.
+// The pickups go first, because a row there outliving its message would read as a message nobody
+// can see having been taken.
 const sweepBoard = (db: D1Database, userId: string, now: number): D1PreparedStatement[] => [
   db
     .prepare(
@@ -1972,50 +1974,66 @@ export const postBoardMessage = async (db: D1Database, input: BoardInput): Promi
   };
 };
 
+// How far down the oldest-first walk a pickup reaches: the running total of the bodies through each
+// message, which the budget then cuts. One message always fits, because a post over the same
+// ceiling is refused.
+const BOARD_THROUGH = `SUM(LENGTH(CAST(m.body AS BLOB)))
+     OVER (ORDER BY m.created_at, m.message_id ROWS UNBOUNDED PRECEDING) AS through`;
+
 // The messages one session takes off the board, and takes for good: the claim is an insert against
 // a primary key that is the message, so two sessions booting together both run it and only one
-// writes a row. The reader is handed what its own insert wrote and nothing else, which is what
-// makes a fleet message run once instead of once per session.
+// writes a row. Writing the claim from the board itself is what keeps a pickup row from outliving
+// the message it acknowledges, and the read that follows it in the same batch is handed what this
+// session holds, which is what makes a fleet message run once instead of once per session.
 //
-// A candidate the other session took between the walk and the claim comes back unclaimed and is
-// dropped. The claim does not re-check the window: the walk filtered it against the same clock, and
-// only the sweep ever takes a row away.
+// A session reads its own pickups again, because the start hook that takes them can be killed by
+// its own timeout after the claim has been written. `SessionStart` fires again on resume and on
+// compact under the same session id, so the message comes back to the one session that took it
+// rather than being lost to the fleet.
+//
+// A session-addressed message is only ever picked up from the device that session runs on, so a
+// caller naming a session id it does not hold is handed nothing. The device is checked inside the
+// walk rather than ahead of it because `sessions --sync` is detached and races the pickup: a
+// session not on record yet leaves its message waiting instead of having it refused.
 export const claimBoardMessages = async (
   db: D1Database,
   userId: string,
   taker: BoardTaker,
   now: number,
 ): Promise<BoardMessage[]> => {
-  const [, , waiting] = await db.batch<BoardRow>([
-    ...sweepBoard(db, userId, now),
+  const [, held] = await db.batch<BoardRow>([
     db
       .prepare(
-        `SELECT ${BOARD_FIELDS} FROM board_messages m
-         WHERE m.user_id = ?1 AND m.expires_at > ?2
-           AND ((m.scope = 'fleet' AND m.target = ?1)
-             OR (m.scope = 'host' AND m.target = ?3)
-             OR (m.scope = 'session' AND m.target = ?4))
-           AND NOT EXISTS (SELECT 1 FROM board_pickups p WHERE p.user_id = m.user_id AND p.message_id = m.message_id)
-         ORDER BY m.created_at, m.message_id
-         LIMIT ?5`,
+        `INSERT INTO board_pickups (user_id, message_id, session_id, device_id, host, picked_up_at)
+         SELECT ?1, message_id, ?4, ?3, ?6, ?7 FROM
+           (SELECT m.message_id, ${BOARD_THROUGH}
+            FROM board_messages m
+            WHERE m.user_id = ?1 AND m.expires_at > ?2
+              AND ((m.scope = 'fleet' AND m.target = ?1)
+                OR (m.scope = 'host' AND m.target = ?3)
+                OR (m.scope = 'session' AND m.target = ?4
+                  AND EXISTS (SELECT 1 FROM sessions s
+                    WHERE s.user_id = m.user_id AND s.session_id = m.target AND s.device_id = ?3)))
+              AND NOT EXISTS (SELECT 1 FROM board_pickups p
+                WHERE p.user_id = m.user_id AND p.message_id = m.message_id
+                  AND (p.session_id <> ?4 OR p.device_id <> ?3)))
+         WHERE through <= ?5
+         ON CONFLICT (user_id, message_id) DO NOTHING`,
       )
-      .bind(userId, now, taker.deviceId, taker.sessionId, MAX_PICKUP),
+      .bind(userId, now, taker.deviceId, taker.sessionId, MAX_PICKUP_BYTES, taker.host, taker.pickedUpAt),
+    db
+      .prepare(
+        `SELECT * FROM
+           (SELECT ${BOARD_FIELDS}, ${BOARD_THROUGH}
+            FROM board_messages m
+            JOIN board_pickups p ON p.user_id = m.user_id AND p.message_id = m.message_id
+            WHERE m.user_id = ?1 AND m.expires_at > ?2 AND p.session_id = ?4 AND p.device_id = ?3)
+         WHERE through <= ?5
+         ORDER BY created_at, message_id`,
+      )
+      .bind(userId, now, taker.deviceId, taker.sessionId, MAX_PICKUP_BYTES),
   ]);
-  const candidates = waiting?.results ?? [];
-  if (candidates.length === 0) return [];
-  const claims = await db.batch<{ message_id: string }>(
-    candidates.map((row) =>
-      db
-        .prepare(
-          `INSERT INTO board_pickups (user_id, message_id, session_id, device_id, host, picked_up_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-           ON CONFLICT (user_id, message_id) DO NOTHING
-           RETURNING message_id`,
-        )
-        .bind(userId, row.message_id, taker.sessionId, taker.deviceId, taker.host, taker.pickedUpAt),
-    ),
-  );
-  return candidates.filter((_, index) => (claims[index]?.results.length ?? 0) === 1).map(toBoardMessage);
+  return (held?.results ?? []).map(toBoardMessage);
 };
 
 export const listBoard = async (
@@ -2025,22 +2043,19 @@ export const listBoard = async (
   [cursorAt, cursorId]: Cursor,
   now: number,
 ): Promise<{ entries: BoardEntry[]; nextCursor: string }> => {
-  const [, , listed] = await db.batch<BoardEntryRow>([
-    ...sweepBoard(db, userId, now),
-    db
-      .prepare(
-        `SELECT ${BOARD_FIELDS}, p.session_id AS taker_session_id, p.device_id AS taker_device_id,
-           p.host AS taker_host, p.picked_up_at
-         FROM board_messages m
-         LEFT JOIN board_pickups p ON p.user_id = m.user_id AND p.message_id = m.message_id
-         WHERE m.user_id = ?1 AND m.expires_at > ?2
-           AND (m.created_at < ?3 OR (m.created_at = ?3 AND m.message_id < ?4))
-         ORDER BY m.created_at DESC, m.message_id DESC
-         LIMIT ?5`,
-      )
-      .bind(userId, now, cursorAt, cursorId, limit + 1),
-  ]);
-  const results = listed?.results ?? [];
+  const { results } = await db
+    .prepare(
+      `SELECT ${BOARD_FIELDS}, p.session_id AS taker_session_id, p.device_id AS taker_device_id,
+         p.host AS taker_host, p.picked_up_at
+       FROM board_messages m
+       LEFT JOIN board_pickups p ON p.user_id = m.user_id AND p.message_id = m.message_id
+       WHERE m.user_id = ?1 AND m.expires_at > ?2
+         AND (m.created_at < ?3 OR (m.created_at = ?3 AND m.message_id < ?4))
+       ORDER BY m.created_at DESC, m.message_id DESC
+       LIMIT ?5`,
+    )
+    .bind(userId, now, cursorAt, cursorId, limit + 1)
+    .all<BoardEntryRow>();
   const entries = results.slice(0, limit).map(toBoardEntry);
   const last = entries.at(-1);
   const nextCursor = results.length > limit && last ? encodeCursor(last.message.createdAt, last.message.messageId) : "";

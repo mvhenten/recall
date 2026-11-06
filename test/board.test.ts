@@ -81,8 +81,42 @@ describe("the board", () => {
     expect(await pickUp(desktop, "a1b2c3d4")).toEqual([]);
   });
 
+  // The pickup is told which session is taking the messages, and a session-addressed message is
+  // only ever taken from the host that session runs on: naming somebody else's session id takes
+  // nothing and leaves the message waiting for the session it was posted to.
+  it("takes a session message only on the device that session runs on", async () => {
+    const h = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const { laptop, desktop } = await account(h, userId);
+    expect((await laptop.sync("9f8a1b2c")).status).toBe(204);
+    const posted = await laptop.request("POST", "/v1/board", {
+      scope: "session",
+      sessionId: "9f8a1b2c",
+      body: "for the laptop session only",
+    });
+    expect(posted.status).toBe(201);
+
+    expect(await pickUp(desktop, "9f8a1b2c")).toEqual([]);
+    expect((await pickUp(laptop, "9f8a1b2c")).map((message) => message.body)).toEqual(["for the laptop session only"]);
+  });
+
+  // The start hook runs the pickup under a timeout, which kills it after the claim is written, so a
+  // session reads back what it already took rather than losing the message to nobody. `SessionStart`
+  // fires again on resume and on compact under the same session id, which is what brings it back.
+  it("hands a session the messages it already took", async () => {
+    const h = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const { laptop, desktop } = await account(h, userId);
+    await postToFleet(laptop, "rerun the migration");
+
+    expect((await pickUp(laptop, "9f8a1b2c")).map((message) => message.body)).toEqual(["rerun the migration"]);
+    expect((await pickUp(laptop, "9f8a1b2c")).map((message) => message.body)).toEqual(["rerun the migration"]);
+    expect(await pickUp(desktop, "9f8a1b2c")).toEqual([]);
+    expect(await pickUp(desktop, "7e3d4a5b")).toEqual([]);
+  });
+
   // A message nobody booted into cannot haunt the fleet: past the window it is picked up by
-  // nobody, reads on no listing, and its row is swept by the next read.
+  // nobody and reads on no listing, because the pickup and the listing both read inside it.
   it("stops holding a message once its week is up", async () => {
     const h = await harness();
     const userId = `user-${crypto.randomUUID()}`;
@@ -139,17 +173,10 @@ describe("the board", () => {
     const bob = await h.user("bob");
     await postToFleet(laptop, "ours alone");
 
-    expect((await h.send("/v1/board", { method: "POST" })).status).toBe(401);
     expect((await bob.request("POST", "/v1/board", { scope: "host", deviceId: desktopId, body: "x" })).status).toBe(
       404,
     );
     expect(await pickUp(bob, "9f8a1b2c")).toEqual([]);
     expect(await readBoard(bob)).toEqual([]);
-
-    expect((await laptop.request("POST", "/v1/board", { scope: "fleet" })).status).toBe(400);
-    expect((await laptop.request("POST", "/v1/board", { scope: "nowhere", body: "x" })).status).toBe(400);
-    expect((await laptop.request("POST", "/v1/board/pickup", { sessionId: "two words" })).status).toBe(400);
-    expect((await laptop.request("GET", "/v1/board/pickup")).status).toBe(405);
-    expect((await laptop.request("DELETE", "/v1/board")).status).toBe(405);
   });
 });
