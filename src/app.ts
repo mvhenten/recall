@@ -1,3 +1,4 @@
+import { EMAIL_ONLY, emailOf } from "./access";
 import {
   type ArtifactChrome,
   type ArtifactRefusal,
@@ -69,6 +70,7 @@ import {
 } from "./dashboard";
 import {
   type Caller,
+  connectorDevice,
   DEVICE_CODE_TTL_MS,
   type DeviceCodeLimits,
   decideDeviceCode,
@@ -98,6 +100,7 @@ import {
   type SendInput,
 } from "./mailbox";
 import { render } from "./markdown";
+import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -124,6 +127,7 @@ import {
   parseSessionSearch,
   parseTranscriptFile,
   parseUsage,
+  type SaveInput,
   type SearchInput,
   type SessionHit,
   type StatsWindows,
@@ -236,6 +240,20 @@ import {
   writeChunks,
   writeLabels,
 } from "./store";
+import {
+  editedMemory,
+  parseEditArgs,
+  parseListArgs,
+  parseNameArgs,
+  parseSaveArgs,
+  parseSearchArgs,
+  parseSendArgs,
+  renderMemory,
+  resolveTarget,
+  SEARCH_LIMIT,
+  TOOLS,
+  toolArguments,
+} from "./tools";
 import type { Reach } from "./transcript-plan";
 import {
   archivedFiles,
@@ -266,9 +284,18 @@ export interface ArtifactHost {
   sharing: { verify: Verify } | null;
 }
 
+// The connector endpoint, where a deployment switched it on. Its Access application admits a
+// browser sign-in and an Access service token, and the service token's common name names the user
+// it acts for, since a token carries no email to look up.
+export interface McpHost {
+  verify: Verify;
+  serviceClients: Map<string, string>;
+}
+
 export interface Deps {
   verify: Verify;
   artifactHost: ArtifactHost | null;
+  mcpHost: McpHost | null;
   deviceCodeLimits: DeviceCodeLimits;
   embedder: Embedder;
   now: () => number;
@@ -793,7 +820,10 @@ export const createApp = (deps: Deps): App => {
     if (!assertion) return refuse(401, "Sign in first", "This page needs a Cloudflare Access sign-in.");
     const verified = await verify(assertion);
     if (!verified.ok) return refuse(401, "Sign in again", `Cloudflare Access sign-in rejected: ${verified.reason}.`);
-    return verified.email;
+    if (verified.principal.kind !== "email") {
+      return refuse(401, "Sign in again", `Cloudflare Access sign-in rejected: ${EMAIL_ONLY}.`);
+    }
+    return verified.principal.email;
   };
 
   const invited = async (db: D1Database, email: string, refuse: Refusal): Promise<string | Response> => {
@@ -975,8 +1005,10 @@ export const createApp = (deps: Deps): App => {
     }
     const verified = await host.verify(assertion);
     if (!verified.ok) return notice({ kind: "unauthorized", reason: verified.reason, address });
-    const userId = await userForEmail(db, verified.email);
-    if (userId === null) return notice({ kind: "forbidden", email: verified.email });
+    const email = emailOf(verified.principal);
+    if (email === null) return notice({ kind: "unauthorized", reason: EMAIL_ONLY, address });
+    const userId = await userForEmail(db, email);
+    if (userId === null) return notice({ kind: "forbidden", email });
     // Every artifact address begins with the artifact prefix, so no name occupies the hostname's
     // first segment and no path a publisher controls can name a route.
     const [prefix, rawName, ...tail] = url.pathname.slice(1).split("/");
@@ -1050,7 +1082,7 @@ export const createApp = (deps: Deps): App => {
     if (share === null) return gone;
     // The proven address and the one the share names, compared and neither printed: one is on the
     // reader's own screen and naming the other would say who the artifact was shared with.
-    if (share.subject !== verified.email) {
+    if (share.subject !== emailOf(verified.principal)) {
       return { ok: false, refusal: { kind: "elsewhere", signInAgain: signInAgainAt(url) } };
     }
     return { ok: true, share };
@@ -2285,10 +2317,7 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
-  const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
-    const parsed = parseSearch(await readJson(request));
-    if (!parsed.ok) return error(400, parsed.error);
-    const input = parsed.value;
+  const searched = async (db: D1Database, userId: string, input: SearchInput): Promise<unknown> => {
     const rankings = await rank(db, userId, input, []);
     const [shown, nearby] = await Promise.all([
       hits(db, userId, rankings.inScope, input.limit),
@@ -2301,8 +2330,166 @@ export const createApp = (deps: Deps): App => {
       tags: memory.tags,
       description: memory.description,
     }));
-    return json({ hits: shown, elsewhere });
+    return { hits: shown, elsewhere };
   };
+
+  const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
+    const parsed = parseSearch(await readJson(request));
+    if (!parsed.ok) return error(400, parsed.error);
+    return json(await searched(db, userId, parsed.value));
+  };
+
+  // Which identity the endpoint saw, and which user it acts for. Each refusal names the scheme it
+  // tried, so a connector that will not connect says why rather than only that it did not.
+  const mcpCaller = async (request: Request, env: AppEnv, host: McpHost): Promise<Caller | Response> => {
+    const assertion = request.headers.get("cf-access-jwt-assertion");
+    const sentServiceHeaders = request.headers.get("cf-access-client-id") !== null;
+    if (assertion === null) {
+      return mcpRefusal(
+        401,
+        sentServiceHeaders
+          ? "Cloudflare Access let the request through without an assertion, so the CF-Access-Client-Id and CF-Access-Client-Secret pair is not a service token this account issued"
+          : `no Cloudflare Access assertion reached ${MCP_PATH}: sign in to Access in a browser first, or send CF-Access-Client-Id and CF-Access-Client-Secret for a service token`,
+      );
+    }
+    const verified = await host.verify(assertion);
+    if (!verified.ok) {
+      return mcpRefusal(
+        401,
+        `Cloudflare Access ${sentServiceHeaders ? "service token" : "sign-in"} rejected: ${verified.reason}`,
+      );
+    }
+    const { principal } = verified;
+    if (principal.kind === "serviceToken") {
+      const owner = host.serviceClients.get(principal.commonName);
+      if (owner === undefined) {
+        return mcpRefusal(
+          403,
+          `the Access service token ${principal.commonName} acts for no user of this recall; the deployment names one token per user`,
+        );
+      }
+      return connectorDevice(env.DB, owner, deps.now());
+    }
+    const origin = request.headers.get("origin");
+    const own = new URL(request.url).origin;
+    if (origin !== null && origin !== own) {
+      return mcpRefusal(
+        403,
+        `the Access sign-in scheme answers ${own} alone and this request came from ${origin}; use the CF-Access-Client-Id and CF-Access-Client-Secret service token scheme instead`,
+      );
+    }
+    const userId = await userForEmail(env.DB, principal.email);
+    if (userId === null) {
+      return mcpRefusal(403, `${principal.email} is not invited to this recall; ask its owner to add it`);
+    }
+    return connectorDevice(env.DB, userId, deps.now());
+  };
+
+  // One tool call, against the same store the API serves. Every scope the stdio server reads off a
+  // working copy is global here, which is settled in parseSearchArgs and its siblings rather than
+  // again in each branch.
+  const runTool = (env: AppEnv, caller: Caller): RunTool => {
+    const db = env.DB;
+    const { userId } = caller;
+    const refused = (reason: string): ToolResult => ({ ok: false, error: `recall: ${reason}` });
+    const document = (value: unknown): ToolResult => ({ ok: true, text: JSON.stringify(value) });
+    const saved = async (name: string, input: SaveInput): Promise<ToolResult> => {
+      const [vector] = await deps.embedder.embed([embeddingText(name, input.description, input.body)]);
+      if (!vector) throw new Error("the embedder answered the memory with no vector");
+      const written = await saveMemory(db, userId, name, input, quantize(vector), deps.now());
+      return document({ name: written.memory.name, created: written.created, tags: written.memory.tags });
+    };
+    return async (call: ToolCall): Promise<ToolResult> => {
+      const definition = TOOLS.find((tool) => tool.name === call.name);
+      if (definition === undefined) return refused(`no tool named ${call.name}`);
+      const args = toolArguments(definition, call.arguments);
+      if (!args.ok) return refused(args.error);
+      if (call.name === "recall_search") {
+        const input = parseSearchArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const { query, tags, mode } = input.value;
+        return document(
+          await searched(db, userId, { query, tags, mode, limit: SEARCH_LIMIT, minScore: DEFAULT_MIN_SCORE }),
+        );
+      }
+      if (call.name === "recall_get") {
+        const input = parseNameArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const memory = await getMemory(db, userId, input.value.name);
+        if (memory === null) return refused(`no memory named ${input.value.name}`);
+        const [recalled] = await recall(db, userId, [memory.memoryId], deps.now());
+        return { ok: true, text: renderMemory(recalled ?? memory) };
+      }
+      if (call.name === "recall_list") {
+        const input = parseListArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const sort = MEMORY_SORTS[0]?.key ?? "newest";
+        const cursor = decodeCursor("", memoryCursorDirection(sort));
+        if (!cursor) return refused("the listing cursor is malformed");
+        const page = await listMemories(db, userId, { ...input.value, types: [], cursor: "", sort }, cursor);
+        return document(page.memories);
+      }
+      if (call.name === "recall_save") {
+        const input = parseSaveArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const name = parseName(input.value.name);
+        if (!name.ok) return refused(name.error);
+        return saved(name.value, input.value);
+      }
+      if (call.name === "recall_edit") {
+        const input = parseEditArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const memory = await getMemory(db, userId, input.value.name);
+        if (memory === null) return refused(`no memory named ${input.value.name}`);
+        return saved(memory.name, editedMemory(memory, input.value));
+      }
+      if (call.name === "recall_delete") {
+        const input = parseNameArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const memory = await getMemory(db, userId, input.value.name);
+        if (memory === null) return refused(`no memory named ${input.value.name}`);
+        await deleteMemory(db, userId, memory.memoryId);
+        return document({ deleted: memory.name });
+      }
+      const input = parseSendArgs(args.value);
+      if (!input.ok) return refused(input.error);
+      const now = deps.now();
+      const [devices, sessions, labels] = await Promise.all([
+        listDevices(db, userId),
+        listSessions(db, userId, now),
+        readLabels(db, userId),
+      ]);
+      const target = resolveTarget(devices, labels, sessions, input.value.to);
+      if (!target.ok) return refused(target.error);
+      if (new TextEncoder().encode(input.value.message).byteLength > MAX_BODY_BYTES) {
+        return refused(`message must hold at most ${MAX_BODY_BYTES} bytes`);
+      }
+      const sender: Sender = { deviceId: caller.deviceId, host: caller.host, name: caller.name };
+      const message: SendInput = {
+        kind: "news",
+        toDeviceId: target.value.toDeviceId,
+        toSessionId: target.value.toSessionId,
+        fromSessionId: "",
+        body: input.value.message,
+      };
+      const sent = await mailboxFor(env, userId).publish(message, sender, now);
+      return document({
+        messageId: sent.message.messageId,
+        toDeviceId: sent.message.toDeviceId,
+        toSessionId: sent.message.toSessionId,
+      });
+    };
+  };
+
+  const mcp = (request: Request, env: AppEnv): Promise<Response> =>
+    mcpEndpoint(request, async () => {
+      const host = deps.mcpHost;
+      if (host === null) {
+        return mcpRefusal(404, "this recall serves no MCP connector; its deployment has not switched one on");
+      }
+      const caller = await mcpCaller(request, env, host);
+      return caller instanceof Response ? caller : runTool(env, caller);
+    });
 
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
     const url = new URL(request.url);
@@ -2312,6 +2499,7 @@ export const createApp = (deps: Deps): App => {
         ? sharedSite(request, url, env.DB, host)
         : artifactSite(request, url, env.DB, host);
     }
+    if (url.pathname === MCP_PATH) return mcp(request, env);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
     if (url.pathname === TRANSCRIPT_SCRIPT_PATH) return transcriptScript();
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {

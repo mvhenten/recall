@@ -102,6 +102,11 @@ if (artifactHostname === hostname) {
   die("RECALL_ARTIFACT_HOSTNAME serves published pages on a second host, so it cannot be RECALL_HOSTNAME");
 }
 
+// Optional, read the same two ways. Unset leaves the MCP connector off.
+const mcpSetting = process.env.RECALL_MCP_CONNECTOR ?? (await optionalBuilderObject("RECALL_MCP_CONNECTOR"));
+if (!["", "true", "false"].includes(mcpSetting)) die("RECALL_MCP_CONNECTOR must be true or false");
+const mcpConnector = mcpSetting === "true";
+
 const run = (command, args, { env = {}, cwd = ROOT, capture = false, allowFailure = false } = {}) => {
   const result = spawnSync(command, args, {
     cwd,
@@ -170,6 +175,7 @@ const tofuEnv = {
   TF_VAR_account_id: accountId,
   TF_VAR_hostname: hostname,
   TF_VAR_artifact_hostname: artifactHostname,
+  TF_VAR_mcp_connector: String(mcpConnector),
   TF_VAR_otp_idp_id: otpIdpId,
   TF_VAR_users: JSON.stringify(users),
 };
@@ -239,6 +245,9 @@ const deployConfig = {
           ARTIFACT_SHARE_ACCESS_AUD: output("artifact_share_access_aud"),
           DASHBOARD_HOSTNAME: hostname,
         }),
+    ...(mcpConnector
+      ? { MCP_ACCESS_AUD: output("mcp_access_aud"), MCP_SERVICE_CLIENTS: output("mcp_service_clients") }
+      : {}),
   },
 };
 const deployConfigPath = join(ROOT, "wrangler.deploy.json");

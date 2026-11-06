@@ -7,6 +7,9 @@ locals {
   # artifact address begins /a/; that holds structurally and not by the name grammar.
   share_link_prefix  = "/link"
   share_email_prefix = "/email"
+
+  # The path the connector answers on, which MCP_PATH in src/mcp.ts names too.
+  mcp_prefix = "/mcp"
 }
 
 data "cloudflare_zero_trust_organization" "this" {
@@ -89,6 +92,28 @@ resource "cloudflare_zero_trust_access_policy" "approvers" {
   include    = [for email in local.emails : { email = { email = email } }]
 }
 
+# One service token per user, so the connector endpoint can tell whose memories a token reaches.
+# The secret is minted once and lives only in state; rotate it in the dashboard to read it.
+resource "cloudflare_zero_trust_access_service_token" "connector" {
+  for_each = var.mcp_connector ? var.users : {}
+
+  account_id = var.account_id
+  name       = "recall-${each.key}-connector"
+  duration   = "forever"
+}
+
+resource "cloudflare_zero_trust_access_policy" "connector_tokens" {
+  count      = var.mcp_connector ? 1 : 0
+  account_id = var.account_id
+  name       = "recall connector tokens"
+  decision   = "non_identity"
+  include = [
+    for token in cloudflare_zero_trust_access_service_token.connector : {
+      service_token = { token_id = token.id }
+    }
+  ]
+}
+
 resource "cloudflare_zero_trust_access_application" "recall" {
   account_id                = var.account_id
   name                      = "recall"
@@ -119,6 +144,37 @@ resource "cloudflare_zero_trust_access_application" "artifacts" {
     {
       id         = cloudflare_zero_trust_access_policy.approvers.id
       precedence = 1
+    }
+  ]
+}
+
+# The connector answers on a path of the main hostname, so it takes an application of its own
+# rather than a second host. Access matches the longest path first, so this one covers /mcp and the
+# bypass over the hostname is unchanged. It admits the approver emails and the connector service
+# tokens, and answers 401 instead of redirecting, since nothing behind it renders a login page.
+resource "cloudflare_zero_trust_access_application" "mcp" {
+  count                     = var.mcp_connector ? 1 : 0
+  account_id                = var.account_id
+  name                      = "recall connector"
+  type                      = "self_hosted"
+  session_duration          = "24h"
+  app_launcher_visible      = false
+  allowed_idps              = [var.otp_idp_id]
+  service_auth_401_redirect = true
+  destinations = [
+    {
+      type = "public"
+      uri  = "${var.hostname}${local.mcp_prefix}"
+    }
+  ]
+  policies = [
+    {
+      id         = one(cloudflare_zero_trust_access_policy.connector_tokens[*].id)
+      precedence = 1
+    },
+    {
+      id         = cloudflare_zero_trust_access_policy.approvers.id
+      precedence = 2
     }
   ]
 }
