@@ -1,8 +1,7 @@
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
-  LEASE_MS,
   type Mailbox,
   type Message,
   type MessageFrame,
@@ -15,7 +14,7 @@ import {
   type Sent,
   TAKER_WINDOW_MS,
 } from "../src/mailbox";
-import { type Client, harness } from "./harness";
+import { type Client, harness, mailboxRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -27,40 +26,8 @@ interface Listener {
 
 const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
-const queued = (userId: string, toDeviceId: string, now: number): Promise<Message[]> =>
-  runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => mailbox.list(toDeviceId, now));
-
 const alarmAt = (userId: string): Promise<number | null> =>
   runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) => state.storage.getAlarm());
-
-// The rows a device has, read past everything the mailbox decides, so a test can tell a row that
-// is still there from one a read declined to hand over.
-const rowIds = (userId: string, toDeviceId: string): Promise<string[]> =>
-  runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) =>
-    state.storage.sql
-      .exec<{ message_id: string }>("SELECT message_id FROM messages WHERE to_device_id = ?", toDeviceId)
-      .toArray()
-      .map((row) => row.message_id),
-  );
-
-// An order as the three day queue left it: sent two days ago, and carrying an expiry that is still
-// a day out.
-const leaveStaleOrder = async (userId: string, toDeviceId: string, now: number): Promise<string> => {
-  const messageId = crypto.randomUUID();
-  const day = 86_400_000;
-  await runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) => {
-    state.storage.sql.exec(
-      `INSERT INTO messages
-         (message_id, kind, to_device_id, to_session_id, from_device_id, from_host, from_name, body, created_at, expires_at)
-         VALUES (?, 'order', ?, '', 'd-sender', 'laptop', '', 'rerun the migration', ?, ?)`,
-      messageId,
-      toDeviceId,
-      now - 2 * day,
-      now + day,
-    );
-  });
-  return messageId;
-};
 
 const deviceId = async (client: Client, name: string): Promise<string> => {
   const response = await client.request("GET", "/v1/devices");
@@ -71,10 +38,10 @@ const deviceId = async (client: Client, name: string): Promise<string> => {
   return device.deviceId;
 };
 
-// A lease is written on the clock the send runs on and read by the alarm, which has only the wall
-// clock to read, so the two have to agree before the first order goes out: a lease stamped on the
-// harness clock alone is either years overdue or never due, and nothing past it can test the
-// alarm. Signing a device in advances the harness clock, so the two are squared up last.
+// A row is written on the clock the send runs on and read by the alarm, which has only the wall
+// clock, so the two have to agree before the first order goes out: a row stamped on the harness
+// clock alone is years past the TTL to the alarm. Signing a device in advances the harness clock,
+// so the two are squared up last.
 const bus = async () => {
   const h = await harness();
   const userId = `user-${crypto.randomUUID()}`;
@@ -87,9 +54,9 @@ const bus = async () => {
 };
 
 // `takes` is the session the listener reports, standing in for the daemon picking one of its own
-// sessions; a listener that takes nothing leaves the order under its lease, which is what a host
-// whose chosen session died does. `declares` is whether the upgrade says this daemon reads the kind
-// of a message, which a daemon from before orders does not.
+// sessions; a listener that takes nothing says nothing back, which is what a host whose chosen
+// session died does. `declares` is whether the upgrade says this daemon reads the kind of a
+// message, which a daemon from before orders does not.
 const listen = async (h: Harness, token: string, takes: string, declares = true): Promise<Listener> => {
   const response = await h.send("/v1/messages/listen", {
     headers: {
@@ -158,16 +125,20 @@ describe("orders", () => {
       sessionId: first.received.length === 1 ? "desktop-aaaa" : "desktop-bbbb",
     });
     expect(first.received.length + second.received.length).toBe(1);
-    await eventually(async () => (await queued(userId, desktopId, h.now())).length === 0, "the order being released");
+    await eventually(async () => (await mailboxRows(userId, desktopId)).length === 0, "the order being released");
   });
 
-  it("tells the sender loudly when the host is not listening at all, and keeps the order queued", async () => {
-    const { h, userId, laptop, desktopId } = await bus();
+  it("tells the sender loudly when the host is not listening, and keeps nothing for one that attaches later", async () => {
+    const { h, userId, laptop, desktopToken, desktopId } = await bus();
 
     const sent = await outcome(await order(laptop, desktopId, "rerun the migration"));
 
     expect(sent.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
-    expect(await queued(userId, desktopId, h.now())).toEqual([sent.message]);
+    expect(await mailboxRows(userId, desktopId)).toEqual([]);
+
+    const late = await listen(h, desktopToken, "desktop-aaaa");
+    await eventually(async () => (await mailboxRows(userId, desktopId)).length === 0, "the late socket attaching");
+    expect(late.received).toEqual([]);
   });
 
   it("tells the sender when the host took the order back because no session could act on it", async () => {
@@ -181,7 +152,7 @@ describe("orders", () => {
     const sent = await outcome(await order(laptop, desktopId, "rerun the migration"));
 
     expect(sent.outcome).toEqual({ state: "untaken", reason: NO_SESSION_TOOK_IT });
-    expect(await queued(userId, desktopId, h.now())).toEqual([]);
+    expect(await mailboxRows(userId, desktopId)).toEqual([]);
   });
 
   it("drops an order its listening host never answered for, so the failure the sender reports is true", {
@@ -199,7 +170,7 @@ describe("orders", () => {
     if (sent === null) throw new Error("the mailbox refused the order it had room for");
     expect(sent.outcome).toEqual({ state: "untaken", reason: NOT_TAKEN });
     await eventually(() => holder.received.length === 1, "the order reaching the host that says nothing");
-    expect(await queued(userId, desktopId, h.now())).toEqual([]);
+    expect(await mailboxRows(userId, desktopId)).toEqual([]);
   });
 
   it("hands no order to a daemon too old to read a kind, and says nobody is listening", async () => {
@@ -216,59 +187,16 @@ describe("orders", () => {
 
     expect(second.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
     expect(ids(old.received)).toEqual([news.message.messageId]);
-    expect(ids(await queued(userId, desktopId, h.now())).sort()).toEqual(
-      ids([first.message, news.message, second.message]).sort(),
-    );
-  });
-
-  it("hands a backlog one order at a time, the next on the receipt for the last", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
-    const first = await outcome(await order(laptop, desktopId, "rerun the migration"));
-    const second = await outcome(await order(laptop, desktopId, "restart the worker"));
-
-    const holder = await listen(h, desktopToken, "");
-    await eventually(() => holder.received.length === 1, "the drain handing one order");
-    expect(ids(holder.received)).toEqual([first.message.messageId]);
-
-    ack(holder, first.message.messageId);
-
-    await eventually(() => holder.received.length === 2, "the second order on the receipt for the first");
-    expect(ids(holder.received)).toEqual([first.message.messageId, second.message.messageId]);
-    expect(ids(await queued(userId, desktopId, h.now()))).toEqual([second.message.messageId]);
-  });
-
-  it("offers an order again when the host that took it never reported on it", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
-    const sent = await outcome(await order(laptop, desktopId, "rerun the migration"));
-
-    h.tick(-(LEASE_MS + 1));
-    const desktop = await listen(h, desktopToken, "");
-    h.tick(LEASE_MS + 1);
-
-    await runDurableObjectAlarm(mailboxOf(userId));
-
-    await eventually(() => desktop.received.length >= 2, "the order being offered again");
-    expect(new Set(ids(desktop.received))).toEqual(new Set([sent.message.messageId]));
-    expect(await queued(userId, desktopId, h.now())).toEqual([sent.message]);
-  });
-
-  it("arms the alarm at the expiry of the lease the drain wrote", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
-    await outcome(await order(laptop, desktopId, "rerun the migration"));
-
-    const at = h.now();
-    await listen(h, desktopToken, "");
-
-    expect(await alarmAt(userId)).toBe(at + LEASE_MS);
+    expect(await mailboxRows(userId, desktopId)).toEqual([news.message.messageId]);
   });
 
   // The sweep is the only thing that closes the socket of a revoked device, so a mailbox busy
   // enough to reschedule its alarm on every send must not keep pushing that pass out of reach.
   it("keeps the sweep due where the last one left it, however much traffic arrives", async () => {
-    const { laptop, userId, desktopId } = await bus();
-    await outcome(await order(laptop, desktopId, "rerun the migration"));
+    const { h, laptop, userId, desktopToken, desktopId } = await bus();
+    await listen(h, desktopToken, "desktop-aaaa");
     const due = await alarmAt(userId);
-    if (due === null) throw new Error("a mailbox holding an order owes an alarm");
+    if (due === null) throw new Error("a mailbox with a socket attached owes an alarm");
 
     for (const body of ["the build is green", "the deploy is out", "main is red"]) {
       expect((await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body })).status).toBe(201);
@@ -276,44 +204,24 @@ describe("orders", () => {
     }
   });
 
-  // Every read decides the TTL for itself, which is what makes the backlog of a three day queue go
-  // away rather than keep landing: the row's own expiry is still a day out and counts for nothing.
-  // A receipt is the read with no delete in front of it, so it is where that has to hold.
-  it("hands nothing past the TTL on a receipt, whatever expiry the queued row carries", async () => {
+  it("refuses a receipt that does not quote the token the order went out under", {
+    timeout: 4 * TAKER_WINDOW_MS,
+  }, async () => {
     const { h, userId, laptop, desktopToken, desktopId } = await bus();
     const holder = await listen(h, desktopToken, "");
+    const placing = order(laptop, desktopId, "rerun the migration");
+    await eventually(() => holder.received.length === 1, "the order reaching the host");
+    const pushed = holder.received[0];
+    if (!pushed) throw new Error("the order never arrived");
+
+    ack(holder, pushed.messageId, crypto.randomUUID());
     const news = await outcome(
       await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "the build is green" }),
     );
-    await eventually(() => holder.received.length === 1, "the news reaching the host");
-    const stale = await leaveStaleOrder(userId, desktopId, h.now());
-
-    ack(holder, news.message.messageId);
-
-    await eventually(async () => (await rowIds(userId, desktopId)).join() === stale, "the receipt for the news");
-    expect(ids(holder.received)).toEqual([news.message.messageId]);
-    expect(await queued(userId, desktopId, h.now())).toEqual([]);
-    expect(await rowIds(userId, desktopId)).toEqual([]);
-  });
-
-  it("refuses a receipt that does not quote the lease the order went out under", async () => {
-    const { h, userId, laptop, desktopToken, desktopId } = await bus();
-    const sent = await outcome(await order(laptop, desktopId, "rerun the migration"));
-    const holder = await listen(h, desktopToken, "");
-    await eventually(() => holder.received.length === 1, "the drain handing the order");
-
-    ack(holder, sent.message.messageId, crypto.randomUUID());
-    expect(
-      (await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "the build is green" })).status,
-    ).toBe(201);
     await eventually(() => holder.received.length === 2, "the news that follows the refused receipt");
-    const news = holder.received[1];
-    if (!news) throw new Error("the news never arrived");
-    ack(holder, news.messageId);
+    expect(await mailboxRows(userId, desktopId)).toEqual([pushed.messageId, news.message.messageId]);
 
-    await eventually(
-      async () => ids(await queued(userId, desktopId, h.now())).join() === sent.message.messageId,
-      "the news being released while the order is held",
-    );
+    ack(holder, pushed.messageId);
+    expect((await outcome(await placing)).outcome).toEqual({ state: "untaken", reason: NO_SESSION_TOOK_IT });
   });
 });

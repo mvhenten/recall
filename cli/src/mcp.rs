@@ -454,7 +454,7 @@ impl Recall {
 
     #[tool(
         name = "recall_send",
-        description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named by its label or as recall devices shows it. The message arrives as a user turn there. This is the only route to a session on another machine: Claude Code's own SendMessage and ListAgents see only sessions on this one, so answering a message from another host through them reaches a local session instead."
+        description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named by its label or as recall devices shows it. The message arrives as a user turn there. This is the only route to a session on another machine: Claude Code's own SendMessage and ListAgents see only sessions on this one, so answering a message from another host through them reaches a local session instead. A message is a ping that is relevant now, not a board a session reads when it starts: it reaches the hosts listening the moment it is sent, and one sent where nothing is listening is an error saying nobody got it rather than something a later session picks up."
     )]
     async fn send(&self, Parameters(params): Parameters<SendParams>) -> Result<String, String> {
         blocking(move || {
@@ -472,7 +472,7 @@ impl Recall {
 
     #[tool(
         name = "recall_order",
-        description = "Give one Claude Code session on another host an instruction to carry out, and learn which session took it. Unlike recall_send, which every session on the host reads, an order is held by the one session that takes it, so a fleet instruction is run once per host instead of once per session. Name a host as recall devices shows it, or by its label. An order no session takes is an error saying so. A listening host that takes one back leaves nothing behind, but an order to a host that is not listening stays queued for a session that attaches within the next ten seconds, so sending it again before then can have it run twice."
+        description = "Give one Claude Code session on another host an instruction to carry out, and learn which session took it. Unlike recall_send, which every session on the host reads, an order is held by the one session that takes it, so a fleet instruction is run once per host instead of once per session. Name a host as recall devices shows it, or by its label. An order no session takes is an error saying so, and nothing is left behind for a later session to run: an order to a host that is not listening reaches nobody and is gone, so send it again once that host is listening."
     )]
     async fn order(&self, Parameters(params): Parameters<OrderParams>) -> Result<String, String> {
         blocking(move || {

@@ -1132,6 +1132,12 @@ export const createApp = (deps: Deps): App => {
     if (sent === null) {
       return refuse(`This account already holds ${MAX_QUEUED_MESSAGES} queued messages, so the bus took nothing.`, 400);
     }
+    if (sent.outcome.state === "untaken") {
+      return refuse(
+        "The host that ran this session is not listening, so nobody read it. Nothing is kept for a session that starts later; send it again once that host is back.",
+        400,
+      );
+    }
     return new Response(null, {
       status: 303,
       headers: {

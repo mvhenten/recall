@@ -2,10 +2,10 @@ import { DurableObject } from "cloudflare:workers";
 import { listDevices } from "./device";
 import { type Parsed, parseSessionId } from "./model";
 
-// The whole life of a queued message. A message is only worth reading by a session that exists
-// roughly now: one written into a session that started long after it was sent arrives with no idea
-// what it refers to, which is the flood a three day queue produced. Ten seconds is the window a
-// host reconnecting or sitting between sessions still catches.
+// A message is a ping that is relevant now. It goes to the sockets attached when it is sent and to
+// nothing else: the bus is not a board a session reads at boot, so one that was not listening then
+// never sees it, and the sender is told nobody got it. The TTL is the outer bound on a row that is
+// still in flight, not a window anything waits in.
 export const MESSAGE_TTL_MS = 10_000;
 export const MAX_QUEUED_MESSAGES = 1_000;
 export const MAX_BODY_BYTES = 32_768;
@@ -13,8 +13,8 @@ export const SWEEP_INTERVAL_MS = 900_000;
 
 // How long one socket holds an order to itself, so no other connection sees it while that one is
 // writing it into a session. A minute is ten of the five second timeouts the daemon allows itself
-// for that write. It outlives the message, so an order its holder never reported on is expired
-// rather than offered again.
+// for that write. Nothing is handed out again when it lapses; it only reclaims the row of a holder
+// that was evicted before its receipt landed.
 export const LEASE_MS = 60_000;
 
 // How long a send waits for the host to name the session that took an order, and the whole life of
@@ -35,7 +35,7 @@ export const CLOSE_BAD_FRAME = 4000;
 export const CLOSE_REVOKED = 4001;
 
 export const NOTHING_LISTENING =
-  "no host is listening as that device, so nothing can take the order; one attaching within ten seconds still runs it";
+  "no host is listening as that device, so nothing was delivered; the bus holds nothing for one that attaches later";
 export const NOT_TAKEN = "the host is listening but no session took the order, so it was dropped";
 export const NO_SESSION_TOOK_IT = "the host took the order back: it has no session that can act on it";
 
@@ -107,24 +107,12 @@ export interface TookFrame {
   token: string;
 }
 
-// A host that writes neither leaves the lease to expire, and the order goes out again.
+// A host that writes neither says nothing, and the send gives up on the order when its window
+// closes.
 export type Receipt = AckFrame | TookFrame;
 
 export interface MailboxEnv {
   DB: D1Database;
-}
-
-interface MessageRow extends Record<string, string | number> {
-  message_id: string;
-  kind: MessageKind;
-  to_device_id: string;
-  to_session_id: string;
-  from_device_id: string;
-  from_host: string;
-  from_name: string;
-  body: string;
-  created_at: number;
-  expires_at: number;
 }
 
 // `orders` is what the socket declared on the upgrade: whether the daemon behind it reads the kind
@@ -137,26 +125,7 @@ interface Attachment {
 const COLUMNS =
   "message_id, kind, to_device_id, to_session_id, from_device_id, from_host, from_name, body, created_at, expires_at";
 
-// Every read of the queue decides the TTL for itself, so what is handed to a host is bounded by
-// how old the message is and by nothing else: a row written when the TTL was longer, and one the
-// sweep has not reached yet, are both already gone to every read past this cutoff. The stored
-// `expires_at` is what the receiver is told, never what the mailbox believes.
-const LIVE = "created_at > ?";
-
 const liveSince = (now: number): number => now - MESSAGE_TTL_MS;
-
-const toMessage = (row: MessageRow): Message => ({
-  messageId: row.message_id,
-  kind: row.kind,
-  toDeviceId: row.to_device_id,
-  toSessionId: row.to_session_id,
-  fromDeviceId: row.from_device_id,
-  fromHost: row.from_host,
-  fromName: row.from_name,
-  body: row.body,
-  createdAt: row.created_at,
-  expiresAt: row.expires_at,
-});
 
 const parseToSessionId = (value: unknown): Parsed<string> => {
   if (value === undefined || value === "") return { ok: true, value: "" };
@@ -280,16 +249,17 @@ export class Mailbox extends DurableObject<MailboxEnv> {
        )`,
     );
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_by_device ON messages (to_device_id, created_at, message_id)");
-    // One row per order a host is holding, so the table is the whole of the lease state, and
-    // `token` is what the holder has to quote to release it.
+    // One row per order a socket is holding: the token it has to quote to release it. An order
+    // lives only between the push and the receipt, so nothing here is ever waited on or aged out.
     this.sql.exec(
-      `CREATE TABLE IF NOT EXISTS leases (
+      `CREATE TABLE IF NOT EXISTS order_tokens (
          message_id TEXT PRIMARY KEY,
-         expires_at INTEGER NOT NULL,
          token TEXT NOT NULL
        )`,
     );
-    this.sql.exec("CREATE INDEX IF NOT EXISTS leases_by_expiry ON leases (expires_at)");
+    // `leases` was the same rows under an expiry nothing could reach, and the index over it. Its
+    // rows only ever described an order in flight, so a mailbox loses nothing by dropping it.
+    this.sql.exec("DROP TABLE IF EXISTS leases");
     // A mailbox created before per-session addressing has no to_session_id, and its queued messages
     // are all for the whole host; one created before a message named its sender has no from_host or
     // from_name, and its queued messages are delivered under a header that names neither; one
@@ -323,15 +293,9 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
     pair[1].serializeAttachment({ deviceId, orders } satisfies Attachment);
+    // A socket attaching is handed nothing. A message is a ping that was relevant when it was
+    // sent, and this socket was not there for it; the sender has already been told nobody got it.
     this.expire(now);
-    this.release(now);
-    for (const message of this.rows("AND kind = 'news'", deviceId, now)) {
-      pair[1].send(messageFrame(message, crypto.randomUUID()));
-    }
-    // One order on top of the news: the oldest no session is holding. The host's other orders wait
-    // for the receipt on this one, since it writes them into its sessions one at a time.
-    const next = this.nextOrder(deviceId, now);
-    if (next !== null) this.hand(next, now);
     await this.scheduleAlarm();
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -346,19 +310,12 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       );
       return;
     }
-    const now = Date.now();
-    if (this.remove(deviceId, receipt.messageId, receipt.token)) {
-      this.settle(receipt);
-      const next = this.nextOrder(deviceId, now);
-      if (next !== null) this.hand(next, now);
-    }
+    if (this.remove(deviceId, receipt.messageId, receipt.token)) this.settle(receipt);
     await this.scheduleAlarm();
   }
 
   async alarm(): Promise<void> {
-    const now = Date.now();
-    this.handBack(now);
-    await this.sweep(now);
+    await this.sweep(Date.now());
     await this.scheduleAlarm();
   }
 
@@ -390,63 +347,34 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       message.createdAt,
       message.expiresAt,
     );
-    const outcome = await this.place(message, now);
+    const outcome = await this.place(message);
     await this.scheduleAlarm();
     return { message, outcome };
   }
 
-  list(toDeviceId: string, now: number): Message[] {
-    this.expire(now);
-    return this.rows("", toDeviceId, now);
-  }
-
-  // News is handed out and nothing is waited on. An order goes to one socket, and the sender waits
-  // for the receipt naming the session: a host that answers nothing within the window loses the
-  // order, while one that was never listening keeps it for the next socket to attach.
-  private async place(message: Message, now: number): Promise<Outcome> {
+  // Whoever is attached takes the message, and a sender whose message reached nobody is told so
+  // rather than left to assume it landed. News goes to every socket the device has open; an order
+  // goes to one, and the sender waits for the receipt naming the session that ran it.
+  private async place(message: Message): Promise<Outcome> {
     if (message.kind === "news") {
-      this.broadcast(message);
-      return { state: "fanout" };
+      if (this.broadcast(message) > 0) return { state: "fanout" };
+      this.drop(message.toDeviceId, message.messageId);
+      return { state: "untaken", reason: NOTHING_LISTENING };
     }
-    if (!this.hand(message, now)) return { state: "untaken", reason: NOTHING_LISTENING };
+    if (!this.hand(message)) {
+      this.drop(message.toDeviceId, message.messageId);
+      return { state: "untaken", reason: NOTHING_LISTENING };
+    }
     const outcome = await this.taker(message.messageId);
     if (outcome.state === "untaken") this.drop(message.toDeviceId, message.messageId);
     return outcome;
   }
 
-  // The one order a device may be handed next: the oldest still inside its TTL and under no lease.
-  // A second lease started now would run out while the host was still writing the first order into
-  // a session.
-  private nextOrder(toDeviceId: string, now: number): Message | null {
-    const [row] = this.sql
-      .exec<MessageRow>(
-        `SELECT ${COLUMNS} FROM messages
-           WHERE to_device_id = ? AND ${LIVE} AND kind = 'order'
-             AND message_id NOT IN (SELECT message_id FROM leases)
-           ORDER BY created_at, rowid LIMIT 1`,
-        toDeviceId,
-        liveSince(now),
-      )
-      .toArray();
-    return row === undefined ? null : toMessage(row);
-  }
-
-  private rows(filter: string, toDeviceId: string, now: number): Message[] {
-    return this.sql
-      .exec<MessageRow>(
-        `SELECT ${COLUMNS} FROM messages WHERE to_device_id = ? AND ${LIVE} ${filter} ORDER BY created_at, rowid`,
-        toDeviceId,
-        liveSince(now),
-      )
-      .toArray()
-      .map(toMessage);
-  }
-
   // A receipt releases the message it names only if it quotes that frame's token, so a daemon
-  // acking an id out of an old backlog cannot delete an order another socket is still placing.
+  // acking an id it has seen before cannot delete an order another socket is still placing.
   private remove(toDeviceId: string, messageId: string, token: string): boolean {
     const [held] = this.sql
-      .exec<{ token: string }>("SELECT token FROM leases WHERE message_id = ?", messageId)
+      .exec<{ token: string }>("SELECT token FROM order_tokens WHERE message_id = ?", messageId)
       .toArray();
     if (held !== undefined && held.token !== token) return false;
     return this.drop(toDeviceId, messageId);
@@ -461,7 +389,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
       messageId,
     ).rowsWritten;
     if (removed === 0) return false;
-    this.sql.exec("DELETE FROM leases WHERE message_id = ?", messageId);
+    this.sql.exec("DELETE FROM order_tokens WHERE message_id = ?", messageId);
     return true;
   }
 
@@ -475,56 +403,29 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     );
   }
 
-  private broadcast(message: Message): void {
+  // How many sockets the news reached, so a send that reached none can say so.
+  private broadcast(message: Message): number {
+    let delivered = 0;
     for (const socket of this.ctx.getWebSockets()) {
-      if (deviceOf(socket) === message.toDeviceId) deliver(socket, messageFrame(message, crypto.randomUUID()));
+      if (deviceOf(socket) !== message.toDeviceId) continue;
+      if (deliver(socket, messageFrame(message, crypto.randomUUID()))) delivered += 1;
     }
+    return delivered;
   }
 
-  // One order to one live socket that declared it reads kinds, held under a lease until that host
-  // reports what became of it. A daemon too old to read a kind would write the order into every
-  // session it has, so it is handed none and the order waits for one that attaches later.
-  private hand(message: Message, now: number): boolean {
+  // One order to one live socket that declared it reads kinds, under a token that socket has to
+  // quote to release it. A daemon too old to read a kind would write the order into every session
+  // it has, so it is handed none and the sender is told nobody took it.
+  private hand(message: Message): boolean {
     for (const socket of this.ctx.getWebSockets()) {
       const to = attached(socket);
       if (to === null || !to.orders || to.deviceId !== message.toDeviceId) continue;
       const token = crypto.randomUUID();
       if (!deliver(socket, messageFrame(message, token))) continue;
-      this.lease(message.messageId, token, now);
+      this.sql.exec("INSERT OR REPLACE INTO order_tokens (message_id, token) VALUES (?, ?)", message.messageId, token);
       return true;
     }
     return false;
-  }
-
-  private lease(messageId: string, token: string, now: number): void {
-    this.sql.exec(
-      "INSERT OR REPLACE INTO leases (message_id, expires_at, token) VALUES (?, ?, ?)",
-      messageId,
-      now + LEASE_MS,
-      token,
-    );
-  }
-
-  private release(now: number): void {
-    this.sql.exec("DELETE FROM leases WHERE expires_at <= ?", now);
-  }
-
-  // The devices whose lease has run out, each offered one order again. A host that is gone takes
-  // nothing and its orders wait, under no lease, for the next socket to attach — for as long as
-  // the TTL leaves them anything to offer.
-  private handBack(now: number): void {
-    const devices = this.sql
-      .exec<{ to_device_id: string }>(
-        `SELECT DISTINCT to_device_id FROM messages
-           WHERE message_id IN (SELECT message_id FROM leases WHERE expires_at <= ?)`,
-        now,
-      )
-      .toArray();
-    this.release(now);
-    for (const device of devices) {
-      const next = this.nextOrder(device.to_device_id, now);
-      if (next !== null) this.hand(next, now);
-    }
   }
 
   private taker(messageId: string): Promise<Outcome> {
@@ -541,9 +442,8 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     });
   }
 
-  // The quarter-hourly pass: retire what has expired, forget the messages of a device that is
-  // gone, and close the socket of one that is revoked. It shares the lease alarm, and a lease due
-  // sooner does not bring it forward.
+  // The quarter-hourly pass, and the only thing the alarm is for: take out rows nothing acked,
+  // forget the rows of a device that is gone, and close the socket of one that is revoked.
   private async sweep(now: number): Promise<void> {
     if (now < (await this.sweepDue())) return;
     await this.ctx.storage.put(SWEPT_AT, now);
@@ -570,7 +470,7 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     for (const target of targets) {
       if (live.has(target.to_device_id)) continue;
       this.sql.exec(
-        "DELETE FROM leases WHERE message_id IN (SELECT message_id FROM messages WHERE to_device_id = ?)",
+        "DELETE FROM order_tokens WHERE message_id IN (SELECT message_id FROM messages WHERE to_device_id = ?)",
         target.to_device_id,
       );
       this.sql.exec("DELETE FROM messages WHERE to_device_id = ?", target.to_device_id);
@@ -581,14 +481,11 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     return this.sql.exec<{ queued: number }>("SELECT count(*) AS queued FROM messages").one().queued;
   }
 
-  // One alarm, set to the earliest thing the mailbox owes: the next lease expiry, which hands an
-  // order a host never answered for to whoever is listening then, or the next sweep, which falls a
-  // quarter hour after the last one however much traffic arrives in between. A mailbox holding
-  // nothing with nobody attached owes neither and stops waking up.
+  // The next sweep, which falls a quarter hour after the last one however much traffic arrives in
+  // between. A mailbox holding nothing with nobody attached owes nothing and stops waking up.
   private async scheduleAlarm(): Promise<void> {
-    const due = this.sql.exec<{ due: number | null }>("SELECT min(expires_at) AS due FROM leases").one().due;
-    if (due === null && this.queued() === 0 && this.ctx.getWebSockets().length === 0) return;
-    await this.ctx.storage.setAlarm(Math.min(due ?? Number.POSITIVE_INFINITY, await this.sweepDue()));
+    if (this.queued() === 0 && this.ctx.getWebSockets().length === 0) return;
+    await this.ctx.storage.setAlarm(await this.sweepDue());
   }
 
   // When the next quarter-hourly pass falls due. A mailbox that has never made one dates its first
@@ -602,13 +499,13 @@ export class Mailbox extends DurableObject<MailboxEnv> {
     return now + SWEEP_INTERVAL_MS;
   }
 
-  // Takes out the rows the reads have already stopped handing over. It is the same cutoff, so a
-  // mailbox nothing has touched since the TTL changed holds rows no read will return and this
-  // clears them on the next thing that happens to it.
+  // Takes out a row no receipt ever released. Nothing is delivered from a row, so this only keeps
+  // the table from growing: whatever a deploy or a dropped socket left behind goes on the next
+  // thing that happens to the mailbox.
   private expire(now: number): void {
     const since = liveSince(now);
     this.sql.exec(
-      "DELETE FROM leases WHERE message_id IN (SELECT message_id FROM messages WHERE created_at <= ?)",
+      "DELETE FROM order_tokens WHERE message_id IN (SELECT message_id FROM messages WHERE created_at <= ?)",
       since,
     );
     this.sql.exec("DELETE FROM messages WHERE created_at <= ?", since);

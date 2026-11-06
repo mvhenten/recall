@@ -1,8 +1,16 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { MAX_BODY_BYTES, MAX_QUEUED_MESSAGES, type Mailbox, MESSAGE_TTL_MS, type Message } from "../src/mailbox";
-import { type Client, harness } from "./harness";
+import {
+  MAX_BODY_BYTES,
+  MAX_QUEUED_MESSAGES,
+  type Mailbox,
+  MESSAGE_TTL_MS,
+  type Message,
+  NOTHING_LISTENING,
+  type Sent,
+} from "../src/mailbox";
+import { type Client, harness, mailboxRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -25,9 +33,6 @@ const deviceId = async (client: Client, name: string): Promise<string> => {
 
 const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
-const queued = (userId: string, toDeviceId: string, now: number): Promise<Message[]> =>
-  runInDurableObject(mailboxOf(userId), (mailbox: Mailbox) => mailbox.list(toDeviceId, now));
-
 const send = (
   client: Client,
   toDeviceId: string,
@@ -36,10 +41,11 @@ const send = (
   fromSessionId = "",
 ): Promise<Response> => client.request("POST", "/v1/messages", { toDeviceId, toSessionId, fromSessionId, body });
 
-const sentMessage = async (response: Response): Promise<Message> => {
+const sentMessage = async (response: Response): Promise<Message> => (await sentBody(response)).message;
+
+const sentBody = async (response: Response): Promise<Sent> => {
   expect(response.status).toBe(201);
-  const body: { message: Message } = await response.json();
-  return body.message;
+  return await response.json();
 };
 
 describe("messages", () => {
@@ -65,24 +71,25 @@ describe("messages", () => {
     expect(stale).toMatchObject({ fromHost: "core", fromName: "" });
   });
 
-  it("queues a sent message against the target device only, until that device acks it", async () => {
+  it("names the target and the sender on a send, and holds nothing for a device that was not listening", async () => {
     const h = await harness();
     const userId = `user-${crypto.randomUUID()}`;
     const { laptop } = await account(h, userId);
     const laptopId = await deviceId(laptop, "laptop");
     const desktopId = await deviceId(laptop, "desktop");
 
-    const message = await sentMessage(await send(laptop, desktopId, "the release is green"));
-    expect(message).toMatchObject({
+    const sent = await sentBody(await send(laptop, desktopId, "the release is green"));
+
+    expect(sent.message).toMatchObject({
       toDeviceId: desktopId,
       toSessionId: "",
       fromDeviceId: laptopId,
       body: "the release is green",
     });
-    expect(message.expiresAt).toBe(message.createdAt + MESSAGE_TTL_MS);
-
-    expect(await queued(userId, desktopId, h.now())).toEqual([message]);
-    expect(await queued(userId, laptopId, h.now())).toEqual([]);
+    expect(sent.message.expiresAt).toBe(sent.message.createdAt + MESSAGE_TTL_MS);
+    expect(sent.outcome).toEqual({ state: "untaken", reason: NOTHING_LISTENING });
+    expect(await mailboxRows(userId, desktopId)).toEqual([]);
+    expect(await mailboxRows(userId, laptopId)).toEqual([]);
   });
 
   it("queues a message for the one session named, and only on that session's own device", async () => {
@@ -95,15 +102,16 @@ describe("messages", () => {
 
     const message = await sentMessage(await send(laptop, desktopId, "only you", "9f8a1b2c"));
     expect(message).toMatchObject({ toDeviceId: desktopId, toSessionId: "9f8a1b2c" });
-    expect(await queued(userId, desktopId, h.now())).toEqual([message]);
 
     expect((await send(laptop, laptopId, "the wrong host", "9f8a1b2c")).status).toBe(404);
     expect((await send(laptop, desktopId, "a session that ended", "gone")).status).toBe(404);
     expect((await send(laptop, desktopId, "malformed", "two words")).status).toBe(400);
-    expect(await queued(userId, laptopId, h.now())).toEqual([]);
+    expect(await mailboxRows(userId, laptopId)).toEqual([]);
   });
 
-  it("refuses an oversized body, caps the queue per account and expires messages after the TTL", async () => {
+  // A send keeps nothing, so the only rows that pile up are pushes a host took and never acked.
+  // The cap is what stops those filling the account, and the TTL is what clears them.
+  it("refuses an oversized body, caps the rows per account and clears them after the TTL", async () => {
     const h = await harness();
     const userId = `user-${crypto.randomUUID()}`;
     const { laptop } = await account(h, userId);
@@ -111,20 +119,25 @@ describe("messages", () => {
 
     expect((await send(laptop, desktopId, "x".repeat(MAX_BODY_BYTES + 1))).status).toBe(413);
 
-    await runInDurableObject(mailboxOf(userId), async (mailbox: Mailbox) => {
+    await runInDurableObject(mailboxOf(userId), (_mailbox: Mailbox, state: DurableObjectState) => {
       for (let index = 0; index < MAX_QUEUED_MESSAGES; index += 1) {
-        await mailbox.enqueue(
-          { kind: "news", toDeviceId: desktopId, toSessionId: "", fromSessionId: "", body: `queued ${index}` },
-          { deviceId: desktopId, host: "desktop", name: "" },
+        state.storage.sql.exec(
+          `INSERT INTO messages
+             (message_id, kind, to_device_id, to_session_id, from_device_id, from_host, from_name, body, created_at, expires_at)
+             VALUES (?, 'news', ?, '', 'd-sender', 'laptop', '', ?, ?, ?)`,
+          crypto.randomUUID(),
+          desktopId,
+          `nothing acked ${index}`,
           h.now(),
+          h.now() + MESSAGE_TTL_MS,
         );
       }
     });
     expect((await send(laptop, desktopId, "one too many")).status).toBe(429);
 
-    h.tick(MESSAGE_TTL_MS);
-    expect(await queued(userId, desktopId, h.now())).toEqual([]);
+    h.tick(MESSAGE_TTL_MS + 1);
     expect((await send(laptop, desktopId, "room again")).status).toBe(201);
+    expect(await mailboxRows(userId, desktopId)).toEqual([]);
   });
 
   it("sends only for an authenticated caller to a device on that caller's own account", async () => {
@@ -139,7 +152,7 @@ describe("messages", () => {
       401,
     );
     expect((await send(bob, desktopId, "wrong account")).status).toBe(404);
-    expect(await queued(userId, desktopId, h.now())).toEqual([]);
+    expect(await mailboxRows(userId, desktopId)).toEqual([]);
 
     expect((await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId })).status).toBe(400);
     expect((await laptop.request("GET", "/v1/messages")).status).toBe(405);

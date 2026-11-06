@@ -538,14 +538,28 @@ pub fn order_refusal(sent: &api::Sent, to: &str) -> String {
 
 /// An order is worth nothing to the sender who cannot tell whether anyone picked it up, so one
 /// nobody took ends the command with the reason the service gave rather than a line that reads
-/// like success. A host that is listening and names no session loses the order; one that is not
-/// listening keeps it for the ten seconds the service leaves it queued.
+/// like success. Nothing is left behind either way: a host that names no session loses the order,
+/// and so does one that was not listening.
 fn report_order(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
     let Some(api::Outcome::Taken { session_id }) = &sent.outcome else {
         bail!("{}", order_refusal(sent, to));
     };
     if !json {
         println!("order {} taken by {session_id} on {to}", sent.message.message_id);
+    }
+    Ok(())
+}
+
+/// News is a ping that is relevant now, so one that reached no host is a failure and not a quiet
+/// success: the bus keeps nothing for a session that starts later, and a sender shown a line that
+/// reads like success would never know to send it again.
+fn report_send(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
+    let id = &sent.message.message_id;
+    if let Some(api::Outcome::Untaken { reason }) = &sent.outcome {
+        bail!("message {id} reached nobody on {to}: {reason}");
+    }
+    if !json {
+        println!("sent {id} to {to}");
     }
     Ok(())
 }
@@ -929,9 +943,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let sent = client.send(&target, api::Kind::News, &sending_session(), &body)?;
             if cli.json {
                 print_json(&sent.message)?;
-            } else {
-                println!("sent {} to {to}", sent.message.message_id);
             }
+            report_send(&sent, &to, cli.json)?;
         }
         Command::Order { to, message } => {
             require_messaging(&settings::load(&cli.settings)?)?;

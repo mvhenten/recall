@@ -365,6 +365,9 @@ pub struct Message {
     pub from_name: String,
     pub body: String,
     pub created_at: i64,
+    /// Nothing reads this. The service stamps it, decides a row's life from `created_at`, and no
+    /// host compares it against a clock of its own; defaulted so the field can leave the wire.
+    #[serde(default)]
     pub expires_at: i64,
 }
 

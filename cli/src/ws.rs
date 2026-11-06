@@ -46,8 +46,8 @@ pub fn listen_url(endpoint: &str) -> Result<String> {
     Ok(format!("{scheme}://{rest}/v1/messages/listen"))
 }
 
-/// What this host sends back about a message it was handed. `Silent` leaves the mailbox holding
-/// the message, so its lease is the only thing that moves it.
+/// What this host sends back about a message it was handed. `Silent` says nothing, which leaves
+/// the sender waiting out the window it gives an order before reporting that nobody took it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reply {
     Ack,
