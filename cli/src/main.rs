@@ -25,6 +25,18 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use transcripts::Pass;
 
+/// Where a test puts the files it makes: this repo's own gitignored scratch directory, named for
+/// the test and the process that ran it, and never the machine's shared temporary one.
+#[cfg(test)]
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../.tmp")
+        .join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[derive(Parser)]
 #[command(
     name = "recall",

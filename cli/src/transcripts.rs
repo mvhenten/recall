@@ -22,11 +22,12 @@
 //! it keeps, and the file is what says where that falls in it — a reading of the file, which only
 //! a pass that has lost its place pays for.
 //!
-//! A stretch is cut back to the last complete line it holds, the way `hooks/usage.mjs` cuts the
-//! same files, so a record half written is never sent as the half of it this host can see and a
-//! secret half written is never sent as the half of itself that is not one yet. Whether a file
-//! ends for good where it ends now is the caller's to say and nothing this reader can work out:
-//! only a session that has ended writes nothing more.
+//! A stretch of a file of turns is cut back to the last complete line it holds, the way
+//! `hooks/usage.mjs` cuts the same files, so a record half written is never sent as the half of it
+//! this host can see and a secret half written is never sent as the half of itself that is not one
+//! yet. A tool output has no records and no lines to keep whole, so a stretch of one is every byte
+//! read. Whether a file ends for good where it ends now is the caller's to say and nothing this
+//! reader can work out: only a session that has ended writes nothing more.
 //!
 //! The position is kept apart from the mark the usage counter keeps in the session record, so
 //! moving either can neither skip nor replay the other.
@@ -122,16 +123,36 @@ fn named(stem: &str, holds: Holds) -> Option<String> {
     Some(file)
 }
 
-/// The files of one kind one session wrote, in name order. A session that delegated nothing and
-/// one that persisted no output have no directory for either, which is the common case and no
-/// error. A directory that is there and cannot be read is one: it is exactly the undercount this
-/// reader exists to end, and answering with the session's own transcript alone would hide it. A
-/// file named what this host cannot send is the same undercount by another route, so it fails here
-/// rather than being passed over into a session archived without it.
-fn under(dir: &Path, extension: &str, holds: Holds) -> Result<Vec<Source>> {
+/// What a file of a session holds, read off the name the service holds it under. A persisted tool
+/// output is the one kind named for what it is.
+pub fn holds_of(file: &str) -> Holds {
+    match file.starts_with(TOOL_RESULT) {
+        true => Holds::Output,
+        false => Holds::Turns,
+    }
+}
+
+/// The files one session wrote, and the ones among them this host can send nothing of.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sources {
+    /// The session's own transcript first, then the delegated turns, then the tool outputs it
+    /// persisted, each set in name order.
+    pub found: Vec<Source>,
+    /// Files named what the service would refuse, or what another of this session's files is held
+    /// under. Nothing this host could send them as would restore to the path the turns pointing at
+    /// them read, so the caller is told which they are rather than left with a session archived
+    /// without them and nothing saying so.
+    pub unsendable: Vec<PathBuf>,
+}
+
+/// The files of one kind one session wrote. A session that delegated nothing and one that
+/// persisted no output have no directory for either, which is the common case and no error. A
+/// directory that is there and cannot be read is one: it is exactly the undercount this reader
+/// exists to end, and answering with the session's own transcript alone would hide it.
+fn under(dir: &Path, extension: &str, holds: Holds, into: &mut Sources) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
     };
     let mut found = Vec::new();
@@ -140,14 +161,15 @@ fn under(dir: &Path, extension: &str, holds: Holds) -> Result<Vec<Source>> {
         if path.extension() != Some(OsStr::new(extension)) {
             continue;
         }
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        // A name that is not UTF-8 and one the service would refuse are the same thing here:
+        // nothing this host can hold the file by.
+        let sendable = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| named(stem, holds));
+        let Some(file) = sendable else {
+            into.unsendable.push(path);
             continue;
-        };
-        let Some(file) = named(stem, holds) else {
-            bail!(
-                "{} is named what this host cannot send a transcript file under",
-                path.display()
-            );
         };
         let size = size_of(&path);
         found.push(Source {
@@ -158,23 +180,26 @@ fn under(dir: &Path, extension: &str, holds: Holds) -> Result<Vec<Source>> {
         });
     }
     found.sort_by(|left, right| left.file.cmp(&right.file));
-    Ok(found)
+    into.found.extend(found);
+    Ok(())
 }
 
-/// Every file one session writes: its own first, then the delegated turns, then the tool outputs
-/// it persisted, each set in name order.
-pub fn sources(transcript: &Path) -> Result<Vec<Source>> {
-    let mut found = vec![Source {
-        file: MAIN.to_string(),
-        path: transcript.to_path_buf(),
-        size: size_of(transcript),
-        holds: Holds::Turns,
-    }];
+/// Every file one session writes, and whichever of them this host has no name for.
+pub fn sources(transcript: &Path) -> Result<Sources> {
+    let mut found = Sources {
+        found: vec![Source {
+            file: MAIN.to_string(),
+            path: transcript.to_path_buf(),
+            size: size_of(transcript),
+            holds: Holds::Turns,
+        }],
+        unsendable: Vec::new(),
+    };
     let Some(dir) = beside(transcript) else {
         return Ok(found);
     };
-    found.extend(under(&dir.join("subagents"), "jsonl", Holds::Turns)?);
-    found.extend(under(&dir.join("tool-results"), "txt", Holds::Output)?);
+    under(&dir.join("subagents"), "jsonl", Holds::Turns, &mut found)?;
+    under(&dir.join("tool-results"), "txt", Holds::Output, &mut found)?;
     Ok(found)
 }
 
@@ -221,11 +246,16 @@ struct Bytes {
     full: bool,
 }
 
-/// One stretch of a file, cut the way `hooks/usage.mjs` cuts the same files: back to the last
-/// complete line, so a record still being written is never sent as the half of it this host can
-/// see. An unterminated tail is not a record, and holding it back costs nothing — the pass after
-/// this one takes it whole, and the final pass takes it whatever state it is in.
-fn read_at(path: &Path, offset: i64, pass: Pass) -> Result<Bytes> {
+/// One stretch of a file. A file of records is cut the way `hooks/usage.mjs` cuts the same files:
+/// back to the last complete line, so a record still being written is never sent as the half of it
+/// this host can see. An unterminated tail is not a record, and holding it back costs nothing —
+/// the pass after this one takes it whole, and the final pass takes it whatever state it is in.
+///
+/// A tool output holds no records, so there is no half of one to hold back and every byte read of
+/// it is a byte to send. One that never ends in a line break would otherwise wait for the final
+/// pass, and the beat that exists to carry a long turn's bytes up while it runs would never reach
+/// it at all.
+fn read_at(path: &Path, offset: i64, pass: Pass, holds: Holds) -> Result<Bytes> {
     let mut file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     let mut before = None;
     if offset > 0 {
@@ -248,33 +278,20 @@ fn read_at(path: &Path, offset: i64, pass: Pass) -> Result<Bytes> {
         .read_to_end(&mut read)
         .with_context(|| format!("reading {}", path.display()))?;
     let full = read.len() == MAX_CHUNK;
-    if full {
-        if let Some(last) = read.iter().rposition(|byte| *byte == NEWLINE) {
-            read.truncate(last + 1);
+    let whole = !full && pass == Pass::Final;
+    if holds == Holds::Turns && !whole {
+        match read.iter().rposition(|byte| *byte == NEWLINE) {
+            Some(last) => read.truncate(last + 1),
+            // A line longer than a whole stretch is read as it stands; one shorter than that is a
+            // record the session is still writing.
+            None if full => {}
+            None => read.clear(),
         }
-        return Ok(Bytes {
-            before,
-            read,
-            whole: false,
-            full,
-        });
-    }
-    if pass == Pass::Final {
-        return Ok(Bytes {
-            before,
-            read,
-            whole: true,
-            full,
-        });
-    }
-    match read.iter().rposition(|byte| *byte == NEWLINE) {
-        Some(last) => read.truncate(last + 1),
-        None => read.clear(),
     }
     Ok(Bytes {
         before,
         read,
-        whole: false,
+        whole,
         full,
     })
 }
@@ -297,9 +314,14 @@ enum Stretch {
     Waiting,
 }
 
-fn stretch(path: &Path, offset: i64, pass: Pass) -> Result<Stretch> {
-    let read = read_at(path, offset, pass)?;
-    let redacted = redact::redact(&read.read, read.before, read.whole);
+/// One stretch as the service takes it: a body of at most `MAX_CHUNK` bytes. The source is read to
+/// that and no further, but a placeholder is longer than most of what it stands in, so the stretch
+/// is written out to the length the service accepts and accounts for however much of the file that
+/// came to. Offering a longer body is a 413 the pass cannot act on and a stretch no later pass can
+/// get past either.
+fn stretch(path: &Path, offset: i64, pass: Pass, holds: Holds) -> Result<Stretch> {
+    let read = read_at(path, offset, pass, holds)?;
+    let redacted = redact::within(&read.read, read.before, read.whole, MAX_CHUNK);
     if redacted.source > 0 {
         return Ok(Stretch::Holding(redacted.bytes, redacted.source as i64));
     }
@@ -336,13 +358,22 @@ enum Resumed {
 /// rewritten or truncated under it. Nothing is spliced onto the stretches already written, since
 /// the offsets they are keyed by no longer describe anything in the new file and a splice would
 /// read as lines the session never wrote. `hooks/usage.mjs` reads the same shape the same way,
-/// counting the new file from its end rather than counting the old one over again. Every other
-/// answer a reading could fail on is a fault and says which: a secret no stretch can hold, and an
-/// archive whose end falls inside a placeholder.
-fn resume(path: &Path, archive: i64) -> Result<Resumed> {
+/// counting the new file from its end rather than counting the old one over again. The one answer
+/// a reading fails on is a secret no stretch can hold.
+///
+/// The archive's end can also fall inside a placeholder, which is a file the session went on
+/// writing after a final pass took the line it was half way through. That line ran out part way
+/// into a secret, too little of it to read as one, so it went up as the prose it looked like; the
+/// bytes that finished it arrived after, and the replay now reads the whole of it as a secret the
+/// archive holds the front of. Nothing can be taken back out of the archive, so the reading
+/// carries on from the end of what the placeholder stood in: the rest of the secret is never sent,
+/// that one record keeps the half of itself that went up, and the file is archived again from
+/// there. The place and the archive's end part company by the length of the placeholder, which the
+/// first reading after it closes again.
+fn resume(path: &Path, archive: i64, holds: Holds) -> Result<Resumed> {
     let mut at = Sent::default();
     while at.archive < archive {
-        let read = read_at(path, at.source, Pass::Final)?;
+        let read = read_at(path, at.source, Pass::Final, holds)?;
         if read.read.is_empty() {
             break;
         }
@@ -357,14 +388,14 @@ fn resume(path: &Path, archive: i64) -> Result<Resumed> {
         let end = at.archive + redacted.bytes.len() as i64;
         if end > archive {
             let into = (archive - at.archive) as usize;
-            let Some(found) = redact::source_of(&read.read, read.before, read.whole, into) else {
-                // Every stretch ends on a run of the file written out as it was read, so the end
-                // of the archive falls on one too. One that falls inside a placeholder stands for
-                // bytes that were never sent, and no place in the file answers for it.
-                bail!(
-                    "the archive of {} ends {archive} bytes in, which falls inside a secret this host wrote out as a placeholder",
-                    path.display()
-                );
+            let found = match redact::source_of(&read.read, read.before, read.whole, into) {
+                redact::Place::At(found) => found,
+                redact::Place::Within { past } => past,
+                redact::Place::Beyond => bail!(
+                    "the archive of {} ends {archive} bytes in, past everything the stretch at {} writes out",
+                    path.display(),
+                    at.source
+                ),
             };
             return Ok(Resumed::At(Sent {
                 source: at.source + found as i64,
@@ -389,7 +420,7 @@ pub fn placed(source: &Source, archive: i64) -> Result<Sent> {
     if archive == 0 {
         return Ok(Sent::default());
     }
-    Ok(match resume(&source.path, archive)? {
+    Ok(match resume(&source.path, archive, source.holds)? {
         Resumed::At(sent) => sent,
         Resumed::Rewritten => Sent {
             source: source.size,
@@ -398,29 +429,25 @@ pub fn placed(source: &Source, archive: i64) -> Result<Sent> {
     })
 }
 
-/// How long the archive of one file on disk runs. The archive holds the file redacted and a
-/// placeholder is not the length of what it stands in, so the file's own size says nothing about
-/// it: this is the sender's own arithmetic over the file at rest, which is what a host that sent
-/// the whole of it put there.
-pub fn archived_len(path: &Path) -> Result<i64> {
+/// How long the archive of one file on disk runs at the least. The archive holds the file redacted
+/// and a placeholder is not the length of what it stands in, so the file's own size says nothing
+/// about it: this is the sender's own arithmetic over the file at rest, stretch by stretch as a
+/// pass sends them.
+///
+/// The record at the end of the file is weighed as a pass that cannot say the session has stopped
+/// weighs it, which is held back. A reader of this is deciding whether this host holds as much of
+/// a file as the archive does, and the reading that cannot overstate is the one it wants: a tail
+/// counted in here but never sent reads as a transcript that is whole when it is a part.
+pub fn archived_len(path: &Path, holds: Holds) -> Result<i64> {
     let size = size_of(path);
     let mut at = Sent::default();
     while at.source < size {
-        let read = read_at(path, at.source, Pass::Final)?;
-        if read.read.is_empty() {
+        let Stretch::Holding(bytes, span) = stretch(path, at.source, Pass::Open, holds)? else {
             break;
-        }
-        let redacted = redact::redact(&read.read, read.before, read.whole);
-        if redacted.source == 0 {
-            bail!(
-                "{} holds a secret longer than a stretch at {}, so how long its archive runs cannot be read",
-                path.display(),
-                at.source
-            );
-        }
+        };
         at = Sent {
-            source: at.source + redacted.source as i64,
-            archive: at.archive + redacted.bytes.len() as i64,
+            source: at.source + span,
+            archive: at.archive + bytes.len() as i64,
         };
     }
     Ok(at.archive)
@@ -441,7 +468,7 @@ pub fn send_from(store: &impl Store, session_id: &str, source: &Source, from: Se
     let mut at = from;
     let mut bytes = 0;
     while at.source < source.size {
-        let Stretch::Holding(sent, span) = stretch(&source.path, at.source, pass)? else {
+        let Stretch::Holding(sent, span) = stretch(&source.path, at.source, pass, source.holds)? else {
             break;
         };
         match store.append(session_id, &source.file, at.archive, &sent)? {
@@ -484,6 +511,11 @@ pub struct Archive {
 impl Archive {
     /// Every file of one session, caught up with the service. The session's own transcript is what
     /// names the set, so a session whose record carries none sends nothing.
+    ///
+    /// A file this host has no name for is named to the caller once this run, after the rest of
+    /// the session has gone up. The name is nothing a later pass changes, so answering on every
+    /// beat would say the same thing for as long as the session runs and hold back the files the
+    /// session is still writing for exactly as long.
     pub fn send(&mut self, store: &impl Store, session_id: &str, transcript: &Path, pass: Pass) -> Result<i64> {
         if transcript.as_os_str().is_empty() {
             return Ok(0);
@@ -494,6 +526,7 @@ impl Archive {
         let held = match self.seen.get(session_id) {
             Some(known) => {
                 if sources
+                    .found
                     .iter()
                     .all(|source| known.get(&source.file).is_some_and(|sent| sent.source >= source.size))
                 {
@@ -504,22 +537,34 @@ impl Archive {
             None => {
                 let archived = store.held(session_id)?.bytes;
                 let mut found = HashMap::new();
-                for source in &sources {
+                for source in &sources.found {
                     let archive = archived.get(&source.file).copied().unwrap_or(0);
                     found.insert(source.file.clone(), placed(source, archive)?);
                 }
                 found
             }
         };
+        let first = !self.seen.contains_key(session_id);
         let mut sent = 0;
         let mut ends = HashMap::new();
-        for source in &sources {
+        for source in &sources.found {
             let from = held.get(&source.file).copied().unwrap_or_default();
             let reached = send_from(store, session_id, source, from, pass)?;
             ends.insert(source.file.clone(), reached.sent);
             sent += reached.bytes;
         }
         self.seen.insert(session_id.to_string(), ends);
+        if first && !sources.unsendable.is_empty() {
+            let named: Vec<String> = sources
+                .unsendable
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            bail!(
+                "session {session_id} holds files named what this host cannot send a transcript file under, so no part of them is archived: {}",
+                named.join(", ")
+            );
+        }
         Ok(sent)
     }
 
@@ -534,6 +579,7 @@ impl Archive {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     struct Sandbox {
@@ -542,8 +588,7 @@ mod tests {
 
     impl Sandbox {
         fn new(name: &str) -> Sandbox {
-            let dir = std::env::temp_dir().join(format!("recall-transcripts-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = crate::scratch(&format!("transcripts-{name}"));
             std::fs::create_dir_all(dir.join("project")).unwrap();
             Sandbox { dir }
         }
@@ -620,6 +665,14 @@ mod tests {
         }
 
         fn append(&self, _session_id: &str, file: &str, offset: i64, bytes: &[u8]) -> Result<Appended> {
+            // A body past MAX_CHUNK_BYTES is a 413 the service answers with nothing a pass can
+            // place, so every test here is a test that no stretch is offered as one.
+            if bytes.len() > MAX_CHUNK {
+                bail!(
+                    "a body of {} bytes is more than the {MAX_CHUNK} a stretch may hold",
+                    bytes.len()
+                );
+            }
             if self.objects.borrow().contains_key(&(file.to_string(), offset)) {
                 return Ok(Appended::Refused(self.ends().get(file).copied().unwrap_or(offset)));
             }
@@ -641,6 +694,7 @@ mod tests {
 
         let named: Vec<String> = sources(&transcript)
             .unwrap()
+            .found
             .into_iter()
             .map(|source| source.file)
             .collect();
@@ -720,7 +774,7 @@ mod tests {
         let sandbox = Sandbox::new("replayed");
         let transcript = sandbox.transcript("s-1", "one\ntwo\n");
         let service = Fake::default();
-        let source = sources(&transcript).unwrap().remove(0);
+        let source = sources(&transcript).unwrap().found.remove(0);
 
         assert_eq!(
             send_from(&service, "s-1", &source, placed(&source, 0).unwrap(), Pass::Open).unwrap(),
@@ -783,7 +837,7 @@ mod tests {
         );
         assert!(error.contains("subagents"), "{error}");
         assert_eq!(
-            sources(&transcript).unwrap().len(),
+            sources(&transcript).unwrap().found.len(),
             2,
             "and a directory that can be read again names its files"
         );
@@ -950,49 +1004,190 @@ mod tests {
     }
 
     #[test]
-    fn a_file_named_what_this_host_cannot_send_under_fails_rather_than_being_passed_over() {
+    fn a_file_named_what_this_host_cannot_send_under_is_named_rather_than_passed_over() {
         let sandbox = Sandbox::new("named");
         let transcript = sandbox.transcript("s-1", "one\n");
         sandbox.delegated("s-1", "tool-results.x", "ay\n");
-
-        let refused = sources(&transcript);
-
-        let error = format!(
-            "{:#}",
-            refused.expect_err("a delegated turn may not take the name of a persisted output")
-        );
-        assert!(error.contains("tool-results.x.jsonl"), "{error}");
-
-        let sandbox = Sandbox::new("overlong");
-        let transcript = sandbox.transcript("s-1", "one\n");
         sandbox.persisted("s-1", &"a".repeat(101), "output\n");
+        // A name that is not UTF-8 at all, which the service has nothing to take either.
+        let dir = sandbox.dir.join("project").join("s-1").join("tool-results");
+        std::fs::write(dir.join(OsStr::from_bytes(b"bad\xff.txt")), "more\n").unwrap();
 
-        let refused = sources(&transcript);
+        let found = sources(&transcript).unwrap();
+
+        assert_eq!(
+            found
+                .found
+                .iter()
+                .map(|source| source.file.as_str())
+                .collect::<Vec<_>>(),
+            vec![MAIN],
+            "a delegated turn may not take the name of a persisted output, an output may not run past what the service takes, and neither may hide behind the other"
+        );
+        assert_eq!(found.unsendable.len(), 3, "{:?}", found.unsendable);
+    }
+
+    #[test]
+    fn a_session_holding_a_file_this_host_cannot_name_sends_the_rest_of_itself_and_says_so_once() {
+        let sandbox = Sandbox::new("unnameable");
+        let transcript = sandbox.transcript("s-1", "one\n");
+        sandbox.delegated("s-1", "agent-a", "ay\n");
+        sandbox.persisted("s-1", &"a".repeat(101), "output\n");
+        let service = Fake::default();
+        let mut archive = Archive::default();
+
+        let refused = archive.send(&service, "s-1", &transcript, Pass::Open);
 
         let error = format!(
             "{:#}",
             refused.expect_err("an output named past what the service takes is one #84 would quietly drop")
         );
         assert!(error.contains("tool-results"), "{error}");
+        assert_eq!(
+            service.body("main"),
+            "one\n",
+            "and the files it could name went up rather than waiting on the one it could not"
+        );
+        assert_eq!(service.body("agent-a"), "ay\n");
+
+        std::fs::write(&transcript, "one\ntwo\n").unwrap();
+        assert_eq!(
+            archive.send(&service, "s-1", &transcript, Pass::Open).unwrap(),
+            4,
+            "a name is nothing a later pass changes, so the beats after the first carry on"
+        );
+        assert_eq!(service.body("main"), "one\ntwo\n");
+    }
+
+    #[test]
+    fn a_stretch_whose_placeholders_run_past_what_the_service_takes_goes_up_cut_to_fit() {
+        let sandbox = Sandbox::new("expanded");
+        // Every line gives up sixteen bytes of header value for a twenty-three byte placeholder,
+        // so a megabyte of them read off the file offers a body of 1,198,344 — a 413 the pass
+        // cannot place, and the same stretch read again on every beat after it.
+        let line = "{\"out\":\"Authorization: Bearer abcdefghijklmnop\"}\n";
+        let shown = "{\"out\":\"Authorization: Bearer [redacted:bearer-token]\"}\n";
+        let lines = 1_100_000 / line.len();
+        let transcript = sandbox.transcript("s-1", &line.repeat(lines));
+        let service = Fake::default();
+
+        let sent = Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
+
+        assert_eq!(sent, shown.repeat(lines).len() as i64);
+        assert_eq!(
+            service.body("main"),
+            shown.repeat(lines),
+            "the whole of the file is in the archive, redacted, over as many stretches as that takes"
+        );
+        assert!(service.whole("main"), "and the stretches leave no hole between them");
+    }
+
+    #[test]
+    fn a_marker_at_the_head_of_a_stretch_goes_up_read_against_the_byte_in_front_of_it_in_the_file() {
+        // A key sitting exactly where a stretch is cut. The byte in front of it is out in the
+        // file rather than in the stretch, and is what says whether the key opens a word of its
+        // own, so the padding runs to a stretch less one byte and the cut lands on the marker.
+        const KEY: &str = "sk-FAKE0000000000000000000000000000000000fake";
+        for (sep, redacted) in [('x', false), (' ', true)] {
+            let sandbox = Sandbox::new(&format!("head-{}", sep as u32));
+            let head = format!("{}{sep}", "x".repeat(MAX_CHUNK - 1));
+            let transcript = sandbox.transcript("s-1", &format!("{head}{KEY}\n"));
+            let service = Fake::default();
+
+            Archive::default()
+                .send(&service, "s-1", &transcript, Pass::Open)
+                .unwrap();
+
+            let want = match redacted {
+                true => format!("{head}[redacted:openai-api-key]\n"),
+                false => format!("{head}{KEY}\n"),
+            };
+            assert_eq!(
+                service.body("main"),
+                want,
+                "a key behind {sep:?} at the head of a stretch, which the byte in front of it decides"
+            );
+            assert!(service.whole("main"));
+        }
+    }
+
+    #[test]
+    fn a_session_resumed_after_a_half_written_secret_went_up_is_archived_on_from_past_it() {
+        let sandbox = Sandbox::new("resumed");
+        // The pass that ended the session took the line it was still writing, which ran out part
+        // way into a token — too little of it to read as one, so it went up as it stood.
+        let half = format!("one\n{{\"text\":\"export {}", &TOKEN[..12]);
+        let transcript = sandbox.transcript("s-1", &half);
+        let service = Fake::default();
+        Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Final)
+            .unwrap();
+        assert_eq!(service.body("main"), half, "the half of the token on disk is the trade");
+
+        // `claude --resume` on the same file: the token completes, so the reading a pass that has
+        // lost its place pays for now holds a secret the archive ends inside.
+        std::fs::write(&transcript, format!("one\n{{\"text\":\"export {TOKEN}\"}}\nthree\n")).unwrap();
+        let sent = Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
+
+        assert_eq!(sent, 9, "the lines the resumed session wrote go up");
+        assert_eq!(
+            service.body("main"),
+            format!("{half}\"}}\nthree\n"),
+            "the record the secret was half of keeps the half that went up, and the rest of the secret is never sent"
+        );
+        assert!(
+            !service.body("main").contains("TOKENvalue"),
+            "no part of the token that arrived after is in the archive"
+        );
+        assert!(service.whole("main"));
+    }
+
+    #[test]
+    fn a_persisted_output_that_never_ends_in_a_line_break_goes_up_on_the_beat_rather_than_waiting() {
+        let sandbox = Sandbox::new("unlined");
+        let transcript = sandbox.transcript("s-1", "one\n");
+        sandbox.persisted("s-1", "b374nf1qv", "a tool wrote this and no line break");
+        let service = Fake::default();
+
+        Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
+
+        assert_eq!(
+            service.body("tool-results.b374nf1qv"),
+            "a tool wrote this and no line break",
+            "an output holds no records, so there is no half of one to wait for"
+        );
     }
 
     #[test]
     fn how_long_the_archive_of_a_file_runs_is_read_off_the_file_and_never_its_size() {
         let sandbox = Sandbox::new("length");
-        let text = format!("one {TOKEN}\ntwo\n");
+        // Longer than a stretch, so the reading runs over several, and ending in a record the
+        // session is still writing, which no pass has put up.
+        let line = format!("{{\"text\":\"{TOKEN} {}\"}}\n", "x".repeat(900));
+        let text = format!("{}{{\"text\":\"half", line.repeat(2400));
         let transcript = sandbox.transcript("s-1", &text);
         let service = Fake::default();
         Archive::default()
-            .send(&service, "s-1", &transcript, Pass::Final)
+            .send(&service, "s-1", &transcript, Pass::Open)
             .unwrap();
 
+        assert!(
+            text.len() as i64 > 2 * MAX_CHUNK as i64,
+            "the file runs over three stretches"
+        );
         assert_eq!(
-            archived_len(&transcript).unwrap(),
+            archived_len(&transcript, Holds::Turns).unwrap(),
             service.body("main").len() as i64,
-            "a file sent whole runs to exactly what the archive of it holds"
+            "a file runs to exactly what the archive of it holds, over as many stretches as it takes"
         );
         assert_ne!(
-            archived_len(&transcript).unwrap(),
+            archived_len(&transcript, Holds::Turns).unwrap(),
             text.len() as i64,
             "which is not its size on disk, because a placeholder is not the length of the secret"
         );

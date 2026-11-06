@@ -303,12 +303,18 @@ fn events(spans: &[(String, Counted)], account: &str, prompts: i64, block: i64) 
         .collect()
 }
 
-/// The transcript files one past session is made of.
+/// The transcript files one past session is made of. A file this host has no name for stops the
+/// run that found it: a backfill sends each session once and nothing comes back to it, so a
+/// session sent without one of its files is one archived without it for good.
 fn parts(transcript: &Path) -> Result<Vec<Part>> {
-    Ok(transcripts::sources(transcript)?
-        .into_iter()
-        .map(|source| Part { source })
-        .collect())
+    let sources = transcripts::sources(transcript)?;
+    if let Some(path) = sources.unsendable.first() {
+        bail!(
+            "{} is named what this host cannot send a transcript file under",
+            path.display()
+        );
+    }
+    Ok(sources.found.into_iter().map(|source| Part { source }).collect())
 }
 
 /// One past session read out of its transcript, or nothing for a transcript that holds neither a

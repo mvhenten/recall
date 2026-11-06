@@ -8,7 +8,10 @@
 //!
 //! A match is written out as `[redacted:<kind>]`, which says what was there. That is shorter or
 //! longer than what it replaced, so the file on disk and the archive of it run to different
-//! lengths, and the caller carries its place in each.
+//! lengths, and the caller carries its place in each. A placeholder is longer than most of what it
+//! stands in — twenty-eight bytes for an access key id's twenty — so a stretch read to the
+//! largest body the caller may send can redact to more than that, and a caller says how much it
+//! can take rather than finding out from a service that refuses the body.
 //!
 //! A secret may sit across the cut between one stretch and the next. A stretch is cut at a line
 //! end and a secret does not span lines, so the cut is almost never inside one; a PEM block does
@@ -39,29 +42,80 @@ fn hidden(kind: &str) -> usize {
 }
 
 /// A stretch as it is written out: runs of the file as they were read, and the secrets between
-/// them under the names of what they were.
+/// them under the names of what they were. `lead` is how much of the run in front of a secret is
+/// the name that said what it was — nothing for a secret written over marker and all, and the
+/// marker and what stood between for one that keeps its place in the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Piece<'a> {
     Kept(&'a [u8]),
-    Hidden(&'static str, usize),
+    Hidden {
+        kind: &'static str,
+        lead: usize,
+        span: usize,
+    },
 }
 
 /// The stretch, redacted, and how much of it that accounts for. `before` is the byte of the file
 /// just in front of the stretch, and nothing for a stretch that starts at the file's first byte.
 pub fn redact(input: &[u8], before: Option<u8>, whole: bool) -> Redacted {
+    within(input, before, whole, usize::MAX)
+}
+
+/// The stretch, redacted and written out to at most `limit` bytes, and how much of the stretch
+/// that accounts for. A placeholder is longer than most of what it stands in, so a stretch read to
+/// the largest body a caller may send can redact to more than that and the cut has to come back.
+///
+/// Where it comes back to is a place the rest of the file reads the same from. Nothing is cut
+/// inside a placeholder, nothing between a name and the value it named — a header's scheme and a
+/// registry's `_authToken=` are read in front of the run they stand for, and a stretch opening
+/// past them would send that run as the prose it then looks like — and nothing out of the middle
+/// of a secret written over marker and all. What is left is the runs of the file written out as
+/// they were read, which a stretch may open anywhere in: the service holds a file as a run of byte
+/// ranges, so a line cut in two still reads whole.
+pub fn within(input: &[u8], before: Option<u8>, whole: bool, limit: usize) -> Redacted {
     let (pieces, source) = pieces(input, before, whole);
-    let mut bytes = Vec::with_capacity(source);
-    for piece in pieces {
+    let mut bytes = Vec::with_capacity(input.len().min(limit));
+    let mut at = 0;
+    for (index, piece) in pieces.iter().enumerate() {
         match piece {
-            Piece::Kept(run) => bytes.extend_from_slice(run),
-            Piece::Hidden(kind, _) => {
+            Piece::Kept(run) => {
+                if run.len() > limit - bytes.len() {
+                    let take = (limit - bytes.len()).min(run.len() - leading(pieces.get(index + 1)));
+                    bytes.extend_from_slice(&run[..take]);
+                    return Redacted {
+                        bytes,
+                        source: at + take,
+                    };
+                }
+                bytes.extend_from_slice(run);
+                at += run.len();
+            }
+            Piece::Hidden { kind, lead, span } => {
+                if hidden(kind) > limit - bytes.len() {
+                    bytes.truncate(bytes.len() - lead);
+                    return Redacted {
+                        bytes,
+                        source: at - lead,
+                    };
+                }
                 bytes.extend_from_slice(OPENS);
                 bytes.extend_from_slice(kind.as_bytes());
                 bytes.push(b']');
+                at += span;
             }
         }
     }
     Redacted { bytes, source }
+}
+
+/// How much of the run in front of a secret named what it was, and nothing where no secret
+/// follows. Those bytes go up with the secret or not at all: a stretch that ended between them
+/// would leave the next one opening on a run of bytes with nothing left to say what they are.
+fn leading(next: Option<&Piece<'_>>) -> usize {
+    match next {
+        Some(Piece::Hidden { lead, .. }) => *lead,
+        _ => 0,
+    }
 }
 
 /// One line of a session's own prose, redacted. A prompt is a whole line in hand rather than a
@@ -71,10 +125,23 @@ pub fn text(line: &str) -> String {
     String::from_utf8_lossy(&redact(line.as_bytes(), None, true).bytes).into_owned()
 }
 
+/// Where the end of an archive falls in the stretch of the file that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// A byte written out as it was read, this many bytes into the stretch.
+    At(usize),
+    /// Inside a placeholder, which stands for bytes the archive never held, so no place in the
+    /// file answers for the end. `past` is where what the placeholder stood in ends, which is the
+    /// first place a reading can carry on from without writing out the rest of a secret the
+    /// archive holds the front of.
+    Within { past: usize },
+    /// Past everything the stretch writes out.
+    Beyond,
+}
+
 /// Where in the file the archive's end falls, for an end that lands inside a stretch rather than
-/// on the cut some pass made. A position inside a placeholder is no position in the file: the
-/// bytes it stands for were never sent, so there is nothing to count off.
-pub fn source_of(input: &[u8], before: Option<u8>, whole: bool, archive: usize) -> Option<usize> {
+/// on the cut some pass made.
+pub fn source_of(input: &[u8], before: Option<u8>, whole: bool, archive: usize) -> Place {
     let (pieces, _) = pieces(input, before, whole);
     let mut at = 0;
     let mut out = 0;
@@ -82,21 +149,21 @@ pub fn source_of(input: &[u8], before: Option<u8>, whole: bool, archive: usize) 
         match piece {
             Piece::Kept(run) => {
                 if archive <= out + run.len() {
-                    return Some(at + archive - out);
+                    return Place::At(at + archive - out);
                 }
                 at += run.len();
                 out += run.len();
             }
-            Piece::Hidden(kind, source) => {
+            Piece::Hidden { kind, span, .. } => {
                 if archive < out + hidden(kind) {
-                    return None;
+                    return Place::Within { past: at + span };
                 }
-                at += source;
+                at += span;
                 out += hidden(kind);
             }
         }
     }
-    (archive == out).then_some(at)
+    Place::Beyond
 }
 
 /// The run of a stretch that is written out, piece by piece, and where it is cut.
@@ -113,7 +180,11 @@ fn pieces(input: &[u8], before: Option<u8>, whole: bool) -> (Vec<Piece<'_>>, usi
             }
             Look::Hit(hit) => {
                 found.push(Piece::Kept(&input[kept..hit.from]));
-                found.push(Piece::Hidden(hit.kind, hit.to - hit.from));
+                found.push(Piece::Hidden {
+                    kind: hit.kind,
+                    lead: hit.from - at,
+                    span: hit.to - hit.from,
+                });
                 kept = hit.to;
                 at = hit.to;
             }
@@ -671,24 +742,46 @@ mod tests {
         let line = b"id AKIAZZ7EXAMPLE9QTVB2 end\n";
         let archive = redact(line, None, true).bytes;
 
-        assert_eq!(source_of(line, None, true, 0), Some(0));
+        assert_eq!(source_of(line, None, true, 0), Place::At(0));
         assert_eq!(
             source_of(line, None, true, 3),
-            Some(3),
+            Place::At(3),
             "a byte sent as it was read is its own place"
         );
         assert_eq!(
             source_of(line, None, true, 3 + hidden("aws-access-key-id")),
-            Some(3 + "AKIAZZ7EXAMPLE9QTVB2".len()),
+            Place::At(3 + "AKIAZZ7EXAMPLE9QTVB2".len()),
             "the end of a placeholder is the end of what it stood in"
         );
         assert_eq!(
             source_of(line, None, true, 3 + hidden("aws-access-key-id") - 1),
-            None,
-            "and a place inside one is no place in the file at all"
+            Place::Within {
+                past: 3 + "AKIAZZ7EXAMPLE9QTVB2".len()
+            },
+            "and a place inside one is no place in the file, which the end of what it stood in is"
         );
-        assert_eq!(source_of(line, None, true, archive.len()), Some(line.len()));
-        assert_eq!(source_of(line, None, true, archive.len() + 1), None);
+        assert_eq!(source_of(line, None, true, archive.len()), Place::At(line.len()));
+        assert_eq!(source_of(line, None, true, archive.len() + 1), Place::Beyond);
+    }
+
+    #[test]
+    fn a_stretch_written_out_to_a_length_is_cut_where_the_rest_of_it_reads_the_same_from() {
+        let line = "id AKIAZZ7EXAMPLE9QTVB2 and Authorization: Bearer abcdefghijklmnop end\n";
+        let whole = stripped(line);
+        for limit in 1..=whole.len() {
+            let head = within(line.as_bytes(), None, true, limit);
+            assert!(head.bytes.len() <= limit, "a stretch written out to {limit} fits in it");
+            assert!(head.source <= line.len());
+
+            let before = head.source.checked_sub(1).map(|at| line.as_bytes()[at]);
+            let mut sent = head.bytes.clone();
+            sent.extend_from_slice(&redact(&line.as_bytes()[head.source..], before, true).bytes);
+            assert_eq!(
+                String::from_utf8(sent).unwrap(),
+                whole,
+                "the stretch after one cut at {limit} carries on where it left off"
+            );
+        }
     }
 
     #[test]
