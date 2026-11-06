@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_SEEN: usize = 1000;
 
-/// The message ids already handled, kept beside the lockfile in `$XDG_RUNTIME_DIR/recall` so a
-/// restarted daemon does not replay the backlog the mailbox pushes on every reconnect. Oldest
-/// ids fall off once the set is full; the queue TTL is shorter than it takes to wrap around.
+/// The news ids already delivered, kept beside the lockfile in `$XDG_RUNTIME_DIR/recall`. News
+/// goes to every socket the host has open, so the one window where it arrives twice is a handover:
+/// the daemon being replaced and the one replacing it are both attached, and the second copy is
+/// dropped here before it reaches a session. Oldest ids fall off once the set is full.
 pub struct Seen {
     path: PathBuf,
     order: VecDeque<String>,
@@ -30,9 +31,7 @@ impl Seen {
         self.ids.contains(message_id)
     }
 
-    /// Records a message id, which only happens once it has been delivered. Recording ahead of
-    /// delivery would turn an interrupted handover into a lost message: the id would survive the
-    /// restart, the redelivery would short-circuit, and the ack would drop the row unread.
+    /// Records a message id, which only happens once it has reached the sessions listening.
     pub fn record(&mut self, message_id: &str) {
         if !self.ids.insert(message_id.to_string()) {
             return;

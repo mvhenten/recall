@@ -216,28 +216,29 @@ fn delivered_body(message: &Message) -> String {
     format!("{}\n{}", header(message), message.body)
 }
 
-async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) -> Reply {
+/// News is written into the sessions that were listening and answered with nothing; only an order
+/// writes a receipt back, naming the session that took it. A message can only arrive twice where
+/// it went to every socket the host has open, which is news, so that is where the duplicate is
+/// dropped before it reaches a session.
+async fn deliver(message: &Message, sessions_dir: &Path, seen: &mut Seen) -> Option<Reply> {
     let started = Instant::now();
-    if seen.contains(&message.message_id) {
-        log(&format!("message:replayed:{}", message.message_id), started.elapsed());
-        return Reply::Ack;
-    }
     let body = delivered_body(message);
     match message.kind {
-        Kind::News => news(message, sessions_dir, seen, &body, started).await,
-        Kind::Order => order(message, sessions_dir, seen, &body, started).await,
+        Kind::Order => Some(order(message, sessions_dir, &body, started).await),
+        Kind::News => {
+            if seen.contains(&message.message_id) {
+                log(&format!("message:replayed:{}", message.message_id), started.elapsed());
+                return None;
+            }
+            news(message, sessions_dir, seen, &body, started).await;
+            None
+        }
     }
 }
 
-async fn news(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) -> Reply {
+async fn news(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) {
     let (target, fanout) = if message.to_session_id.is_empty() {
-        let now = Timestamp::now().as_millisecond();
-        let Some(fanout) = sessions::to_host(sessions_dir, body, message.created_at, now).await else {
-            seen.record(&message.message_id);
-            log(&format!("message:retired:{}", message.message_id), started.elapsed());
-            return Reply::Ack;
-        };
-        ("host".to_string(), fanout)
+        ("host".to_string(), sessions::to_host(sessions_dir, body).await)
     } else {
         (
             format!("session:{}", message.to_session_id),
@@ -252,28 +253,18 @@ async fn news(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &st
         ),
         started.elapsed(),
     );
-    Reply::Ack
 }
 
-async fn order(message: &Message, sessions_dir: &Path, seen: &mut Seen, body: &str, started: Instant) -> Reply {
+async fn order(message: &Message, sessions_dir: &Path, body: &str, started: Instant) -> Reply {
     let placed = if message.to_session_id.is_empty() {
-        let now = Timestamp::now().as_millisecond();
-        sessions::to_one(sessions_dir, body, message.created_at, now).await
+        sessions::to_one(sessions_dir, body).await
     } else {
         sessions::to_one_session(sessions_dir, &message.to_session_id, body).await
     };
     let id = &message.message_id;
     let (outcome, reply) = match placed {
-        sessions::Placed::Taken(session_id) => {
-            seen.record(id);
-            (format!("taken:{session_id}"), Reply::Took(session_id))
-        }
-        sessions::Placed::Refused => ("refused".to_string(), Reply::Silent),
-        sessions::Placed::Waiting => ("waiting".to_string(), Reply::Silent),
-        sessions::Placed::Retired => {
-            seen.record(id);
-            ("retired".to_string(), Reply::Ack)
-        }
+        sessions::Placed::Taken(session_id) => (format!("taken:{session_id}"), Reply::Took(session_id)),
+        sessions::Placed::Retired => ("retired".to_string(), Reply::NoTaker),
     };
     log(
         &format!("order:{}:{id}:{outcome}", message.from_device_id),
@@ -804,7 +795,6 @@ mod tests {
             from_name: from_name.to_string(),
             body: "ship it".to_string(),
             created_at: 1_762_000_000_000,
-            expires_at: 1_762_259_200_000,
         };
         let message = |from_host: &str, from_name: &str| sent("d-1", from_host, from_name);
 
@@ -839,7 +829,6 @@ mod tests {
             from_name: "owner@example.com".to_string(),
             body: "ship it".to_string(),
             created_at: 1_762_000_000_000,
-            expires_at: 1_762_259_200_000,
         };
 
         let line = header(&sent("dashboard", "dashboard"));

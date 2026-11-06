@@ -126,15 +126,20 @@ pub struct Status {
 pub struct Registered {
     pub session_id: String,
     pub path: PathBuf,
-    pub started_at: i64,
     pub inbox: Inbox,
 }
 
 pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a host-addressed message stays deliverable to a session that was not yet running when
-/// it was sent, so telling a host to do something keeps working while it sits between sessions.
-pub const HOST_GRACE: Duration = Duration::from_secs(600);
+/// How long the service waits for the receipt naming the session that took an order. It mirrors
+/// `TAKER_WINDOW_MS` in src/mailbox.ts, and the two have to agree: a session that takes an order
+/// after the service has given up runs work its sender was already told nobody started.
+pub const TAKER_WINDOW: Duration = Duration::from_secs(10);
+
+/// What the walk over this host's sessions may spend: the window less one write timeout, so the
+/// receipt is written while the send is still waiting even when the last session the walk tries
+/// runs that timeout out.
+pub const ORDER_WALK: Duration = TAKER_WINDOW.saturating_sub(DELIVER_TIMEOUT);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Fanout {
@@ -354,7 +359,6 @@ fn registered(dir: &Path) -> Vec<Registered> {
             State::Registered(inbox) => Some(Registered {
                 session_id: status.session_id,
                 path,
-                started_at: status.record.started_at,
                 inbox,
             }),
             _ => None,
@@ -393,22 +397,22 @@ async fn send(registered: &Registered, body: &str) -> Result<()> {
 /// A session that has stopped reading its socket is treated as one that refused the message.
 /// The pump awaits delivery inside the same select! that drives its heartbeat, so a wedged
 /// Claude would otherwise take the whole host's mailbox connection down with it.
-async fn write_frames(registered: &Registered, body: &str) -> Result<()> {
-    tokio::time::timeout(DELIVER_TIMEOUT, send(registered, body))
+async fn write_frames(registered: &Registered, body: &str, limit: Duration) -> Result<()> {
+    tokio::time::timeout(limit, send(registered, body))
         .await
         .with_context(|| {
             format!(
-                "{} did not take the message within {} seconds",
+                "{} did not take the message within {}ms",
                 registered.inbox.socket.display(),
-                DELIVER_TIMEOUT.as_secs()
+                limit.as_millis()
             )
         })?
 }
 
-/// A socket that refuses the write loses its registration; the message is acked either way,
-/// because the mailbox has no better host to hand it to.
-async fn write_or_prune(registered: &Registered, body: &str, fanout: &mut Fanout) {
-    match write_frames(registered, body).await {
+/// A socket that refuses the write loses its registration, since nothing else will carry the
+/// message to it.
+async fn write_or_prune(registered: &Registered, body: &str, limit: Duration, fanout: &mut Fanout) {
+    match write_frames(registered, body, limit).await {
         Ok(()) => fanout.delivered += 1,
         Err(_) => {
             let _ = std::fs::remove_file(&registered.path);
@@ -431,67 +435,59 @@ fn addressable(dir: &Path) -> Vec<Registered> {
 async fn write_all(registrations: Vec<Registered>, body: &str) -> Fanout {
     let mut fanout = Fanout::default();
     for registered in registrations {
-        write_or_prune(&registered, body, &mut fanout).await;
+        write_or_prune(&registered, body, DELIVER_TIMEOUT, &mut fanout).await;
     }
     fanout
 }
 
-/// Delivers a host-addressed message to the sessions that were already running when it was sent,
-/// once per inbox socket: a session that started afterwards has no idea what a queued message
-/// refers to. When none of those is left the message goes to whoever is registered now, so a host
-/// momentarily between sessions still takes it; past `HOST_GRACE` it is retired unread, which is
-/// what `None` says.
-pub async fn to_host(dir: &Path, body: &str, created_at: i64, now: i64) -> Option<Fanout> {
-    let registrations = addressable(dir);
-    let running: Vec<Registered> = registrations
-        .iter()
-        .filter(|registered| registered.started_at <= created_at)
-        .cloned()
-        .collect();
-    if !running.is_empty() {
-        return Some(write_all(running, body).await);
-    }
-    let grace = i64::try_from(HOST_GRACE.as_millis()).unwrap_or(i64::MAX);
-    if now.saturating_sub(created_at) > grace {
-        return None;
-    }
-    Some(write_all(registrations, body).await)
+/// Delivers a host-addressed message to the sessions registered now, once per inbox socket. The
+/// service only pushes to a socket that was attached when the message was sent, and the daemon
+/// writes it the moment it arrives, so these are the sessions that were running then. No timestamp
+/// is compared: a host's own clock and the stamps the service puts on a message differ by skew,
+/// which says nothing about who should read it.
+pub async fn to_host(dir: &Path, body: &str) -> Fanout {
+    write_all(addressable(dir), body).await
 }
 
-/// What became of an order on this host. `Refused` is a session that would not take the write, so
-/// the order goes back for the next one to try. `Waiting` is a host with nothing to run an order
-/// sent that recently; `Retired` is the same host once the order is older than the grace.
+/// What became of an order on this host. `Retired` is a host with no session that took it, which
+/// leaves nothing behind for a later session, so the sender is told the order reached nobody.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Placed {
     Taken(String),
-    Refused,
-    Waiting,
     Retired,
 }
 
-/// Delivers an order to the one session that should act on it, by the same rule `to_host` picks
-/// its sessions by: the newest that was already running when the order was sent, and otherwise
-/// the newest registered now. Past `HOST_GRACE` there is nobody left to wait for.
-pub async fn to_one(dir: &Path, body: &str, created_at: i64, now: i64) -> Placed {
-    let registrations = addressable(dir);
-    if let Some(running) = registrations
-        .iter()
-        .find(|registered| registered.started_at <= created_at)
-    {
-        return place(running, body).await;
+/// Delivers an order to the one session that should act on it: the newest registered now, by the
+/// same rule `to_host` picks its sessions by. A session that will not take the write loses its
+/// registration and the next one is offered the order, since no other connection will ever see it.
+///
+/// The walk spends at most `ORDER_WALK`, and a session is only offered the order while what is
+/// left of that budget still covers the write. Past it the order is retired here: the sender is
+/// about to be told nobody took it, and a session taking it after that would run work its sender
+/// believes never started.
+pub async fn to_one(dir: &Path, body: &str) -> Placed {
+    let deadline = Instant::now() + ORDER_WALK;
+    for registered in addressable(dir) {
+        let Some(limit) = left(deadline) else {
+            return Placed::Retired;
+        };
+        if place(&registered, body, limit).await {
+            return Placed::Taken(registered.session_id);
+        }
     }
-    let grace = i64::try_from(HOST_GRACE.as_millis()).unwrap_or(i64::MAX);
-    if now.saturating_sub(created_at) > grace {
-        return Placed::Retired;
-    }
-    match registrations.first() {
-        Some(newest) => place(newest, body).await,
-        None => Placed::Waiting,
-    }
+    Placed::Retired
 }
 
-/// Delivers an order to the one session it names. A session this host cannot address is the end of
-/// it: no other session was addressed, so there is nothing to hand the order to.
+/// How long is left of the walk's budget, or nothing once it is spent.
+fn left(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(DELIVER_TIMEOUT))
+}
+
+/// Delivers an order to the one session it names. A session this host cannot address, or one that
+/// will not take the write, is the end of it: no other session was addressed.
 pub async fn to_one_session(dir: &Path, session_id: &str, body: &str) -> Placed {
     let Some(registered) = addressable(dir)
         .into_iter()
@@ -499,16 +495,16 @@ pub async fn to_one_session(dir: &Path, session_id: &str, body: &str) -> Placed 
     else {
         return Placed::Retired;
     };
-    place(&registered, body).await
+    if place(&registered, body, DELIVER_TIMEOUT).await {
+        return Placed::Taken(registered.session_id);
+    }
+    Placed::Retired
 }
 
-async fn place(registered: &Registered, body: &str) -> Placed {
+async fn place(registered: &Registered, body: &str, limit: Duration) -> bool {
     let mut fanout = Fanout::default();
-    write_or_prune(registered, body, &mut fanout).await;
-    if fanout.delivered == 0 {
-        return Placed::Refused;
-    }
-    Placed::Taken(registered.session_id.clone())
+    write_or_prune(registered, body, limit, &mut fanout).await;
+    fanout.delivered == 1
 }
 
 /// Delivers a message body to the one session named, so a handle reaches that session and nothing
@@ -522,7 +518,7 @@ pub async fn to_session(dir: &Path, session_id: &str, body: &str) -> Fanout {
     else {
         return fanout;
     };
-    write_or_prune(&registered, body, &mut fanout).await;
+    write_or_prune(&registered, body, DELIVER_TIMEOUT, &mut fanout).await;
     fanout
 }
 
@@ -650,9 +646,7 @@ mod tests {
         sandbox.register("s-child", &socket, mine);
 
         let delivery = tokio::spawn(async move { read_frames(&listener).await });
-        let fanout = to_host(&sandbox.sessions(), "ship it", STARTED_AT, STARTED_AT)
-            .await
-            .unwrap();
+        let fanout = to_host(&sandbox.sessions(), "ship it").await;
 
         assert_eq!(
             fanout,
@@ -756,9 +750,7 @@ mod tests {
         sandbox.register("s-there", &there, mine);
 
         let delivery = tokio::spawn(async move { (read_frames(&left).await, read_frames(&right).await) });
-        let fanout = to_host(&sandbox.sessions(), "all of you", STARTED_AT, STARTED_AT)
-            .await
-            .unwrap();
+        let fanout = to_host(&sandbox.sessions(), "all of you").await;
 
         assert_eq!(
             fanout,
@@ -800,7 +792,7 @@ mod tests {
             }
             written
         });
-        let placed = to_one(&sandbox.sessions(), "rerun the migration", STARTED_AT, STARTED_AT).await;
+        let placed = to_one(&sandbox.sessions(), "rerun the migration").await;
 
         let Placed::Taken(session_id) = placed else {
             panic!("a host with three registered sessions must place an order, got {placed:?}");
@@ -816,20 +808,27 @@ mod tests {
         );
     }
 
-    fn grace_ms() -> i64 {
-        i64::try_from(HOST_GRACE.as_millis()).unwrap()
+    /// The service gives up on an order `TAKER_WINDOW` after it pushed it and tells the sender
+    /// nobody took it. The walk has to be over by then, write timeout included, or a session takes
+    /// an order whose sender has already been told it failed.
+    #[test]
+    fn the_order_walk_and_the_write_it_ends_on_fit_inside_the_window_the_service_waits() {
+        assert!(!ORDER_WALK.is_zero(), "the walk has to be allowed one session");
+        assert!(
+            ORDER_WALK + DELIVER_TIMEOUT <= TAKER_WINDOW,
+            "{ORDER_WALK:?} of walking plus {DELIVER_TIMEOUT:?} of writing must fit in {TAKER_WINDOW:?}"
+        );
     }
 
     #[tokio::test]
-    async fn an_order_no_session_can_take_waits_out_the_grace_and_is_then_retired() {
+    async fn an_order_a_host_has_no_session_for_is_retired_rather_than_held() {
         let sandbox = Sandbox::new("order-nobody");
         let dir = sandbox.sessions();
-        let sent = STARTED_AT;
 
-        assert_eq!(to_one(&dir, "rerun the migration", sent, sent).await, Placed::Waiting);
         assert_eq!(
-            to_one(&dir, "rerun the migration", sent, sent + grace_ms() + 1).await,
-            Placed::Retired
+            to_one(&dir, "rerun the migration").await,
+            Placed::Retired,
+            "a host with nothing registered keeps no order for a session that starts later"
         );
         assert_eq!(
             to_one_session(&dir, "s-gone", "rerun the migration").await,
@@ -838,96 +837,32 @@ mod tests {
         );
     }
 
+    /// The session the order is offered first has a socket nothing is reading, which is what a
+    /// session whose Claude died leaves behind. Nothing else will ever see the order, so this host
+    /// is the only chance it gets and the next session here has to be offered it.
     #[tokio::test]
-    async fn an_order_a_dead_session_will_not_take_is_refused_rather_than_swallowed() {
-        let sandbox = Sandbox::new("order-refused");
-        let socket = sandbox.dir.join("inbox.sock");
-        drop(UnixListener::bind(&socket).unwrap());
-        sandbox.register("s-dead", &socket, std::process::id() as i32);
+    async fn an_order_a_dead_session_will_not_take_goes_to_the_next_one_that_will() {
+        let sandbox = Sandbox::new("order-walks-on");
+        let mine = std::process::id() as i32;
+        let dead = sandbox.dir.join("dead.sock");
+        let live = sandbox.dir.join("live.sock");
+        drop(UnixListener::bind(&dead).unwrap());
+        let listening = UnixListener::bind(&live).unwrap();
+        sandbox.register("s-live", &live, mine);
+        sandbox.register("s-dead", &dead, mine);
 
+        let accepting = tokio::spawn(async move { read_frames(&listening).await });
+        let placed = to_one(&sandbox.sessions(), "rerun the migration").await;
+
+        assert_eq!(placed, Placed::Taken("s-live".to_string()));
         assert_eq!(
-            to_one_session(&sandbox.sessions(), "s-dead", "rerun the migration").await,
-            Placed::Refused
+            accepting.await.unwrap()[1]["message"],
+            serde_json::json!({ "role": "user", "content": "rerun the migration" })
         );
         assert_eq!(
             to_one_session(&sandbox.sessions(), "s-dead", "rerun the migration").await,
             Placed::Retired,
-            "the refusal took the registration with it, so there is nothing left to try"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_session_that_started_after_the_send_takes_nothing_once_the_grace_has_passed() {
-        let sandbox = Sandbox::new("stale-host");
-        let socket = sandbox.dir.join("inbox.sock");
-        let listening = UnixListener::bind(&socket).unwrap();
-        let sent = STARTED_AT - 1;
-        sandbox.register_started("s-later", &socket, std::process::id() as i32, STARTED_AT);
-
-        assert_eq!(
-            to_host(&sandbox.sessions(), "rerun the migration", sent, sent + grace_ms() + 1).await,
-            None,
-            "a message queued before this session existed is retired, not delivered"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), listening.accept())
-                .await
-                .is_err(),
-            "a session that had no part in a queued message must not be written to at all"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_session_running_when_the_message_was_sent_takes_it_however_old_it_is() {
-        let sandbox = Sandbox::new("live-at-send");
-        let socket = sandbox.dir.join("inbox.sock");
-        let listening = UnixListener::bind(&socket).unwrap();
-        sandbox.register_started("s-live", &socket, std::process::id() as i32, STARTED_AT);
-        let sent = STARTED_AT + 60_000;
-
-        let delivery = tokio::spawn(async move { read_frames(&listening).await });
-        let fanout = to_host(&sandbox.sessions(), "ship it", sent, sent + grace_ms() * 10)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            fanout,
-            Fanout {
-                delivered: 1,
-                pruned: 0
-            }
-        );
-        let frames = delivery.await.unwrap();
-        assert_eq!(
-            frames[1]["message"],
-            serde_json::json!({ "role": "user", "content": "ship it" })
-        );
-    }
-
-    #[tokio::test]
-    async fn a_session_starting_inside_the_grace_takes_a_message_the_host_had_nobody_for() {
-        let sandbox = Sandbox::new("grace-host");
-        let socket = sandbox.dir.join("inbox.sock");
-        let listening = UnixListener::bind(&socket).unwrap();
-        sandbox.register_started("s-next", &socket, std::process::id() as i32, STARTED_AT);
-        let sent = STARTED_AT - 60_000;
-
-        let delivery = tokio::spawn(async move { read_frames(&listening).await });
-        let fanout = to_host(&sandbox.sessions(), "pull main", sent, STARTED_AT + 1_000)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            fanout,
-            Fanout {
-                delivered: 1,
-                pruned: 0
-            }
-        );
-        let frames = delivery.await.unwrap();
-        assert_eq!(
-            frames[1]["message"],
-            serde_json::json!({ "role": "user", "content": "pull main" })
+            "the session that would not take it lost its registration"
         );
     }
 

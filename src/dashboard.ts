@@ -1446,7 +1446,7 @@ const SEND_WINDOW = "the bus reaches a session its host still holds";
 const flashHtml = (flash: Flash | null, name: string): string => {
   if (flash === null) return "";
   if (flash.tone === "refused") return `<p class="flash bad">${escapeHtml(flash.text)}</p>`;
-  return `<p class="flash">Queued for <strong>${escapeHtml(name)}</strong>. Its host hands it to the session as the next turn, unless the host has already let the session go.</p>`;
+  return `<p class="flash">Sent to <strong>${escapeHtml(name)}</strong>. Its host hands it to the session as the next turn, unless its host was not listening, in which case nothing was kept and nobody read it.</p>`;
 };
 
 const sendCard = (view: SessionView): string => {

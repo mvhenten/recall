@@ -330,7 +330,9 @@ impl Kind {
     }
 }
 
-/// What the service made of a send. `reason` is what the sender is told when nobody took it.
+/// What the service made of a send. News is published to whoever was attached and nothing more is
+/// owed, which is a `Fanout`. An order names the session that took it, and `reason` is what the
+/// sender is told when none did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Outcome {
@@ -365,7 +367,6 @@ pub struct Message {
     pub from_name: String,
     pub body: String,
     pub created_at: i64,
-    pub expires_at: i64,
 }
 
 /// `outcome` is absent from a service that predates orders, which is the only thing that tells

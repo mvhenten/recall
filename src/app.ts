@@ -81,9 +81,7 @@ import { ARTIFACT_SORTS, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortIn
 import {
   DEVICE_HEADER,
   MAX_BODY_BYTES,
-  MAX_QUEUED_MESSAGES,
   type Mailbox,
-  NOW_HEADER,
   ORDERS_HEADER,
   parseSend,
   type Sender,
@@ -401,10 +399,11 @@ export const createApp = (deps: Deps): App => {
 
   const devices = async (
     request: Request,
-    db: D1Database,
+    env: AppEnv,
     caller: Caller,
     deviceId: string | undefined,
   ): Promise<Response> => {
+    const db = env.DB;
     if (deviceId === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
       const [listed, labels] = await Promise.all([listDevices(db, caller.userId), readLabels(db, caller.userId)]);
@@ -419,6 +418,7 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "DELETE") return error(405, "method not allowed");
     const target = deviceId === "current" ? caller.deviceId : deviceId;
     if (!(await revokeDevice(db, caller.userId, target))) return error(404, `no device ${target}`);
+    await mailboxFor(env, caller.userId).revoke(target);
     return new Response(null, { status: 204 });
   };
 
@@ -693,9 +693,7 @@ export const createApp = (deps: Deps): App => {
       return error(404, `no session ${toSessionId} on device ${toDeviceId}`);
     }
     const sender = await senderOf(env.DB, caller, fromSessionId, now);
-    const sent = await mailboxFor(env, caller.userId).enqueue(input.value, sender, now);
-    if (sent === null) return error(429, `this account already holds ${MAX_QUEUED_MESSAGES} queued messages`);
-    return json(sent, 201);
+    return json(await mailboxFor(env, caller.userId).publish(input.value, sender, now), 201);
   };
 
   const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
@@ -703,7 +701,6 @@ export const createApp = (deps: Deps): App => {
       headers: {
         upgrade: "websocket",
         [DEVICE_HEADER]: caller.deviceId,
-        [NOW_HEADER]: String(deps.now()),
         [ORDERS_HEADER]: request.headers.get(ORDERS_HEADER) ?? "",
       },
     });
@@ -1094,7 +1091,7 @@ export const createApp = (deps: Deps): App => {
   };
 
   // The dashboard's own send, which is the Labels tab's post shape pointed at the message bus: an
-  // origin and CSRF check, then the same enqueue `POST /v1/messages` makes. A browser carries no
+  // origin and CSRF check, then the same publish `POST /v1/messages` makes. A browser carries no
   // device token, so it cannot reach that endpoint; what it shares with it is the mailbox.
   //
   // Every refusal, the refused origin and token among them, re-renders the page with the typing
@@ -1128,10 +1125,7 @@ export const createApp = (deps: Deps): App => {
     }
     const sender: Sender = { deviceId: DASHBOARD_DEVICE, host: DASHBOARD_DEVICE, name: email };
     const input: SendInput = { kind: "news", toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
-    const sent = await mailboxFor(env, userId).enqueue(input, sender, deps.now());
-    if (sent === null) {
-      return refuse(`This account already holds ${MAX_QUEUED_MESSAGES} queued messages, so the bus took nothing.`, 400);
-    }
+    await mailboxFor(env, userId).publish(input, sender, deps.now());
     return new Response(null, {
       status: 303,
       headers: {
@@ -1691,7 +1685,7 @@ export const createApp = (deps: Deps): App => {
     }
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
-    if (collection === "devices") return devices(request, env.DB, caller, rawName);
+    if (collection === "devices") return devices(request, env, caller, rawName);
     if (collection === "sessions") return sessions(request, url, env, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {

@@ -1,8 +1,6 @@
-import { runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
-import { MAX_BODY_BYTES, type Mailbox, type Message } from "../src/mailbox";
+import { MAX_BODY_BYTES, type Message, type NewsFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
 import { SESSION_TTL_MS } from "../src/model";
 import { followedBatch, type Plan, type Reach, type Read } from "../src/transcript-plan";
 import { type Client, harness } from "./harness";
@@ -15,13 +13,44 @@ interface Owner {
   userId: string;
   email: string;
   assertion: string;
+  token: string;
   laptop: Client;
 }
 
 const owner = async (h: Harness): Promise<Owner> => {
   const userId = `user-${crypto.randomUUID()}`;
   const email = await h.invite(`${userId}@example.com`, userId);
-  return { userId, email, assertion: await h.assertionFor(email), laptop: h.clientWithToken(await h.login(email)) };
+  const token = await h.login(email);
+  return { userId, email, assertion: await h.assertionFor(email), token, laptop: h.clientWithToken(token) };
+};
+
+// A send from the dashboard reaches a session the same way one from another host does: through a
+// socket the host has open. News answers nothing back, so this only has to be attached.
+const attach = async (h: Harness, token: string): Promise<WebSocket> => {
+  const response = await h.send("/v1/messages/listen", {
+    headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
+  });
+  expect(response.status).toBe(101);
+  const socket = response.webSocket;
+  if (!socket) throw new Error("the listen upgrade carried no socket");
+  socket.accept();
+  return socket;
+};
+
+const framesOn = (socket: WebSocket): Message[] => {
+  const received: Message[] = [];
+  socket.addEventListener("message", (event) => {
+    received.push((JSON.parse(String(event.data)) as NewsFrame).message);
+  });
+  return received;
+};
+
+const eventually = async (ready: () => boolean, what: string): Promise<void> => {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (ready()) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`${what} never happened`);
 };
 
 const open = (h: Harness, path: string, assertion: string | null, cookie = ""): Promise<Response> =>
@@ -120,11 +149,6 @@ const send = async (h: Harness, path: string, assertion: string, body: string): 
   const { csrf, cookie } = await form(h, path, assertion);
   return post(h, path, assertion, { csrf, cookie, body });
 };
-
-const queued = (userId: string, toDeviceId: string, now: number): Promise<Message[]> =>
-  runInDurableObject(env.MAILBOX.get(env.MAILBOX.idFromName(userId)), (mailbox: Mailbox) =>
-    mailbox.list(toDeviceId, now),
-  );
 
 const deviceId = async (client: Client): Promise<string> => {
   const response = await client.request("GET", "/v1/devices");
@@ -458,20 +482,20 @@ describe("following a transcript as it is written", () => {
 });
 
 describe("the send box", () => {
-  it("queues a message to the session's own host, named for the browser that typed it", async () => {
+  it("pushes a message to the session's own host, named for the browser that typed it", async () => {
     const h = await harness();
     const you = await owner(h);
     const laptopId = await deviceId(you.laptop);
     expect((await you.laptop.sync("9f8a1b2c")).status).toBe(204);
     const path = "/dashboard/sessions/9f8a1b2c";
+    const received = framesOn(await attach(h, you.token));
 
     const sent = await send(h, path, you.assertion, "pull main and rerun the migration");
     expect(sent.status).toBe(303);
     expect(sent.headers.get("location")).toBe(path);
 
-    const messages = await queued(you.userId, laptopId, h.now());
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toMatchObject({
+    await eventually(() => received.length === 1, "the push to the host");
+    expect(received[0]).toMatchObject({
       toDeviceId: laptopId,
       toSessionId: "9f8a1b2c",
       fromDeviceId: "dashboard",
@@ -484,9 +508,9 @@ describe("the send box", () => {
     // page it lands on says it once and the reload after it does not.
     const landed = await open(h, path, you.assertion, cookieFrom(sent));
     expect(landed.status).toBe(200);
-    expect(await landed.text()).toContain("Queued for");
+    expect(await landed.text()).toContain("Sent to");
     expect(cookieFrom(landed)).not.toContain("9f8a1b2c");
-    expect(await read(h, path, you.assertion)).not.toContain("Queued for");
+    expect(await read(h, path, you.assertion)).not.toContain("Sent to");
   });
 
   // Two session pages open at once, or a Labels tab beside one, must not invalidate each other's
@@ -494,7 +518,6 @@ describe("the send box", () => {
   it("keeps the token a page arrived with, so a second page does not break the first", async () => {
     const h = await harness();
     const you = await owner(h);
-    const laptopId = await deviceId(you.laptop);
     expect((await you.laptop.sync("9f8a1b2c")).status).toBe(204);
     expect((await you.laptop.sync("beefbeef")).status).toBe(204);
     const first = await form(h, "/dashboard/sessions/9f8a1b2c", you.assertion);
@@ -507,13 +530,11 @@ describe("the send box", () => {
 
     const sent = await post(h, "/dashboard/sessions/9f8a1b2c", you.assertion, { ...first, body: "still works" });
     expect(sent.status).toBe(303);
-    expect(await queued(you.userId, laptopId, h.now())).toHaveLength(1);
   });
 
   it("says what went wrong and keeps the typing, rather than clearing the box on a refusal", async () => {
     const h = await harness();
     const you = await owner(h);
-    const laptopId = await deviceId(you.laptop);
     expect((await you.laptop.sync("9f8a1b2c")).status).toBe(204);
     const path = "/dashboard/sessions/9f8a1b2c";
 
@@ -545,8 +566,6 @@ describe("the send box", () => {
         })
       ).status,
     ).toBe(403);
-
-    expect(await queued(you.userId, laptopId, h.now())).toEqual([]);
   });
 
   // The bus reaches a session for as long as its host holds it, which is a day after its last
@@ -555,7 +574,6 @@ describe("the send box", () => {
   it("offers the box while the host holds the session, and refuses once it has let it go", async () => {
     const h = await harness();
     const you = await owner(h);
-    const laptopId = await deviceId(you.laptop);
     expect((await you.laptop.sync("deadbeef")).status).toBe(204);
     const path = "/dashboard/sessions/deadbeef";
     const { csrf, cookie } = await form(h, path, you.assertion);
@@ -575,6 +593,5 @@ describe("the send box", () => {
     const refused = await post(h, path, you.assertion, { csrf, cookie, body: "anyone there" });
     expect(refused.status).toBe(400);
     expect(await refused.text()).toContain("No host is running this session any more, so the bus has nowhere");
-    expect(await queued(you.userId, laptopId, h.now())).toHaveLength(1);
   });
 });
