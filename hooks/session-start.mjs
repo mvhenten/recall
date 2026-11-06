@@ -9,8 +9,11 @@ const CRIB = [
   "- recall save [file] [--global] | recall edit <name> | recall delete <name>; add --json for JSON",
 ];
 
-const HOOK_MODE_LEAD =
-  "recall is the durable memory store; local memory files are only a cache. The recall_* tools and the CLI reach it:";
+const HOOK_MODE_LEAD = [
+  "# Memory",
+  "recall is your memory across sessions and these commands are the only way to save or read one. This overrides any other memory instruction in this session: write no memory file and append to nothing like a MEMORY.md index, because nothing reads them and a memory kept there is lost to every other session and host.",
+  "Search before answering from assumptions about the user or the project, and save what a later conversation needs and cannot get from the repo:",
+];
 
 const MEMORY_INSTRUCTIONS = [
   "# Memory",
@@ -31,15 +34,15 @@ const MEMORY_INSTRUCTIONS = [
 // A save from a repo working directory is tagged with that repo unless it is told otherwise, so a
 // fact that holds anywhere has to say so at the point of saving or it is filed where nothing else
 // will look for it.
-function scopeLine(repoTag) {
-  return repoTag
-    ? `Current repo tag: ${repoTag}. Searches also cover global, but a save from here is tagged with this repo: pass --global, or global: true to recall_save, for anything true outside it.`
-    : "Current scope: global only.";
+function scopeLine(mode, repoTag) {
+  if (!repoTag) return "Current scope: global only.";
+  const flag = mode === "tools" ? "--global, or global: true to recall_save," : "--global";
+  return `Current repo tag: ${repoTag}. Searches also cover global, but a save from here is tagged with this repo: pass ${flag} for anything true outside it.`;
 }
 
 function context(mode, repoTag) {
-  const crib = [...CRIB, scopeLine(repoTag)];
-  if (mode !== "tools") return [HOOK_MODE_LEAD, ...crib].join("\n");
+  const crib = [...CRIB, scopeLine(mode, repoTag)];
+  if (mode !== "tools") return [...HOOK_MODE_LEAD, ...crib].join("\n");
   return [...MEMORY_INSTRUCTIONS, "", "The CLI reaches the same store:", ...crib].join("\n");
 }
 
