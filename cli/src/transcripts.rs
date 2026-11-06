@@ -659,9 +659,10 @@ mod tests {
     #[test]
     fn a_secret_across_the_cut_between_two_stretches_goes_up_whole_or_not_at_all() {
         let sandbox = Sandbox::new("boundary");
-        // One line longer than a stretch, cut where the token sits across the end of the first.
-        let head = "x".repeat(MAX_CHUNK - 8);
-        let text = format!("{head}{TOKEN} tail\n");
+        // One line longer than a stretch, cut eight bytes into a token that opens a word of its
+        // own: a marker running on out of the padding is part of that word and no secret at all.
+        let head = "x".repeat(MAX_CHUNK - 9);
+        let text = format!("{head} {TOKEN} tail\n");
         let transcript = sandbox.transcript("s-1", &text);
         let service = Fake::default();
 
@@ -669,7 +670,7 @@ mod tests {
 
         let body = service.body("main");
         assert!(!body.contains("ghp_"), "no part of the token is in the archive");
-        assert_eq!(body, format!("{head}{PLACEHOLDER} tail\n"));
+        assert_eq!(body, format!("{head} {PLACEHOLDER} tail\n"));
         assert_eq!(sent, body.len() as i64, "a pass counts the bytes it put there");
     }
 
