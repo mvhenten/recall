@@ -8,6 +8,15 @@ import {
   type ReadPermission,
   type WritePermission,
 } from "./artifacts";
+import {
+  BOARD_WINDOW_MS,
+  type BoardEntry,
+  type BoardInput,
+  type BoardMessage,
+  type BoardScope,
+  type BoardTaker,
+  MAX_PICKUP_BYTES,
+} from "./board";
 import type { Caller } from "./device";
 import {
   DAY_MS,
@@ -1861,4 +1870,194 @@ export const recall = async (db: D1Database, userId: string, memoryIds: string[]
       .bind(userId, ids),
   ]);
   return (selected?.results ?? []).map(toMemory);
+};
+
+interface BoardRow {
+  message_id: string;
+  scope: BoardScope;
+  target: string;
+  from_device_id: string;
+  from_host: string;
+  from_name: string;
+  body: string;
+  created_at: number;
+  expires_at: number;
+}
+
+// One row of the board joined to its pickup, where it has one. The pickup columns read as null for
+// a message still waiting, which is what the entry's two states are read off.
+interface BoardEntryRow extends BoardRow {
+  taker_session_id: string | null;
+  taker_device_id: string | null;
+  taker_host: string | null;
+  picked_up_at: number | null;
+}
+
+const BOARD_FIELDS = `m.message_id, m.scope, m.target, m.from_device_id, m.from_host, m.from_name, m.body,
+  m.created_at, m.expires_at`;
+
+const toBoardMessage = (row: BoardRow): BoardMessage => ({
+  messageId: row.message_id,
+  scope: row.scope,
+  target: row.target,
+  fromDeviceId: row.from_device_id,
+  fromHost: row.from_host,
+  fromName: row.from_name,
+  body: row.body,
+  createdAt: row.created_at,
+  expiresAt: row.expires_at,
+});
+
+const toBoardEntry = (row: BoardEntryRow): BoardEntry => {
+  const message = toBoardMessage(row);
+  if (row.picked_up_at === null) return { state: "waiting", message };
+  return {
+    state: "taken",
+    message,
+    takenBy: {
+      sessionId: row.taker_session_id ?? "",
+      deviceId: row.taker_device_id ?? "",
+      host: row.taker_host ?? "",
+      pickedUpAt: row.picked_up_at,
+    },
+  };
+};
+
+// What has fallen out of the window, taken out where the board is posted to rather than on a
+// schedule: nothing in this service makes a pass of its own. A read sweeps nothing, because every
+// read already filters on the window and would be spending writes on rows it is ignoring anyway.
+// The pickups go first, because a row there outliving its message would read as a message nobody
+// can see having been taken.
+const sweepBoard = (db: D1Database, userId: string, now: number): D1PreparedStatement[] => [
+  db
+    .prepare(
+      `DELETE FROM board_pickups WHERE user_id = ?1 AND message_id IN
+         (SELECT message_id FROM board_messages WHERE user_id = ?1 AND expires_at <= ?2)`,
+    )
+    .bind(userId, now),
+  db.prepare("DELETE FROM board_messages WHERE user_id = ?1 AND expires_at <= ?2").bind(userId, now),
+];
+
+export const postBoardMessage = async (db: D1Database, input: BoardInput): Promise<BoardMessage> => {
+  const expiresAt = input.createdAt + BOARD_WINDOW_MS;
+  await db.batch([
+    ...sweepBoard(db, input.userId, input.createdAt),
+    db
+      .prepare(
+        `INSERT INTO board_messages (user_id, message_id, scope, target, from_device_id, from_host, from_name,
+           body, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+      )
+      .bind(
+        input.userId,
+        input.messageId,
+        input.address.scope,
+        input.address.target,
+        input.fromDeviceId,
+        input.fromHost,
+        input.fromName,
+        input.body,
+        input.createdAt,
+        expiresAt,
+      ),
+  ]);
+  return {
+    messageId: input.messageId,
+    scope: input.address.scope,
+    target: input.address.target,
+    fromDeviceId: input.fromDeviceId,
+    fromHost: input.fromHost,
+    fromName: input.fromName,
+    body: input.body,
+    createdAt: input.createdAt,
+    expiresAt,
+  };
+};
+
+// How far down the oldest-first walk a pickup reaches: the running total of the bodies through each
+// message, which the budget then cuts. One message always fits, because a post over the same
+// ceiling is refused.
+const BOARD_THROUGH = `SUM(LENGTH(CAST(m.body AS BLOB)))
+     OVER (ORDER BY m.created_at, m.message_id ROWS UNBOUNDED PRECEDING) AS through`;
+
+// The messages one session takes off the board, and takes for good: the claim is an insert against
+// a primary key that is the message, so two sessions booting together both run it and only one
+// writes a row. Writing the claim from the board itself is what keeps a pickup row from outliving
+// the message it acknowledges, and the read that follows it in the same batch is handed what this
+// session holds, which is what makes a fleet message run once instead of once per session.
+//
+// A session reads its own pickups again, because the start hook that takes them can be killed by
+// its own timeout after the claim has been written. `SessionStart` fires again on resume and on
+// compact under the same session id, so the message comes back to the one session that took it
+// rather than being lost to the fleet.
+//
+// A session-addressed message is only ever picked up from the device that session runs on, so a
+// caller naming a session id it does not hold is handed nothing. The device is checked inside the
+// walk rather than ahead of it because `sessions --sync` is detached and races the pickup: a
+// session not on record yet leaves its message waiting instead of having it refused.
+export const claimBoardMessages = async (
+  db: D1Database,
+  userId: string,
+  taker: BoardTaker,
+  now: number,
+): Promise<BoardMessage[]> => {
+  const [, held] = await db.batch<BoardRow>([
+    db
+      .prepare(
+        `INSERT INTO board_pickups (user_id, message_id, session_id, device_id, host, picked_up_at)
+         SELECT ?1, message_id, ?4, ?3, ?6, ?7 FROM
+           (SELECT m.message_id, ${BOARD_THROUGH}
+            FROM board_messages m
+            WHERE m.user_id = ?1 AND m.expires_at > ?2
+              AND ((m.scope = 'fleet' AND m.target = ?1)
+                OR (m.scope = 'host' AND m.target = ?3)
+                OR (m.scope = 'session' AND m.target = ?4
+                  AND EXISTS (SELECT 1 FROM sessions s
+                    WHERE s.user_id = m.user_id AND s.session_id = m.target AND s.device_id = ?3)))
+              AND NOT EXISTS (SELECT 1 FROM board_pickups p
+                WHERE p.user_id = m.user_id AND p.message_id = m.message_id
+                  AND (p.session_id <> ?4 OR p.device_id <> ?3)))
+         WHERE through <= ?5
+         ON CONFLICT (user_id, message_id) DO NOTHING`,
+      )
+      .bind(userId, now, taker.deviceId, taker.sessionId, MAX_PICKUP_BYTES, taker.host, taker.pickedUpAt),
+    db
+      .prepare(
+        `SELECT * FROM
+           (SELECT ${BOARD_FIELDS}, ${BOARD_THROUGH}
+            FROM board_messages m
+            JOIN board_pickups p ON p.user_id = m.user_id AND p.message_id = m.message_id
+            WHERE m.user_id = ?1 AND m.expires_at > ?2 AND p.session_id = ?4 AND p.device_id = ?3)
+         WHERE through <= ?5
+         ORDER BY created_at, message_id`,
+      )
+      .bind(userId, now, taker.deviceId, taker.sessionId, MAX_PICKUP_BYTES),
+  ]);
+  return (held?.results ?? []).map(toBoardMessage);
+};
+
+export const listBoard = async (
+  db: D1Database,
+  userId: string,
+  limit: number,
+  [cursorAt, cursorId]: Cursor,
+  now: number,
+): Promise<{ entries: BoardEntry[]; nextCursor: string }> => {
+  const { results } = await db
+    .prepare(
+      `SELECT ${BOARD_FIELDS}, p.session_id AS taker_session_id, p.device_id AS taker_device_id,
+         p.host AS taker_host, p.picked_up_at
+       FROM board_messages m
+       LEFT JOIN board_pickups p ON p.user_id = m.user_id AND p.message_id = m.message_id
+       WHERE m.user_id = ?1 AND m.expires_at > ?2
+         AND (m.created_at < ?3 OR (m.created_at = ?3 AND m.message_id < ?4))
+       ORDER BY m.created_at DESC, m.message_id DESC
+       LIMIT ?5`,
+    )
+    .bind(userId, now, cursorAt, cursorId, limit + 1)
+    .all<BoardEntryRow>();
+  const entries = results.slice(0, limit).map(toBoardEntry);
+  const last = entries.at(-1);
+  const nextCursor = results.length > limit && last ? encodeCursor(last.message.createdAt, last.message.messageId) : "";
+  return { entries, nextCursor };
 };

@@ -80,16 +80,27 @@ function registerSession(input, repoTag) {
 // beside it. Every session syncs, registered or not, since a host with messaging off still belongs
 // in the list `recall sessions` prints; the sync is left to run, because an unreachable service
 // must not keep the session waiting for its memory context.
+//
+// This is also where a session picks up its board messages: the injected context is the only hook
+// that runs at start, so what the pickup took leads the context and the memory crib follows it. A
+// pickup that never reached the service takes nothing, and the next session's start reads the board
+// again. One that timed out after the service wrote the claim is read back by this same session,
+// since `SessionStart` fires again on resume and on compact and a pickup hands a session what it
+// already holds.
 async function run(input) {
   const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
   const repoTag = repo.ok ? repo.stdout.trim() : "";
   const messaging = registerSession(input, repoTag);
   if (input.session_id) recallDetached(["sessions", "--sync", input.session_id], input.cwd);
-  const work = [recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS })];
-  if (messaging === "registered") {
+  const listening = messaging === "registered";
+  const work = [
+    recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
+    listening ? recall(["pickup", "--session", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS }) : null,
+  ];
+  if (listening) {
     work.push(recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }));
   }
-  const [config] = await Promise.all(work);
+  const [config, picked] = await Promise.all(work);
   if (!config.ok && config.error.includes("recall CLI not found")) {
     sessionContext(INSTALL_HINT);
     return "not-installed";
@@ -99,8 +110,10 @@ async function run(input) {
     sessionContext(`recall is misconfigured: ${error}`);
     return `error:${firstLine(error)}`;
   }
-  sessionContext(context(mode, repoTag));
-  return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${messaging}`;
+  const board = picked?.ok ? picked.stdout.trim() : "";
+  sessionContext(board === "" ? context(mode, repoTag) : `${board}\n\n${context(mode, repoTag)}`);
+  const took = board === "" ? "" : ":board";
+  return `crib:${mode}:${repoTag ? "repo" : "global"}:messaging:${messaging}${took}`;
 }
 
 const started = Date.now();

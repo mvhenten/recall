@@ -1,4 +1,7 @@
-use crate::api::{Artifact, Audience, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit, Share};
+use crate::api::{
+    Artifact, Audience, BoardEntry, BoardMessage, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit,
+    Share,
+};
 use crate::sessions;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -366,6 +369,76 @@ pub fn render_elsewhere(entries: &[Elsewhere]) -> String {
         })
         .collect();
     format!("Also in other scopes:\n\n{lines}")
+}
+
+/// Who posted a board message, as the one who reads it sees it: the host's label where it carries
+/// one, then the handle of the session that posted it. A post that could name no session reads as
+/// its host alone, and one from a service that named no sender reads as its device id.
+fn poster(message: &BoardMessage) -> String {
+    let from = if message.from_host.is_empty() {
+        &message.from_device_id
+    } else {
+        &message.from_host
+    };
+    if message.from_name.is_empty() {
+        return from.clone();
+    }
+    format!("{from}/{}", message.from_name)
+}
+
+fn board_address(message: &BoardMessage) -> String {
+    if message.scope == "fleet" {
+        return "the fleet".to_string();
+    }
+    format!("{} {}", message.scope, message.target)
+}
+
+/// What a pickup injects into the session that took it: one line of facts over each message, then
+/// the message. The line says who posted it and how long it sat on the board, because a reader
+/// acting on a week-old instruction has to know that is what it is doing.
+pub fn render_pickup(messages: &[BoardMessage], now: i64) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            format!(
+                "[recall board, posted {} ago by {}]\n{}\n",
+                sessions::age(message.created_at, now),
+                poster(message),
+                message.body.trim()
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// The board, newest first: where each message is addressed, who posted it, how old it is, and
+/// either that it is still waiting or the session that took it.
+pub fn render_board(entries: &[BoardEntry], now: i64) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            let (message, state) = match entry {
+                BoardEntry::Waiting { message } => (message, "waiting".to_string()),
+                BoardEntry::Taken { message, taken_by } => (
+                    message,
+                    format!(
+                        "taken {} ago by {}/{}",
+                        sessions::age(taken_by.picked_up_at, now),
+                        taken_by.host,
+                        taken_by.session_id
+                    ),
+                ),
+            };
+            format!(
+                "- **{}** from {} {} ago, {}\n  {}\n",
+                board_address(message),
+                poster(message),
+                sessions::age(message.created_at, now),
+                state,
+                message.body.trim().replace('\n', "\n  ")
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
