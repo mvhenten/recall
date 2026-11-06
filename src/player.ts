@@ -7,15 +7,17 @@ export interface PlayerState {
   current: number | null;
 }
 
-// The manifest the player page carries into the browser: the artifact's name, so a row's control
-// can address the file, and whether storage holds the file at all.
+// The manifest the player page carries into the browser: the base the page was served under, so a
+// row's control addresses the file inside whatever address space the reader is in, and whether
+// storage holds the file at all. A base rather than a name, because a player served under a share
+// prefix cannot reach its files by the artifact's name.
 export interface PlannedTrack {
   path: string;
   gone: boolean;
 }
 
 export interface PlayerPlan {
-  name: string;
+  base: string;
   tracks: PlannedTrack[];
 }
 

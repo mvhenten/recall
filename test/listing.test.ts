@@ -81,6 +81,7 @@ describe("the artifacts tab's type chips", () => {
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_000,
     lastWriter: "alice@example.com",
+    shareCount: 0,
   };
 
   const shelf = (artifacts: ArtifactView[], byType: ArtifactTypeCount[]): Published => ({

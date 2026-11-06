@@ -230,7 +230,7 @@ export const playerPage = (record: ArtifactRecord, dashboard: string, missing: r
     record.bytes,
   )} · published ${moment(record.updatedAt)} · ${record.lastWriter}`;
   const plan: PlayerPlan = {
-    name: record.name,
+    base: `/${encodeURIComponent(record.name)}`,
     tracks: record.files.map((file) => ({ path: file.path, gone: gone.has(file.path) })),
   };
   const rows = record.files.map((file, index) => trackRow(file, index, gone.has(file.path))).join("");

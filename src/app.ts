@@ -294,7 +294,7 @@ interface Rankings {
 // at most fifty paths, so a body past this is not a manifest.
 const MANIFEST_BYTES = 64 * 1024;
 
-const viewOf = (host: ArtifactHost, record: ArtifactRecord): ArtifactView => ({
+const viewOf = (host: ArtifactHost, record: ArtifactRecord, shareCount: number): ArtifactView => ({
   name: record.name,
   url: `https://${host.hostname}/${encodeURIComponent(record.name)}`,
   type: record.type,
@@ -307,6 +307,7 @@ const viewOf = (host: ArtifactHost, record: ArtifactRecord): ArtifactView => ({
   createdAt: record.createdAt,
   updatedAt: record.updatedAt,
   lastWriter: record.lastWriter,
+  shareCount,
 });
 
 const jsonOrNull = (text: string): unknown => {
@@ -1238,7 +1239,7 @@ export const createApp = (deps: Deps): App => {
             })),
     ]);
     return {
-      artifacts: page.artifacts.map((record) => viewOf(host, record)),
+      artifacts: page.artifacts.map((record) => viewOf(host, record, 0)),
       counts,
       nextCursor: page.nextCursor,
       cut: page.cut,
@@ -1485,7 +1486,7 @@ export const createApp = (deps: Deps): App => {
     const saved = await getArtifact(db, owner, name);
     if (saved === null) throw new Error(`artifact ${name} vanished right after it was published`);
     if (target !== null) await collect(host.bucket, owner, name, target.rev);
-    return json({ artifact: viewOf(host, saved), ownedByAnother: owner !== caller.userId });
+    return json({ artifact: viewOf(host, saved, 0), ownedByAnother: owner !== caller.userId });
   };
 
   const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
@@ -1558,7 +1559,7 @@ export const createApp = (deps: Deps): App => {
     // files over the API while refusing to say anything about itself.
     const record = await resolveArtifact(db, userId, name.value);
     if (record === null) return error(404, `no artifact named ${name.value}`);
-    return json({ artifact: viewOf(host, record) });
+    return json({ artifact: viewOf(host, record, 0) });
   };
 
   const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {

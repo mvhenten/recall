@@ -59,7 +59,7 @@ const boot = (parts: Parts, plan: PlayerPlan): void => {
   const addressOf = (index: number): string => {
     const track = plan.tracks[index];
     if (track === undefined) throw new RangeError(`the player page names no track at ${index}`);
-    return `/${encodeURIComponent(plan.name)}/${track.path.split("/").map(encodeURIComponent).join("/")}`;
+    return `${plan.base}/${track.path.split("/").map(encodeURIComponent).join("/")}`;
   };
 
   const nameOf = (index: number): string => plan.tracks[index]?.path ?? "";
