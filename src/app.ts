@@ -3047,13 +3047,14 @@ export const createApp = (deps: Deps): App => {
     if (mark !== null && mark.archived > 0) {
       return error(409, `session ${sessionId} holds a transcript written as bytes; records and bytes are two paths`);
     }
-    const refuse = (next: number): Response => {
-      const conflict: V2RecordsConflict = {
-        error: `${file.value} holds ${next} records; send the records starting at ${next}`,
-        next,
-      };
-      return json(conflict, 409);
+    // Every 409 this endpoint answers carries the real reach, because the only thing a host can do
+    // with one is send again from there.
+    const conflict = (next: number, error: string): Response => {
+      const refused: V2RecordsConflict = { error, next };
+      return json(refused, 409);
     };
+    const refuse = (next: number): Response =>
+      conflict(next, `${file.value} holds ${next} records; send the records starting at ${next}`);
     const accepted = (next: number): Response => {
       const taken: V2RecordsAccepted = { file: file.value, next };
       return json(taken);
@@ -3076,7 +3077,8 @@ export const createApp = (deps: Deps): App => {
     if (!(await putRecords(bucket, userId, sessionId, file.value, from, records))) {
       const stored = await readRecordAppend(bucket, userId, sessionId, file.value, from);
       if (stored?.some((record, at) => at < records.length && record !== records[at]) === true) {
-        return error(409, `${file.value} holds other records at ordinal ${from}; a record is written once`);
+        const reach = await recordsReach(bucket, userId, sessionId, file.value);
+        return conflict(reach, `${file.value} holds other records at ordinal ${from}; a record is written once`);
       }
       return refuse(await recordsReach(bucket, userId, sessionId, file.value));
     }
@@ -3095,10 +3097,6 @@ export const createApp = (deps: Deps): App => {
     // the one that has to index it, or nothing ever will.
     const behind = await readRecordsBetween(bucket, userId, sessionId, file.value, marked, from);
     const text = [...behind, ...records].join("\n");
-    if (from === 0) {
-      const named = agentName(text.slice(0, HEAD_BYTES));
-      if (named !== "") await nameSession(db, userId, sessionId, named);
-    }
     const carried = await openChunks(db, userId, sessionId, file.value);
     const { closed, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
     const chunkFrom = await chunkReach(db, userId, sessionId);
@@ -3108,6 +3106,13 @@ export const createApp = (deps: Deps): App => {
     // of a file the first had not finished writing; it is told the real `next` and sends again.
     const commit = { userId, sessionId, file: file.value, held: marked, next, chunkFrom, chunks: indexed, open };
     if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
+    // The span this append indexed opens the session wherever the mark stood at nothing, which is
+    // not the same as the call carrying ordinal 0: a first append that lost its commit leaves the
+    // name to whichever later one carries the mark off zero. A losing append names nothing.
+    if (marked === 0) {
+      const named = agentName(text.slice(0, HEAD_BYTES));
+      if (named !== "") await nameSession(db, userId, sessionId, named);
+    }
     return accepted(next);
   };
 
@@ -3115,20 +3120,29 @@ export const createApp = (deps: Deps): App => {
   // where the character ceiling runs out, so the one a file is still holding closes nowhere at all
   // unless the end of the session closes it — and a short session, which turns nowhere, would be
   // unfindable entirely. `/v1` closed everything at the end of every indexing bite.
-  const closeSession = async (db: D1Database, userId: string, sessionId: string): Promise<void> => {
-    const open = await openChunks(db, userId, sessionId, MAIN_FILE);
-    if (open.length === 0) return;
-    const [held, chunkFrom] = await Promise.all([
+  //
+  // It is also the last chance the span past the mark has. An append that stored its records and
+  // lost its commit leaves the archive ahead of the mark, and the gap fold that would have carried
+  // the index over it only runs on another append; where the session ended there, the end of it is
+  // the append that never came.
+  const closeSession = async (bucket: R2Bucket, db: D1Database, userId: string, sessionId: string): Promise<void> => {
+    const [open, held, chunkFrom, reach] = await Promise.all([
+      openChunks(db, userId, sessionId, MAIN_FILE),
       recordReach(db, userId, sessionId, MAIN_FILE),
       chunkReach(db, userId, sessionId),
+      recordsReach(bucket, userId, sessionId, MAIN_FILE),
     ]);
-    const indexed = await embedChunks(closeChunks(open));
+    const next = Math.max(held, reach);
+    if (open.length === 0 && next === held) return;
+    const behind = await readRecordsBetween(bucket, userId, sessionId, MAIN_FILE, held, next);
+    const tail = chunkTurnsCarrying(readTurns(behind.join("\n"), MAIN_FILE), open);
+    const indexed = await embedChunks([...tail.closed, ...closeChunks(tail.open)]);
     await commitRecords(db, {
       userId,
       sessionId,
       file: MAIN_FILE,
       held,
-      next: held,
+      next,
       chunkFrom,
       chunks: indexed,
       open: [],
@@ -3164,7 +3178,7 @@ export const createApp = (deps: Deps): App => {
       return new Response(null, { status: 204 });
     }
     if (request.method !== "DELETE") return error(405, "method not allowed");
-    await closeSession(db, caller.userId, sessionId.value);
+    await closeSession(bucket, db, caller.userId, sessionId.value);
     if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
     return new Response(null, { status: 204 });
   };

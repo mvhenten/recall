@@ -56,6 +56,16 @@ const setOf = (chunks: ChunkRow[]): string[] =>
 const chunkCount = async (userId: string, sessionId: string): Promise<number> =>
   (await chunksOf(userId, sessionId)).length;
 
+// One point two concurrent requests can be steered by, so a test can say which of them reaches the
+// archive first and which one finds the mark moved.
+const signal = (): { waited: Promise<void>; fire: () => void } => {
+  let fire = (): void => {};
+  const waited = new Promise<void>((resolve) => {
+    fire = resolve;
+  });
+  return { waited, fire };
+};
+
 describe("POST /v2/sessions/{sessionId}/records", () => {
   it("takes the next ordinal and refuses one on either side of it", async () => {
     const { user } = await harness();
@@ -286,6 +296,67 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     expect((await client.v2.end(session)).status).toBe(204);
     const said = (await chunksOf(client.userId, session)).map((chunk) => chunk.text).join("\n");
     for (const subject of [...SUBJECTS, "retention"]) expect(said).toContain(`${subject}:`);
+  });
+
+  // The same loss on the last append a session ever makes. Another append would carry the index
+  // over the span the loser stored, but the session that ends there never sends one, so the end of
+  // it is the only thing left that can index those records.
+  it("indexes the records the last append of a session left ahead of the mark", async () => {
+    const leadingAt = signal();
+    const leadingGo = signal();
+    const followerAt = signal();
+    const followerGo = signal();
+    let calls = 0;
+    const gated: Embedder = {
+      async embed(texts: string[]): Promise<Float32Array[]> {
+        calls += 1;
+        const at = calls;
+        if (at === 1) {
+          leadingAt.fire();
+          await leadingGo.waited;
+        }
+        if (at === 2) {
+          followerAt.fire();
+          await followerGo.waited;
+        }
+        return wordEmbedder.embed(texts);
+      },
+    };
+
+    const { user } = await harness({ embedder: gated });
+    const client = await user("tail");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    // Both appends store their records and then stop at the embedder. The leading one is let go
+    // first and takes the mark, which leaves the follower committing against a mark that moved.
+    const leading = client.v2.records(session, "main", 0, records.slice(0, 8));
+    await leadingAt.waited;
+    const following = client.v2.records(session, "main", 8, records.slice(8));
+    await followerAt.waited;
+    leadingGo.fire();
+    expect((await leading).status).toBe(200);
+    followerGo.fire();
+    const lost = await following;
+    expect(lost.status).toBe(409);
+    expect(await lost.json()).toMatchObject({ next: 8 });
+
+    // The follower's records are in the archive at ordinal 8 and nothing read them for turns.
+    const stranded = ["auditing", "pagination"];
+    const before = (await chunksOf(client.userId, session)).map((chunk) => chunk.text).join("\n");
+    for (const subject of stranded) expect(before).not.toContain(`${subject}:`);
+
+    expect((await client.v2.end(session)).status).toBe(204);
+    const said = (await chunksOf(client.userId, session)).map((chunk) => chunk.text).join("\n");
+    for (const subject of SUBJECTS) expect(said).toContain(`${subject}:`);
+
+    const marked = await env.DB.prepare(
+      "SELECT next_ordinal FROM session_records WHERE user_id = ? AND session_id = ? AND file = 'main'",
+    )
+      .bind(client.userId, session)
+      .first<{ next_ordinal: number }>();
+    expect(marked?.next_ordinal).toBe(records.length);
   });
 
   // The archive takes a record once. A host sending different prose at an ordinal it already wrote
