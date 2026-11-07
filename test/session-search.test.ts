@@ -20,6 +20,43 @@ const about = (subject: string): string =>
 
 const bytes = (text: string): number => new TextEncoder().encode(text).byteLength;
 
+// A run of turns about one subject, long enough that several of them run past one bite of the
+// indexer. Every turn carries its own number, so the chunks can be read back for the turns a bite
+// seam falls between; the number holds a digit, which the harness's embedder is blind to, so what a
+// search sees of this prose is the subject alone.
+const run = (from: number, turns: number, subject: string): string => {
+  const written: string[] = [];
+  for (let turn = from; turn < from + turns; turn += 1) {
+    const stamp = new Date(1_700_000_000_000 + turn * 1_000).toISOString();
+    written.push(
+      line({
+        type: "user",
+        timestamp: stamp,
+        origin: { kind: "human" },
+        message: {
+          content: `t${turn}x ${subject}: ${`what ${subject} does, and why it does it that way. `.repeat(20)}`,
+        },
+      }),
+      line({
+        type: "assistant",
+        timestamp: stamp,
+        message: {
+          model: "claude-opus-5",
+          content: [
+            { type: "text", text: `t${turn}x ${subject} works like this: ${`${subject} does its job. `.repeat(20)}` },
+          ],
+        },
+      }),
+    );
+  }
+  return written.join("");
+};
+
+const turnsIn = (chunks: string[]): number[] =>
+  [...new Set([...chunks.join("\n").matchAll(/\bt(\d+)x\b/g)].map((found) => Number(found[1])))].sort(
+    (left, right) => left - right,
+  );
+
 const sessionOf = async (response: Response): Promise<PastSession> => {
   expect(response.status).toBe(200);
   const body = (await response.json()) as { session: PastSession };
@@ -143,6 +180,52 @@ describe("indexing off the storage event", () => {
     await h.deliver();
     expect(await h.chunks(userId, "s-long")).toEqual(grown);
     expect((await hitsOf(await client.searchSessions("the labels tab")))[0]?.session.sessionId).toBe("s-long");
+  });
+
+  // What `recall sessions --backfill` hands the indexer: a session hundreds of bites behind its
+  // archive. One bite is all one invocation takes, so the session is caught up over as many
+  // invocations, and while it is still behind its messages go back for redelivery rather than
+  // acking — an acked message with nothing else asking what is behind would leave the rest of the
+  // transcript unindexed for good. The chunks are read back after every delivery because a bite
+  // seam is where prose would be dropped or indexed twice: each delivery appends to what the one
+  // before it wrote and rewrites none of it.
+  it("takes one bite of a session far behind per delivery, and sends its messages back until it is level", async () => {
+    const h = await harness();
+    const userId = `behind-${crypto.randomUUID()}`;
+    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
+    await client.sync("s-behind");
+    const head = named("rogiffavof") + run(0, 430, "the offset table");
+    const middle = run(430, 430, "the labels tab");
+    const tail = run(860, 430, "the signing key");
+    await client.archive("s-behind", "main", 0, head);
+    await client.archive("s-behind", "main", bytes(head), middle);
+    await client.archive("s-behind", "main", bytes(head) + bytes(middle), tail);
+    const archived = bytes(head) + bytes(middle) + bytes(tail);
+
+    await h.deliver();
+
+    const afterOne = await h.chunks(userId, "s-behind");
+    expect(h.retried()).toBe(3);
+    expect(afterOne.length).toBeGreaterThan(0);
+    expect((await h.indexMark(userId, "s-behind"))?.bytes).toBeLessThan(archived);
+
+    await h.deliver();
+
+    const afterTwo = await h.chunks(userId, "s-behind");
+    expect(h.retried()).toBe(3);
+    expect(afterTwo.slice(0, afterOne.length)).toEqual(afterOne);
+    expect(afterTwo.length).toBeGreaterThan(afterOne.length);
+
+    await h.deliver();
+
+    const afterThree = await h.chunks(userId, "s-behind");
+    expect(h.retried()).toBe(0);
+    expect(afterThree.slice(0, afterTwo.length)).toEqual(afterTwo);
+    const mark = await h.indexMark(userId, "s-behind");
+    expect(mark?.bytes).toBe(archived);
+    expect(mark?.chunks).toBe(afterThree.length);
+    expect(turnsIn(afterThree)).toEqual([...Array(1_290).keys()]);
+    expect((await hitsOf(await client.searchSessions("the signing key")))[0]?.session.sessionId).toBe("s-behind");
   });
 
   // The failure that would otherwise take the index down for every account at once. One delivery
