@@ -12,6 +12,8 @@
 // segments and `parseStretchKey` refuses a fifth, so the consumer that indexes the byte path reads
 // no record object and no change was needed there.
 
+import type { TranscriptFile } from "./transcripts";
+
 // How many records one append may carry, and how many bytes of them. Both are the ceiling the
 // endpoint answers 413 against, and the byte ceiling is the one the byte path already holds a
 // stretch to.
@@ -28,43 +30,111 @@ const ORDINAL_DIGITS = 16;
 // so the reach of a file is one listing and no read of a body.
 const HELD = "records";
 
-const filePrefix = (userId: string, sessionId: string, file: string): string =>
-  `${RECORDS_PREFIX}/${userId}/${sessionId}/${file}/`;
+const sessionPrefix = (userId: string, sessionId: string): string => `${RECORDS_PREFIX}/${userId}/${sessionId}/`;
 
-export const ordinalName = (ordinal: number): string => String(ordinal).padStart(ORDINAL_DIGITS, "0");
+const ordinalName = (ordinal: number): string => String(ordinal).padStart(ORDINAL_DIGITS, "0");
 
-export const recordKey = (userId: string, sessionId: string, file: string, from: number): string =>
-  `${filePrefix(userId, sessionId, file)}${ordinalName(from)}`;
+const recordKey = (userId: string, sessionId: string, file: string, from: number): string =>
+  `${sessionPrefix(userId, sessionId)}${file}/${ordinalName(from)}`;
+
+// One record object as its key and its metadata describe it, which is the whole of what the
+// archive knows about one: which file it belongs to, the ordinal its first record carries, how
+// many it holds, and what it weighs.
+interface RecordObject {
+  key: string;
+  file: string;
+  from: number;
+  held: number;
+  bytes: number;
+}
+
+// Every record object of one session, in the order the records were written. An object whose name
+// or count will not read is a key this archive did not write. Skipping it would answer a
+// conflicted writer a reach short of the truth and send it to write over records already stored,
+// so the listing fails instead.
+const listRecords = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<RecordObject[]> => {
+  const prefix = sessionPrefix(userId, sessionId);
+  const objects: RecordObject[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor, include: ["customMetadata"] });
+    for (const object of page.objects) {
+      const [file, name, ...rest] = object.key.slice(prefix.length).split("/");
+      const from = Number(name);
+      const held = Number(object.customMetadata?.[HELD]);
+      const wrote =
+        file !== undefined &&
+        file !== "" &&
+        rest.length === 0 &&
+        Number.isSafeInteger(from) &&
+        name === ordinalName(from) &&
+        Number.isSafeInteger(held) &&
+        held > 0;
+      if (!wrote) throw new Error(`${object.key} is no record object this archive wrote`);
+      objects.push({ key: object.key, file, from, held, bytes: object.size });
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor !== undefined);
+  return objects.sort((left, right) => left.from - right.from);
+};
 
 // How many records of one file the archive holds, counted off the objects and nothing else. It is
 // read only where the mark and the objects disagree — a replay, or a writer beaten to a place — so
 // an append in the ordinary case pays for no listing at all.
-//
-// An object whose name or count will not read is a key this archive did not write. Skipping it
-// would answer a conflicted writer a reach short of the truth and send it to write over records
-// already stored, so the listing fails instead.
 export const recordsReach = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
 ): Promise<number> => {
-  const prefix = filePrefix(userId, sessionId, file);
-  let reach = 0;
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, cursor, include: ["customMetadata"] });
-    for (const object of page.objects) {
-      const from = Number(object.key.slice(prefix.length));
-      const held = Number(object.customMetadata?.[HELD]);
-      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(held) || from < 0 || held < 1) {
-        throw new Error(`${object.key} is no record object this archive wrote`);
+  const objects = await listRecords(bucket, userId, sessionId);
+  return objects
+    .filter((object) => object.file === file)
+    .reduce((reach, object) => Math.max(reach, object.from + object.held), 0);
+};
+
+// The files of a session the record path holds, and what each weighs as the transcript it joins
+// back to: the objects laid end to end with the newline that divides two appends. Nothing here is
+// a span of a file on disk the way a byte-path stretch is — a record is a whole line verbatim —
+// so the archive accounts for every byte of what it holds and for no byte it does not.
+export const recordFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
+  const weighed = new Map<string, number>();
+  for (const object of await listRecords(bucket, userId, sessionId)) {
+    const bytes = weighed.get(object.file);
+    weighed.set(object.file, bytes === undefined ? object.bytes : bytes + object.bytes + 1);
+  }
+  return [...weighed]
+    .map(([file, bytes]): TranscriptFile => ({ file, bytes, through: bytes, named: true }))
+    .sort((left, right) => left.file.localeCompare(right.file));
+};
+
+// One file of a session's transcript, read back out of its records. The objects are handed over in
+// ordinal order with a newline between them, which is the file the host sent: a record is one
+// JSONL line and an append is a run of them, so the only byte an append boundary costs is the one
+// that ends its last line.
+export const readRecords = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+): Promise<ReadableStream<Uint8Array> | null> => {
+  const objects = (await listRecords(bucket, userId, sessionId)).filter((object) => object.file === file);
+  if (objects.length === 0) return null;
+  let next = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const object = objects[next];
+      if (object === undefined) {
+        controller.close();
+        return;
       }
-      reach = Math.max(reach, from + held);
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
-  return reach;
+      next += 1;
+      const body = await bucket.get(object.key);
+      if (body === null) throw new Error(`the archive lost ${object.key} of ${file}`);
+      if (next > 1) controller.enqueue(new Uint8Array([10]));
+      controller.enqueue(new Uint8Array(await body.arrayBuffer()));
+    },
+  });
 };
 
 // One append of one file, which lands only where nothing is yet. Two writers holding the same

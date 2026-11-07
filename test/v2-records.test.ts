@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import type { Embedder } from "../src/model";
 import { MAX_RECORDS_BYTES, MAX_RECORDS_PER_APPEND, RECORDS_PREFIX } from "../src/records";
-import { harness } from "./harness";
+import { harness, wordEmbedder } from "./harness";
 
 const line = (entry: Record<string, unknown>): string => JSON.stringify(entry);
 
@@ -166,15 +167,110 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     await client.v2.sync(session);
     const records = conversation();
 
-    // The same prose reaches the archive both ways: a byte-path stretch, which a storage event
-    // would otherwise index, and a record append, which indexes itself inside the request.
-    expect((await client.archive(session, "main", 0, `${records.join("\n")}\n`)).status).toBe(200);
+    // The same prose reaches the archive both ways: a record append, which indexes itself inside
+    // the request, and a byte-path stretch, which a storage event would otherwise index.
     expect((await client.v2.records(session, "main", 0, records)).status).toBe(200);
+    expect((await client.archive(session, "main", 0, `${records.join("\n")}\n`)).status).toBe(200);
     const indexed = await chunkCount(client.userId, session);
     expect(indexed).toBeGreaterThan(0);
 
     await deliver();
     expect(await chunkCount(client.userId, session)).toBe(indexed);
+  });
+
+  // The reverse order, which the mark alone cannot answer: the queue drains first and indexes the
+  // prose at ordinals the record append would then index it at a second time. One session takes
+  // one path into the index, and the one it took is the one that wrote it.
+  it("refuses records for a session the byte path already wrote", async () => {
+    const { user, deliver } = await harness();
+    const client = await user("crossed");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    expect((await client.archive(session, "main", 0, `${records.join("\n")}\n`)).status).toBe(200);
+    await deliver();
+    const indexed = await chunkCount(client.userId, session);
+    expect(indexed).toBeGreaterThan(0);
+
+    const refused = await client.v2.records(session, "main", 0, records);
+    expect(refused.status).toBe(409);
+    expect(await refused.text()).toContain("two paths");
+    expect(await chunkCount(client.userId, session)).toBe(indexed);
+  });
+
+  // A delegated file is the model talking to itself and derives nothing, so an append of one must
+  // leave the byte path free to index the session's own prose.
+  it("leaves the byte path indexing a session whose delegated turn took records", async () => {
+    const { user, deliver } = await harness();
+    const client = await user("delegated");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    expect((await client.v2.records(session, "main-agent-1", 0, records)).status).toBe(200);
+    expect(await chunkCount(client.userId, session)).toBe(0);
+
+    expect((await client.archive(session, "main", 0, `${records.join("\n")}\n`)).status).toBe(200);
+    await deliver();
+    expect(await chunkCount(client.userId, session)).toBeGreaterThan(0);
+  });
+
+  // Ordinals are implicit in position, so a host knows its next `from` without asking and sends
+  // the second append while the first is still embedding. The second reads the chunks and the open
+  // chunk of a file the first has not finished writing, so one of the two must lose and be told.
+  it("refuses the later of two pipelined appends rather than losing its chunks", async () => {
+    let reached = (): void => {};
+    const atEmbedder = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let release = (): void => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let first = true;
+    const gated: Embedder = {
+      async embed(texts: string[]): Promise<Float32Array[]> {
+        if (first) {
+          first = false;
+          reached();
+          await held;
+        }
+        return wordEmbedder.embed(texts);
+      },
+    };
+
+    const { user } = await harness({ embedder: gated });
+    const client = await user("pipelined");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    const leading = client.v2.records(session, "main", 0, records.slice(0, 6));
+    await atEmbedder;
+    const following = await client.v2.records(session, "main", 6, records.slice(6));
+    release();
+    const led = await leading;
+
+    expect([led.status, following.status].sort()).toEqual([200, 409]);
+    const lost = led.status === 409 ? led : following;
+    const { next }: { next: number } = await lost.json();
+
+    // The mark, the chunk counter and the chunk ordinals all say the same thing: one append's
+    // chunks are in the index whole, and the other wrote none of its own over them.
+    const marked = await env.DB.prepare(
+      "SELECT next_ordinal FROM session_records WHERE user_id = ? AND session_id = ? AND file = 'main'",
+    )
+      .bind(client.userId, session)
+      .first<{ next_ordinal: number }>();
+    expect(next).toBe(marked?.next_ordinal);
+
+    const counted = await env.DB.prepare("SELECT chunks FROM session_index WHERE user_id = ? AND session_id = ?")
+      .bind(client.userId, session)
+      .first<{ chunks: number }>();
+    const indexed = await chunksOf(client.userId, session);
+    expect(indexed.length).toBeGreaterThan(0);
+    expect(counted?.chunks).toBe(indexed.length);
   });
 
   it("makes what it indexed findable by meaning", async () => {
@@ -188,6 +284,52 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     expect(found.status).toBe(200);
     const { hits }: { hits: Array<{ session: { sessionId: string } }> } = await found.json();
     expect(hits.map((hit) => hit.session.sessionId)).toContain(session);
+  });
+
+  // A chunk closes where the conversation turns or where the ceiling runs out, so the last one of
+  // a session closes nowhere at all. A short session turns nowhere and would be unfindable whole.
+  it("makes the last turn of a session findable once the session ends", async () => {
+    const { user } = await harness();
+    const client = await user("ending");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+
+    const said = `the quarterly reconciliation runs against the ledger snapshot ${crypto.randomUUID().slice(0, 8)}`;
+    expect((await client.v2.records(session, "main", 0, [prompt(0, said)])).status).toBe(200);
+    expect(await chunkCount(client.userId, session)).toBe(0);
+
+    expect((await client.v2.end(session)).status).toBe(204);
+    const closed = await chunksOf(client.userId, session);
+    expect(closed.map((chunk) => chunk.text)).toContain(said);
+
+    const found = await client.v2.searchHistory("reconciliation ledger snapshot");
+    const { hits }: { hits: Array<{ session: { sessionId: string } }> } = await found.json();
+    expect(hits.map((hit) => hit.session.sessionId)).toContain(session);
+  });
+
+  it("lists and reads back the transcript of a session that only ever posted records", async () => {
+    const { user } = await harness();
+    const client = await user("readback");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    expect((await client.v2.records(session, "main", 0, records.slice(0, 4))).status).toBe(200);
+    expect((await client.v2.records(session, "main", 4, records.slice(4))).status).toBe(200);
+    expect((await client.v2.records(session, "main-agent-1", 0, [prompt(0, "delegated")])).status).toBe(200);
+
+    const listed = await client.v2.files(session);
+    expect(listed.status).toBe(200);
+    const { files }: { files: Array<{ file: string; bytes: number }> } = await listed.json();
+    expect(files.map((file) => file.file)).toEqual(["main", "main-agent-1"]);
+
+    const read = await client.v2.transcript(session, "main");
+    expect(read.status).toBe(200);
+    expect((await read.text()).split("\n")).toEqual(records);
+
+    const described = await client.v2.session(session);
+    const { files: held }: { files: Array<{ file: string }> } = await described.json();
+    expect(held.map((file) => file.file)).toContain("main");
   });
 
   it("refuses to read or append to another account's session", async () => {

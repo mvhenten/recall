@@ -31,8 +31,8 @@ import {
   RAW_INLINE_BYTES,
   readArtifactFile,
 } from "./artifacts";
-import { type BoardAddress, type BoardTaker, parsePost } from "./board";
-import { chunkTurns, chunkTurnsCarrying } from "./chunks";
+import { type BoardAddress, type BoardPost, type BoardTaker, parsePost, parseV2Post } from "./board";
+import { type Chunk, chunkTurns, chunkTurnsCarrying, closeChunks } from "./chunks";
 import {
   ARTIFACTS_TAB,
   type ArtifactShelf,
@@ -160,7 +160,14 @@ import {
   sizeText,
 } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
-import { MAX_RECORDS_BYTES, MAX_RECORDS_PER_APPEND, putRecords, recordsReach } from "./records";
+import {
+  MAX_RECORDS_BYTES,
+  MAX_RECORDS_PER_APPEND,
+  putRecords,
+  readRecords,
+  recordFiles,
+  recordsReach,
+} from "./records";
 import {
   ARTIFACT_PREFIX,
   FILE_SEGMENT,
@@ -290,6 +297,7 @@ import {
   type StretchBody,
   type Stretched,
   storedStretch,
+  type TranscriptFile,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
 import {
@@ -302,7 +310,12 @@ import {
   sendInputOf,
   sessionHitView,
   sessionView,
+  type V2RecordsAccepted,
+  type V2RecordsConflict,
 } from "./v2";
+
+// How a surface reads the address off a board post. The two differ only there.
+type PostReader = (input: unknown, userId: string) => Parsed<BoardPost>;
 
 export interface ArtifactHost {
   hostname: string;
@@ -649,15 +662,30 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
+  // The chunks with their vectors, embedded in batches the provider takes in one call.
+  const embedChunks = async (closed: readonly Chunk[]): Promise<IndexedChunk[]> => {
+    const indexed: IndexedChunk[] = [];
+    for (let start = 0; start < closed.length; start += EMBED_BATCH) {
+      const batch = closed.slice(start, start + EMBED_BATCH);
+      const vectors = await deps.embedder.embed(batch.map((chunk) => chunk.text));
+      batch.forEach((chunk, index) => {
+        const vector = vectors[index];
+        if (!vector) throw new Error(`the embedder answered ${batch.length} chunks with ${vectors.length} vectors`);
+        indexed.push({ ...chunk, embedding: quantize(vector) });
+      });
+    }
+    return indexed;
+  };
+
   // Sessions by meaning. The full-text query runs first and the chunks it named are scored
   // against the query vector, together with the newest the account holds, and the two rankings
   // are fused with a third: the user's own chunks, scored again on their own, so a session that
   // was asked for a thing outranks one that merely mentioned it. The full-text pass leading is
   // what bounds the scan — the alternative was reading every chunk on record, which cost a
   // search more every week the archive grew.
-  const sessionSearchHits = async (url: URL, db: D1Database, userId: string): Promise<SessionHit[] | Response> => {
+  const sessionSearchHits = async (url: URL, db: D1Database, userId: string): Promise<Parsed<SessionHit[]>> => {
     const parsed = parseSessionSearch(url.searchParams);
-    if (!parsed.ok) return error(400, parsed.error);
+    if (!parsed.ok) return parsed;
     const input = parsed.value;
     const [vector] = await deps.embedder.embed([input.query]);
     if (!vector) throw new Error("the embedder answered the query with no vector");
@@ -669,7 +697,7 @@ export const createApp = (deps: Deps): App => {
       matched.map((hit) => hit.chunkSeq),
       CHUNK_RECENT,
     );
-    if (chunks.length === 0) return [];
+    if (chunks.length === 0) return { ok: true, value: [] };
     const scored = chunks
       .map((chunk): [ChunkCandidate, number] => [chunk, dot(vector, chunk.embedding)])
       .sort((a, b) => b[1] - a[1]);
@@ -708,12 +736,12 @@ export const createApp = (deps: Deps): App => {
       if (!found || !excerpt) throw new Error(`chunk ${hit.chunkSeq} of session ${sessionId} has no session or text`);
       return { session: found, score: hit.score, excerpt };
     });
-    return hits;
+    return { ok: true, value: hits };
   };
 
   const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
     const hits = await sessionSearchHits(url, db, userId);
-    return hits instanceof Response ? hits : json({ hits });
+    return hits.ok ? json({ hits: hits.value }) : error(400, hits.error);
   };
 
   // One bite of one session's prose, read out of the archive and written into the index. It
@@ -926,19 +954,23 @@ export const createApp = (deps: Deps): App => {
 
   // The board, which is the bus's opposite. A message posted here is held until a session picks it
   // up, and the address is the one `recall send` already resolves: the fleet, a host, or a session.
+  // The two surfaces address a post differently and resolve it the same way: `/v1` names the
+  // target in one of two optional fields, `/v2` in the one `address` every other `/v2` endpoint
+  // carries.
   const board = async (
     request: Request,
     url: URL,
     db: D1Database,
     caller: Caller,
     segment: string | undefined,
+    read: PostReader,
   ): Promise<Response> => {
     if (segment === "pickup") {
       return request.method === "POST" ? pickUpBoard(request, db, caller) : error(405, "method not allowed");
     }
     if (segment !== undefined) return error(404, "not found");
     if (request.method === "GET") return readBoard(url, db, caller.userId);
-    return request.method === "POST" ? postToBoard(request, db, caller) : error(405, "method not allowed");
+    return request.method === "POST" ? postToBoard(request, db, caller, read) : error(405, "method not allowed");
   };
 
   const readBoard = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
@@ -964,8 +996,8 @@ export const createApp = (deps: Deps): App => {
     return address;
   };
 
-  const postToBoard = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
-    const input = parsePost(await readJson(request), caller.userId);
+  const postToBoard = async (request: Request, db: D1Database, caller: Caller, read: PostReader): Promise<Response> => {
+    const input = read(await readJson(request), caller.userId);
     if (!input.ok) return error(400, input.error);
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
@@ -2886,11 +2918,25 @@ export const createApp = (deps: Deps): App => {
     return json({ sessions: listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)) });
   };
 
+  // Every file of a session the archive holds, whichever path wrote it. The record path is the one
+  // `/v2` writes with and the byte path is what `/v1` left behind, so a file the records hold is
+  // answered off them and the byte path answers for the rest.
+  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
+    const [recorded, archived] = await Promise.all([
+      recordFiles(bucket, userId, sessionId),
+      archivedFiles(bucket, userId, sessionId),
+    ]);
+    const held = new Set(recorded.map((file) => file.file));
+    return [...recorded, ...archived.filter((file) => !held.has(file.file))].sort((left, right) =>
+      left.file.localeCompare(right.file),
+    );
+  };
+
   const v2Session = async (bucket: R2Bucket, db: D1Database, caller: Caller, target: string): Promise<Response> => {
     const found = await findSession(db, caller.userId, target, deps.now());
     if (!found) return error(404, `no session named ${target}`);
     const [files, labels] = await Promise.all([
-      archivedFiles(bucket, caller.userId, found.session.sessionId),
+      v2FilesOf(bucket, caller.userId, found.session.sessionId),
       readLabels(db, caller.userId),
     ]);
     return json({ session: pastSessionView(found.session, labels.hosts), matches: found.matches, files });
@@ -2908,7 +2954,7 @@ export const createApp = (deps: Deps): App => {
     if (request.method !== "GET") return error(405, "method not allowed");
     if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
     const [files, counted] = await Promise.all([
-      archivedFiles(bucket, caller.userId, sessionId),
+      v2FilesOf(bucket, caller.userId, sessionId),
       countedFiles(db, caller.userId, sessionId),
     ]);
     return json({ files, counted });
@@ -2928,15 +2974,21 @@ export const createApp = (deps: Deps): App => {
     if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
     const file = parseTranscriptFile(url.searchParams.get("file"));
     if (!file.ok) return error(400, file.error);
+    const ndjson = (body: ReadableStream<Uint8Array>, gzip: boolean): Response =>
+      new Response(body, {
+        headers: {
+          "content-type": "application/x-ndjson",
+          "cache-control": "no-store",
+          ...(gzip ? { "content-encoding": "gzip" } : {}),
+        },
+      });
+    // The records first: they are what `/v2` writes, and a session that only ever posted them has
+    // nothing under the byte path's prefix at all.
+    const recorded = await readRecords(bucket, caller.userId, sessionId, file.value);
+    if (recorded !== null) return ndjson(recorded, false);
     const archived = await readTranscript(bucket, caller.userId, sessionId, file.value, takesGzip(request));
     if (archived === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
-    return new Response(archived.body, {
-      headers: {
-        "content-type": "application/x-ndjson",
-        "cache-control": "no-store",
-        ...(archived.gzip ? { "content-encoding": "gzip" } : {}),
-      },
-    });
+    return ndjson(archived.body, archived.gzip);
   };
 
   const v2Usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
@@ -2960,7 +3012,7 @@ export const createApp = (deps: Deps): App => {
   // write of prose already indexed.
   const v2Records = async (
     request: Request,
-    env: AppEnv,
+    bucket: R2Bucket,
     db: D1Database,
     caller: Caller,
     sessionId: string,
@@ -2986,9 +3038,24 @@ export const createApp = (deps: Deps): App => {
     if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
     const { userId } = caller;
     const { from, records } = input.value;
-    const bucket = env.TRANSCRIPTS;
-    const refuse = (next: number): Response =>
-      json({ error: `${file.value} holds ${next} records; send the records starting at ${next}`, next }, 409);
+    // One session, one path into the index. A session the byte path already wrote cannot take
+    // records: the two would index the same prose, and the chunk counter they share belongs to
+    // whichever of them reached it first.
+    const mark = await indexMark(db, userId, sessionId);
+    if (mark !== null && mark.archived > 0) {
+      return error(409, `session ${sessionId} holds a transcript written as bytes; records and bytes are two paths`);
+    }
+    const refuse = (next: number): Response => {
+      const conflict: V2RecordsConflict = {
+        error: `${file.value} holds ${next} records; send the records starting at ${next}`,
+        next,
+      };
+      return json(conflict, 409);
+    };
+    const accepted = (next: number): Response => {
+      const taken: V2RecordsAccepted = { file: file.value, next };
+      return json(taken);
+    };
     // The mark says where the file is waiting, and the objects are the arbiter. The two part
     // company only where a writer stored records and did not live to write the mark, so the
     // listing is paid for on the conflicting call alone and never on the ordinary one.
@@ -3004,8 +3071,9 @@ export const createApp = (deps: Deps): App => {
     // Only the session's own file reaches the index, exactly as the byte path's consumer reads
     // only `main`. A delegated turn is the model talking to itself and derives nothing.
     if (file.value !== MAIN_FILE) {
-      await commitRecords(db, { userId, sessionId, file: file.value, next, from: 0, chunks: [], open: [] });
-      return json({ file: file.value, next });
+      const commit = { userId, sessionId, file: file.value, held: marked, next, chunkFrom: 0, chunks: [], open: [] };
+      if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
+      return accepted(next);
     }
     const text = records.join("\n");
     if (from === 0) {
@@ -3014,43 +3082,62 @@ export const createApp = (deps: Deps): App => {
     }
     const carried = await openChunks(db, userId, sessionId, file.value);
     const { closed, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
-    const at = await chunkReach(db, userId, sessionId);
-    const indexed: IndexedChunk[] = [];
-    for (let start = 0; start < closed.length; start += EMBED_BATCH) {
-      const batch = closed.slice(start, start + EMBED_BATCH);
-      const vectors = await deps.embedder.embed(batch.map((chunk) => chunk.text));
-      batch.forEach((chunk, index) => {
-        const vector = vectors[index];
-        if (!vector) throw new Error(`the embedder answered ${batch.length} chunks with ${vectors.length} vectors`);
-        indexed.push({ ...chunk, embedding: quantize(vector) });
-      });
-    }
-    await commitRecords(db, { userId, sessionId, file: file.value, next, from: at, chunks: indexed, open });
-    return json({ file: file.value, next });
+    const chunkFrom = await chunkReach(db, userId, sessionId);
+    const indexed = await embedChunks(closed);
+    // The mark the work above was read against, still standing. A host knows its next `from`
+    // without asking and pipelines two appends, and the second read the chunks and the open chunk
+    // of a file the first had not finished writing; it is told the real `next` and sends again.
+    const commit = { userId, sessionId, file: file.value, held: marked, next, chunkFrom, chunks: indexed, open };
+    if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
+    return accepted(next);
+  };
+
+  // What a session leaves behind when it ends. A chunk closes where the conversation turns or
+  // where the character ceiling runs out, so the one a file is still holding closes nowhere at all
+  // unless the end of the session closes it — and a short session, which turns nowhere, would be
+  // unfindable entirely. `/v1` closed everything at the end of every indexing bite.
+  const closeSession = async (db: D1Database, userId: string, sessionId: string): Promise<void> => {
+    const open = await openChunks(db, userId, sessionId, MAIN_FILE);
+    if (open.length === 0) return;
+    const [held, chunkFrom] = await Promise.all([
+      recordReach(db, userId, sessionId, MAIN_FILE),
+      chunkReach(db, userId, sessionId),
+    ]);
+    const indexed = await embedChunks(closeChunks(open));
+    await commitRecords(db, {
+      userId,
+      sessionId,
+      file: MAIN_FILE,
+      held,
+      next: held,
+      chunkFrom,
+      chunks: indexed,
+      open: [],
+    });
   };
 
   const v2Sessions = async (
     request: Request,
     url: URL,
-    env: AppEnv,
+    bucket: R2Bucket,
+    db: D1Database,
     caller: Caller,
     rawSessionId: string | undefined,
     subresource: string | undefined,
   ): Promise<Response> => {
-    const db = env.DB;
     if (rawSessionId === undefined) {
       return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);
     if (subresource === "usage") return v2Usage(request, db, caller, sessionId.value);
-    if (subresource === "records") return v2Records(request, env, db, caller, sessionId.value);
-    if (subresource === "files") return v2Files(request, env.TRANSCRIPTS, db, caller, sessionId.value);
+    if (subresource === "records") return v2Records(request, bucket, db, caller, sessionId.value);
+    if (subresource === "files") return v2Files(request, bucket, db, caller, sessionId.value);
     if (subresource === "transcript") {
-      return v2Transcript(request, url, env.TRANSCRIPTS, db, caller, sessionId.value);
+      return v2Transcript(request, url, bucket, db, caller, sessionId.value);
     }
     if (subresource !== undefined) return error(404, "not found");
-    if (request.method === "GET") return v2Session(env.TRANSCRIPTS, db, caller, sessionId.value);
+    if (request.method === "GET") return v2Session(bucket, db, caller, sessionId.value);
     if (request.method === "PUT") {
       const input = parseSessionSync(await readJson(request));
       if (!input.ok) return error(400, input.error);
@@ -3058,6 +3145,7 @@ export const createApp = (deps: Deps): App => {
       return new Response(null, { status: 204 });
     }
     if (request.method !== "DELETE") return error(405, "method not allowed");
+    await closeSession(db, caller.userId, sessionId.value);
     if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
     return new Response(null, { status: 204 });
   };
@@ -3072,9 +3160,9 @@ export const createApp = (deps: Deps): App => {
       return json(await listSessionHistoryIds(db, userId, url.searchParams.get("cursor") ?? ""));
     }
     const hits = await sessionSearchHits(url, db, userId);
-    if (hits instanceof Response) return hits;
+    if (!hits.ok) return error(400, hits.error);
     const labels = await readLabels(db, userId);
-    return json({ hits: hits.map((hit) => sessionHitView(hit, labels.hosts)) });
+    return json({ hits: hits.value.map((hit) => sessionHitView(hit, labels.hosts)) });
   };
 
   const v2SendMessage = async (request: Request, env: AppEnv, db: D1Database, caller: Caller): Promise<Response> => {
@@ -3083,7 +3171,7 @@ export const createApp = (deps: Deps): App => {
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
-    const { scope, target } = input.value;
+    const { scope, target } = input.value.address;
     const now = deps.now();
     // A session is addressed by itself and the device it runs on is read off it, where `/v1` had
     // the caller name both and an empty session id meant every session on the device.
@@ -3124,8 +3212,8 @@ export const createApp = (deps: Deps): App => {
     if (caller instanceof Response) return caller;
     const db = env.DB;
     if (collection === "devices") return v2Devices(request, env, db, caller, rawName);
-    if (collection === "board") return board(request, url, db, caller, rawName);
-    if (collection === "sessions") return v2Sessions(request, url, env, caller, rawName, rest[0]);
+    if (collection === "board") return board(request, url, db, caller, rawName, parseV2Post);
+    if (collection === "sessions") return v2Sessions(request, url, env.TRANSCRIPTS, db, caller, rawName, rest[0]);
     if (collection === "history") {
       if (rawName !== undefined) return error(404, "not found");
       return v2History(request, url, db, caller);
@@ -3183,7 +3271,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env, caller, rawName);
-    if (collection === "board") return board(request, url, env.DB, caller, rawName);
+    if (collection === "board") return board(request, url, env.DB, caller, rawName, parsePost);
     if (collection === "sessions") return sessions(request, url, env, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {

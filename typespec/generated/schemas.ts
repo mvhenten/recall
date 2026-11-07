@@ -55,6 +55,65 @@ export const UsageDeltaSchema = z.object({
   files: z.array(z.string()).max(500),
 });
 
+export const DeviceSchema = z.object({
+  deviceId: z.string().min(1),
+  name: z.string().max(500),
+  host: z.string().min(1).max(500),
+  hostLabel: z.string().min(1).max(500),
+  createdAt: z.number(),
+  lastUsedAt: z.number(),
+  current: z.boolean(),
+});
+
+export const SessionSchema = z.object({
+  sessionId: z.string().min(1),
+  name: z.string().max(500),
+  agentName: z.string().max(500),
+  deviceId: z.string().min(1),
+  host: z.string().max(500),
+  hostLabel: z.string().max(500),
+  cwd: z.string().max(500),
+  repo: z.string().max(500),
+  branch: z.string().max(500),
+  commit: z.string().max(500),
+  startedAt: z.string().datetime({ offset: true }),
+  lastActivityAt: z.string().datetime({ offset: true }),
+  prompts: z.number().min(0).max(1000000),
+  focus: SessionFocusSchema,
+  mode: SessionModeSchema,
+  permissionMode: z.string().max(500),
+  pid: z.number().min(0),
+  current: z.boolean(),
+});
+
+export const PastSessionSchema = z.object({
+  sessionId: z.string().min(1),
+  name: z.string().max(500),
+  agentName: z.string().max(500),
+  host: z.string().max(500),
+  hostLabel: z.string().max(500),
+  cwd: z.string().max(500),
+  repo: z.string().max(500),
+  branch: z.string().max(500),
+  startedAt: z.string().datetime({ offset: true }),
+  lastActivityAt: z.string().datetime({ offset: true }),
+  prompts: z.number().min(0).max(1000000),
+  focus: SessionFocusSchema,
+  running: z.boolean(),
+});
+
+export const SessionExcerptSchema = z.object({
+  speaker: z.union([z.literal("user"), z.literal("model")]),
+  text: z.string(),
+  at: z.string().datetime({ offset: true }),
+});
+
+export const SessionHitSchema = z.object({
+  session: PastSessionSchema,
+  score: z.number(),
+  excerpt: SessionExcerptSchema,
+});
+
 export const MessageAddressSchema = z.object({
   scope: z.union([z.literal("host"), z.literal("session")]),
   target: z.string().min(1),

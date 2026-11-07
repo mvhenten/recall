@@ -144,6 +144,124 @@ model UsageDelta {
   files: string[];
 }
 
+model Device {
+  @minLength(1)
+  deviceId: string;
+
+  @maxLength(maxSessionText)
+  name: string;
+
+  @minLength(1)
+  @maxLength(maxSessionText)
+  host: string;
+
+  @minLength(1)
+  @maxLength(maxSessionText)
+  hostLabel: string;
+
+  createdAt: int64;
+  lastUsedAt: int64;
+  current: boolean;
+}
+
+model Session {
+  @minLength(1)
+  sessionId: string;
+
+  @maxLength(maxSessionText)
+  name: string;
+
+  @maxLength(maxSessionText)
+  agentName: string;
+
+  @minLength(1)
+  deviceId: string;
+
+  @maxLength(maxSessionText)
+  host: string;
+
+  @maxLength(maxSessionText)
+  hostLabel: string;
+
+  @maxLength(maxSessionText)
+  cwd: string;
+
+  @maxLength(maxSessionText)
+  repo: string;
+
+  @maxLength(maxSessionText)
+  branch: string;
+
+  @maxLength(maxSessionText)
+  commit: string;
+
+  startedAt: offsetDateTime;
+  lastActivityAt: offsetDateTime;
+
+  @minValue(0)
+  @maxValue(maxPrompts)
+  prompts: int32;
+
+  focus: SessionFocus;
+  mode: SessionMode;
+
+  @maxLength(maxSessionText)
+  permissionMode: string;
+
+  @minValue(0)
+  pid: safeint;
+
+  current: boolean;
+}
+
+model PastSession {
+  @minLength(1)
+  sessionId: string;
+
+  @maxLength(maxSessionText)
+  name: string;
+
+  @maxLength(maxSessionText)
+  agentName: string;
+
+  @maxLength(maxSessionText)
+  host: string;
+
+  @maxLength(maxSessionText)
+  hostLabel: string;
+
+  @maxLength(maxSessionText)
+  cwd: string;
+
+  @maxLength(maxSessionText)
+  repo: string;
+
+  @maxLength(maxSessionText)
+  branch: string;
+
+  startedAt: offsetDateTime;
+  lastActivityAt: offsetDateTime;
+
+  @minValue(0)
+  @maxValue(maxPrompts)
+  prompts: int32;
+
+  focus: SessionFocus;
+  running: boolean;
+}
+
+model SessionExcerpt {
+  speaker: "user" | "model";
+  text: string;
+  at: offsetDateTime;
+}
+
+model SessionHit {
+  session: PastSession;
+  score: float64;
+  excerpt: SessionExcerpt;
+}
+
 model MessageAddress {
   scope: "host" | "session";
 

@@ -248,6 +248,255 @@
         "files"
       ]
     },
+    "Device": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "Device.json",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "hostLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "lastUsedAt": {
+          "type": "string"
+        },
+        "current": {
+          "type": "boolean"
+        }
+      },
+      "required": ["deviceId", "name", "host", "hostLabel", "createdAt", "lastUsedAt", "current"]
+    },
+    "Session": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "Session.json",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "agentName": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "deviceId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "hostLabel": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "cwd": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "repo": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "branch": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "commit": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastActivityAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "prompts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "focus": {
+          "$ref": "SessionFocus.json"
+        },
+        "mode": {
+          "$ref": "SessionMode.json"
+        },
+        "permissionMode": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "current": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sessionId",
+        "name",
+        "agentName",
+        "deviceId",
+        "host",
+        "hostLabel",
+        "cwd",
+        "repo",
+        "branch",
+        "commit",
+        "startedAt",
+        "lastActivityAt",
+        "prompts",
+        "focus",
+        "mode",
+        "permissionMode",
+        "pid",
+        "current"
+      ]
+    },
+    "PastSession": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "PastSession.json",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "agentName": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "host": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "hostLabel": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "cwd": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "repo": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "branch": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastActivityAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "prompts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "focus": {
+          "$ref": "SessionFocus.json"
+        },
+        "running": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sessionId",
+        "name",
+        "agentName",
+        "host",
+        "hostLabel",
+        "cwd",
+        "repo",
+        "branch",
+        "startedAt",
+        "lastActivityAt",
+        "prompts",
+        "focus",
+        "running"
+      ]
+    },
+    "SessionExcerpt": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SessionExcerpt.json",
+      "type": "object",
+      "properties": {
+        "speaker": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "user"
+            },
+            {
+              "type": "string",
+              "const": "model"
+            }
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["speaker", "text", "at"]
+    },
+    "SessionHit": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SessionHit.json",
+      "type": "object",
+      "properties": {
+        "session": {
+          "$ref": "PastSession.json"
+        },
+        "score": {
+          "type": "number"
+        },
+        "excerpt": {
+          "$ref": "SessionExcerpt.json"
+        }
+      },
+      "required": ["session", "score", "excerpt"]
+    },
     "MessageAddress": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$id": "MessageAddress.json",

@@ -31,6 +31,41 @@
           }
         }
       },
+      "Device": {
+        "type": "object",
+        "required": ["deviceId", "name", "host", "hostLabel", "createdAt", "lastUsedAt", "current"],
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "hostLabel": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lastUsedAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "current": {
+            "type": "boolean"
+          }
+        }
+      },
       "MessageAddress": {
         "type": "object",
         "required": ["scope", "target"],
@@ -42,6 +77,78 @@
           "target": {
             "type": "string",
             "minLength": 1
+          }
+        }
+      },
+      "PastSession": {
+        "type": "object",
+        "required": [
+          "sessionId",
+          "name",
+          "agentName",
+          "host",
+          "hostLabel",
+          "cwd",
+          "repo",
+          "branch",
+          "startedAt",
+          "lastActivityAt",
+          "prompts",
+          "focus",
+          "running"
+        ],
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "agentName": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "host": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "hostLabel": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "cwd": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "repo": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "branch": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "prompts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "focus": {
+            "$ref": "#/components/schemas/SessionFocus"
+          },
+          "running": {
+            "type": "boolean"
           }
         }
       },
@@ -96,6 +203,120 @@
           }
         }
       },
+      "Session": {
+        "type": "object",
+        "required": [
+          "sessionId",
+          "name",
+          "agentName",
+          "deviceId",
+          "host",
+          "hostLabel",
+          "cwd",
+          "repo",
+          "branch",
+          "commit",
+          "startedAt",
+          "lastActivityAt",
+          "prompts",
+          "focus",
+          "mode",
+          "permissionMode",
+          "pid",
+          "current"
+        ],
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "agentName": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "deviceId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "host": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "hostLabel": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "cwd": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "repo": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "branch": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "commit": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "prompts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "focus": {
+            "$ref": "#/components/schemas/SessionFocus"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/SessionMode"
+          },
+          "permissionMode": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "current": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SessionExcerpt": {
+        "type": "object",
+        "required": ["speaker", "text", "at"],
+        "properties": {
+          "speaker": {
+            "type": "string",
+            "enum": ["user", "model"]
+          },
+          "text": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "SessionFocus": {
         "type": "object",
         "required": ["first", "latest"],
@@ -107,6 +328,22 @@
           "latest": {
             "type": "string",
             "maxLength": 200
+          }
+        }
+      },
+      "SessionHit": {
+        "type": "object",
+        "required": ["session", "score", "excerpt"],
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/PastSession"
+          },
+          "score": {
+            "type": "number",
+            "format": "double"
+          },
+          "excerpt": {
+            "$ref": "#/components/schemas/SessionExcerpt"
           }
         }
       },

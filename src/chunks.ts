@@ -104,6 +104,11 @@ export const chunkTurnsCarrying = (turns: Turn[], carried: readonly OpenChunk[])
   return { closed: inOrder(closed), open };
 };
 
+// The chunks a file was left holding, closed because no more records are coming. An open chunk
+// waits for the turn that would have grown it, and a session that has ended has none: closing them
+// is what makes its last words findable at all.
+export const closeChunks = (open: readonly OpenChunk[]): Chunk[] => inOrder(open.map(closedOf));
+
 export const chunkTurns = (turns: Turn[]): Chunk[] => {
   const { closed, open } = chunkTurnsCarrying(turns, []);
   return inOrder([...closed, ...open.map(closedOf)]);

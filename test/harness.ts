@@ -40,7 +40,7 @@ export const UNEMBEDDABLE = "zzsickzz";
 
 // Embeds plain words only: tokens holding a digit are invisible to it, the way
 // rare identifiers barely register with a real embedding model.
-const wordEmbedder: Embedder = {
+export const wordEmbedder: Embedder = {
   async embed(texts: string[]): Promise<Float32Array[]> {
     return texts.map((text) => {
       if (text.includes(UNEMBEDDABLE)) throw new Error("the embedder refused this text");
@@ -91,6 +91,9 @@ export interface V2Client {
   records(sessionId: string, file: string, from: number, records: string[]): Promise<Response>;
   session(target: string): Promise<Response>;
   files(sessionId: string): Promise<Response>;
+  transcript(sessionId: string, file: string): Promise<Response>;
+  /// The session over, which is where the chunk its last turns were still filling closes.
+  end(sessionId: string): Promise<Response>;
   searchHistory(query: string, limit?: number): Promise<Response>;
 }
 
@@ -213,6 +216,9 @@ export interface HarnessOptions {
   // deployment publishes artifacts and shares none by naming no share audience.
   sharing?: "on" | "off";
   mcpConnector?: "on" | "off";
+  /// Stands in for the model a test wants to hold still — one that blocks inside a request is how
+  /// two appends are put in flight at once.
+  embedder?: Embedder;
 }
 
 export const harness = async ({
@@ -221,6 +227,7 @@ export const harness = async ({
   artifacts = "on",
   sharing = "on",
   mcpConnector = "on",
+  embedder = wordEmbedder,
 }: HarnessOptions = {}) => {
   const { publicKey, privateKey } = await generateKeyPair("RS256");
   const { n, e } = await exportJWK(publicKey);
@@ -246,7 +253,7 @@ export const harness = async ({
             sharing: sharing === "off" ? null : { verify: accessVerifier(source, ISSUER, ARTIFACT_SHARE_AUDIENCE) },
           },
     mcpHost: mcpConnector === "off" ? null : { verify: accessVerifier(source, ISSUER, MCP_AUDIENCE), serviceClients },
-    embedder: wordEmbedder,
+    embedder,
     deviceCodeLimits,
     now: () => clock,
   });
@@ -418,6 +425,13 @@ export const harness = async ({
       },
       files(sessionId) {
         return this.request("GET", `/v2/sessions/${encodeURIComponent(sessionId)}/files`);
+      },
+      transcript(sessionId, file) {
+        const path = `/v2/sessions/${encodeURIComponent(sessionId)}/transcript?file=${encodeURIComponent(file)}`;
+        return this.request("GET", path);
+      },
+      end(sessionId) {
+        return this.request("DELETE", `/v2/sessions/${encodeURIComponent(sessionId)}`);
       },
       searchHistory(query, limit = 10) {
         return this.request("GET", `/v2/history?q=${encodeURIComponent(query)}&limit=${limit}`);

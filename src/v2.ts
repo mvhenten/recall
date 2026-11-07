@@ -10,12 +10,19 @@
 import type { z } from "zod";
 import {
   AppendRecordsSchema,
+  type DeviceSchema,
+  type PastSessionSchema,
+  type RecordsAcceptedSchema,
+  type RecordsConflictSchema,
   SendMessageSchema,
+  type SessionHitSchema,
+  type SessionModeSchema,
+  type SessionSchema,
   SessionSyncSchema,
   UsageDeltaSchema,
 } from "../typespec/generated/schemas";
 import type { Device } from "./device";
-import type { MessageKind, SendInput } from "./mailbox";
+import type { SendInput } from "./mailbox";
 import {
   fail,
   type Parsed,
@@ -27,11 +34,21 @@ import {
   type UsageInput,
 } from "./model";
 
+// Everything `/v2` answers with, taken from the contract rather than restated beside it. A client
+// is generated off the same models, so a field the service adds and the contract does not know
+// about is a type error here and never a shape only this service speaks.
+export type V2Device = z.infer<typeof DeviceSchema>;
+export type V2Session = z.infer<typeof SessionSchema>;
+export type V2PastSession = z.infer<typeof PastSessionSchema>;
+export type V2SessionHit = z.infer<typeof SessionHitSchema>;
+export type V2RecordsAccepted = z.infer<typeof RecordsAcceptedSchema>;
+export type V2RecordsConflict = z.infer<typeof RecordsConflictSchema>;
+export type V2SendInput = z.infer<typeof SendMessageSchema>;
+export type V2AppendRecords = z.infer<typeof AppendRecordsSchema>;
+
 // The three things a session's mode can be. `/v1` said "the host could not tell" with an empty
 // string, which reads as a missing field rather than as an answer.
-export const V2_SESSION_MODES = ["Interactive", "Headless", "Unknown"] as const;
-
-export type V2SessionMode = (typeof V2_SESSION_MODES)[number];
+type V2SessionMode = z.infer<typeof SessionModeSchema>;
 
 const MODE_OUT: Record<SessionMode, V2SessionMode> = {
   interactive: "Interactive",
@@ -60,16 +77,6 @@ export const hostLabelOf = (labels: Map<string, string>, host: string): string =
   return label === undefined || label === "" ? host : label;
 };
 
-export interface V2Device {
-  deviceId: string;
-  name: string;
-  host: string;
-  hostLabel: string;
-  createdAt: number;
-  lastUsedAt: number;
-  current: boolean;
-}
-
 export const deviceView = (device: Device, labels: Map<string, string>, callerDeviceId: string): V2Device => ({
   deviceId: device.deviceId,
   name: device.name,
@@ -79,27 +86,6 @@ export const deviceView = (device: Device, labels: Map<string, string>, callerDe
   lastUsedAt: device.lastUsedAt,
   current: device.deviceId === callerDeviceId,
 });
-
-export interface V2Session {
-  sessionId: string;
-  name: string;
-  agentName: string;
-  deviceId: string;
-  host: string;
-  hostLabel: string;
-  cwd: string;
-  repo: string;
-  branch: string;
-  commit: string;
-  startedAt: string;
-  lastActivityAt: string;
-  prompts: number;
-  focus: { first: string; latest: string };
-  mode: V2SessionMode;
-  permissionMode: string;
-  pid: number;
-  current: boolean;
-}
 
 export const sessionView = (session: Session, labels: Map<string, string>, callerDeviceId: string): V2Session => ({
   sessionId: session.sessionId,
@@ -122,22 +108,6 @@ export const sessionView = (session: Session, labels: Map<string, string>, calle
   current: session.deviceId === callerDeviceId,
 });
 
-export interface V2PastSession {
-  sessionId: string;
-  name: string;
-  agentName: string;
-  host: string;
-  hostLabel: string;
-  cwd: string;
-  repo: string;
-  branch: string;
-  startedAt: string;
-  lastActivityAt: string;
-  prompts: number;
-  focus: { first: string; latest: string };
-  running: boolean;
-}
-
 export const pastSessionView = (session: PastSession, labels: Map<string, string>): V2PastSession => ({
   sessionId: session.sessionId,
   name: session.name,
@@ -153,12 +123,6 @@ export const pastSessionView = (session: PastSession, labels: Map<string, string
   focus: session.focus,
   running: session.running,
 });
-
-export interface V2SessionHit {
-  session: V2PastSession;
-  score: number;
-  excerpt: { speaker: string; text: string; at: string };
-}
 
 export const sessionHitView = (hit: SessionHit, labels: Map<string, string>): V2SessionHit => ({
   session: pastSessionView(hit.session, labels),
@@ -184,13 +148,7 @@ const validated = <T extends Record<string, unknown>>(schema: z.ZodType<T>, body
   return { ok: true, value: read.data };
 };
 
-export interface AppendRecordsInput {
-  file: string;
-  from: number;
-  records: string[];
-}
-
-export const parseAppendRecords = (body: unknown): Parsed<AppendRecordsInput> => validated(AppendRecordsSchema, body);
+export const parseAppendRecords = (body: unknown): Parsed<V2AppendRecords> => validated(AppendRecordsSchema, body);
 
 export const parseSessionSync = (body: unknown): Parsed<SessionInput> => {
   const read = validated(SessionSyncSchema, body);
@@ -254,29 +212,7 @@ export const parseUsageDelta = (body: unknown, now: number, epoch: number, ahead
 // Where a bus message is addressed, in the vocabulary the board already resolves. `/v1` addressed
 // one to a device and said "every session on it" with an empty session id, so the two scopes were
 // one field that meant two things depending on whether it was filled in.
-export interface V2SendInput {
-  kind: MessageKind;
-  scope: "host" | "session";
-  target: string;
-  fromSessionId: string;
-  body: string;
-}
-
-export const parseV2Send = (body: unknown): Parsed<V2SendInput> => {
-  const read = validated(SendMessageSchema, body);
-  if (!read.ok) return read;
-  const input = read.value;
-  return {
-    ok: true,
-    value: {
-      kind: input.kind,
-      scope: input.address.scope,
-      target: input.address.target,
-      fromSessionId: input.fromSessionId,
-      body: input.body,
-    },
-  };
-};
+export const parseV2Send = (body: unknown): Parsed<V2SendInput> => validated(SendMessageSchema, body);
 
 // The address resolved to the pair the mailbox publishes on. A message to a host reaches every
 // session it has attached; one to a session reaches that session alone, and the device it runs on
@@ -284,7 +220,7 @@ export const parseV2Send = (body: unknown): Parsed<V2SendInput> => {
 export const sendInputOf = (input: V2SendInput, toDeviceId: string): SendInput => ({
   kind: input.kind,
   toDeviceId,
-  toSessionId: input.scope === "session" ? input.target : "",
+  toSessionId: input.address.scope === "session" ? input.address.target : "",
   fromSessionId: input.fromSessionId,
   body: input.body,
 });

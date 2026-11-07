@@ -260,13 +260,41 @@ describe("the /v2 surface", () => {
     expect(legacy.status).toBe(400);
   });
 
+  it("addresses a board post the way it addresses a message", async () => {
+    const { user } = await harness();
+    const client = await user("posting");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const { devices }: { devices: V2Device[] } = await (await client.request("GET", "/v2/devices")).json();
+    const deviceId = devices[0]?.deviceId ?? "";
+
+    const toHost = await client.v2.request("POST", "/v2/board", {
+      address: { scope: "host", target: deviceId },
+      body: "one host",
+    });
+    expect(toHost.status).toBe(201);
+    expect(await toHost.json()).toMatchObject({ scope: "host", target: deviceId });
+
+    const toSession = await client.v2.request("POST", "/v2/board", {
+      address: { scope: "session", target: session },
+      body: "one session",
+    });
+    expect(toSession.status).toBe(201);
+    expect(await toSession.json()).toMatchObject({ scope: "session", target: session });
+
+    // The two fields `/v1` reads the target out of mean nothing here, so a post that names one and
+    // no address is refused rather than going to the whole fleet.
+    const legacy = await client.v2.request("POST", "/v2/board", { scope: "host", deviceId, body: "the old shape" });
+    expect(legacy.status).toBe(400);
+  });
+
   it("serves the board, artifacts and the socket under /v2 unchanged", async () => {
     const { user } = await harness();
     const client = await user("transcribed");
     const session = crypto.randomUUID();
     await client.v2.sync(session);
 
-    const posted = await client.v2.request("POST", "/v2/board", { scope: "fleet", body: "read me" });
+    const posted = await client.v2.request("POST", "/v2/board", { address: { scope: "fleet" }, body: "read me" });
     expect(posted.status).toBe(201);
     const read = await client.request("GET", "/v2/board");
     expect(read.status).toBe(200);
