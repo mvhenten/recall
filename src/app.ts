@@ -164,7 +164,9 @@ import {
   MAX_RECORDS_BYTES,
   MAX_RECORDS_PER_APPEND,
   putRecords,
+  readRecordAppend,
   readRecords,
+  readRecordsBetween,
   recordFiles,
   recordsReach,
 } from "./records";
@@ -3064,7 +3066,18 @@ export const createApp = (deps: Deps): App => {
       const held = await recordsReach(bucket, userId, sessionId, file.value);
       if (from !== held) return refuse(held);
     }
+    // A put that does not land means the archive already holds an append at this ordinal. The
+    // conditional put weighs presence and never content, so what is stored there is read back
+    // before the writer is sent anywhere: two appends starting in the same place and agreeing as
+    // far as they overlap are one host sending a different number of records, and it is told the
+    // real reach and sends from there. Records that disagree at an ordinal are a transcript being
+    // rewritten, and neither side's prose may be dropped for the other's without the host hearing
+    // of it.
     if (!(await putRecords(bucket, userId, sessionId, file.value, from, records))) {
+      const stored = await readRecordAppend(bucket, userId, sessionId, file.value, from);
+      if (stored?.some((record, at) => at < records.length && record !== records[at]) === true) {
+        return error(409, `${file.value} holds other records at ordinal ${from}; a record is written once`);
+      }
       return refuse(await recordsReach(bucket, userId, sessionId, file.value));
     }
     const next = from + records.length;
@@ -3075,7 +3088,13 @@ export const createApp = (deps: Deps): App => {
       if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
       return accepted(next);
     }
-    const text = records.join("\n");
+    // Every record the index has not read yet, which is this append and the span between the mark
+    // and it. That span is what an append landing ahead of the mark leaves behind: another writer
+    // stored records and lost the file before it could index them, or this one did and is sending
+    // again. The prose is in the archive either way, and the append carrying the mark past it is
+    // the one that has to index it, or nothing ever will.
+    const behind = await readRecordsBetween(bucket, userId, sessionId, file.value, marked, from);
+    const text = [...behind, ...records].join("\n");
     if (from === 0) {
       const named = agentName(text.slice(0, HEAD_BYTES));
       if (named !== "") await nameSession(db, userId, sessionId, named);

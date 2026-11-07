@@ -137,6 +137,53 @@ export const readRecords = async (
   });
 };
 
+// One append read back as the records it holds, or null where the archive holds no object at that
+// ordinal. It is what a writer beaten to its own key reads to find out whether the records already
+// stored there are the ones it was sending.
+export const readRecordAppend = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  from: number,
+): Promise<string[] | null> => {
+  const body = await bucket.get(recordKey(userId, sessionId, file, from));
+  if (body === null) return null;
+  return (await body.text()).split("\n");
+};
+
+// The records of one file between two ordinals. An append whose `from` runs ahead of the mark is
+// carrying the index over records the archive already holds and nothing ever read for turns, so it
+// reads them back and indexes them with its own.
+//
+// The objects have to tile the span exactly. A gap or an overlap is an archive no append can read
+// its own history out of, and indexing a short read would put the chunks of one ordinal under
+// another; it fails instead.
+export const readRecordsBetween = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  from: number,
+  through: number,
+): Promise<string[]> => {
+  if (through <= from) return [];
+  const objects = (await listRecords(bucket, userId, sessionId)).filter(
+    (object) => object.file === file && object.from + object.held > from && object.from < through,
+  );
+  const records: string[] = [];
+  let at = from;
+  for (const object of objects) {
+    if (object.from !== at) throw new Error(`${file} of ${sessionId} holds no records at ordinal ${at}`);
+    const body = await bucket.get(object.key);
+    if (body === null) throw new Error(`the archive lost ${object.key} of ${file}`);
+    records.push(...(await body.text()).split("\n"));
+    at = object.from + object.held;
+  }
+  if (at !== through) throw new Error(`${file} of ${sessionId} holds no records at ordinal ${at}`);
+  return records;
+};
+
 // One append of one file, which lands only where nothing is yet. Two writers holding the same
 // `from` both reach here and the conditional put settles which of them the archive keeps; the
 // loser is answered `false` and told the real reach rather than writing over the records the

@@ -246,15 +246,18 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     await client.v2.sync(session);
     const records = conversation();
 
-    const leading = client.v2.records(session, "main", 0, records.slice(0, 6));
+    // The leading append closes a chunk and so reaches the embedder, which is where it is held
+    // while the following one runs the whole of the request path beside it.
+    const leading = client.v2.records(session, "main", 0, records.slice(0, 8));
     await atEmbedder;
-    const following = await client.v2.records(session, "main", 6, records.slice(6));
+    const following = await client.v2.records(session, "main", 8, records.slice(8));
     release();
     const led = await leading;
 
     expect([led.status, following.status].sort()).toEqual([200, 409]);
     const lost = led.status === 409 ? led : following;
     const { next }: { next: number } = await lost.json();
+    expect(next).toBe(records.length);
 
     // The mark, the chunk counter and the chunk ordinals all say the same thing: one append's
     // chunks are in the index whole, and the other wrote none of its own over them.
@@ -271,6 +274,43 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     const indexed = await chunksOf(client.userId, session);
     expect(indexed.length).toBeGreaterThan(0);
     expect(counted?.chunks).toBe(indexed.length);
+
+    // The refused host sends again at the ordinal it was handed and lands, which is the sequence
+    // terminating rather than the two of them taking turns losing the file.
+    const resumed = await client.v2.records(session, "main", next, about(6, "retention"));
+    expect(resumed.status).toBe(200);
+
+    // Nothing was dropped. The loser's records are in the archive under their own key and only the
+    // winner read them for turns, so every subject of the conversation is in the index once the
+    // session closes the chunk it was still filling.
+    expect((await client.v2.end(session)).status).toBe(204);
+    const said = (await chunksOf(client.userId, session)).map((chunk) => chunk.text).join("\n");
+    for (const subject of [...SUBJECTS, "retention"]) expect(said).toContain(`${subject}:`);
+  });
+
+  // The archive takes a record once. A host sending different prose at an ordinal it already wrote
+  // is rewriting a transcript, and neither its records nor the stored ones may be dropped for the
+  // other without it being told.
+  it("refuses an append whose records differ from the ones stored at its ordinal", async () => {
+    const { user } = await harness();
+    const client = await user("rewritten");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    expect((await client.v2.records(session, "main", 0, records.slice(0, 4))).status).toBe(200);
+    const stored = await client.v2.transcript(session, "main");
+    expect((await stored.text()).split("\n")).toEqual(records.slice(0, 4));
+
+    // The mark is at 4 and the archive holds an object at 4, which only a writer that stored
+    // records and lost the file leaves behind; the host sends other prose at the same ordinal.
+    const [kept, other] = records.slice(4, 6);
+    await env.TRANSCRIPTS.put(`${RECORDS_PREFIX}/${client.userId}/${session}/main/${"0".repeat(15)}4`, kept ?? "", {
+      customMetadata: { records: "1" },
+    });
+    const rewritten = await client.v2.records(session, "main", 4, [other ?? ""]);
+    expect(rewritten.status).toBe(409);
+    expect(await rewritten.text()).toContain("written once");
   });
 
   it("makes what it indexed findable by meaning", async () => {
