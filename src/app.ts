@@ -183,7 +183,6 @@ import {
   artifactCursorDirection,
   artifactShares,
   type ChunkCandidate,
-  type ChunkMatch,
   type Cursor,
   chunkExcerpts,
   chunkMatches,
@@ -389,9 +388,11 @@ const EMBED_BATCH = 96;
 // writes it among the first entries.
 export const HEAD_BYTES = 8_192;
 
-// How many chunks the full-text pass returns. The vector pass scores every chunk the account
-// holds, so this bounds only the half that cannot be ranked by score.
+// How many chunks the full-text pass returns, and how many of the newest the vector pass scores
+// beside them. The two together are every chunk one search reads, so a search costs the same on
+// an archive of a thousand chunks and on one of a million.
 const CHUNK_MATCHES = 100;
+export const CHUNK_RECENT = 500;
 
 type Ranking = Array<[string, number]>;
 
@@ -630,10 +631,12 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
-  // Sessions by meaning. Every chunk the account holds is scored against the query and the
-  // full-text query runs over the same table, and the two rankings are fused with a third: the
-  // user's own chunks, scored again on their own, so a session that was asked for a thing
-  // outranks one that merely mentioned it.
+  // Sessions by meaning. The full-text query runs first and the chunks it named are scored
+  // against the query vector, together with the newest the account holds, and the two rankings
+  // are fused with a third: the user's own chunks, scored again on their own, so a session that
+  // was asked for a thing outranks one that merely mentioned it. The full-text pass leading is
+  // what bounds the scan — the alternative was reading every chunk on record, which cost a
+  // search more every week the archive grew.
   const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
     const parsed = parseSessionSearch(url.searchParams);
     if (!parsed.ok) return error(400, parsed.error);
@@ -641,10 +644,13 @@ export const createApp = (deps: Deps): App => {
     const [vector] = await deps.embedder.embed([input.query]);
     if (!vector) throw new Error("the embedder answered the query with no vector");
     const match = ftsQuery(input.query);
-    const [chunks, matched] = await Promise.all([
-      chunkVectors(db, userId),
-      match === null ? Promise.resolve<ChunkMatch[]>([]) : chunkMatches(db, userId, match, CHUNK_MATCHES),
-    ]);
+    const matched = match === null ? [] : await chunkMatches(db, userId, match, CHUNK_MATCHES);
+    const chunks = await chunkVectors(
+      db,
+      userId,
+      matched.map((hit) => hit.chunkSeq),
+      CHUNK_RECENT,
+    );
     if (chunks.length === 0) return json({ hits: [] });
     const scored = chunks
       .map((chunk): [ChunkCandidate, number] => [chunk, dot(vector, chunk.embedding)])

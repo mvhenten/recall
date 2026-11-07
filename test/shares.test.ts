@@ -545,6 +545,29 @@ describe("a name that reads like a route", () => {
     expect((await o.alice.request("GET", "/v1/artifacts/deck/elsewhere")).status).toBe(404);
     expect((await o.h.sendToArtifactHost("/a/shares", o.assertion)).status).toBe(200);
   });
+
+  // SQLite binds at most a hundred parameters per statement, and the largest page the listing
+  // takes is a hundred rows. Reading the shares of that page by one parameter per name was two
+  // over, so the biggest page an account could ask for failed outright.
+  it("reads the shares of the largest page the listing takes", async () => {
+    const o = await owner();
+    const names = Array.from({ length: 100 }, (_one, at) => `plan-${String(at).padStart(3, "0")}`);
+    for (let at = 0; at < names.length; at += 10) {
+      await Promise.all(names.slice(at, at + 10).map((name) => document(o.alice, name)));
+    }
+    await share(o.alice, "plan-000");
+
+    const counted = await o.alice.request("GET", "/v1/artifacts?limit=100&sort=name");
+    const listed = await o.alice.request("GET", "/v1/artifacts?limit=100&sort=name&shares=true");
+
+    expect([counted.status, listed.status]).toEqual([200, 200]);
+    const page = await counted.json<{ artifacts: ArtifactView[] }>();
+    expect(page.artifacts).toHaveLength(100);
+    expect(page.artifacts[0]?.shareCount).toBe(1);
+    const held = await listed.json<{ artifacts: Array<{ name: string; shares: ShareView[] }> }>();
+    expect(held.artifacts[0]?.shares).toHaveLength(1);
+    expect(held.artifacts[1]?.shares).toHaveLength(0);
+  });
 });
 
 describe("a deployment that binds no share audience", () => {

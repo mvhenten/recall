@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { CHUNK_RECENT } from "../src/app";
 import type { PastSession, SessionHit } from "../src/model";
 import { harness, UNEMBEDDABLE } from "./harness";
 
@@ -19,6 +20,29 @@ const about = (subject: string): string =>
   ].join("");
 
 const bytes = (text: string): number => new TextEncoder().encode(text).byteLength;
+
+// A word made of letters alone, since the test embedder is blind to any token holding a digit.
+const coined = (at: number): string => {
+  let rest = at;
+  let word = "";
+  for (let letter = 0; letter < 4; letter += 1) {
+    word += String.fromCharCode(97 + (rest % 26));
+    rest = Math.floor(rest / 26);
+  }
+  return word;
+};
+
+// Turns that share no word with each other, so each closes a chunk of its own, and none with any
+// query, so none of them can win one. This is the archive a search has to stay cheap over.
+const filler = (turns: number): string => {
+  const written: string[] = [];
+  for (let turn = 0; turn < turns; turn += 1) {
+    const words: string[] = [];
+    for (let word = 0; word < 90; word += 1) words.push(coined(turn * 90 + word));
+    written.push(prompt(words.join(" ")));
+  }
+  return written.join("");
+};
 
 // A run of turns about one subject, long enough that several of them run past one bite of the
 // indexer. Every turn carries its own number, so the chunks can be read back for the turns a bite
@@ -153,6 +177,37 @@ describe("searching sessions by meaning", () => {
     const found = await hitsOf(await mine.searchSessions("signing key rotation"));
 
     expect(found.map((hit) => hit.session.sessionId)).toEqual(["s-mine"]);
+  });
+
+  // A search reads the full-text candidates and the newest chunks, not the whole archive. The
+  // three sessions here were indexed before a filler session longer than that window, so every
+  // chunk that can win one of these queries sits outside it and is reachable only through the
+  // full-text pass. The same queries answered with the same chunks when the scan was unbounded.
+  it("ranks the same chunks top once the archive has outgrown the window the scan covers", async () => {
+    const h = await harness();
+    const userId = `bounded-${crypto.randomUUID()}`;
+    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
+    const subjects = [
+      ["s-offset", "the transcript archive offset", "where does the transcript archive keep its offset"],
+      ["s-pipeline", "the release pipeline", "what runs in the release pipeline"],
+      ["s-labels", "the labels tab", "the labels tab"],
+    ] as const;
+    for (const [sessionId, subject] of subjects) {
+      await client.sync(sessionId);
+      await client.archive(sessionId, "main", 0, about(subject));
+    }
+    await h.deliver();
+    await client.sync("s-filler");
+    await client.archive("s-filler", "main", 0, filler(CHUNK_RECENT + 100));
+    await h.deliver();
+    await h.deliver();
+    expect((await h.chunks(userId, "s-filler")).length).toBeGreaterThan(CHUNK_RECENT);
+
+    for (const [sessionId, subject, query] of subjects) {
+      const found = await hitsOf(await client.searchSessions(query));
+      expect([query, found[0]?.session.sessionId]).toEqual([query, sessionId]);
+      expect(found[0]?.excerpt.text).toContain(subject);
+    }
   });
 });
 
