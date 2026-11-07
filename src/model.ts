@@ -1,5 +1,6 @@
 import { isStretchName } from "./transcript-plan";
 import { MAX_STRETCH_BYTES } from "./transcripts";
+import type { Speaker } from "./turns";
 
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
 export const modes = ["hybrid", "vector", "text"] as const;
@@ -138,7 +139,7 @@ export interface PastSession {
 export interface SessionHit {
   session: PastSession;
   score: number;
-  excerpt: { speaker: string; text: string; at: number };
+  excerpt: { speaker: Speaker; text: string; at: number };
 }
 
 export interface SessionSearch {

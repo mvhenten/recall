@@ -26,7 +26,129 @@
             "items": {
               "$ref": "#/components/schemas/TranscriptLine"
             },
+            "minItems": 1,
             "maxItems": 1000
+          }
+        }
+      },
+      "Device": {
+        "type": "object",
+        "required": ["deviceId", "name", "host", "hostLabel", "createdAt", "lastUsedAt", "current"],
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "hostLabel": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lastUsedAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "current": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MessageAddress": {
+        "type": "object",
+        "required": ["scope", "target"],
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": ["host", "session"]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "PastSession": {
+        "type": "object",
+        "required": [
+          "sessionId",
+          "name",
+          "agentName",
+          "host",
+          "hostLabel",
+          "cwd",
+          "repo",
+          "branch",
+          "startedAt",
+          "lastActivityAt",
+          "prompts",
+          "focus",
+          "running"
+        ],
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "agentName": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "host": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "hostLabel": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "cwd": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "repo": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "branch": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "prompts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "focus": {
+            "$ref": "#/components/schemas/SessionFocus"
+          },
+          "running": {
+            "type": "boolean"
           }
         }
       },
@@ -45,9 +167,356 @@
           }
         }
       },
+      "RecordsConflict": {
+        "type": "object",
+        "required": ["error", "next"],
+        "properties": {
+          "error": {
+            "type": "string",
+            "minLength": 1
+          },
+          "next": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "SendMessage": {
+        "type": "object",
+        "required": ["kind", "address", "fromSessionId", "body"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["news", "order"]
+          },
+          "address": {
+            "$ref": "#/components/schemas/MessageAddress"
+          },
+          "fromSessionId": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "required": [
+          "sessionId",
+          "name",
+          "agentName",
+          "deviceId",
+          "host",
+          "hostLabel",
+          "cwd",
+          "repo",
+          "branch",
+          "commit",
+          "startedAt",
+          "lastActivityAt",
+          "prompts",
+          "focus",
+          "mode",
+          "permissionMode",
+          "pid",
+          "current"
+        ],
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "agentName": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "deviceId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "host": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "hostLabel": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "cwd": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "repo": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "branch": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "commit": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "prompts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "focus": {
+            "$ref": "#/components/schemas/SessionFocus"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/SessionMode"
+          },
+          "permissionMode": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "current": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SessionExcerpt": {
+        "type": "object",
+        "required": ["speaker", "text", "at"],
+        "properties": {
+          "speaker": {
+            "type": "string",
+            "enum": ["user", "model"]
+          },
+          "text": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SessionFocus": {
+        "type": "object",
+        "required": ["first", "latest"],
+        "properties": {
+          "first": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "latest": {
+            "type": "string",
+            "maxLength": 200
+          }
+        }
+      },
+      "SessionHit": {
+        "type": "object",
+        "required": ["session", "score", "excerpt"],
+        "properties": {
+          "session": {
+            "$ref": "#/components/schemas/PastSession"
+          },
+          "score": {
+            "type": "number",
+            "format": "double"
+          },
+          "excerpt": {
+            "$ref": "#/components/schemas/SessionExcerpt"
+          }
+        }
+      },
+      "SessionMode": {
+        "type": "string",
+        "enum": ["Interactive", "Headless", "Unknown"]
+      },
+      "SessionSync": {
+        "type": "object",
+        "required": [
+          "host",
+          "cwd",
+          "repo",
+          "branch",
+          "commit",
+          "startedAt",
+          "lastActivityAt",
+          "prompts",
+          "focus",
+          "mode",
+          "permissionMode",
+          "pid"
+        ],
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "cwd": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "repo": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "branch": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "commit": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "prompts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "focus": {
+            "$ref": "#/components/schemas/SessionFocus"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/SessionMode"
+          },
+          "permissionMode": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "TranscriptLine": {
         "type": "string",
         "minLength": 1
+      },
+      "UsageDelta": {
+        "type": "object",
+        "required": [
+          "seq",
+          "host",
+          "repo",
+          "provider",
+          "account",
+          "model",
+          "prompts",
+          "inputTokens",
+          "outputTokens",
+          "cacheWriteTokens",
+          "cacheReadTokens",
+          "at",
+          "durable",
+          "files"
+        ],
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "repo": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "provider": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "account": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "prompts": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "inputTokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 1000000000
+          },
+          "outputTokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 1000000000
+          },
+          "cacheWriteTokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 1000000000
+          },
+          "cacheReadTokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 1000000000
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "durable": {
+            "type": "boolean"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500
+          }
+        }
       }
     }
   }

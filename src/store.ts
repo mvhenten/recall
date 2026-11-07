@@ -17,6 +17,7 @@ import {
   type BoardTaker,
   MAX_PICKUP_BYTES,
 } from "./board";
+import type { OpenChunk } from "./chunks";
 import type { Caller } from "./device";
 import {
   DAY_MS,
@@ -56,6 +57,8 @@ import {
   usageDayStart,
 } from "./model";
 import type { ShareMode, ShareRecord } from "./shares";
+import { MAIN_FILE } from "./transcripts";
+import type { Speaker } from "./turns";
 
 interface MemoryRow {
   memory_id: string;
@@ -383,11 +386,12 @@ export const putSession = async (
     expireSessions(db, caller.userId, now),
     db
       .prepare(
-        `INSERT INTO sessions (user_id, session_id, device_id, host, cwd, repo, branch, commit_subject,
+        `INSERT INTO sessions (user_id, session_id, device_id, device_name, host, cwd, repo, branch, commit_subject,
            started_at, last_activity_at, prompts, focus_first, focus_latest, mode, permission_mode, pid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT (user_id, session_id) DO UPDATE SET
-           device_id = excluded.device_id, host = excluded.host, cwd = excluded.cwd, repo = excluded.repo,
+           device_id = excluded.device_id, device_name = excluded.device_name, host = excluded.host,
+           cwd = excluded.cwd, repo = excluded.repo,
            branch = excluded.branch, commit_subject = excluded.commit_subject, started_at = excluded.started_at,
            last_activity_at = excluded.last_activity_at, prompts = excluded.prompts,
            focus_first = excluded.focus_first, focus_latest = excluded.focus_latest, mode = excluded.mode,
@@ -397,6 +401,7 @@ export const putSession = async (
         caller.userId,
         sessionId,
         caller.deviceId,
+        caller.name,
         input.host,
         input.cwd,
         input.repo,
@@ -415,10 +420,10 @@ export const putSession = async (
       .prepare(
         `INSERT OR REPLACE INTO session_history (user_id, session_id, device_id, device_name, host, cwd, repo,
            branch, commit_subject, started_at, last_activity_at, prompts, focus_first, focus_latest, mode, agent_name)
-         SELECT s.user_id, s.session_id, s.device_id, COALESCE(d.name, ''), s.host, s.cwd, s.repo,
+         SELECT s.user_id, s.session_id, s.device_id, s.device_name, s.host, s.cwd, s.repo,
            s.branch, s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest,
            s.mode, s.agent_name
-         FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
+         FROM sessions s
          WHERE s.user_id = ?1 AND s.session_id = ?2`,
       )
       .bind(caller.userId, sessionId),
@@ -438,10 +443,10 @@ export const listSessions = async (db: D1Database, userId: string, now: number):
     expireSessions(db, userId, now),
     db
       .prepare(
-        `SELECT s.session_id, COALESCE(d.name, '') AS device_name, s.agent_name, s.device_id, s.host, s.cwd, s.repo,
+        `SELECT s.session_id, s.device_name, s.agent_name, s.device_id, s.host, s.cwd, s.repo,
            s.branch, s.commit_subject, s.started_at, s.last_activity_at, s.prompts, s.focus_first, s.focus_latest,
            s.mode, s.permission_mode, s.pid
-         FROM sessions s LEFT JOIN devices d ON d.device_id = s.device_id AND d.user_id = s.user_id
+         FROM sessions s
          WHERE s.user_id = ? ORDER BY s.last_activity_at DESC, s.session_id`,
       )
       .bind(userId),
@@ -1239,7 +1244,7 @@ export const chunkMatches = async (
 };
 
 export interface Excerpt {
-  speaker: string;
+  speaker: Speaker;
   text: string;
   at: number;
 }
@@ -1255,7 +1260,7 @@ export const chunkExcerpts = async (
        WHERE user_id = ? AND chunk_seq IN (SELECT value FROM json_each(?))`,
     )
     .bind(userId, JSON.stringify(chunkSeqs))
-    .all<{ chunk_seq: number; speaker: string; text: string; at: number }>();
+    .all<{ chunk_seq: number; speaker: Speaker; text: string; at: number }>();
   return new Map(results.map((row) => [row.chunk_seq, { speaker: row.speaker, text: row.text, at: row.at }]));
 };
 
@@ -2069,4 +2074,134 @@ export const listBoard = async (
   const last = entries.at(-1);
   const nextCursor = results.length > limit && last ? encodeCursor(last.message.createdAt, last.message.messageId) : "";
   return { entries, nextCursor };
+};
+
+// Where the record path has reached in one file of one session, which is the ordinal the next
+// record carries. It is the mark the endpoint weighs an append against; the objects are the
+// arbiter and are read only where the two disagree.
+export const recordReach = async (db: D1Database, userId: string, sessionId: string, file: string): Promise<number> => {
+  const row = await db
+    .prepare("SELECT next_ordinal FROM session_records WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
+    .bind(userId, sessionId, file)
+    .first<{ next_ordinal: number }>();
+  return row === null ? 0 : row.next_ordinal;
+};
+
+// Whether a session's own transcript is on the record mark. A session with a row for `main` indexes
+// itself in the request that appends to it, so the consumer the byte path's storage event wakes
+// leaves it alone rather than indexing the same prose a second time. The mark is read for `main`
+// alone: a delegated file derives nothing either way, and a row for one of those would otherwise
+// stop the byte path from ever indexing the session's own prose.
+export const onRecordMark = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+  const row = await db
+    .prepare("SELECT file FROM session_records WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
+    .bind(userId, sessionId, MAIN_FILE)
+    .first<{ file: string }>();
+  return row !== null;
+};
+
+export const openChunks = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  file: string,
+): Promise<OpenChunk[]> => {
+  const { results } = await db
+    .prepare("SELECT speaker, pieces, at FROM session_open_chunks WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
+    .bind(userId, sessionId, file)
+    .all<{ speaker: Speaker; pieces: string; at: number }>();
+  return results.map((row) => {
+    const held: unknown = JSON.parse(row.pieces);
+    if (!Array.isArray(held) || held.some((piece) => typeof piece !== "string")) {
+      throw new Error(`the open chunk of ${file} in session ${sessionId} holds no pieces`);
+    }
+    return { speaker: row.speaker, pieces: held as string[], at: row.at };
+  });
+};
+
+// How many chunks a session already holds, which is the ordinal the next one takes. The record
+// path shares the counter with the byte path, so a session that was indexed either way appends to
+// what is there rather than writing over it.
+export const chunkReach = async (db: D1Database, userId: string, sessionId: string): Promise<number> => {
+  const row = await db
+    .prepare("SELECT chunks FROM session_index WHERE user_id = ?1 AND session_id = ?2")
+    .bind(userId, sessionId)
+    .first<{ chunks: number }>();
+  return row === null ? 0 : row.chunks;
+};
+
+export interface RecordCommit {
+  userId: string;
+  sessionId: string;
+  file: string;
+  /// The mark the appending request read before it did any work. Everything below lands only
+  /// while the mark still stands there, which is what makes one append of a file at a time.
+  held: number;
+  next: number;
+  chunkFrom: number;
+  chunks: IndexedChunk[];
+  open: readonly OpenChunk[];
+}
+
+// The mark the append was weighed against, still standing. Every statement of the commit carries
+// it, so a second append that read the same mark and was beaten to it writes nothing at all rather
+// than laying its chunks over the winner's. The account, the session and the file are always the
+// first three parameters; the mark is wherever the statement around it has room.
+const markStands = (at: number): string =>
+  `?${at} = COALESCE(
+     (SELECT next_ordinal FROM session_records WHERE user_id = ?1 AND session_id = ?2 AND file = ?3), 0)`;
+
+// Everything one record append leaves behind, written in one batch: the chunks it closed, the
+// chunk counter they take their ordinals from, how far the records of the file now reach, and the
+// chunk the batch ran out before closing. They land together because a mark ahead of its chunks
+// would have the next append open where this one's prose was never indexed.
+//
+// It answers whether the mark was still where the request read it. A caller told `false` lost the
+// file to another append and nothing it carried was written; ordinals are implicit in position, so
+// a host knows its next `from` without asking and pipelines two appends as a matter of course.
+export const commitRecords = async (db: D1Database, commit: RecordCommit): Promise<boolean> => {
+  const { userId, sessionId, file, held, chunkFrom, chunks, open, next } = commit;
+  const results = await db.batch([
+    ...chunks.map((chunk, index) =>
+      db
+        .prepare(
+          `INSERT INTO session_chunks (user_id, session_id, ordinal, speaker, text, embedding, at)
+           SELECT ?1, ?2, ?4, ?5, ?6, ?7, ?8 WHERE ${markStands(9)}`,
+        )
+        .bind(userId, sessionId, file, chunkFrom + index, chunk.speaker, chunk.text, chunk.embedding, chunk.at, held),
+    ),
+    ...(chunks.length === 0
+      ? []
+      : [
+          db
+            .prepare(
+              `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks)
+               SELECT ?1, ?2, 0, 0, ?4 WHERE ${markStands(5)}
+               ON CONFLICT (user_id, session_id) DO UPDATE SET chunks = MAX(session_index.chunks, excluded.chunks)`,
+            )
+            .bind(userId, sessionId, file, chunkFrom + chunks.length, held),
+        ]),
+    db
+      .prepare(
+        `DELETE FROM session_open_chunks
+         WHERE user_id = ?1 AND session_id = ?2 AND file = ?3 AND ${markStands(4)}`,
+      )
+      .bind(userId, sessionId, file, held),
+    ...open.map((chunk) =>
+      db
+        .prepare(
+          `INSERT INTO session_open_chunks (user_id, session_id, file, speaker, pieces, at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE ${markStands(7)}`,
+        )
+        .bind(userId, sessionId, file, chunk.speaker, JSON.stringify(chunk.pieces), chunk.at, held),
+    ),
+    db
+      .prepare(
+        `INSERT INTO session_records (user_id, session_id, file, next_ordinal)
+         SELECT ?1, ?2, ?3, ?4 WHERE ${markStands(5)}
+         ON CONFLICT (user_id, session_id, file) DO UPDATE SET next_ordinal = excluded.next_ordinal`,
+      )
+      .bind(userId, sessionId, file, next, held),
+  ]);
+  return (results.at(-1)?.meta.changes ?? 0) === 1;
 };

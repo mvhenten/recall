@@ -31,8 +31,8 @@ import {
   RAW_INLINE_BYTES,
   readArtifactFile,
 } from "./artifacts";
-import { type BoardAddress, type BoardTaker, parsePost } from "./board";
-import { chunkTurns } from "./chunks";
+import { type BoardAddress, type BoardPost, type BoardTaker, parsePost, parseV2Post } from "./board";
+import { type Chunk, chunkTurns, chunkTurnsCarrying, closeChunks } from "./chunks";
 import {
   ARTIFACTS_TAB,
   type ArtifactShelf,
@@ -142,6 +142,7 @@ import {
   type StatsWindows,
   sessionHandle,
   USAGE_CHART_DAYS,
+  USAGE_EPOCH,
   USAGE_MONTH_DAYS,
   USAGE_WEEK_DAYS,
   type Verify,
@@ -159,6 +160,16 @@ import {
   sizeText,
 } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
+import {
+  MAX_RECORDS_BYTES,
+  MAX_RECORDS_PER_APPEND,
+  putRecords,
+  readRecordAppend,
+  readRecords,
+  readRecordsBetween,
+  recordFiles,
+  recordsReach,
+} from "./records";
 import {
   ARTIFACT_PREFIX,
   FILE_SEGMENT,
@@ -186,9 +197,11 @@ import {
   type Cursor,
   chunkExcerpts,
   chunkMatches,
+  chunkReach,
   chunkVectors,
   claimBoardMessages,
   claimRevision,
+  commitRecords,
   countedFiles,
   createArtifact,
   createEmailShare,
@@ -221,6 +234,8 @@ import {
   memoryCounts,
   memoryCursorDirection,
   nameSession,
+  onRecordMark,
+  openChunks,
   postBoardMessage,
   putSession,
   type RevokeScope,
@@ -228,6 +243,7 @@ import {
   readLabels,
   readStats,
   recall,
+  recordReach,
   recordShareUse,
   recordUsage,
   replaceArtifact,
@@ -283,8 +299,25 @@ import {
   type StretchBody,
   type Stretched,
   storedStretch,
+  type TranscriptFile,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
+import {
+  deviceView,
+  parseAppendRecords,
+  parseSessionSync,
+  parseUsageDelta,
+  parseV2Send,
+  pastSessionView,
+  sendInputOf,
+  sessionHitView,
+  sessionView,
+  type V2RecordsAccepted,
+  type V2RecordsConflict,
+} from "./v2";
+
+// How a surface reads the address off a board post. The two differ only there.
+type PostReader = (input: unknown, userId: string) => Parsed<BoardPost>;
 
 export interface ArtifactHost {
   hostname: string;
@@ -631,15 +664,30 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
+  // The chunks with their vectors, embedded in batches the provider takes in one call.
+  const embedChunks = async (closed: readonly Chunk[]): Promise<IndexedChunk[]> => {
+    const indexed: IndexedChunk[] = [];
+    for (let start = 0; start < closed.length; start += EMBED_BATCH) {
+      const batch = closed.slice(start, start + EMBED_BATCH);
+      const vectors = await deps.embedder.embed(batch.map((chunk) => chunk.text));
+      batch.forEach((chunk, index) => {
+        const vector = vectors[index];
+        if (!vector) throw new Error(`the embedder answered ${batch.length} chunks with ${vectors.length} vectors`);
+        indexed.push({ ...chunk, embedding: quantize(vector) });
+      });
+    }
+    return indexed;
+  };
+
   // Sessions by meaning. The full-text query runs first and the chunks it named are scored
   // against the query vector, together with the newest the account holds, and the two rankings
   // are fused with a third: the user's own chunks, scored again on their own, so a session that
   // was asked for a thing outranks one that merely mentioned it. The full-text pass leading is
   // what bounds the scan — the alternative was reading every chunk on record, which cost a
   // search more every week the archive grew.
-  const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+  const sessionSearchHits = async (url: URL, db: D1Database, userId: string): Promise<Parsed<SessionHit[]>> => {
     const parsed = parseSessionSearch(url.searchParams);
-    if (!parsed.ok) return error(400, parsed.error);
+    if (!parsed.ok) return parsed;
     const input = parsed.value;
     const [vector] = await deps.embedder.embed([input.query]);
     if (!vector) throw new Error("the embedder answered the query with no vector");
@@ -651,7 +699,7 @@ export const createApp = (deps: Deps): App => {
       matched.map((hit) => hit.chunkSeq),
       CHUNK_RECENT,
     );
-    if (chunks.length === 0) return json({ hits: [] });
+    if (chunks.length === 0) return { ok: true, value: [] };
     const scored = chunks
       .map((chunk): [ChunkCandidate, number] => [chunk, dot(vector, chunk.embedding)])
       .sort((a, b) => b[1] - a[1]);
@@ -690,7 +738,12 @@ export const createApp = (deps: Deps): App => {
       if (!found || !excerpt) throw new Error(`chunk ${hit.chunkSeq} of session ${sessionId} has no session or text`);
       return { session: found, score: hit.score, excerpt };
     });
-    return json({ hits });
+    return { ok: true, value: hits };
+  };
+
+  const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+    const hits = await sessionSearchHits(url, db, userId);
+    return hits.ok ? json({ hits: hits.value }) : error(400, hits.error);
   };
 
   // One bite of one session's prose, read out of the archive and written into the index. It
@@ -903,19 +956,23 @@ export const createApp = (deps: Deps): App => {
 
   // The board, which is the bus's opposite. A message posted here is held until a session picks it
   // up, and the address is the one `recall send` already resolves: the fleet, a host, or a session.
+  // The two surfaces address a post differently and resolve it the same way: `/v1` names the
+  // target in one of two optional fields, `/v2` in the one `address` every other `/v2` endpoint
+  // carries.
   const board = async (
     request: Request,
     url: URL,
-    env: AppEnv,
+    db: D1Database,
     caller: Caller,
     segment: string | undefined,
+    read: PostReader,
   ): Promise<Response> => {
     if (segment === "pickup") {
-      return request.method === "POST" ? pickUpBoard(request, env, caller) : error(405, "method not allowed");
+      return request.method === "POST" ? pickUpBoard(request, db, caller) : error(405, "method not allowed");
     }
     if (segment !== undefined) return error(404, "not found");
-    if (request.method === "GET") return readBoard(url, env.DB, caller.userId);
-    return request.method === "POST" ? postToBoard(request, env, caller) : error(405, "method not allowed");
+    if (request.method === "GET") return readBoard(url, db, caller.userId);
+    return request.method === "POST" ? postToBoard(request, db, caller, read) : error(405, "method not allowed");
   };
 
   const readBoard = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
@@ -941,18 +998,18 @@ export const createApp = (deps: Deps): App => {
     return address;
   };
 
-  const postToBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
-    const input = parsePost(await readJson(request), caller.userId);
+  const postToBoard = async (request: Request, db: D1Database, caller: Caller, read: PostReader): Promise<Response> => {
+    const input = read(await readJson(request), caller.userId);
     if (!input.ok) return error(400, input.error);
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
     const now = deps.now();
-    const address = await addressFor(env.DB, caller.userId, input.value.address);
+    const address = await addressFor(db, caller.userId, input.value.address);
     if (address instanceof Response) return address;
-    const from = await senderOf(env.DB, caller, input.value.fromSessionId, now);
+    const from = await senderOf(db, caller, input.value.fromSessionId, now);
     return json(
-      await postBoardMessage(env.DB, {
+      await postBoardMessage(db, {
         userId: caller.userId,
         messageId: crypto.randomUUID(),
         address,
@@ -970,7 +1027,7 @@ export const createApp = (deps: Deps): App => {
   // session is the caller's: a session-addressed message is only taken from the device that session
   // runs on. The check lives in the claim rather than here because a session the hook has not
   // synced yet must leave its message waiting instead of having the pickup refused.
-  const pickUpBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+  const pickUpBoard = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
     const body = await readJson(request);
     const asked = isRecord(body) ? body.sessionId : undefined;
     if (typeof asked !== "string") return error(400, "sessionId must be the id of the session taking the messages");
@@ -983,7 +1040,7 @@ export const createApp = (deps: Deps): App => {
       host: caller.host,
       pickedUpAt: now,
     };
-    return json({ messages: await claimBoardMessages(env.DB, caller.userId, taker, now) });
+    return json({ messages: await claimBoardMessages(db, caller.userId, taker, now) });
   };
 
   const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
@@ -2826,6 +2883,387 @@ export const createApp = (deps: Deps): App => {
       return caller instanceof Response ? caller : runTool(env, caller);
     });
 
+  // The second version of the API, which is the first one with its sentinels and its epoch
+  // integers taken out. `/v1` is untouched and stays the live surface until every host has
+  // crossed; this answers beside it, authenticates with the same device tokens, and shares every
+  // handler whose shape was never the problem.
+  //
+  // A caller is proved once, here, and handed to every handler below with the database it reads.
+  // No handler under this branch reaches back into the environment for a binding once the caller
+  // is known, which is what lets the whole branch move behind a Durable Object unchanged.
+  const v2Devices = async (
+    request: Request,
+    env: AppEnv,
+    db: D1Database,
+    caller: Caller,
+    deviceId: string | undefined,
+  ): Promise<Response> => {
+    if (deviceId === undefined) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      const [listed, labels] = await Promise.all([listDevices(db, caller.userId), readLabels(db, caller.userId)]);
+      return json({ devices: listed.map((device) => deviceView(device, labels.hosts, caller.deviceId)) });
+    }
+    // No `current`: a client revokes its own login by reading its row off the listing, where
+    // `current` already says which one it is. A path segment that means a different device
+    // depending on who sent the request is one `curl` cannot be used to reason about.
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    if (!(await revokeDevice(db, caller.userId, deviceId))) return error(404, `no device ${deviceId}`);
+    await mailboxFor(env, caller.userId).revoke(deviceId);
+    return new Response(null, { status: 204 });
+  };
+
+  const v2SessionsList = async (db: D1Database, caller: Caller): Promise<Response> => {
+    const [listed, labels] = await Promise.all([
+      listSessions(db, caller.userId, deps.now()),
+      readLabels(db, caller.userId),
+    ]);
+    return json({ sessions: listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)) });
+  };
+
+  // Every file of a session the archive holds, whichever path wrote it. The record path is the one
+  // `/v2` writes with and the byte path is what `/v1` left behind, so a file the records hold is
+  // answered off them and the byte path answers for the rest.
+  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
+    const [recorded, archived] = await Promise.all([
+      recordFiles(bucket, userId, sessionId),
+      archivedFiles(bucket, userId, sessionId),
+    ]);
+    const held = new Set(recorded.map((file) => file.file));
+    return [...recorded, ...archived.filter((file) => !held.has(file.file))].sort((left, right) =>
+      left.file.localeCompare(right.file),
+    );
+  };
+
+  const v2Session = async (bucket: R2Bucket, db: D1Database, caller: Caller, target: string): Promise<Response> => {
+    const found = await findSession(db, caller.userId, target, deps.now());
+    if (!found) return error(404, `no session named ${target}`);
+    const [files, labels] = await Promise.all([
+      v2FilesOf(bucket, caller.userId, found.session.sessionId),
+      readLabels(db, caller.userId),
+    ]);
+    return json({ session: pastSessionView(found.session, labels.hosts), matches: found.matches, files });
+  };
+
+  // The transcript files a session has on record, which `/v1` served from the transcript path when
+  // no file was named. One path, one shape.
+  const v2Files = async (
+    request: Request,
+    bucket: R2Bucket,
+    db: D1Database,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const [files, counted] = await Promise.all([
+      v2FilesOf(bucket, caller.userId, sessionId),
+      countedFiles(db, caller.userId, sessionId),
+    ]);
+    return json({ files, counted });
+  };
+
+  // One file of a session's transcript, read back. The PUT `/v1` answered here is gone: a host
+  // sends records now, and the records endpoint is the one way prose enters the archive on `/v2`.
+  const v2Transcript = async (
+    request: Request,
+    url: URL,
+    bucket: R2Bucket,
+    db: D1Database,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    const ndjson = (body: ReadableStream<Uint8Array>, gzip: boolean): Response =>
+      new Response(body, {
+        headers: {
+          "content-type": "application/x-ndjson",
+          "cache-control": "no-store",
+          ...(gzip ? { "content-encoding": "gzip" } : {}),
+        },
+      });
+    // The records first: they are what `/v2` writes, and a session that only ever posted them has
+    // nothing under the byte path's prefix at all.
+    const recorded = await readRecords(bucket, caller.userId, sessionId, file.value);
+    if (recorded !== null) return ndjson(recorded, false);
+    const archived = await readTranscript(bucket, caller.userId, sessionId, file.value, takesGzip(request));
+    if (archived === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
+    return ndjson(archived.body, archived.gzip);
+  };
+
+  const v2Usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const now = deps.now();
+    const input = parseUsageDelta(await readJson(request), now, USAGE_EPOCH, DAY_MS);
+    if (!input.ok) return error(400, input.error);
+    await recordUsage(db, caller.userId, sessionId, input.value, now);
+    return new Response(null, { status: 204 });
+  };
+
+  // A stretch of a session's transcript as the records it holds, and the whole of what that costs:
+  // the records are stored, read for turns, chunked, embedded and written to the index before the
+  // response goes back. Embedding is a subrequest and so is wall clock rather than billed CPU,
+  // which is what makes indexing in the request affordable where reading a megabyte of archive
+  // back was not.
+  //
+  // Ordering is total and carries no clock. The record at index `i` has ordinal `from + i`, so an
+  // ordinal is a position and never a field; `from` has to equal the next ordinal the file is
+  // waiting for, which makes a replayed call a 409 carrying the real `next` and never a second
+  // write of prose already indexed.
+  const v2Records = async (
+    request: Request,
+    bucket: R2Bucket,
+    db: D1Database,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const tooLarge = error(413, `an append must hold at most ${MAX_RECORDS_BYTES} bytes`);
+    if (Number(request.headers.get("content-length") ?? 0) > MAX_RECORDS_BYTES) return tooLarge;
+    const body = await request.arrayBuffer();
+    if (body.byteLength > MAX_RECORDS_BYTES) return tooLarge;
+    const sent = jsonOrNull(new TextDecoder().decode(body));
+    // Counted before the contract's own schema reads it: the schema bounds the array too, but a
+    // body past the ceiling is refused for being too large rather than for being malformed, and a
+    // host told 400 would retry it forever.
+    if (isRecord(sent) && Array.isArray(sent.records) && sent.records.length > MAX_RECORDS_PER_APPEND) {
+      return error(413, `an append must carry at most ${MAX_RECORDS_PER_APPEND} records`);
+    }
+    const input = parseAppendRecords(sent);
+    if (!input.ok) return error(400, input.error);
+    const file = parseTranscriptFile(input.value.file);
+    if (!file.ok) return error(400, file.error);
+    // The account is what a session belongs to, and the key prefix below is built from the
+    // caller's own user id, so neither a read nor an append can reach another account's session.
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const { userId } = caller;
+    const { from, records } = input.value;
+    // One session, one path into the index. A session the byte path already wrote cannot take
+    // records: the two would index the same prose, and the chunk counter they share belongs to
+    // whichever of them reached it first.
+    const mark = await indexMark(db, userId, sessionId);
+    if (mark !== null && mark.archived > 0) {
+      return error(409, `session ${sessionId} holds a transcript written as bytes; records and bytes are two paths`);
+    }
+    // Every 409 this endpoint answers carries the real reach, because the only thing a host can do
+    // with one is send again from there.
+    const conflict = (next: number, error: string): Response => {
+      const refused: V2RecordsConflict = { error, next };
+      return json(refused, 409);
+    };
+    const refuse = (next: number): Response =>
+      conflict(next, `${file.value} holds ${next} records; send the records starting at ${next}`);
+    const accepted = (next: number): Response => {
+      const taken: V2RecordsAccepted = { file: file.value, next };
+      return json(taken);
+    };
+    // The mark says where the file is waiting, and the objects are the arbiter. The two part
+    // company only where a writer stored records and did not live to write the mark, so the
+    // listing is paid for on the conflicting call alone and never on the ordinary one.
+    const marked = await recordReach(db, userId, sessionId, file.value);
+    if (from !== marked) {
+      const held = await recordsReach(bucket, userId, sessionId, file.value);
+      if (from !== held) return refuse(held);
+    }
+    // A put that does not land means the archive already holds an append at this ordinal. The
+    // conditional put weighs presence and never content, so what is stored there is read back
+    // before the writer is sent anywhere: two appends starting in the same place and agreeing as
+    // far as they overlap are one host sending a different number of records, and it is told the
+    // real reach and sends from there. Records that disagree at an ordinal are a transcript being
+    // rewritten, and neither side's prose may be dropped for the other's without the host hearing
+    // of it.
+    if (!(await putRecords(bucket, userId, sessionId, file.value, from, records))) {
+      const stored = await readRecordAppend(bucket, userId, sessionId, file.value, from);
+      if (stored?.some((record, at) => at < records.length && record !== records[at]) === true) {
+        const reach = await recordsReach(bucket, userId, sessionId, file.value);
+        return conflict(reach, `${file.value} holds other records at ordinal ${from}; a record is written once`);
+      }
+      return refuse(await recordsReach(bucket, userId, sessionId, file.value));
+    }
+    const next = from + records.length;
+    // Only the session's own file reaches the index, exactly as the byte path's consumer reads
+    // only `main`. A delegated turn is the model talking to itself and derives nothing.
+    if (file.value !== MAIN_FILE) {
+      const commit = { userId, sessionId, file: file.value, held: marked, next, chunkFrom: 0, chunks: [], open: [] };
+      if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
+      return accepted(next);
+    }
+    // Every record the index has not read yet, which is this append and the span between the mark
+    // and it. That span is what an append landing ahead of the mark leaves behind: another writer
+    // stored records and lost the file before it could index them, or this one did and is sending
+    // again. The prose is in the archive either way, and the append carrying the mark past it is
+    // the one that has to index it, or nothing ever will.
+    const behind = await readRecordsBetween(bucket, userId, sessionId, file.value, marked, from);
+    const text = [...behind, ...records].join("\n");
+    const carried = await openChunks(db, userId, sessionId, file.value);
+    const { closed, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
+    const chunkFrom = await chunkReach(db, userId, sessionId);
+    const indexed = await embedChunks(closed);
+    // The mark the work above was read against, still standing. A host knows its next `from`
+    // without asking and pipelines two appends, and the second read the chunks and the open chunk
+    // of a file the first had not finished writing; it is told the real `next` and sends again.
+    const commit = { userId, sessionId, file: file.value, held: marked, next, chunkFrom, chunks: indexed, open };
+    if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
+    // The span this append indexed opens the session wherever the mark stood at nothing, which is
+    // not the same as the call carrying ordinal 0: a first append that lost its commit leaves the
+    // name to whichever later one carries the mark off zero. A losing append names nothing.
+    if (marked === 0) {
+      const named = agentName(text.slice(0, HEAD_BYTES));
+      if (named !== "") await nameSession(db, userId, sessionId, named);
+    }
+    return accepted(next);
+  };
+
+  // What a session leaves behind when it ends. A chunk closes where the conversation turns or
+  // where the character ceiling runs out, so the one a file is still holding closes nowhere at all
+  // unless the end of the session closes it — and a short session, which turns nowhere, would be
+  // unfindable entirely. `/v1` closed everything at the end of every indexing bite.
+  //
+  // It is also the last chance the span past the mark has. An append that stored its records and
+  // lost its commit leaves the archive ahead of the mark, and the gap fold that would have carried
+  // the index over it only runs on another append; where the session ended there, the end of it is
+  // the append that never came.
+  const closeSession = async (bucket: R2Bucket, db: D1Database, userId: string, sessionId: string): Promise<void> => {
+    const [open, held, chunkFrom, reach] = await Promise.all([
+      openChunks(db, userId, sessionId, MAIN_FILE),
+      recordReach(db, userId, sessionId, MAIN_FILE),
+      chunkReach(db, userId, sessionId),
+      recordsReach(bucket, userId, sessionId, MAIN_FILE),
+    ]);
+    const next = Math.max(held, reach);
+    if (open.length === 0 && next === held) return;
+    const behind = await readRecordsBetween(bucket, userId, sessionId, MAIN_FILE, held, next);
+    const tail = chunkTurnsCarrying(readTurns(behind.join("\n"), MAIN_FILE), open);
+    const indexed = await embedChunks([...tail.closed, ...closeChunks(tail.open)]);
+    await commitRecords(db, {
+      userId,
+      sessionId,
+      file: MAIN_FILE,
+      held,
+      next,
+      chunkFrom,
+      chunks: indexed,
+      open: [],
+    });
+  };
+
+  const v2Sessions = async (
+    request: Request,
+    url: URL,
+    bucket: R2Bucket,
+    db: D1Database,
+    caller: Caller,
+    rawSessionId: string | undefined,
+    subresource: string | undefined,
+  ): Promise<Response> => {
+    if (rawSessionId === undefined) {
+      return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
+    }
+    const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!sessionId.ok) return error(400, sessionId.error);
+    if (subresource === "usage") return v2Usage(request, db, caller, sessionId.value);
+    if (subresource === "records") return v2Records(request, bucket, db, caller, sessionId.value);
+    if (subresource === "files") return v2Files(request, bucket, db, caller, sessionId.value);
+    if (subresource === "transcript") {
+      return v2Transcript(request, url, bucket, db, caller, sessionId.value);
+    }
+    if (subresource !== undefined) return error(404, "not found");
+    if (request.method === "GET") return v2Session(bucket, db, caller, sessionId.value);
+    if (request.method === "PUT") {
+      const input = parseSessionSync(await readJson(request));
+      if (!input.ok) return error(400, input.error);
+      await putSession(db, caller, sessionId.value, input.value, deps.now());
+      return new Response(null, { status: 204 });
+    }
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    await closeSession(bucket, db, caller.userId, sessionId.value);
+    if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
+    return new Response(null, { status: 204 });
+  };
+
+  // Every session the account has on record, and the ones a query finds by meaning. It is its own
+  // collection rather than a scope of the sessions listing because `history` is a legal session id
+  // and `/v2/sessions/history` would have answered two things depending on which one was meant.
+  const v2History = async (request: Request, url: URL, db: D1Database, caller: Caller): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    const { userId } = caller;
+    if (url.searchParams.get("q") === null) {
+      return json(await listSessionHistoryIds(db, userId, url.searchParams.get("cursor") ?? ""));
+    }
+    const hits = await sessionSearchHits(url, db, userId);
+    if (!hits.ok) return error(400, hits.error);
+    const labels = await readLabels(db, userId);
+    return json({ hits: hits.value.map((hit) => sessionHitView(hit, labels.hosts)) });
+  };
+
+  const v2SendMessage = async (request: Request, env: AppEnv, db: D1Database, caller: Caller): Promise<Response> => {
+    const input = parseV2Send(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
+      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
+    }
+    const { scope, target } = input.value.address;
+    const now = deps.now();
+    // A session is addressed by itself and the device it runs on is read off it, where `/v1` had
+    // the caller name both and an empty session id meant every session on the device.
+    const toDeviceId =
+      scope === "host"
+        ? (await hasDevice(db, caller.userId, target))
+          ? target
+          : null
+        : await liveSessionDevice(db, caller.userId, target, now);
+    if (toDeviceId === null) {
+      return error(404, scope === "host" ? `no device ${target}` : `no session ${target} running on this account`);
+    }
+    const sender = await senderOf(db, caller, input.value.fromSessionId, now);
+    const sent = await mailboxFor(env, caller.userId).publish(sendInputOf(input.value, toDeviceId), sender, now);
+    return json(sent, 201);
+  };
+
+  const routeV2 = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    collection: string | undefined,
+    rawName: string | undefined,
+    rest: readonly string[],
+  ): Promise<Response> => {
+    if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts") return error(404, "not found");
+    if (rest.length > 1 && collection !== "artifacts") return error(404, "not found");
+    // The device grant is RFC 8628 and its snake_case is the standard rather than a slip, so it is
+    // carried over as it stands: a client that signed in against `/v1` signs in against `/v2` with
+    // the same code, and `/v1` can go whole.
+    if (collection === "device") {
+      if (request.method !== "POST") return error(405, "method not allowed");
+      if (rawName === "code") return startDevice(request, url, env.DB);
+      if (rawName === "token") return pollDevice(request, env.DB);
+      return error(404, "not found");
+    }
+    const caller = await authenticate(request, env.DB);
+    if (caller instanceof Response) return caller;
+    const db = env.DB;
+    if (collection === "devices") return v2Devices(request, env, db, caller, rawName);
+    if (collection === "board") return board(request, url, db, caller, rawName, parseV2Post);
+    if (collection === "sessions") return v2Sessions(request, url, env.TRANSCRIPTS, db, caller, rawName, rest[0]);
+    if (collection === "history") {
+      if (rawName !== undefined) return error(404, "not found");
+      return v2History(request, url, db, caller);
+    }
+    if (collection === "artifacts") return artifacts(request, url, db, caller, rawName, rest);
+    if (collection !== "messages") return error(404, "not found");
+    if (rawName === "listen") {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
+        return error(426, "/v2/messages/listen only answers a WebSocket upgrade; send Upgrade: websocket");
+      }
+      return listen(request, env, caller);
+    }
+    if (rawName !== undefined) return error(404, "not found");
+    return request.method === "POST" ? v2SendMessage(request, env, db, caller) : error(405, "method not allowed");
+  };
+
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
     const url = new URL(request.url);
     const host = deps.artifactHost;
@@ -2850,6 +3288,7 @@ export const createApp = (deps: Deps): App => {
       );
     }
     const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
+    if (version === "v2") return routeV2(request, url, env, collection, rawName, rest);
     if (version !== "v1") return error(404, "not found");
     const subresource = rest[0];
     // An artifact's files are addressed by a path of up to three segments, so the tail below the
@@ -2865,7 +3304,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env, caller, rawName);
-    if (collection === "board") return board(request, url, env, caller, rawName);
+    if (collection === "board") return board(request, url, env.DB, caller, rawName, parsePost);
     if (collection === "sessions") return sessions(request, url, env, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {
@@ -2937,6 +3376,10 @@ export const createApp = (deps: Deps): App => {
         else session.messages.push(message);
       }
       for (const { stretch, messages } of sessions.values()) {
+        // A session on the record mark indexes itself inside the append that writes it, so the
+        // byte path leaves it alone. The two read the same prose, and a session on both marks
+        // would hold every chunk of it twice.
+        if (await onRecordMark(env.DB, stretch.userId, stretch.sessionId)) continue;
         const caughtUp = await indexSession(env, stretch.userId, stretch.sessionId).catch((failure: unknown) => {
           console.error(
             JSON.stringify({
