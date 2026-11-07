@@ -21,6 +21,7 @@
           "items": {
             "$ref": "TranscriptLine.json"
           },
+          "minItems": 1,
           "maxItems": 1000
         }
       },
@@ -48,6 +49,259 @@
         }
       },
       "required": ["file", "next"]
+    },
+    "RecordsConflict": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RecordsConflict.json",
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": "string",
+          "minLength": 1
+        },
+        "next": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        }
+      },
+      "required": ["error", "next"]
+    },
+    "SessionFocus": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SessionFocus.json",
+      "type": "object",
+      "properties": {
+        "first": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "latest": {
+          "type": "string",
+          "maxLength": 200
+        }
+      },
+      "required": ["first", "latest"]
+    },
+    "SessionSync": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SessionSync.json",
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "cwd": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "repo": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "branch": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "commit": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastActivityAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "prompts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "focus": {
+          "$ref": "SessionFocus.json"
+        },
+        "mode": {
+          "$ref": "SessionMode.json"
+        },
+        "permissionMode": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "host",
+        "cwd",
+        "repo",
+        "branch",
+        "commit",
+        "startedAt",
+        "lastActivityAt",
+        "prompts",
+        "focus",
+        "mode",
+        "permissionMode",
+        "pid"
+      ]
+    },
+    "SessionMode": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SessionMode.json",
+      "type": "string",
+      "enum": ["Interactive", "Headless", "Unknown"]
+    },
+    "UsageDelta": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "UsageDelta.json",
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "repo": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "account": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "prompts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "inputTokens": {
+          "type": "string",
+          "minimum": 0,
+          "maximum": 1000000000
+        },
+        "outputTokens": {
+          "type": "string",
+          "minimum": 0,
+          "maximum": 1000000000
+        },
+        "cacheWriteTokens": {
+          "type": "string",
+          "minimum": 0,
+          "maximum": 1000000000
+        },
+        "cacheReadTokens": {
+          "type": "string",
+          "minimum": 0,
+          "maximum": 1000000000
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "durable": {
+          "type": "boolean"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 500
+        }
+      },
+      "required": [
+        "seq",
+        "host",
+        "repo",
+        "provider",
+        "account",
+        "model",
+        "prompts",
+        "inputTokens",
+        "outputTokens",
+        "cacheWriteTokens",
+        "cacheReadTokens",
+        "at",
+        "durable",
+        "files"
+      ]
+    },
+    "MessageAddress": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MessageAddress.json",
+      "type": "object",
+      "properties": {
+        "scope": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "host"
+            },
+            {
+              "type": "string",
+              "const": "session"
+            }
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["scope", "target"]
+    },
+    "SendMessage": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SendMessage.json",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "news"
+            },
+            {
+              "type": "string",
+              "const": "order"
+            }
+          ]
+        },
+        "address": {
+          "$ref": "MessageAddress.json"
+        },
+        "fromSessionId": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        }
+      },
+      "required": ["kind", "address", "fromSessionId", "body"]
     }
   }
 }

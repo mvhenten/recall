@@ -80,7 +80,24 @@ export interface PublishInput {
   replace: boolean;
 }
 
+// What a host speaks to `/v2` with. It is its own handle rather than a second set of methods on
+// the `/v1` client, so a test naming `client.v2` is saying which surface it is about.
+export interface V2Client {
+  request(method: string, path: string, body?: unknown): Promise<Response>;
+  sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
+  usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
+  /// One append of whole redacted JSONL lines, the record at index `i` carrying ordinal
+  /// `from + i`.
+  records(sessionId: string, file: string, from: number, records: string[]): Promise<Response>;
+  session(target: string): Promise<Response>;
+  files(sessionId: string): Promise<Response>;
+  searchHistory(query: string, limit?: number): Promise<Response>;
+}
+
 export interface Client {
+  v2: V2Client;
+  /// The account this client signs in as, which is what a test reading rows back keys on.
+  userId: string;
   request(method: string, path: string, body?: unknown): Promise<Response>;
   save(name: string, fields: Partial<Pick<Memory, "description" | "type" | "body" | "tags">>): Promise<Memory>;
   publish(name: string, html: string | Uint8Array): Promise<Response>;
@@ -157,6 +174,15 @@ const SESSION_DOCUMENT: Record<string, unknown> = {
   pid: 4242,
 };
 
+// The same session as SESSION_DOCUMENT, in the shapes `/v2` takes: a mode that names itself and
+// instants that carry their offset.
+const V2_SESSION_DOCUMENT: Record<string, unknown> = {
+  ...SESSION_DOCUMENT,
+  startedAt: new Date(1_700_000_000_000).toISOString(),
+  lastActivityAt: new Date(1_700_000_060_000).toISOString(),
+  mode: "Interactive",
+};
+
 const USAGE_DELTA: Record<string, unknown> = {
   seq: 1,
   host: "laptop",
@@ -170,6 +196,13 @@ const USAGE_DELTA: Record<string, unknown> = {
   cacheWriteTokens: 900,
   cacheReadTokens: 8_000,
   at: 1_700_000_060_000,
+};
+
+const V2_USAGE_DELTA: Record<string, unknown> = {
+  ...USAGE_DELTA,
+  at: new Date(1_700_000_060_000).toISOString(),
+  durable: false,
+  files: [],
 };
 
 export interface HarnessOptions {
@@ -336,7 +369,7 @@ export const harness = async ({
     return granted.access_token;
   };
 
-  const clientWithHeaders = (headers: Record<string, string>): Client => {
+  const clientWithHeaders = (headers: Record<string, string>, userId = ""): Client => {
     const request = async (method: string, path: string, body?: unknown): Promise<Response> =>
       send(path, {
         method,
@@ -364,7 +397,35 @@ export const harness = async ({
       const replace = input.replace === true ? "?replace=true" : "";
       return send(`/v1/artifacts/${name}${replace}`, { method: "PUT", headers: { ...headers }, body: form });
     };
+    const v2: V2Client = {
+      request: (method, path, body) =>
+        send(path, {
+          method,
+          headers: { ...headers, "content-type": "application/json" },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        }),
+      sync(sessionId, fields = {}) {
+        return this.request("PUT", `/v2/sessions/${sessionId}`, { ...V2_SESSION_DOCUMENT, ...fields });
+      },
+      usage(sessionId, fields = {}) {
+        return this.request("POST", `/v2/sessions/${sessionId}/usage`, { ...V2_USAGE_DELTA, ...fields });
+      },
+      records(sessionId, file, from, records) {
+        return this.request("POST", `/v2/sessions/${sessionId}/records`, { file, from, records });
+      },
+      session(target) {
+        return this.request("GET", `/v2/sessions/${encodeURIComponent(target)}`);
+      },
+      files(sessionId) {
+        return this.request("GET", `/v2/sessions/${encodeURIComponent(sessionId)}/files`);
+      },
+      searchHistory(query, limit = 10) {
+        return this.request("GET", `/v2/history?q=${encodeURIComponent(query)}&limit=${limit}`);
+      },
+    };
     return {
+      v2,
+      userId,
       request,
       async save(name, fields) {
         const response = await request("PUT", `/v1/memories/${name}`, {
@@ -456,7 +517,8 @@ export const harness = async ({
     };
   };
 
-  const clientWithToken = (token: string): Client => clientWithHeaders({ authorization: `Bearer ${token}` });
+  const clientWithToken = (token: string, userId = ""): Client =>
+    clientWithHeaders({ authorization: `Bearer ${token}` }, userId);
 
   // One JSON-RPC message over the connector endpoint, with whichever Access credential the caller
   // wants the Worker to see.
@@ -491,8 +553,11 @@ export const harness = async ({
     };
   };
 
-  const user = async (label: string): Promise<Client> =>
-    clientWithToken(await login(await invite(`${label}-${crypto.randomUUID()}@example.com`)));
+  const user = async (label: string): Promise<Client> => {
+    const userId = `user-${crypto.randomUUID()}`;
+    const email = await invite(`${label}-${crypto.randomUUID()}@example.com`, userId);
+    return clientWithToken(await login(email), userId);
+  };
 
   return {
     user,

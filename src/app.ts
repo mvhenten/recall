@@ -32,7 +32,7 @@ import {
   readArtifactFile,
 } from "./artifacts";
 import { type BoardAddress, type BoardTaker, parsePost } from "./board";
-import { chunkTurns } from "./chunks";
+import { chunkTurns, chunkTurnsCarrying } from "./chunks";
 import {
   ARTIFACTS_TAB,
   type ArtifactShelf,
@@ -142,6 +142,7 @@ import {
   type StatsWindows,
   sessionHandle,
   USAGE_CHART_DAYS,
+  USAGE_EPOCH,
   USAGE_MONTH_DAYS,
   USAGE_WEEK_DAYS,
   type Verify,
@@ -159,6 +160,7 @@ import {
   sizeText,
 } from "./page";
 import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
+import { MAX_RECORDS_BYTES, MAX_RECORDS_PER_APPEND, putRecords, recordsReach } from "./records";
 import {
   ARTIFACT_PREFIX,
   FILE_SEGMENT,
@@ -186,9 +188,11 @@ import {
   type Cursor,
   chunkExcerpts,
   chunkMatches,
+  chunkReach,
   chunkVectors,
   claimBoardMessages,
   claimRevision,
+  commitRecords,
   countedFiles,
   createArtifact,
   createEmailShare,
@@ -221,6 +225,8 @@ import {
   memoryCounts,
   memoryCursorDirection,
   nameSession,
+  onRecordMark,
+  openChunks,
   postBoardMessage,
   putSession,
   type RevokeScope,
@@ -228,6 +234,7 @@ import {
   readLabels,
   readStats,
   recall,
+  recordReach,
   recordShareUse,
   recordUsage,
   replaceArtifact,
@@ -285,6 +292,17 @@ import {
   storedStretch,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
+import {
+  deviceView,
+  parseAppendRecords,
+  parseSessionSync,
+  parseUsageDelta,
+  parseV2Send,
+  pastSessionView,
+  sendInputOf,
+  sessionHitView,
+  sessionView,
+} from "./v2";
 
 export interface ArtifactHost {
   hostname: string;
@@ -637,7 +655,7 @@ export const createApp = (deps: Deps): App => {
   // was asked for a thing outranks one that merely mentioned it. The full-text pass leading is
   // what bounds the scan — the alternative was reading every chunk on record, which cost a
   // search more every week the archive grew.
-  const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+  const sessionSearchHits = async (url: URL, db: D1Database, userId: string): Promise<SessionHit[] | Response> => {
     const parsed = parseSessionSearch(url.searchParams);
     if (!parsed.ok) return error(400, parsed.error);
     const input = parsed.value;
@@ -651,7 +669,7 @@ export const createApp = (deps: Deps): App => {
       matched.map((hit) => hit.chunkSeq),
       CHUNK_RECENT,
     );
-    if (chunks.length === 0) return json({ hits: [] });
+    if (chunks.length === 0) return [];
     const scored = chunks
       .map((chunk): [ChunkCandidate, number] => [chunk, dot(vector, chunk.embedding)])
       .sort((a, b) => b[1] - a[1]);
@@ -690,7 +708,12 @@ export const createApp = (deps: Deps): App => {
       if (!found || !excerpt) throw new Error(`chunk ${hit.chunkSeq} of session ${sessionId} has no session or text`);
       return { session: found, score: hit.score, excerpt };
     });
-    return json({ hits });
+    return hits;
+  };
+
+  const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+    const hits = await sessionSearchHits(url, db, userId);
+    return hits instanceof Response ? hits : json({ hits });
   };
 
   // One bite of one session's prose, read out of the archive and written into the index. It
@@ -906,16 +929,16 @@ export const createApp = (deps: Deps): App => {
   const board = async (
     request: Request,
     url: URL,
-    env: AppEnv,
+    db: D1Database,
     caller: Caller,
     segment: string | undefined,
   ): Promise<Response> => {
     if (segment === "pickup") {
-      return request.method === "POST" ? pickUpBoard(request, env, caller) : error(405, "method not allowed");
+      return request.method === "POST" ? pickUpBoard(request, db, caller) : error(405, "method not allowed");
     }
     if (segment !== undefined) return error(404, "not found");
-    if (request.method === "GET") return readBoard(url, env.DB, caller.userId);
-    return request.method === "POST" ? postToBoard(request, env, caller) : error(405, "method not allowed");
+    if (request.method === "GET") return readBoard(url, db, caller.userId);
+    return request.method === "POST" ? postToBoard(request, db, caller) : error(405, "method not allowed");
   };
 
   const readBoard = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
@@ -941,18 +964,18 @@ export const createApp = (deps: Deps): App => {
     return address;
   };
 
-  const postToBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+  const postToBoard = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
     const input = parsePost(await readJson(request), caller.userId);
     if (!input.ok) return error(400, input.error);
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
     const now = deps.now();
-    const address = await addressFor(env.DB, caller.userId, input.value.address);
+    const address = await addressFor(db, caller.userId, input.value.address);
     if (address instanceof Response) return address;
-    const from = await senderOf(env.DB, caller, input.value.fromSessionId, now);
+    const from = await senderOf(db, caller, input.value.fromSessionId, now);
     return json(
-      await postBoardMessage(env.DB, {
+      await postBoardMessage(db, {
         userId: caller.userId,
         messageId: crypto.randomUUID(),
         address,
@@ -970,7 +993,7 @@ export const createApp = (deps: Deps): App => {
   // session is the caller's: a session-addressed message is only taken from the device that session
   // runs on. The check lives in the claim rather than here because a session the hook has not
   // synced yet must leave its message waiting instead of having the pickup refused.
-  const pickUpBoard = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+  const pickUpBoard = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
     const body = await readJson(request);
     const asked = isRecord(body) ? body.sessionId : undefined;
     if (typeof asked !== "string") return error(400, "sessionId must be the id of the session taking the messages");
@@ -983,7 +1006,7 @@ export const createApp = (deps: Deps): App => {
       host: caller.host,
       pickedUpAt: now,
     };
-    return json({ messages: await claimBoardMessages(env.DB, caller.userId, taker, now) });
+    return json({ messages: await claimBoardMessages(db, caller.userId, taker, now) });
   };
 
   const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
@@ -2826,6 +2849,300 @@ export const createApp = (deps: Deps): App => {
       return caller instanceof Response ? caller : runTool(env, caller);
     });
 
+  // The second version of the API, which is the first one with its sentinels and its epoch
+  // integers taken out. `/v1` is untouched and stays the live surface until every host has
+  // crossed; this answers beside it, authenticates with the same device tokens, and shares every
+  // handler whose shape was never the problem.
+  //
+  // A caller is proved once, here, and handed to every handler below with the database it reads.
+  // No handler under this branch reaches back into the environment for a binding once the caller
+  // is known, which is what lets the whole branch move behind a Durable Object unchanged.
+  const v2Devices = async (
+    request: Request,
+    env: AppEnv,
+    db: D1Database,
+    caller: Caller,
+    deviceId: string | undefined,
+  ): Promise<Response> => {
+    if (deviceId === undefined) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      const [listed, labels] = await Promise.all([listDevices(db, caller.userId), readLabels(db, caller.userId)]);
+      return json({ devices: listed.map((device) => deviceView(device, labels.hosts, caller.deviceId)) });
+    }
+    // No `current`: a client revokes its own login by reading its row off the listing, where
+    // `current` already says which one it is. A path segment that means a different device
+    // depending on who sent the request is one `curl` cannot be used to reason about.
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    if (!(await revokeDevice(db, caller.userId, deviceId))) return error(404, `no device ${deviceId}`);
+    await mailboxFor(env, caller.userId).revoke(deviceId);
+    return new Response(null, { status: 204 });
+  };
+
+  const v2SessionsList = async (db: D1Database, caller: Caller): Promise<Response> => {
+    const [listed, labels] = await Promise.all([
+      listSessions(db, caller.userId, deps.now()),
+      readLabels(db, caller.userId),
+    ]);
+    return json({ sessions: listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)) });
+  };
+
+  const v2Session = async (bucket: R2Bucket, db: D1Database, caller: Caller, target: string): Promise<Response> => {
+    const found = await findSession(db, caller.userId, target, deps.now());
+    if (!found) return error(404, `no session named ${target}`);
+    const [files, labels] = await Promise.all([
+      archivedFiles(bucket, caller.userId, found.session.sessionId),
+      readLabels(db, caller.userId),
+    ]);
+    return json({ session: pastSessionView(found.session, labels.hosts), matches: found.matches, files });
+  };
+
+  // The transcript files a session has on record, which `/v1` served from the transcript path when
+  // no file was named. One path, one shape.
+  const v2Files = async (
+    request: Request,
+    bucket: R2Bucket,
+    db: D1Database,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const [files, counted] = await Promise.all([
+      archivedFiles(bucket, caller.userId, sessionId),
+      countedFiles(db, caller.userId, sessionId),
+    ]);
+    return json({ files, counted });
+  };
+
+  // One file of a session's transcript, read back. The PUT `/v1` answered here is gone: a host
+  // sends records now, and the records endpoint is the one way prose enters the archive on `/v2`.
+  const v2Transcript = async (
+    request: Request,
+    url: URL,
+    bucket: R2Bucket,
+    db: D1Database,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    const archived = await readTranscript(bucket, caller.userId, sessionId, file.value, takesGzip(request));
+    if (archived === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
+    return new Response(archived.body, {
+      headers: {
+        "content-type": "application/x-ndjson",
+        "cache-control": "no-store",
+        ...(archived.gzip ? { "content-encoding": "gzip" } : {}),
+      },
+    });
+  };
+
+  const v2Usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const now = deps.now();
+    const input = parseUsageDelta(await readJson(request), now, USAGE_EPOCH, DAY_MS);
+    if (!input.ok) return error(400, input.error);
+    await recordUsage(db, caller.userId, sessionId, input.value, now);
+    return new Response(null, { status: 204 });
+  };
+
+  // A stretch of a session's transcript as the records it holds, and the whole of what that costs:
+  // the records are stored, read for turns, chunked, embedded and written to the index before the
+  // response goes back. Embedding is a subrequest and so is wall clock rather than billed CPU,
+  // which is what makes indexing in the request affordable where reading a megabyte of archive
+  // back was not.
+  //
+  // Ordering is total and carries no clock. The record at index `i` has ordinal `from + i`, so an
+  // ordinal is a position and never a field; `from` has to equal the next ordinal the file is
+  // waiting for, which makes a replayed call a 409 carrying the real `next` and never a second
+  // write of prose already indexed.
+  const v2Records = async (
+    request: Request,
+    env: AppEnv,
+    db: D1Database,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const tooLarge = error(413, `an append must hold at most ${MAX_RECORDS_BYTES} bytes`);
+    if (Number(request.headers.get("content-length") ?? 0) > MAX_RECORDS_BYTES) return tooLarge;
+    const body = await request.arrayBuffer();
+    if (body.byteLength > MAX_RECORDS_BYTES) return tooLarge;
+    const sent = jsonOrNull(new TextDecoder().decode(body));
+    // Counted before the contract's own schema reads it: the schema bounds the array too, but a
+    // body past the ceiling is refused for being too large rather than for being malformed, and a
+    // host told 400 would retry it forever.
+    if (isRecord(sent) && Array.isArray(sent.records) && sent.records.length > MAX_RECORDS_PER_APPEND) {
+      return error(413, `an append must carry at most ${MAX_RECORDS_PER_APPEND} records`);
+    }
+    const input = parseAppendRecords(sent);
+    if (!input.ok) return error(400, input.error);
+    const file = parseTranscriptFile(input.value.file);
+    if (!file.ok) return error(400, file.error);
+    // The account is what a session belongs to, and the key prefix below is built from the
+    // caller's own user id, so neither a read nor an append can reach another account's session.
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const { userId } = caller;
+    const { from, records } = input.value;
+    const bucket = env.TRANSCRIPTS;
+    const refuse = (next: number): Response =>
+      json({ error: `${file.value} holds ${next} records; send the records starting at ${next}`, next }, 409);
+    // The mark says where the file is waiting, and the objects are the arbiter. The two part
+    // company only where a writer stored records and did not live to write the mark, so the
+    // listing is paid for on the conflicting call alone and never on the ordinary one.
+    const marked = await recordReach(db, userId, sessionId, file.value);
+    if (from !== marked) {
+      const held = await recordsReach(bucket, userId, sessionId, file.value);
+      if (from !== held) return refuse(held);
+    }
+    if (!(await putRecords(bucket, userId, sessionId, file.value, from, records))) {
+      return refuse(await recordsReach(bucket, userId, sessionId, file.value));
+    }
+    const next = from + records.length;
+    // Only the session's own file reaches the index, exactly as the byte path's consumer reads
+    // only `main`. A delegated turn is the model talking to itself and derives nothing.
+    if (file.value !== MAIN_FILE) {
+      await commitRecords(db, { userId, sessionId, file: file.value, next, from: 0, chunks: [], open: [] });
+      return json({ file: file.value, next });
+    }
+    const text = records.join("\n");
+    if (from === 0) {
+      const named = agentName(text.slice(0, HEAD_BYTES));
+      if (named !== "") await nameSession(db, userId, sessionId, named);
+    }
+    const carried = await openChunks(db, userId, sessionId, file.value);
+    const { closed, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
+    const at = await chunkReach(db, userId, sessionId);
+    const indexed: IndexedChunk[] = [];
+    for (let start = 0; start < closed.length; start += EMBED_BATCH) {
+      const batch = closed.slice(start, start + EMBED_BATCH);
+      const vectors = await deps.embedder.embed(batch.map((chunk) => chunk.text));
+      batch.forEach((chunk, index) => {
+        const vector = vectors[index];
+        if (!vector) throw new Error(`the embedder answered ${batch.length} chunks with ${vectors.length} vectors`);
+        indexed.push({ ...chunk, embedding: quantize(vector) });
+      });
+    }
+    await commitRecords(db, { userId, sessionId, file: file.value, next, from: at, chunks: indexed, open });
+    return json({ file: file.value, next });
+  };
+
+  const v2Sessions = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    caller: Caller,
+    rawSessionId: string | undefined,
+    subresource: string | undefined,
+  ): Promise<Response> => {
+    const db = env.DB;
+    if (rawSessionId === undefined) {
+      return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
+    }
+    const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!sessionId.ok) return error(400, sessionId.error);
+    if (subresource === "usage") return v2Usage(request, db, caller, sessionId.value);
+    if (subresource === "records") return v2Records(request, env, db, caller, sessionId.value);
+    if (subresource === "files") return v2Files(request, env.TRANSCRIPTS, db, caller, sessionId.value);
+    if (subresource === "transcript") {
+      return v2Transcript(request, url, env.TRANSCRIPTS, db, caller, sessionId.value);
+    }
+    if (subresource !== undefined) return error(404, "not found");
+    if (request.method === "GET") return v2Session(env.TRANSCRIPTS, db, caller, sessionId.value);
+    if (request.method === "PUT") {
+      const input = parseSessionSync(await readJson(request));
+      if (!input.ok) return error(400, input.error);
+      await putSession(db, caller, sessionId.value, input.value, deps.now());
+      return new Response(null, { status: 204 });
+    }
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
+    return new Response(null, { status: 204 });
+  };
+
+  // Every session the account has on record, and the ones a query finds by meaning. It is its own
+  // collection rather than a scope of the sessions listing because `history` is a legal session id
+  // and `/v2/sessions/history` would have answered two things depending on which one was meant.
+  const v2History = async (request: Request, url: URL, db: D1Database, caller: Caller): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    const { userId } = caller;
+    if (url.searchParams.get("q") === null) {
+      return json(await listSessionHistoryIds(db, userId, url.searchParams.get("cursor") ?? ""));
+    }
+    const hits = await sessionSearchHits(url, db, userId);
+    if (hits instanceof Response) return hits;
+    const labels = await readLabels(db, userId);
+    return json({ hits: hits.map((hit) => sessionHitView(hit, labels.hosts)) });
+  };
+
+  const v2SendMessage = async (request: Request, env: AppEnv, db: D1Database, caller: Caller): Promise<Response> => {
+    const input = parseV2Send(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
+      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
+    }
+    const { scope, target } = input.value;
+    const now = deps.now();
+    // A session is addressed by itself and the device it runs on is read off it, where `/v1` had
+    // the caller name both and an empty session id meant every session on the device.
+    const toDeviceId =
+      scope === "host"
+        ? (await hasDevice(db, caller.userId, target))
+          ? target
+          : null
+        : await liveSessionDevice(db, caller.userId, target, now);
+    if (toDeviceId === null) {
+      return error(404, scope === "host" ? `no device ${target}` : `no session ${target} running on this account`);
+    }
+    const sender = await senderOf(db, caller, input.value.fromSessionId, now);
+    const sent = await mailboxFor(env, caller.userId).publish(sendInputOf(input.value, toDeviceId), sender, now);
+    return json(sent, 201);
+  };
+
+  const routeV2 = async (
+    request: Request,
+    url: URL,
+    env: AppEnv,
+    collection: string | undefined,
+    rawName: string | undefined,
+    rest: readonly string[],
+  ): Promise<Response> => {
+    if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts") return error(404, "not found");
+    if (rest.length > 1 && collection !== "artifacts") return error(404, "not found");
+    // The device grant is RFC 8628 and its snake_case is the standard rather than a slip, so it is
+    // carried over as it stands: a client that signed in against `/v1` signs in against `/v2` with
+    // the same code, and `/v1` can go whole.
+    if (collection === "device") {
+      if (request.method !== "POST") return error(405, "method not allowed");
+      if (rawName === "code") return startDevice(request, url, env.DB);
+      if (rawName === "token") return pollDevice(request, env.DB);
+      return error(404, "not found");
+    }
+    const caller = await authenticate(request, env.DB);
+    if (caller instanceof Response) return caller;
+    const db = env.DB;
+    if (collection === "devices") return v2Devices(request, env, db, caller, rawName);
+    if (collection === "board") return board(request, url, db, caller, rawName);
+    if (collection === "sessions") return v2Sessions(request, url, env, caller, rawName, rest[0]);
+    if (collection === "history") {
+      if (rawName !== undefined) return error(404, "not found");
+      return v2History(request, url, db, caller);
+    }
+    if (collection === "artifacts") return artifacts(request, url, db, caller, rawName, rest);
+    if (collection !== "messages") return error(404, "not found");
+    if (rawName === "listen") {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
+        return error(426, "/v2/messages/listen only answers a WebSocket upgrade; send Upgrade: websocket");
+      }
+      return listen(request, env, caller);
+    }
+    if (rawName !== undefined) return error(404, "not found");
+    return request.method === "POST" ? v2SendMessage(request, env, db, caller) : error(405, "method not allowed");
+  };
+
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
     const url = new URL(request.url);
     const host = deps.artifactHost;
@@ -2850,6 +3167,7 @@ export const createApp = (deps: Deps): App => {
       );
     }
     const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
+    if (version === "v2") return routeV2(request, url, env, collection, rawName, rest);
     if (version !== "v1") return error(404, "not found");
     const subresource = rest[0];
     // An artifact's files are addressed by a path of up to three segments, so the tail below the
@@ -2865,7 +3183,7 @@ export const createApp = (deps: Deps): App => {
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
     if (collection === "devices") return devices(request, env, caller, rawName);
-    if (collection === "board") return board(request, url, env, caller, rawName);
+    if (collection === "board") return board(request, url, env.DB, caller, rawName);
     if (collection === "sessions") return sessions(request, url, env, caller, rawName, subresource);
     if (collection === "messages") {
       if (rawName === "listen") {
@@ -2937,6 +3255,10 @@ export const createApp = (deps: Deps): App => {
         else session.messages.push(message);
       }
       for (const { stretch, messages } of sessions.values()) {
+        // A session on the record mark indexes itself inside the append that writes it, so the
+        // byte path leaves it alone. The two read the same prose, and a session on both marks
+        // would hold every chunk of it twice.
+        if (await onRecordMark(env.DB, stretch.userId, stretch.sessionId)) continue;
         const caughtUp = await indexSession(env, stretch.userId, stretch.sessionId).catch((failure: unknown) => {
           console.error(
             JSON.stringify({

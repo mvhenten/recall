@@ -17,6 +17,7 @@ import {
   type BoardTaker,
   MAX_PICKUP_BYTES,
 } from "./board";
+import type { OpenChunk } from "./chunks";
 import type { Caller } from "./device";
 import {
   DAY_MS,
@@ -2069,4 +2070,112 @@ export const listBoard = async (
   const last = entries.at(-1);
   const nextCursor = results.length > limit && last ? encodeCursor(last.message.createdAt, last.message.messageId) : "";
   return { entries, nextCursor };
+};
+
+// Where the record path has reached in one file of one session, which is the ordinal the next
+// record carries. It is the mark the endpoint weighs an append against; the objects are the
+// arbiter and are read only where the two disagree.
+export const recordReach = async (db: D1Database, userId: string, sessionId: string, file: string): Promise<number> => {
+  const row = await db
+    .prepare("SELECT next_ordinal FROM session_records WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
+    .bind(userId, sessionId, file)
+    .first<{ next_ordinal: number }>();
+  return row === null ? 0 : row.next_ordinal;
+};
+
+// Whether a session is on the record mark at all. A session with a row here indexes itself in the
+// request that appends to it, so the consumer the byte path's storage event wakes leaves it alone
+// rather than indexing the same prose a second time.
+export const onRecordMark = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+  const row = await db
+    .prepare("SELECT file FROM session_records WHERE user_id = ?1 AND session_id = ?2 LIMIT 1")
+    .bind(userId, sessionId)
+    .first<{ file: string }>();
+  return row !== null;
+};
+
+export const openChunks = async (
+  db: D1Database,
+  userId: string,
+  sessionId: string,
+  file: string,
+): Promise<OpenChunk[]> => {
+  const { results } = await db
+    .prepare("SELECT speaker, pieces, at FROM session_open_chunks WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
+    .bind(userId, sessionId, file)
+    .all<{ speaker: string; pieces: string; at: number }>();
+  return results.map((row) => {
+    const held: unknown = JSON.parse(row.pieces);
+    if (!Array.isArray(held) || held.some((piece) => typeof piece !== "string")) {
+      throw new Error(`the open chunk of ${file} in session ${sessionId} holds no pieces`);
+    }
+    if (row.speaker !== "user" && row.speaker !== "model") {
+      throw new Error(`the open chunk of ${file} in session ${sessionId} names the speaker ${row.speaker}`);
+    }
+    return { speaker: row.speaker, pieces: held as string[], at: row.at };
+  });
+};
+
+// How many chunks a session already holds, which is the ordinal the next one takes. The record
+// path shares the counter with the byte path, so a session that was indexed either way appends to
+// what is there rather than writing over it.
+export const chunkReach = async (db: D1Database, userId: string, sessionId: string): Promise<number> => {
+  const row = await db
+    .prepare("SELECT chunks FROM session_index WHERE user_id = ?1 AND session_id = ?2")
+    .bind(userId, sessionId)
+    .first<{ chunks: number }>();
+  return row === null ? 0 : row.chunks;
+};
+
+export interface RecordCommit {
+  userId: string;
+  sessionId: string;
+  file: string;
+  next: number;
+  from: number;
+  chunks: IndexedChunk[];
+  open: readonly OpenChunk[];
+}
+
+// Everything one record append leaves behind, written in one batch: the chunks it closed, the
+// chunk counter they take their ordinals from, how far the records of the file now reach, and the
+// chunk the batch ran out before closing. They land together because a mark ahead of its chunks
+// would have the next append open where this one's prose was never indexed.
+export const commitRecords = async (db: D1Database, commit: RecordCommit): Promise<void> => {
+  const { userId, sessionId, file, from, chunks, open, next } = commit;
+  await db.batch([
+    ...chunks.map((chunk, index) =>
+      db
+        .prepare(
+          `INSERT INTO session_chunks (user_id, session_id, ordinal, speaker, text, embedding, at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT (user_id, session_id, ordinal) DO NOTHING`,
+        )
+        .bind(userId, sessionId, from + index, chunk.speaker, chunk.text, chunk.embedding, chunk.at),
+    ),
+    db
+      .prepare(
+        `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, 0, 0, ?3)
+         ON CONFLICT (user_id, session_id) DO UPDATE SET chunks = MAX(session_index.chunks, excluded.chunks)`,
+      )
+      .bind(userId, sessionId, from + chunks.length),
+    db
+      .prepare(
+        `INSERT INTO session_records (user_id, session_id, file, next_ordinal) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (user_id, session_id, file)
+         DO UPDATE SET next_ordinal = MAX(session_records.next_ordinal, excluded.next_ordinal)`,
+      )
+      .bind(userId, sessionId, file, next),
+    db
+      .prepare("DELETE FROM session_open_chunks WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
+      .bind(userId, sessionId, file),
+    ...open.map((chunk) =>
+      db
+        .prepare(
+          `INSERT INTO session_open_chunks (user_id, session_id, file, speaker, pieces, at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+        )
+        .bind(userId, sessionId, file, chunk.speaker, JSON.stringify(chunk.pieces), chunk.at),
+    ),
+  ]);
 };
