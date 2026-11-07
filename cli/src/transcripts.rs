@@ -65,8 +65,8 @@ pub const MAIN: &str = "main";
 /// under the path that turn reads.
 pub const TOOL_RESULT: &str = "tool-results.";
 
-/// The largest stretch one call carries; mirrors MAX_STRETCH_BYTES in src/transcripts.ts. A
-/// transcript of any size goes up as a run of these rather than in one body.
+/// The largest stretch one call carries. A transcript of any size goes up as a run of these rather
+/// than in one body.
 pub const MAX_STRETCH: usize = 1_048_576;
 
 const NEWLINE: u8 = b'\n';
@@ -112,14 +112,17 @@ fn beside(transcript: &Path) -> Option<PathBuf> {
     Some(transcript.parent()?.join(stem))
 }
 
-/// The names the service takes open with a letter or a digit and hold at most 101 bytes of
-/// letters, digits and `. _ -`; mirrors TRANSCRIPT_FILE in src/model.ts. It is the name this host
-/// sends under that has to pass, not the stem it was built from.
+/// How long a name the service takes, and which characters beyond letters and digits it holds.
+pub(crate) const NAME_MAX_BYTES: usize = 101;
+pub(crate) const NAME_EXTRA_CHARS: &str = "._-";
+
+/// The names the service takes open with a letter or a digit. It is the name this host sends under
+/// that has to pass, not the stem it was built from.
 fn nameable(file: &str) -> bool {
     let mut bytes = file.bytes();
     bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && file.len() <= 101
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && file.len() <= NAME_MAX_BYTES
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || NAME_EXTRA_CHARS.as_bytes().contains(&byte))
 }
 
 /// What one file of a session is sent under, and nothing for a name this host cannot send: one the

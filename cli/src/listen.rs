@@ -170,10 +170,10 @@ pub fn log(outcome: &str, took: Duration) {
         .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
-/// The device id a message typed into the dashboard carries, mirroring DASHBOARD_DEVICE in
-/// src/app.ts, which is the original. Every real device id is a UUID the service minted, so no
-/// device can claim this one; a host's label can read as anything and is never tested here.
-const DASHBOARD_DEVICE: &str = "dashboard";
+/// The device id a message typed into the dashboard carries. Every real device id is a UUID the
+/// service minted, so no device can claim this one; a host's label can read as anything and is
+/// never tested here.
+pub(crate) const DASHBOARD_DEVICE: &str = "dashboard";
 
 /// The line a delivered message arrives under. A session reading one otherwise sees a bare user
 /// turn with nothing saying where it came from, and Claude Code's own cross-session tools reach

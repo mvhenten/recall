@@ -3,9 +3,6 @@
 // only two things are taken from it: the prompts the user typed and the prose the model answered
 // with. Delegated turns live in files of their own and are never read here.
 //
-// `typed` mirrors the reader of the same name in cli/src/adopt.rs, which is the original: a host
-// adopting a running session and this service reading the same transcript back must agree on what
-// a prompt is, or a session's focus line and its index would disagree about what it was about.
 // The dashboard runs this very module in the browser — npm-scripts/build-browser.mjs bundles it
 // into the session page's script — so what the page shows and what the index holds cannot drift.
 // Nothing here may reach for a stopword list, a database or a binding for that reason.
@@ -101,9 +98,8 @@ export const agentName = (head: string): string => {
   return "";
 };
 
-// The name a session's own transcript is held under; mirrors MAIN_FILE in transcripts.ts, which
-// this module cannot import without pulling the archive into the browser bundle. Every other name
-// is a file of delegated turns, which the harness writes one of per subagent.
+// The name a session's own transcript is held under. Every other name is a file of delegated
+// turns, which the harness writes one of per subagent.
 const OWN_FILE = "main";
 
 // Every turn in one stretch of one file of a transcript, in the order it was written. A line that

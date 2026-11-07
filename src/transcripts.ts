@@ -53,8 +53,8 @@ import {
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
 export const MAX_STRETCH_BYTES = 1_048_576;
 
-// The name a session's own transcript is held under; mirrors MAIN in cli/src/transcripts.rs. Every
-// other name is a delegated turn, which the index never reads.
+// The name a session's own transcript is held under. Every other name is a delegated turn, which
+// the index never reads.
 export const MAIN_FILE = "main";
 
 // How far into one file on disk the archive reaches, and whether every key behind that number
