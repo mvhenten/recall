@@ -1185,14 +1185,26 @@ export interface ChunkCandidate {
   embedding: Uint8Array;
 }
 
-// Every chunk this account holds, without its text. A search scores all of them: a vector is 388
-// bytes, so a few thousand chunks is under a megabyte and a few thousand dot products of 384
-// dimensions, which is the same shape the memory search has always had. The prose is read back
-// only for the chunks that win, since carrying it here would be ten times the bytes.
-export const chunkVectors = async (db: D1Database, userId: string): Promise<ChunkCandidate[]> => {
+// The chunks a search scores, without their text: the ones the full-text pass already named, and
+// the newest `recent` the account holds whatever the query was. A vector is 388 bytes, so the set
+// is tens of kilobytes and its cost stays flat as the archive grows, where reading every row made
+// a search cost more every week. `chunk_seq` only ever climbs, so the newest are the highest and
+// the floor is one scalar read. The prose is read back only for the chunks that win, since
+// carrying it here would be ten times the bytes.
+export const chunkVectors = async (
+  db: D1Database,
+  userId: string,
+  chunkSeqs: readonly number[],
+  recent: number,
+): Promise<ChunkCandidate[]> => {
   const rows = await db
-    .prepare("SELECT chunk_seq, session_id, speaker, embedding FROM session_chunks WHERE user_id = ?")
-    .bind(userId)
+    .prepare(
+      `SELECT chunk_seq, session_id, speaker, embedding FROM session_chunks
+       WHERE user_id = ?1 AND (chunk_seq IN (SELECT value FROM json_each(?2)) OR chunk_seq >= (
+         SELECT MIN(chunk_seq) FROM (
+           SELECT chunk_seq FROM session_chunks WHERE user_id = ?1 ORDER BY chunk_seq DESC LIMIT ?3)))`,
+    )
+    .bind(userId, JSON.stringify(chunkSeqs), recent)
     .raw<[number, string, string, unknown]>();
   return rows.map(([chunkSeq, sessionId, speaker, embedding]) => ({
     chunkSeq,
@@ -1576,11 +1588,6 @@ export interface ShareInput {
   expiresAt: number;
 }
 
-// One placeholder per name, numbered from `from`. A listing page holds at most a hundred rows, so
-// the read is bounded by the page rather than by the account.
-const placeholders = (count: number, from: number): string =>
-  Array.from({ length: count }, (_one, index) => `?${from + index}`).join(", ");
-
 // The two reads that resolve a credential, and the only two that do not filter on the expiry: a
 // read of a share's own address is what finds it dead and deletes it, so the row has to come back
 // before the window is compared. Both are one read by a unique key, which is what keeps a guess at
@@ -1621,6 +1628,8 @@ export const artifactShares = async (
 };
 
 // The live shares of the artifacts on one page of a listing, grouped rather than read per row.
+// The names go in as one JSON parameter: SQLite binds at most a hundred per statement, and a page
+// of a hundred rows plus the account and the clock is two over.
 export const sharesFor = async (
   db: D1Database,
   userId: string,
@@ -1632,10 +1641,10 @@ export const sharesFor = async (
   const { results } = await db
     .prepare(
       `SELECT ${SHARE_COLUMNS}
-       WHERE user_id = ?1 AND expires_at > ?2 AND name IN (${placeholders(names.length, 3)})
+       WHERE user_id = ?1 AND expires_at > ?2 AND name IN (SELECT value FROM json_each(?3))
        ORDER BY name, mode DESC, created_at`,
     )
-    .bind(userId, now, ...names)
+    .bind(userId, now, JSON.stringify(names))
     .all<ShareRow>();
   for (const row of results) {
     const share = toShare(row);
@@ -1658,10 +1667,10 @@ export const shareCountsFor = async (
   const { results } = await db
     .prepare(
       `SELECT name, COUNT(*) AS n FROM artifact_shares
-       WHERE user_id = ?1 AND expires_at > ?2 AND name IN (${placeholders(names.length, 3)})
+       WHERE user_id = ?1 AND expires_at > ?2 AND name IN (SELECT value FROM json_each(?3))
        GROUP BY name`,
     )
-    .bind(userId, now, ...names)
+    .bind(userId, now, JSON.stringify(names))
     .all<{ name: string; n: number }>();
   return new Map(results.map((row) => [row.name, row.n]));
 };
