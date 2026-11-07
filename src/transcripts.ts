@@ -252,11 +252,19 @@ export interface Archived {
 // reads come off the runs rather than the objects, so a stretch overlapping the one in front of it
 // hands over only the bytes the file has not already had.
 //
-// Gzip members laid end to end are one gzip stream, so a file every stretch of which is stored
-// gzipped is handed over as it stands and inflated by the reader — no byte of it is touched here,
-// and a third of them go over the wire. A file holding one stretch stored as it stands is not that
-// stream, so it is inflated here instead and goes over as the bytes of the file: the answer is
-// encoded one way throughout, and a caller that does not take gzip is answered that way too.
+// A run boundary is a hole: the bytes between the two runs are in no object, and the line the file
+// ran on with across them is in no object either. So a newline is handed over at every boundary,
+// which leaves the tail of the run in front and the head of the one behind as two part lines rather
+// than one line the file never held. A part line fails to parse and a reader can pass it over; a
+// line made of two unrelated fragments parses, and nothing downstream can tell it from a real one.
+// A file of one run — which is every file the archive accounts for whole — is handed over untouched.
+//
+// Gzip members laid end to end are one gzip stream, so a file of one run every stretch of which is
+// stored gzipped is handed over as it stands and inflated by the reader — no byte of it is touched
+// here, and a third of them go over the wire. A file holding one stretch stored as it stands is not
+// that stream, and neither is one a newline has to go into, so those are inflated here instead and
+// go over as the bytes of the file: the answer is encoded one way throughout, and a caller that does
+// not take gzip is answered that way too.
 export const readTranscript = async (
   bucket: R2Bucket,
   userId: string,
@@ -266,22 +274,27 @@ export const readTranscript = async (
 ): Promise<Archived | null> => {
   const parts = await stretches(bucket, userId, sessionId, file);
   const byName = new Map(parts.map((part) => [part.name, part]));
-  const reads = runsOf(parts).flatMap((run) => run.reads);
+  const runs = runsOf(parts);
+  const reads = runs.flatMap((run, index) =>
+    run.reads.map((read, taken) => ({ read, seam: index > 0 && taken === 0 })),
+  );
   if (reads.length === 0) return null;
-  const gzip = takesGzip && reads.every((read) => byName.get(read.at)?.form === "packed");
+  const gzip = takesGzip && runs.length === 1 && reads.every(({ read }) => byName.get(read.at)?.form === "packed");
   let next = 0;
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
-      const read = reads[next];
-      if (read === undefined) {
+      const handed = reads[next];
+      if (handed === undefined) {
         controller.close();
         return;
       }
       next += 1;
-      const part = byName.get(read.at);
-      if (part === undefined) throw new Error(`the archive lost ${read.at} of ${file}`);
+      const part = byName.get(handed.read.at);
+      if (part === undefined) throw new Error(`the archive lost ${handed.read.at} of ${file}`);
+      if (handed.seam) controller.enqueue(new Uint8Array([10]));
       if (!gzip) {
-        controller.enqueue(await stretchBytes(bucket, userId, sessionId, file, part, read.skip, read.bytes));
+        const { skip, bytes } = handed.read;
+        controller.enqueue(await stretchBytes(bucket, userId, sessionId, file, part, skip, bytes));
         return;
       }
       const object = await bucket.get(keyOf(userId, sessionId, file, part.name));

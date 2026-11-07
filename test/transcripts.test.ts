@@ -49,6 +49,17 @@ const turns = (count: number, tag: string): string =>
     }),
   ).join("\n")}\n`;
 
+// Whether one line of a transcript is a record at all, which is the whole of what a reader has to
+// tell a line the archive holds from a line two fragments either side of a hole were joined into.
+const parses = (line: string): boolean => {
+  try {
+    JSON.parse(line);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const rollup = async (userId: string): Promise<Array<Record<string, unknown>>> => {
   const { results } = await env.DB.prepare(
     "SELECT day, model, prompts, input_tokens FROM usage_daily WHERE user_id = ? ORDER BY day, model",
@@ -606,6 +617,49 @@ describe("transcript archive", () => {
 
     const read = { at: compressedStretchName(9_000, 20_000, bytes(second)), offset: at, skip: 0, bytes: bytes(second) };
     expect(runs).toEqual([{ from: at, to: at + bytes(second), reads: [read] }]);
+  });
+
+  // A stretch that never landed leaves the tail of one stretch and the head of a later one either
+  // side of a hole. Laid straight against each other they make a line the session never wrote, and
+  // a restore writes that line to disk with nothing about it to tell it from a real entry. A
+  // newline at the boundary leaves two part lines instead, which fail to parse and can be passed
+  // over.
+  it("breaks the line across a hole rather than joining one the session never wrote", async () => {
+    const h = await harness();
+    const userId = `holed-${crypto.randomUUID()}`;
+    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
+    await client.sync("s-holed");
+    const head = '{"type":"user","text":"one"}\n{"type":"user","te';
+    const tail = 'xt":"three"}\n';
+    const from = bytes(head) + 64;
+    const prefix = `${userId}/s-holed/main/`;
+    await env.TRANSCRIPTS.put(`${prefix}${stretchName(0, bytes(head))}`, head);
+    await env.TRANSCRIPTS.put(`${prefix}${stretchName(from, from + bytes(tail))}`, tail);
+
+    const read = await (await client.readTranscript("s-holed", "main")).text();
+
+    expect(read).not.toContain('{"type":"user","text":"three"}');
+    expect(read.split("\n").filter((line) => line !== "" && !parses(line))).toEqual([
+      '{"type":"user","te',
+      'xt":"three"}',
+    ]);
+  });
+
+  // What the newline above rests on. A file the archive accounts for whole is one run however many
+  // stretches it was written as, so nothing is handed over that was not written — the lines below
+  // straddle every boundary, which is where a newline that does not belong would show.
+  it("hands a contiguous file back byte for byte as it was written", async () => {
+    const h = await harness();
+    const client = await h.user("restorer");
+    await client.sync("s-whole");
+    const written = ['{"type":"user","text":"one"}\n{"ty', 'pe":"user","text":"two"}\n{"type":"u', 'ser"}\n'];
+    let from = 0;
+    for (const stretch of written) {
+      expect((await client.archive("s-whole", "main", from, stretch)).status).toBe(200);
+      from += bytes(stretch);
+    }
+
+    expect(await (await client.readTranscript("s-whole", "main")).text()).toBe(written.join(""));
   });
 
   it("keeps a session's files once its row has moved to the history", async () => {
