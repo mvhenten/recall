@@ -4,7 +4,7 @@ import { MAX_STRETCH_BYTES } from "./transcripts";
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
 export const modes = ["hybrid", "vector", "text"] as const;
 
-// The tag a memory carries when it belongs to no repository. cli/src/repo.rs names the same string.
+// The tag a memory carries when it belongs to no repository.
 export const GLOBAL_TAG = "global";
 
 export type MemoryType = (typeof memoryTypes)[number];
@@ -76,8 +76,8 @@ export const sessionModes = ["interactive", "headless", ""] as const;
 export type SessionMode = (typeof sessionModes)[number];
 
 export const SESSION_TTL_MS = 86_400_000;
-// The five minutes of IDLE_AFTER in cli/src/sessions.rs, which is the original: both sides derive
-// busy and idle on read and must agree on where the line falls.
+// How long after its last prompt a session still reads as busy. Both sides derive busy and idle on
+// read, never storing either.
 export const IDLE_AFTER_MS = 300_000;
 export const MAX_FOCUS_CHARS = 200;
 export const MAX_SESSION_TEXT_CHARS = 500;
@@ -538,7 +538,7 @@ const isText = (value: unknown, max: number): value is string => typeof value ==
 export const parseSessionId = (value: string): Parsed<string> =>
   SESSION_ID.test(value) ? { ok: true, value } : fail("the session id may hold 1 to 100 letters, digits, - and _");
 
-const TRANSCRIPT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
+export const TRANSCRIPT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
 
 // A session delegates plenty of turns, and each writes a file; far past this the delta is not one
 // this service wrote the rules for.

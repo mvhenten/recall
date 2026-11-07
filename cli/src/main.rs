@@ -8,6 +8,8 @@ mod mcp;
 mod redact;
 mod repo;
 mod restore;
+#[cfg(test)]
+mod schema;
 mod seen;
 mod sessions;
 mod settings;

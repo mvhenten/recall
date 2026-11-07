@@ -1,0 +1,25 @@
+{
+  "envelopes": [
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<system-reminder>",
+    "<task-notification>"
+  ],
+  "humanOrigin": "human",
+  "promptMarks": ["isMeta", "isVisibleInTranscriptOnly", "isCompactSummary"],
+  "sidechainMark": "isSidechain",
+  "mainFile": "main",
+  "transcriptFile": {
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$",
+    "maxBytes": 101,
+    "extraChars": "._-"
+  },
+  "maxStretchBytes": 1048576,
+  "headBytes": 8192,
+  "idleAfterMs": 300000,
+  "globalTag": "global",
+  "dashboardDevice": "dashboard"
+}

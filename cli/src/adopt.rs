@@ -36,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const FOCUS_PART_CHARS: usize = 72;
 const CLAUDE: &str = "claude";
 pub const TRANSCRIPT: &str = "jsonl";
-const HEAD: usize = 8192;
+pub(crate) const HEAD: usize = 8192;
 const ADOPTED: &str = "adopted";
 
 /// How long after a session starts its transcript may be opened. Claude Code opens one seconds in,
@@ -47,7 +47,7 @@ const OPENED_WITHIN: std::time::Duration = std::time::Duration::from_secs(300);
 /// The tagged envelopes Claude Code writes as a user turn. A transcript old enough to carry no
 /// origin on its entries is read off these instead; a prompt that merely opens with a tag of its
 /// own, a question about `<div>` for one, still counts.
-const ENVELOPES: [&str; 7] = [
+pub(crate) const ENVELOPES: [&str; 7] = [
     "<command-name>",
     "<command-message>",
     "<local-command-stdout>",
@@ -56,6 +56,16 @@ const ENVELOPES: [&str; 7] = [
     "<system-reminder>",
     "<task-notification>",
 ];
+
+/// What `origin.kind` reads for a prompt the user submitted; every other kind names the machinery
+/// that wrote the entry.
+pub(crate) const HUMAN_ORIGIN: &str = "human";
+
+/// The marks that say a user turn is not a prompt, for a transcript old enough to carry no origin.
+pub(crate) const PROMPT_MARKS: [&str; 3] = ["isMeta", "isVisibleInTranscriptOnly", "isCompactSummary"];
+
+/// The mark every entry of a delegated turn carries.
+pub(crate) const SIDECHAIN_MARK: &str = "isSidechain";
 
 /// Where one pass looks: the procfs that names the running processes, the directory Claude Code
 /// writes transcripts under, the registry the hooks write, and the host name a record carries.
@@ -409,7 +419,10 @@ fn typed(entry: &Value) -> Option<String> {
     if !entry["toolUseResult"].is_null() || !entry["interruptedMessageId"].is_null() {
         return None;
     }
-    for mark in ["isMeta", "isSidechain", "isVisibleInTranscriptOnly", "isCompactSummary"] {
+    if entry[SIDECHAIN_MARK] == true {
+        return None;
+    }
+    for mark in PROMPT_MARKS {
         if entry[mark] == true {
             return None;
         }
@@ -419,7 +432,7 @@ fn typed(entry: &Value) -> Option<String> {
         return None;
     }
     match entry["origin"]["kind"].as_str() {
-        Some("human") => Some(text),
+        Some(HUMAN_ORIGIN) => Some(text),
         Some(_) => None,
         None if ENVELOPES.iter().any(|envelope| text.starts_with(envelope)) => None,
         None => Some(text),

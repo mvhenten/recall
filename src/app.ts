@@ -370,7 +370,7 @@ const ELSEWHERE_LIMIT = 3;
 // so it says so rather than borrowing one: its host and its device id both read `dashboard`, and
 // the name it carries is the Access email that signed in. Device ids are UUIDs, so no device of
 // the account can be mistaken for the sender of something it did not send.
-const DASHBOARD_DEVICE = "dashboard";
+export const DASHBOARD_DEVICE = "dashboard";
 
 // How many board messages one page of the listing holds, for the dashboard and `recall board`
 // alike. The window is a week, so a board a fleet actually works from fits in one or two.
@@ -386,8 +386,8 @@ const INDEX_BYTES_PER_PASS = 1_048_576;
 const EMBED_BATCH = 96;
 
 // How much of a transcript's head is read for the name the harness gave the session. The harness
-// writes it among the first entries; mirrors HEAD in cli/src/adopt.rs.
-const HEAD_BYTES = 8_192;
+// writes it among the first entries.
+export const HEAD_BYTES = 8_192;
 
 // How many chunks the full-text pass returns. The vector pass scores every chunk the account
 // holds, so this bounds only the half that cannot be ranked by score.
