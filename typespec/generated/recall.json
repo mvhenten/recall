@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "recall.json",
+  "$defs": {
+    "AppendRecords": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "AppendRecords.json",
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "from": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "TranscriptLine.json"
+          },
+          "maxItems": 1000
+        }
+      },
+      "required": ["file", "from", "records"]
+    },
+    "TranscriptLine": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "TranscriptLine.json",
+      "type": "string",
+      "minLength": 1
+    },
+    "RecordsAccepted": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RecordsAccepted.json",
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "next": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        }
+      },
+      "required": ["file", "next"]
+    }
+  }
+}

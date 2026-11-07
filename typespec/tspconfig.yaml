@@ -1,0 +1,17 @@
+emit:
+  - "@typespec/openapi3"
+  - "@kattebak/typespec-zod-emitter"
+  - "@typespec/json-schema"
+options:
+  "@typespec/openapi3":
+    file-type: json
+    output-file: openapi.json
+    emitter-output-dir: "{project-root}/generated"
+  "@kattebak/typespec-zod-emitter":
+    output-file: schemas.ts
+    emit-middleware: false
+    emitter-output-dir: "{project-root}/generated"
+  "@typespec/json-schema":
+    file-type: json
+    bundleId: recall.json
+    emitter-output-dir: "{project-root}/generated"

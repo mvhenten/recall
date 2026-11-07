@@ -1,0 +1,54 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "recall",
+    "version": "0.0.0"
+  },
+  "tags": [],
+  "paths": {},
+  "components": {
+    "schemas": {
+      "AppendRecords": {
+        "type": "object",
+        "required": ["file", "from", "records"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "from": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscriptLine"
+            },
+            "maxItems": 1000
+          }
+        }
+      },
+      "RecordsAccepted": {
+        "type": "object",
+        "required": ["file", "next"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "next": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "TranscriptLine": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
