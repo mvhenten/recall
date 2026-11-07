@@ -1,4 +1,5 @@
-import { isStretchName, MAX_STRETCH_BYTES } from "./transcripts";
+import { isStretchName } from "./transcript-plan";
+import { MAX_STRETCH_BYTES } from "./transcripts";
 
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
 export const modes = ["hybrid", "vector", "text"] as const;
@@ -580,7 +581,7 @@ export const parseStretchOffset = (value: string | null): Parsed<number> => {
 export const parseStretchName = (value: string | null): Parsed<string> =>
   value !== null && isStretchName(value)
     ? { ok: true, value }
-    : fail("at must name a stretch, as <start> or <start>.<end> in sixteen digits each");
+    : fail("at must name a stretch, as <start>, <start>.<end> or <start>.<end>.<inflates> in sixteen digits each");
 
 // Which stretch a box following a file has read to the end of, and nothing when it has read nothing
 // of it. It is what bounds the listing a beat pays for: a stretch keyed by both its ends sits where
@@ -589,13 +590,15 @@ export const parseStretchName = (value: string | null): Parsed<string> =>
 export const parseStretchCursor = (value: string | null): Parsed<string> =>
   value === null || value === "" || isStretchName(value)
     ? { ok: true, value: value ?? "" }
-    : fail("after must name a stretch, as <start> or <start>.<end> in sixteen digits each");
+    : fail("after must name a stretch, as <start>, <start>.<end> or <start>.<end>.<inflates> in sixteen digits each");
 
-// Which stretch of a file an append is offering: where it begins in the file on disk, and where it
-// ends there. A host that names only `offset` is one from before a redacted stretch could run to
-// another length than the file it was read from, and means a place in the archive by it; its
-// stretches are stored and read back on those terms.
-export type StretchSpan = { kind: "source"; from: number; through: number } | { kind: "archive"; from: number };
+// Which stretch of a file an append is offering: where it begins in the file on disk and where it
+// ends there. Whether the body is one gzip member or the bytes of the file is the body's own to say
+// and never a caller's: a name claiming a length the body does not hold would place every stretch
+// past it in the wrong part of the archive. A host that names only `offset` is one from before a
+// redacted stretch could run to another length than the file it was read from, and means a place in
+// the archive by it; its stretches are stored and read back on those terms.
+export type StretchSpan = { kind: "span"; from: number; through: number } | { kind: "archive"; from: number };
 
 export const parseStretchSpan = (params: URLSearchParams): Parsed<StretchSpan> => {
   const offset = parseStretchOffset(params.get("offset"));
@@ -603,9 +606,10 @@ export const parseStretchSpan = (params: URLSearchParams): Parsed<StretchSpan> =
   const asked = params.get("through");
   if (asked === null) return { ok: true, value: { kind: "archive", from: offset.value } };
   const through = Number(asked);
-  return isInteger(through, offset.value + 1, offset.value + MAX_STRETCH_BYTES)
-    ? { ok: true, value: { kind: "source", from: offset.value, through } }
-    : fail(`through must be past offset, by at most ${MAX_STRETCH_BYTES} bytes`);
+  if (!isInteger(through, offset.value + 1, offset.value + MAX_STRETCH_BYTES)) {
+    return fail(`through must be past offset, by at most ${MAX_STRETCH_BYTES} bytes`);
+  }
+  return { ok: true, value: { kind: "span", from: offset.value, through } };
 };
 
 const BYTE_RANGE = /^bytes=([0-9]{1,16})-([0-9]{1,16})$/;

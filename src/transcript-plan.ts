@@ -13,7 +13,69 @@
 // batch is the remnant the next batch completes.
 //
 // Nothing here touches a document or a network, so the whole of the arithmetic a wrong window
-// hides in is read and exercised on its own.
+// hides in is read and exercised on its own. The name a stretch is stored under lives here too:
+// the manifest is a list of them, and the browser and the archive have to read one the same way.
+
+const OFFSET_DIGITS = 16;
+
+const padded = (place: number): string => String(place).padStart(OFFSET_DIGITS, "0");
+
+const STRETCH_NAME = new RegExp(
+  `^([0-9]{${OFFSET_DIGITS}})(?:\\.([0-9]{${OFFSET_DIGITS}})(?:\\.([0-9]{${OFFSET_DIGITS}}))?)?$`,
+);
+
+// What a stretch is stored under, past the file's prefix: where it begins in the file and where it
+// ends there.
+export const stretchName = (from: number, through: number): string => `${padded(from)}.${padded(through)}`;
+
+// What a stretch stored gzipped is stored under: the span of the file it accounts for, and how many
+// bytes the object inflates to. Nothing reads that length off a gzip member without inflating it,
+// and where a stretch sits in the archive is the lengths of the stretches in front of it, so a
+// reader that had to find it out would open every object of the file to place the last one. A
+// listing names every stretch for free, so the name carries it and the placing stays one listing.
+export const compressedStretchName = (from: number, through: number, inflates: number): string =>
+  `${stretchName(from, through)}.${padded(inflates)}`;
+
+// What a host from before redaction stores a stretch under: the one place it reached in the file
+// and in the archive alike.
+export const legacyStretchName = (place: number): string => padded(place);
+
+// Which of the three forms one stretch's name is in, and nothing at all where the name is not one
+// the archive wrote. A `place` is what a host from before redaction stored a stretch under: one
+// number meaning a place in the file and in the archive at once, with the stretch running to the
+// object's own size in both. A `span` names where in the file the stretch begins and ends over an
+// object holding those bytes as they stand. A `packed` names the same span over one gzip member,
+// and says how many bytes it inflates to as well.
+export type NamedStretch =
+  | { form: "place"; from: number }
+  | { form: "span"; from: number; through: number }
+  | { form: "packed"; from: number; through: number; inflates: number };
+
+export const namedStretch = (name: string): NamedStretch | null => {
+  const found = STRETCH_NAME.exec(name);
+  const opens = found?.[1];
+  if (opens === undefined) return null;
+  const from = Number(opens);
+  const ends = found?.[2];
+  if (ends === undefined) return { form: "place", from };
+  const through = Number(ends);
+  const inflates = found?.[3];
+  if (inflates === undefined) return { form: "span", from, through };
+  return { form: "packed", from, through, inflates: Number(inflates) };
+};
+
+// Whether one name is a stretch's, which is what says a key is one the archive wrote.
+export const isStretchName = (name: string): boolean => namedStretch(name) !== null;
+
+export type PackedStretch = Extract<NamedStretch, { form: "packed" }>;
+
+// One name read as a stretch stored gzipped, and nothing at all for either of the other two forms.
+// It is the whole of how a reader tells them apart: a gzip member has no inner range, so it is read
+// whole and inflated where a stretch stored as it stands is ranged inside.
+export const packedStretch = (name: string): PackedStretch | null => {
+  const named = namedStretch(name);
+  return named !== null && named.form === "packed" ? named : null;
+};
 
 // One ranged read of one stretch: which object to open, where that object's first byte falls in
 // the archive, how much of its head to pass over, and how many bytes to take. `at` names the
@@ -21,6 +83,7 @@
 // before a redacted stretch could run to another length than the file it was read from. `skip` is
 // zero for every stretch an archive wrote in order; it is other than zero only where a stretch
 // overlaps the one before it, and then it is what keeps the bytes they share out of the file twice.
+// A read of a compressed stretch is the whole of it: those overlap nothing and are never split.
 export interface Read {
   at: string;
   offset: number;
@@ -40,10 +103,10 @@ export interface Run {
 }
 
 // How many ranged reads a page is willing to name. The manifest is written into every view of the
-// page, at some eighty-five bytes a read — a read names the stretch it opens, and a name is
-// thirty-three characters — and a session archived in small stretches holds tens of thousands of
-// them; past this the oldest are left off, rather than shipping a megabyte of manifest to read a
-// transcript nobody scrolls that far back through.
+// page, at some hundred bytes a read — a read names the stretch it opens, and a name runs to fifty
+// characters — and a session archived in small stretches holds tens of thousands of them; past this
+// the oldest are left off, rather than shipping a megabyte of manifest to read a transcript nobody
+// scrolls that far back through.
 export const MAX_PLANNED_READS = 500;
 
 export interface Listing {
@@ -144,6 +207,11 @@ export interface PlannedBatch {
 // The next batch to fetch and where the walk stands once every read of it has landed. The caller's
 // own cursor is left alone: a batch that fails part way through leaves the reader exactly where it
 // was, and asks for the same bytes again.
+//
+// A compressed stretch is taken whole however little budget is left: it is one gzip member, so
+// there is no part of it to ask for, and splitting one would fetch and inflate the same object once
+// per piece. The budget is spent past rather than inside it, which costs the walk one stretch of
+// overshoot and saves it every read but the first.
 export const plannedBatch = (reads: PlannedRead[], edge: number, pending: number, step: number): PlannedBatch => {
   const batch: PlannedRead[] = [];
   let budget = step;
@@ -152,7 +220,7 @@ export const plannedBatch = (reads: PlannedRead[], edge: number, pending: number
   while (budget > 0 && left > 0) {
     const read = reads[at - 1];
     if (read === undefined) break;
-    const take = Math.min(left, budget);
+    const take = packedStretch(read.at) === null ? Math.min(left, budget) : left;
     batch.unshift({ run: read.run, at: read.at, offset: read.offset, skip: read.skip + left - take, bytes: take });
     budget -= take;
     left -= take;

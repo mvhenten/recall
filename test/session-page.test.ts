@@ -2,9 +2,8 @@ import { describe, expect, it } from "vitest";
 import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Message, type NewsFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
 import { SESSION_TTL_MS } from "../src/model";
-import { followedBatch, type Plan, type Reach, type Read } from "../src/transcript-plan";
-import { stretchName } from "../src/transcripts";
-import { type Client, harness } from "./harness";
+import { followedBatch, type Plan, type Reach, type Read, stretchName } from "../src/transcript-plan";
+import { type Client, harness, inflated } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -112,6 +111,13 @@ const bytesOf = (h: Harness, plan: Plan, read: Read, assertion: string, span?: s
       "cf-access-jwt-assertion": assertion,
       range: span ?? `bytes=${read.skip}-${read.skip + read.bytes - 1}`,
     },
+  });
+
+// One stretch stored gzipped, fetched the way the browser fetches it: no range, since a gzip member
+// has no part to ask for, and gzip taken, since every browser takes it.
+const wholeOf = (h: Harness, plan: Plan, read: Read, assertion: string): Promise<Response> =>
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.at}`, {
+    headers: { "cf-access-jwt-assertion": assertion, "accept-encoding": "gzip" },
   });
 
 // The whole of a file, reassembled out of the manifest alone, with a marker where the manifest
@@ -335,6 +341,31 @@ describe("the transcript bytes", () => {
     expect(response.status).toBe(206);
     expect(response.headers.get("content-range")).toBe(`bytes 10-29/${body.length}`);
     expect(await response.text()).toBe(body.slice(10, 30));
+  });
+
+  // A stretch stored gzipped is handed over as it stands: the browser inflates it, so no byte of
+  // the archive is touched here and under a third of them go over the wire. There is no part of a
+  // gzip member to ask for, so the manifest names the whole of one as one read however small the
+  // step the page walks in, and a range of one is refused rather than answered bytes of the member.
+  it("hands a compressed stretch over whole and gzipped, and refuses a range of one", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const body = transcriptOf(60);
+    const now = h.now();
+    expect((await you.laptop.sync("beef0003", { startedAt: now - 600_000, lastActivityAt: now })).status).toBe(204);
+    expect((await you.laptop.archiveGzip("beef0003", "main", 0, 90_000, body)).status).toBe(200);
+    const plan = planOf(await read(h, "/dashboard/sessions/beef0003", you.assertion));
+    const read0 = plan.runs[0]?.reads[0];
+    if (read0 === undefined) throw new Error("the manifest names no stretch");
+
+    expect(plan.step).toBeLessThan(read0.bytes);
+    expect([read0.skip, read0.bytes]).toEqual([0, body.length]);
+    const whole = await wholeOf(h, plan, read0, you.assertion);
+    expect(whole.status).toBe(200);
+    expect(whole.headers.get("content-encoding")).toBe("gzip");
+    expect(await inflated(whole)).toBe(body);
+
+    expect((await bytesOf(h, plan, read0, you.assertion)).status).toBe(416);
   });
 
   // A dead scrollbox is the one answer the reader cannot tell from a session that said nothing,

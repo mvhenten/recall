@@ -1102,6 +1102,15 @@ impl Client {
     /// accounts for and only where nothing is yet, so one already there — a retry, or another
     /// writer that reached the same place first — is refused with how far the archive now reaches.
     /// That is the same answer: it is where the next stretch begins.
+    ///
+    /// The body is one gzip member, and how many bytes of the file it holds is the service's to
+    /// take: it inflates the member once on a path that already pays for a listing, so nothing
+    /// stores a stretch under a name claiming part of what it holds.
+    ///
+    /// The cap is on the body offered and the source is cut before the compression runs, so the two
+    /// are different numbers and nothing relates them. A member past the cap goes up as the bytes it
+    /// was read from, which the archive stores as it stands: there is nothing to shrink, and a
+    /// stretch no later pass could get past is the one answer this must never leave behind.
     pub fn append_transcript(
         &self,
         session_id: &str,
@@ -1110,15 +1119,21 @@ impl Client {
         through: i64,
         bytes: &[u8],
     ) -> Result<Appended> {
+        let member = crate::transcripts::packed(bytes)?;
+        let (body, content_type) = if member.len() > crate::transcripts::MAX_STRETCH {
+            (bytes, "application/x-ndjson")
+        } else {
+            (&member[..], "application/gzip")
+        };
         let path = format!(
             "{}/transcript?file={}&offset={from}&through={through}",
             Self::session_path(session_id),
-            encode(file)
+            encode(file),
         );
         let mut response = self
             .authed(self.agent.put(self.url(&path)))
-            .header("content-type", "application/x-ndjson")
-            .send(bytes)?;
+            .header("content-type", content_type)
+            .send(body)?;
         if response.status().as_u16() == 409 {
             let extent: Extent = response.body_mut().read_json()?;
             return Ok(Appended::Refused(crate::transcripts::Reach {
