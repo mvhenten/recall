@@ -612,6 +612,11 @@ export const harness = async ({
       await app.consume(env, delivered);
     },
     retried: () => retried,
+    // The clock every handler reads, moved on. A device grant refuses a poll that comes back
+    // inside its own interval, so a test driving one has to let the interval pass.
+    advance: (ms: number): void => {
+      clock += ms;
+    },
     userIdFor: async (email: string): Promise<string> => {
       const row = await env.DB.prepare("SELECT user_id FROM principals WHERE email = ?")
         .bind(email)

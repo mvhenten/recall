@@ -38,7 +38,7 @@ describe("the /v2 surface", () => {
   });
 
   it("signs a device in over the same RFC 8628 shape /v1 serves", async () => {
-    const { send } = await harness();
+    const { send, invite, decide, assertionFor, advance, clientWithToken } = await harness();
     const started = await send("/v2/device/code", {
       method: "POST",
       headers: { "content-type": "application/json", "cf-connecting-ip": crypto.randomUUID() },
@@ -55,6 +55,11 @@ describe("the /v2 surface", () => {
       "verification_uri_complete",
     ]);
 
+    const email = await invite(`granted-${crypto.randomUUID()}@example.com`);
+    const approved = await decide(String(granted.user_code), "approve", await assertionFor(email));
+    expect(approved.status).toBe(200);
+    advance(Number(granted.interval) * 1000);
+
     const polled = await send("/v2/device/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -63,8 +68,10 @@ describe("the /v2 surface", () => {
         device_code: String(granted.device_code),
       }),
     });
-    expect(polled.status).toBe(400);
-    expect(await polled.json()).toMatchObject({ error: "authorization_pending" });
+    expect(polled.status).toBe(200);
+    const token: { access_token: string; token_type: string } = await polled.json();
+    expect(token.token_type).toBe("Bearer");
+    expect((await clientWithToken(token.access_token).request("GET", "/v2/devices")).status).toBe(200);
   });
 
   it("names a session's mode and dates it with an offset", async () => {
