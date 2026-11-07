@@ -1,0 +1,78 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "recall",
+    "version": "0.0.0"
+  },
+  "tags": [],
+  "paths": {},
+  "components": {
+    "schemas": {
+      "AppendRecords": {
+        "type": "object",
+        "required": ["file", "from", "records"],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "from": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscriptRecord"
+            }
+          }
+        }
+      },
+      "FileReach": {
+        "type": "object",
+        "required": ["file", "bytes"],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "RecordsAccepted": {
+        "type": "object",
+        "required": ["file", "next"],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "next": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "Speaker": {
+        "type": "string",
+        "enum": ["User", "Model", "Machinery"]
+      },
+      "TranscriptRecord": {
+        "type": "object",
+        "required": ["ordinal", "recordId", "line"],
+        "properties": {
+          "ordinal": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "recordId": {
+            "type": "string"
+          },
+          "line": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

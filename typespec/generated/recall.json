@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "recall.json",
+  "$defs": {
+    "TranscriptRecord": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "TranscriptRecord.json",
+      "type": "object",
+      "properties": {
+        "ordinal": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "recordId": {
+          "type": "string"
+        },
+        "line": {
+          "type": "string"
+        }
+      },
+      "required": ["ordinal", "recordId", "line"]
+    },
+    "AppendRecords": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "AppendRecords.json",
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "from": {
+          "type": "integer"
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "TranscriptRecord.json"
+          }
+        }
+      },
+      "required": ["file", "from", "records"]
+    },
+    "RecordsAccepted": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RecordsAccepted.json",
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "next": {
+          "type": "integer"
+        }
+      },
+      "required": ["file", "next"]
+    },
+    "FileReach": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "FileReach.json",
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer"
+        }
+      },
+      "required": ["file", "bytes"]
+    },
+    "Speaker": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "Speaker.json",
+      "type": "string",
+      "enum": ["User", "Model", "Machinery"]
+    }
+  }
+}
