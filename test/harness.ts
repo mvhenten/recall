@@ -95,6 +95,13 @@ export interface V2Client {
   /// The session over, which is where the chunk its last turns were still filling closes.
   end(sessionId: string): Promise<Response>;
   searchHistory(query: string, limit?: number): Promise<Response>;
+  saveMemory(name: string, fields?: Record<string, unknown>): Promise<Response>;
+  memory(name: string): Promise<Response>;
+  /// The read that counts as one, which is a write and so a POST of its own.
+  recallMemory(name: string): Promise<Response>;
+  deleteMemory(name: string): Promise<Response>;
+  memories(query?: string): Promise<Response>;
+  searchMemories(fields?: Record<string, unknown>): Promise<Response>;
 }
 
 export interface Client {
@@ -206,6 +213,23 @@ const V2_USAGE_DELTA: Record<string, unknown> = {
   at: new Date(1_700_000_060_000).toISOString(),
   durable: false,
   files: [],
+};
+
+// The same memory `Client.save` writes through `/v1`, in the vocabulary `/v2` takes: a type that
+// names itself and no name in the body, since the path already carries it.
+const V2_MEMORY_DOCUMENT = (name: string): Record<string, unknown> => ({
+  description: `about ${name}`,
+  type: "Project",
+  body: `notes on ${name}`,
+  tags: [],
+});
+
+const V2_SEARCH_DOCUMENT: Record<string, unknown> = {
+  query: "notes",
+  tags: [],
+  limit: 10,
+  minScore: 0.1,
+  mode: "Hybrid",
 };
 
 export interface HarnessOptions {
@@ -435,6 +459,24 @@ export const harness = async ({
       },
       searchHistory(query, limit = 10) {
         return this.request("GET", `/v2/history?q=${encodeURIComponent(query)}&limit=${limit}`);
+      },
+      saveMemory(name, fields = {}) {
+        return this.request("PUT", `/v2/memories/${name}`, { ...V2_MEMORY_DOCUMENT(name), ...fields });
+      },
+      memory(name) {
+        return this.request("GET", `/v2/memories/${encodeURIComponent(name)}`);
+      },
+      recallMemory(name) {
+        return this.request("POST", `/v2/memories/${encodeURIComponent(name)}/recall`);
+      },
+      deleteMemory(name) {
+        return this.request("DELETE", `/v2/memories/${encodeURIComponent(name)}`);
+      },
+      memories(query = "") {
+        return this.request("GET", `/v2/memories${query}`);
+      },
+      searchMemories(fields = {}) {
+        return this.request("POST", "/v2/memories/search", { ...V2_SEARCH_DOCUMENT, ...fields });
       },
     };
     return {

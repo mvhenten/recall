@@ -551,6 +551,207 @@
         }
       },
       "required": ["kind", "address", "fromSessionId", "body"]
+    },
+    "MemoryPath": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MemoryPath.json",
+      "type": "object",
+      "properties": {
+        "memoryName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        }
+      },
+      "required": ["memoryName"]
+    },
+    "Memory": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "Memory.json",
+      "type": "object",
+      "properties": {
+        "memoryId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "memoryName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "type": {
+          "$ref": "MemoryType.json"
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 100000
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryTag.json"
+          },
+          "maxItems": 50
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        },
+        "recallCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        }
+      },
+      "required": [
+        "memoryId",
+        "userId",
+        "memoryName",
+        "description",
+        "type",
+        "body",
+        "tags",
+        "createdAt",
+        "updatedAt",
+        "recallCount"
+      ]
+    },
+    "MemoryType": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MemoryType.json",
+      "type": "string",
+      "enum": ["User", "Feedback", "Project", "Reference"]
+    },
+    "MemoryTag": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MemoryTag.json",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[a-z0-9][a-z0-9._:/-]*$"
+    },
+    "SaveMemory": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SaveMemory.json",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "type": {
+          "$ref": "MemoryType.json"
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 100000
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryTag.json"
+          },
+          "maxItems": 50
+        }
+      },
+      "required": ["description", "type", "body", "tags"]
+    },
+    "SearchMemories": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SearchMemories.json",
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryTag.json"
+          },
+          "maxItems": 50
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "minScore": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 1
+        },
+        "mode": {
+          "$ref": "SearchMode.json"
+        }
+      },
+      "required": ["query", "tags", "limit", "minScore", "mode"]
+    },
+    "SearchMode": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SearchMode.json",
+      "type": "string",
+      "enum": ["Hybrid", "Vector", "Text"]
+    },
+    "MemoryHit": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MemoryHit.json",
+      "type": "object",
+      "properties": {
+        "memory": {
+          "$ref": "Memory.json"
+        },
+        "score": {
+          "type": "number"
+        }
+      },
+      "required": ["memory", "score"]
+    },
+    "NearbyMemory": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "NearbyMemory.json",
+      "type": "object",
+      "properties": {
+        "score": {
+          "type": "number"
+        },
+        "memoryName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "type": {
+          "$ref": "MemoryType.json"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryTag.json"
+          },
+          "maxItems": 50
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      },
+      "required": ["score", "memoryName", "type", "tags", "description"]
     }
   }
 }

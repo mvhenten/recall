@@ -66,6 +66,103 @@
           }
         }
       },
+      "Memory": {
+        "type": "object",
+        "required": [
+          "memoryId",
+          "userId",
+          "memoryName",
+          "description",
+          "type",
+          "body",
+          "tags",
+          "createdAt",
+          "updatedAt",
+          "recallCount"
+        ],
+        "properties": {
+          "memoryId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "userId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "memoryName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "body": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryTag"
+            },
+            "maxItems": 50
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updatedAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "recallCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "MemoryHit": {
+        "type": "object",
+        "required": ["memory", "score"],
+        "properties": {
+          "memory": {
+            "$ref": "#/components/schemas/Memory"
+          },
+          "score": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "MemoryPath": {
+        "type": "object",
+        "required": ["memoryName"],
+        "properties": {
+          "memoryName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          }
+        }
+      },
+      "MemoryTag": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "pattern": "^[a-z0-9][a-z0-9._:/-]*$"
+      },
+      "MemoryType": {
+        "type": "string",
+        "enum": ["User", "Feedback", "Project", "Reference"]
+      },
       "MessageAddress": {
         "type": "object",
         "required": ["scope", "target"],
@@ -77,6 +174,36 @@
           "target": {
             "type": "string",
             "minLength": 1
+          }
+        }
+      },
+      "NearbyMemory": {
+        "type": "object",
+        "required": ["score", "memoryName", "type", "tags", "description"],
+        "properties": {
+          "score": {
+            "type": "number",
+            "format": "double"
+          },
+          "memoryName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryTag"
+            },
+            "maxItems": 50
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
           }
         }
       },
@@ -181,6 +308,68 @@
             "minimum": 0
           }
         }
+      },
+      "SaveMemory": {
+        "type": "object",
+        "required": ["description", "type", "body", "tags"],
+        "properties": {
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "body": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryTag"
+            },
+            "maxItems": 50
+          }
+        }
+      },
+      "SearchMemories": {
+        "type": "object",
+        "required": ["query", "tags", "limit", "minScore", "mode"],
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryTag"
+            },
+            "maxItems": 50
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "maximum": 50
+          },
+          "minScore": {
+            "type": "number",
+            "format": "double",
+            "minimum": -1,
+            "maximum": 1
+          },
+          "mode": {
+            "$ref": "#/components/schemas/SearchMode"
+          }
+        }
+      },
+      "SearchMode": {
+        "type": "string",
+        "enum": ["Hybrid", "Vector", "Text"]
       },
       "SendMessage": {
         "type": "object",

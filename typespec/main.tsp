@@ -14,9 +14,21 @@ const maxPrompts = 1000000;
 const maxUsageTokens = 1000000000;
 const maxCountedFiles = 500;
 const maxMessageBody = 32768;
+const maxMemoryName = 100;
+const maxMemoryDescription = 500;
+const maxMemoryBody = 100000;
+const maxMemoryTags = 50;
+const maxMemoryTag = 200;
+const maxMemoryQuery = 2000;
+const maxMemoryHits = 50;
 
 @minLength(1)
 scalar TranscriptLine extends string;
+
+@minLength(1)
+@maxLength(maxMemoryTag)
+@pattern("^[a-z0-9][a-z0-9._:/-]*$")
+scalar MemoryTag extends string;
 
 model AppendRecords {
   @minLength(1)
@@ -277,4 +289,109 @@ model SendMessage {
   @minLength(1)
   @maxLength(maxMessageBody)
   body: string;
+}
+
+enum MemoryType {
+  User,
+  Feedback,
+  Project,
+  Reference,
+}
+
+enum SearchMode {
+  Hybrid,
+  Vector,
+  Text,
+}
+
+model MemoryPath {
+  @minLength(1)
+  @maxLength(maxMemoryName)
+  @pattern("^[a-z0-9]+(-[a-z0-9]+)*$")
+  memoryName: string;
+}
+
+model Memory {
+  @minLength(1)
+  memoryId: string;
+
+  @minLength(1)
+  userId: string;
+
+  @minLength(1)
+  @maxLength(maxMemoryName)
+  memoryName: string;
+
+  @minLength(1)
+  @maxLength(maxMemoryDescription)
+  description: string;
+
+  type: MemoryType;
+
+  @maxLength(maxMemoryBody)
+  body: string;
+
+  @maxItems(maxMemoryTags)
+  tags: MemoryTag[];
+
+  createdAt: int64;
+  updatedAt: int64;
+
+  @minValue(0)
+  recallCount: int32;
+}
+
+model SaveMemory {
+  @minLength(1)
+  @maxLength(maxMemoryDescription)
+  description: string;
+
+  type: MemoryType;
+
+  @maxLength(maxMemoryBody)
+  body: string;
+
+  @maxItems(maxMemoryTags)
+  tags: MemoryTag[];
+}
+
+model SearchMemories {
+  @minLength(1)
+  @maxLength(maxMemoryQuery)
+  query: string;
+
+  @maxItems(maxMemoryTags)
+  tags: MemoryTag[];
+
+  @minValue(1)
+  @maxValue(maxMemoryHits)
+  limit: int32;
+
+  @minValue(-1)
+  @maxValue(1)
+  minScore: float64;
+
+  mode: SearchMode;
+}
+
+model MemoryHit {
+  memory: Memory;
+  score: float64;
+}
+
+model NearbyMemory {
+  score: float64;
+
+  @minLength(1)
+  @maxLength(maxMemoryName)
+  memoryName: string;
+
+  type: MemoryType;
+
+  @maxItems(maxMemoryTags)
+  tags: MemoryTag[];
+
+  @minLength(1)
+  @maxLength(maxMemoryDescription)
+  description: string;
 }

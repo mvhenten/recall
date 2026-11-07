@@ -309,10 +309,10 @@ describe("the /v2 surface", () => {
     expect((await client.request("GET", "/v2/messages/listen")).status).toBe(426);
   });
 
-  it("serves no memory operations yet", async () => {
+  it("serves the memories and moves the search under them", async () => {
     const { user } = await harness();
     const client = await user("memories");
-    expect((await client.request("GET", "/v2/memories")).status).toBe(404);
+    expect((await client.request("GET", "/v2/memories")).status).toBe(200);
     expect((await client.request("POST", "/v2/search", { query: "anything" })).status).toBe(404);
   });
 
