@@ -11,9 +11,17 @@ import type { z } from "zod";
 import {
   AppendRecordsSchema,
   type DeviceSchema,
+  type MemoryHitSchema,
+  MemoryPathSchema,
+  type MemorySchema,
+  type MemoryTypeSchema,
+  type NearbyMemorySchema,
   type PastSessionSchema,
   type RecordsAcceptedSchema,
   type RecordsConflictSchema,
+  SaveMemorySchema,
+  SearchMemoriesSchema,
+  type SearchModeSchema,
   SendMessageSchema,
   type SessionHitSchema,
   type SessionModeSchema,
@@ -25,8 +33,14 @@ import type { Device } from "./device";
 import type { SendInput } from "./mailbox";
 import {
   fail,
+  type Memory,
+  type MemoryHit,
+  type MemoryType,
+  type Mode,
   type Parsed,
   type PastSession,
+  type SaveInput,
+  type SearchInput,
   type Session,
   type SessionHit,
   type SessionInput,
@@ -45,6 +59,9 @@ export type V2RecordsAccepted = z.infer<typeof RecordsAcceptedSchema>;
 export type V2RecordsConflict = z.infer<typeof RecordsConflictSchema>;
 export type V2SendInput = z.infer<typeof SendMessageSchema>;
 export type V2AppendRecords = z.infer<typeof AppendRecordsSchema>;
+export type V2Memory = z.infer<typeof MemorySchema>;
+export type V2MemoryHit = z.infer<typeof MemoryHitSchema>;
+export type V2NearbyMemory = z.infer<typeof NearbyMemorySchema>;
 
 // The three things a session's mode can be. `/v1` said "the host could not tell" with an empty
 // string, which reads as a missing field rather than as an answer.
@@ -61,6 +78,31 @@ const MODE_IN: Record<V2SessionMode, SessionMode> = {
   Headless: "headless",
   Unknown: "",
 };
+
+type V2MemoryType = z.infer<typeof MemoryTypeSchema>;
+type V2SearchMode = z.infer<typeof SearchModeSchema>;
+
+const MEMORY_TYPE_OUT: Record<MemoryType, V2MemoryType> = {
+  user: "User",
+  feedback: "Feedback",
+  project: "Project",
+  reference: "Reference",
+};
+
+const MEMORY_TYPE_IN: Record<V2MemoryType, MemoryType> = {
+  User: "user",
+  Feedback: "feedback",
+  Project: "project",
+  Reference: "reference",
+};
+
+const SEARCH_MODE_IN: Record<V2SearchMode, Mode> = {
+  Hybrid: "hybrid",
+  Vector: "vector",
+  Text: "text",
+};
+
+const isV2MemoryType = (value: string): value is V2MemoryType => Object.hasOwn(MEMORY_TYPE_IN, value);
 
 // A business date as `/v2` writes one: an instant with its offset named, never a count of
 // milliseconds a reader has to know the epoch of. The archive keeps epoch milliseconds, so the
@@ -130,6 +172,32 @@ export const sessionHitView = (hit: SessionHit, labels: Map<string, string>): V2
   excerpt: { speaker: hit.excerpt.speaker, text: hit.excerpt.text, at: isoOf(hit.excerpt.at) },
 });
 
+// A memory as `/v2` answers with one. `lastRecalledAt` is off the wire: `recallCount` already says
+// whether a memory has ever been recalled, and the zero a never-recalled row carries read as an
+// instant in 1970 to every client that printed it. The column stays where it is.
+export const memoryView = (memory: Memory): V2Memory => ({
+  memoryId: memory.memoryId,
+  userId: memory.userId,
+  memoryName: memory.name,
+  description: memory.description,
+  type: MEMORY_TYPE_OUT[memory.type],
+  body: memory.body,
+  tags: memory.tags,
+  createdAt: memory.createdAt,
+  updatedAt: memory.updatedAt,
+  recallCount: memory.recallCount,
+});
+
+export const memoryHitView = (hit: MemoryHit): V2MemoryHit => ({ memory: memoryView(hit.memory), score: hit.score });
+
+export const nearbyMemoryView = (hit: MemoryHit): V2NearbyMemory => ({
+  score: hit.score,
+  memoryName: hit.memory.name,
+  type: MEMORY_TYPE_OUT[hit.memory.type],
+  tags: hit.memory.tags,
+  description: hit.memory.description,
+});
+
 // What a zod refusal reads as. The issues are joined in the order the schema raised them, so the
 // same body is always refused with the same sentence.
 const complaint = (error: z.ZodError): string =>
@@ -137,14 +205,21 @@ const complaint = (error: z.ZodError): string =>
 
 // Every number in a body, whole. The emitter writes a TypeSpec integer as a bounded zod number and
 // has no way to say it is one, so an ordinal of 3.5 would pass the contract's own schema and land
-// in a key no listing could read back.
-const whole = (body: Record<string, unknown>): boolean =>
-  Object.values(body).every((field) => typeof field !== "number" || Number.isSafeInteger(field));
+// in a key no listing could read back. A field the contract really does measure in fractions names
+// itself, since the schema cannot say that either.
+const whole = (body: Record<string, unknown>, fractional: readonly string[]): boolean =>
+  Object.entries(body).every(
+    ([field, value]) => typeof value !== "number" || fractional.includes(field) || Number.isSafeInteger(value),
+  );
 
-const validated = <T extends Record<string, unknown>>(schema: z.ZodType<T>, body: unknown): Parsed<T> => {
+const validated = <T extends Record<string, unknown>>(
+  schema: z.ZodType<T>,
+  body: unknown,
+  fractional: readonly string[] = [],
+): Parsed<T> => {
   const read = schema.safeParse(body);
   if (!read.success) return fail(complaint(read.error));
-  if (!whole(read.data)) return fail("every number in the body must be whole");
+  if (!whole(read.data, fractional)) return fail("every number in the body must be whole");
   return { ok: true, value: read.data };
 };
 
@@ -217,6 +292,63 @@ export const parseV2Send = (body: unknown): Parsed<V2SendInput> => validated(Sen
 // The address resolved to the pair the mailbox publishes on. A message to a host reaches every
 // session it has attached; one to a session reaches that session alone, and the device it runs on
 // is read from the session rather than named twice by the caller.
+// The slug in the path, read against the contract rather than against a second copy of the rule.
+export const parseMemoryName = (name: string): Parsed<string> => {
+  const read = MemoryPathSchema.safeParse({ memoryName: name });
+  if (!read.success) return fail(complaint(read.error));
+  return { ok: true, value: read.data.memoryName };
+};
+
+// Tags name a set, so the same tag twice is the same tag and the order a caller sent them in says
+// nothing. The charset is the contract's; this is what is left once it has read them.
+const tagSet = (tags: readonly string[]): string[] => [...new Set(tags)].sort();
+
+export const parseSaveMemory = (body: unknown): Parsed<SaveInput> => {
+  const read = validated(SaveMemorySchema, body);
+  if (!read.ok) return read;
+  const input = read.value;
+  return {
+    ok: true,
+    value: {
+      description: input.description,
+      type: MEMORY_TYPE_IN[input.type],
+      body: input.body,
+      tags: tagSet(input.tags),
+    },
+  };
+};
+
+// No `any`. `/v1` took a boolean that had to disagree with the tag list, so the two fields were
+// cross-validated by hand and either one alone was a refusal. An empty tag list means every memory.
+export const parseSearchMemories = (body: unknown): Parsed<SearchInput> => {
+  const read = validated(SearchMemoriesSchema, body, ["minScore"]);
+  if (!read.ok) return read;
+  const input = read.value;
+  return {
+    ok: true,
+    value: {
+      query: input.query,
+      tags: tagSet(input.tags),
+      limit: input.limit,
+      minScore: input.minScore,
+      mode: SEARCH_MODE_IN[input.mode],
+    },
+  };
+};
+
+// A listing is filtered by query parameters, which no body schema covers. The types are the one
+// word `/v2` spells differently, so they are folded back to the store's before the `/v1` listing
+// parser reads the rest.
+export const memoryListParams = (params: URLSearchParams): Parsed<URLSearchParams> => {
+  const folded = new URLSearchParams(params);
+  folded.delete("type");
+  for (const value of params.getAll("type")) {
+    if (!isV2MemoryType(value)) return fail(`type must be one of ${Object.keys(MEMORY_TYPE_IN).join(", ")}`);
+    folded.append("type", MEMORY_TYPE_IN[value]);
+  }
+  return { ok: true, value: folded };
+};
+
 export const sendInputOf = (input: V2SendInput, toDeviceId: string): SendInput => ({
   kind: input.kind,
   toDeviceId,

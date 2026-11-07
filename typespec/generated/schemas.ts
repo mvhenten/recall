@@ -2,6 +2,10 @@ import { z } from "zod";
 
 export const SessionModeSchema = z.enum(["Interactive", "Headless", "Unknown"]);
 
+export const MemoryTypeSchema = z.enum(["User", "Feedback", "Project", "Reference"]);
+
+export const SearchModeSchema = z.enum(["Hybrid", "Vector", "Text"]);
+
 export const AppendRecordsSchema = z.object({
   file: z.string().min(1),
   from: z.number().min(0),
@@ -124,4 +128,85 @@ export const SendMessageSchema = z.object({
   address: MessageAddressSchema,
   fromSessionId: z.string(),
   body: z.string().min(1).max(32768),
+});
+
+export const MemoryPathSchema = z.object({
+  memoryName: z
+    .string()
+    .regex(/^[a-z0-9]+(-[a-z0-9]+)*$/)
+    .min(1)
+    .max(100),
+});
+
+export const MemorySchema = z.object({
+  memoryId: z.string().min(1),
+  userId: z.string().min(1),
+  memoryName: z.string().min(1).max(100),
+  description: z.string().min(1).max(500),
+  type: MemoryTypeSchema,
+  body: z.string().max(100000),
+  tags: z
+    .array(
+      z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+        .min(1)
+        .max(200),
+    )
+    .max(50),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  recallCount: z.number().min(0),
+});
+
+export const SaveMemorySchema = z.object({
+  description: z.string().min(1).max(500),
+  type: MemoryTypeSchema,
+  body: z.string().max(100000),
+  tags: z
+    .array(
+      z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+        .min(1)
+        .max(200),
+    )
+    .max(50),
+});
+
+export const SearchMemoriesSchema = z.object({
+  query: z.string().min(1).max(2000),
+  tags: z
+    .array(
+      z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+        .min(1)
+        .max(200),
+    )
+    .max(50),
+  limit: z.number().min(1).max(50),
+  minScore: z.number().min(-1).max(1),
+  mode: SearchModeSchema,
+});
+
+export const MemoryHitSchema = z.object({
+  memory: MemorySchema,
+  score: z.number(),
+});
+
+export const NearbyMemorySchema = z.object({
+  score: z.number(),
+  memoryName: z.string().min(1).max(100),
+  type: MemoryTypeSchema,
+  tags: z
+    .array(
+      z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+        .min(1)
+        .max(200),
+    )
+    .max(50),
+  description: z.string().min(1).max(500),
 });

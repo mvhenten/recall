@@ -304,7 +304,14 @@ import {
 import { agentName, readTurns } from "./turns";
 import {
   deviceView,
+  memoryHitView,
+  memoryListParams,
+  memoryView,
+  nearbyMemoryView,
   parseAppendRecords,
+  parseMemoryName,
+  parseSaveMemory,
+  parseSearchMemories,
   parseSessionSync,
   parseUsageDelta,
   parseV2Send,
@@ -2709,12 +2716,23 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
-  const searched = async (db: D1Database, userId: string, input: SearchInput): Promise<unknown> => {
+  // What a query finds: the memories in scope of its tags, and the ones it would have found had the
+  // tags not been named. Both surfaces rank the same way and differ only in how they write a hit.
+  const ranked = async (
+    db: D1Database,
+    userId: string,
+    input: SearchInput,
+  ): Promise<{ shown: MemoryHit[]; nearby: MemoryHit[] }> => {
     const rankings = await rank(db, userId, input, []);
     const [shown, nearby] = await Promise.all([
       hits(db, userId, rankings.inScope, input.limit),
       hits(db, userId, rankings.elsewhere, ELSEWHERE_LIMIT),
     ]);
+    return { shown, nearby };
+  };
+
+  const searched = async (db: D1Database, userId: string, input: SearchInput): Promise<unknown> => {
+    const { shown, nearby } = await ranked(db, userId, input);
     const elsewhere = nearby.map(({ memory, score }) => ({
       score,
       name: memory.name,
@@ -2729,6 +2747,76 @@ export const createApp = (deps: Deps): App => {
     const parsed = parseSearch(await readJson(request));
     if (!parsed.ok) return error(400, parsed.error);
     return json(await searched(db, userId, parsed.value));
+  };
+
+  const v2MemoriesList = async (url: URL, db: D1Database, caller: Caller): Promise<Response> => {
+    const params = memoryListParams(url.searchParams);
+    if (!params.ok) return error(400, params.error);
+    const input = parseList(params.value, sortInForce(url, MEMORY_SORTS).sort);
+    if (!input.ok) return error(400, input.error);
+    const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
+    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
+    const page = await listMemories(db, caller.userId, input.value, cursor);
+    return json({ memories: page.memories.map(memoryView), nextCursor: page.nextCursor });
+  };
+
+  const v2MemorySearch = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
+    const input = parseSearchMemories(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    const { shown, nearby } = await ranked(db, caller.userId, input.value);
+    return json({ hits: shown.map(memoryHitView), elsewhere: nearby.map(nearbyMemoryView) });
+  };
+
+  const v2MemorySave = async (request: Request, db: D1Database, caller: Caller, name: string): Promise<Response> => {
+    const input = parseSaveMemory(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
+    if (!vector) throw new Error("the embedder answered the memory with no vector");
+    const saved = await saveMemory(db, caller.userId, name, input.value, quantize(vector), deps.now());
+    return json({ memory: memoryView(saved.memory) }, saved.created ? 201 : 200);
+  };
+
+  // Recalling a memory is a write, so it is a POST and the GET beside it is a read and nothing
+  // more. `/v1` folded the two into one GET behind a query parameter, which left every reader of a
+  // memory deciding whether it meant to count as one.
+  const v2MemoryRecall = async (db: D1Database, caller: Caller, name: string): Promise<Response> => {
+    const memory = await getMemory(db, caller.userId, name);
+    if (!memory) return error(404, `no memory named ${name}`);
+    const [recalled] = await recall(db, caller.userId, [memory.memoryId], deps.now());
+    if (!recalled) return error(404, `no memory named ${name}`);
+    return json({ memory: memoryView(recalled) });
+  };
+
+  // A memory answers a GET, a PUT and a DELETE at its own name and never a POST, which is what
+  // frees `search` beside it and `recall` below it: no position where a slug meets a route word.
+  const v2Memories = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    caller: Caller,
+    rawName: string | undefined,
+    word: string | undefined,
+  ): Promise<Response> => {
+    if (rawName === undefined) {
+      return request.method === "GET" ? v2MemoriesList(url, db, caller) : error(405, "method not allowed");
+    }
+    if (rawName === "search" && word === undefined && request.method === "POST") {
+      return v2MemorySearch(request, db, caller);
+    }
+    const name = parseMemoryName(decodeSegment(rawName) ?? "");
+    if (!name.ok) return error(400, name.error);
+    if (word === "recall") {
+      if (request.method !== "POST") return error(405, "method not allowed");
+      return v2MemoryRecall(db, caller, name.value);
+    }
+    if (word !== undefined) return error(404, "not found");
+    if (request.method === "PUT") return v2MemorySave(request, db, caller, name.value);
+    if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
+    const memory = await getMemory(db, caller.userId, name.value);
+    if (!memory) return error(404, `no memory named ${name.value}`);
+    if (request.method === "GET") return json({ memory: memoryView(memory) });
+    await deleteMemory(db, caller.userId, memory.memoryId);
+    return new Response(null, { status: 204 });
   };
 
   const mcpCaller = async (request: Request, env: AppEnv, host: McpHost): Promise<Caller | Response> => {
@@ -3230,7 +3318,9 @@ export const createApp = (deps: Deps): App => {
     rawName: string | undefined,
     rest: readonly string[],
   ): Promise<Response> => {
-    if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts") return error(404, "not found");
+    if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts" && collection !== "memories") {
+      return error(404, "not found");
+    }
     if (rest.length > 1 && collection !== "artifacts") return error(404, "not found");
     // The device grant is RFC 8628 and its snake_case is the standard rather than a slip, so it is
     // carried over as it stands: a client that signed in against `/v1` signs in against `/v2` with
@@ -3252,6 +3342,7 @@ export const createApp = (deps: Deps): App => {
       return v2History(request, url, db, caller);
     }
     if (collection === "artifacts") return artifacts(request, url, db, caller, rawName, rest);
+    if (collection === "memories") return v2Memories(request, url, db, caller, rawName, rest[0]);
     if (collection !== "messages") return error(404, "not found");
     if (rawName === "listen") {
       if (request.method !== "GET") return error(405, "method not allowed");

@@ -1,0 +1,287 @@
+import { describe, expect, it } from "vitest";
+import type { Client } from "./harness";
+import { harness } from "./harness";
+
+interface V2Memory {
+  memoryId: string;
+  userId: string;
+  memoryName: string;
+  description: string;
+  type: string;
+  body: string;
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+  recallCount: number;
+}
+
+interface V2Hit {
+  memory: V2Memory;
+  score: number;
+}
+
+interface V1Memory {
+  memoryId: string;
+  name: string;
+  recallCount: number;
+  lastRecalledAt: number;
+}
+
+interface V1Hit {
+  memory: V1Memory;
+  score: number;
+}
+
+const CORPUS = [
+  {
+    name: "cursor-paging",
+    description: "keyset paging over the memories table",
+    type: "project" as const,
+    body: "the cursor carries the sort key and the row id that breaks a tie on it",
+    tags: ["repo:recall", "storage"],
+  },
+  {
+    name: "ranking-fusion",
+    description: "reciprocal rank fusion of a vector ranking and a text ranking",
+    type: "reference" as const,
+    body: "two rankings folded into one by rank and never by score",
+    tags: ["search"],
+  },
+  {
+    name: "embedding-quantisation",
+    description: "vectors stored as signed bytes",
+    type: "reference" as const,
+    body: "quantise the vector and keep the dot product honest",
+    tags: ["search", "storage"],
+  },
+  {
+    name: "device-grant",
+    description: "the device authorisation grant a host signs in with",
+    type: "project" as const,
+    body: "the host polls while a browser approves the user code",
+    tags: ["auth"],
+  },
+  {
+    name: "writing-voice",
+    description: "write to be agreed with, not admired",
+    type: "user" as const,
+    body: "state, do not sell, and say it once",
+    tags: ["global"],
+  },
+  {
+    name: "review-threads",
+    description: "resolve every thread before merging",
+    type: "feedback" as const,
+    body: "replying to a review thread is not resolving it",
+    tags: ["global", "process"],
+  },
+];
+
+const QUERIES = ["ranking", "the cursor that breaks a tie", "device grant", "review thread", "vector"];
+
+const corpus = async (client: Client): Promise<void> => {
+  for (const memory of CORPUS) {
+    await client.save(memory.name, {
+      description: memory.description,
+      type: memory.type,
+      body: memory.body,
+      tags: memory.tags,
+    });
+  }
+};
+
+const memoryOf = async (response: Response): Promise<V2Memory> => {
+  expect(response.status).toBe(200);
+  const read: { memory: V2Memory } = await response.json();
+  return read.memory;
+};
+
+describe("the /v2 memories", () => {
+  it("reads a memory without counting the read", async () => {
+    const { user } = await harness();
+    const client = await user("pure-read");
+    await client.save("still-cold", {});
+
+    expect((await memoryOf(await client.v2.memory("still-cold"))).recallCount).toBe(0);
+    expect((await memoryOf(await client.v2.memory("still-cold"))).recallCount).toBe(0);
+    expect((await memoryOf(await client.v2.memory("still-cold"))).recallCount).toBe(0);
+  });
+
+  it("counts one recall per call and answers with the memory", async () => {
+    const { user } = await harness();
+    const client = await user("recalling");
+    const saved = await client.save("warm-memory", {});
+
+    const first = await memoryOf(await client.v2.recallMemory("warm-memory"));
+    expect(first.memoryId).toBe(saved.memoryId);
+    expect(first.recallCount).toBe(1);
+    expect((await memoryOf(await client.v2.recallMemory("warm-memory"))).recallCount).toBe(2);
+    expect((await memoryOf(await client.v2.memory("warm-memory"))).recallCount).toBe(2);
+
+    expect((await client.v2.request("GET", "/v2/memories/warm-memory/recall")).status).toBe(405);
+    expect((await client.v2.recallMemory("no-such-memory")).status).toBe(404);
+  });
+
+  it("leaves lastRecalledAt off the wire", async () => {
+    const { user } = await harness();
+    const client = await user("no-sentinel");
+    await client.save("unrecalled", {});
+
+    const read = await memoryOf(await client.v2.memory("unrecalled"));
+    expect(Object.keys(read)).not.toContain("lastRecalledAt");
+    expect(Object.keys(await memoryOf(await client.v2.recallMemory("unrecalled")))).not.toContain("lastRecalledAt");
+  });
+
+  it("writes, reads back and deletes a memory under its own name", async () => {
+    const { user } = await harness();
+    const client = await user("round-trip");
+
+    const created = await client.v2.saveMemory("fresh-note", { tags: ["repo:recall", "repo:recall"] });
+    expect(created.status).toBe(201);
+    const { memory }: { memory: V2Memory } = await created.json();
+    expect(memory.memoryName).toBe("fresh-note");
+    expect(memory.type).toBe("Project");
+    expect(memory.tags).toEqual(["repo:recall"]);
+
+    const replaced = await client.v2.saveMemory("fresh-note", { type: "Reference" });
+    expect(replaced.status).toBe(200);
+    expect((await memoryOf(await client.v2.memory("fresh-note"))).type).toBe("Reference");
+
+    expect((await client.v2.deleteMemory("fresh-note")).status).toBe(204);
+    expect((await client.v2.memory("fresh-note")).status).toBe(404);
+    expect((await client.v2.deleteMemory("fresh-note")).status).toBe(404);
+  });
+
+  it("matches every memory on an empty tag list and only the tagged ones on a full one", async () => {
+    const { user } = await harness();
+    const client = await user("scoping");
+    await corpus(client);
+
+    const everything = await client.v2.searchMemories({ query: "the", tags: [], minScore: -1, limit: 50 });
+    expect(everything.status).toBe(200);
+    const all: { hits: V2Hit[]; elsewhere: unknown[] } = await everything.json();
+    expect(all.hits.map((hit) => hit.memory.memoryName).sort()).toEqual(CORPUS.map((one) => one.name).sort());
+    expect(all.elsewhere).toEqual([]);
+
+    const scoped = await client.v2.searchMemories({ query: "the", tags: ["search"], minScore: -1, limit: 50 });
+    const some: { hits: V2Hit[] } = await scoped.json();
+    expect(some.hits.map((hit) => hit.memory.memoryName).sort()).toEqual(["embedding-quantisation", "ranking-fusion"]);
+
+    // `any` is gone rather than renamed: a body still carrying it is read for its tags alone,
+    // where `/v1` refused the pair outright.
+    const legacy = await client.v2.searchMemories({ query: "the", tags: ["search"], any: true, minScore: -1 });
+    expect(legacy.status).toBe(200);
+    const read: { hits: V2Hit[] } = await legacy.json();
+    expect(read.hits.map((hit) => hit.memory.memoryName).sort()).toEqual(["embedding-quantisation", "ranking-fusion"]);
+  });
+
+  it("holds the slug, the tag charset and the body ceiling to the generated schema", async () => {
+    const { user } = await harness();
+    const client = await user("limits");
+
+    expect((await client.v2.memory("Not A Slug")).status).toBe(400);
+    expect((await client.v2.memory("trailing-")).status).toBe(400);
+    expect((await client.v2.memory("a".repeat(101))).status).toBe(400);
+
+    expect((await client.v2.saveMemory("tagged", { tags: ["Upper Case"] })).status).toBe(400);
+    expect((await client.v2.saveMemory("tagged", { tags: ["-leading"] })).status).toBe(400);
+    expect((await client.v2.saveMemory("tagged", { tags: ["a".repeat(201)] })).status).toBe(400);
+    expect(
+      (await client.v2.saveMemory("tagged", { tags: Array.from({ length: 51 }, (_, at) => `t${at}`) })).status,
+    ).toBe(400);
+
+    expect((await client.v2.saveMemory("heavy", { body: "x".repeat(100_001) })).status).toBe(400);
+    expect((await client.v2.saveMemory("heavy", { body: "x".repeat(100_000) })).status).toBe(201);
+    expect((await client.v2.saveMemory("typed", { type: "project" })).status).toBe(400);
+    expect((await client.v2.searchMemories({ limit: 3.5 })).status).toBe(400);
+    expect((await client.v2.searchMemories({ mode: "hybrid " })).status).toBe(400);
+  });
+
+  it("serves the search under the memories beside a memory of the same name", async () => {
+    const { user } = await harness();
+    const client = await user("shadowing");
+    await client.v2.saveMemory("search", { body: "a memory whose name is a route word" });
+
+    expect((await memoryOf(await client.v2.memory("search"))).memoryName).toBe("search");
+    const found = await client.v2.searchMemories({ query: "route word" });
+    expect(found.status).toBe(200);
+    const { hits }: { hits: V2Hit[] } = await found.json();
+    expect(hits.map((hit) => hit.memory.memoryName)).toContain("search");
+  });
+
+  it("keeps one account's memories out of another's reach", async () => {
+    const { user } = await harness();
+    const mine = await user("owner");
+    const theirs = await user("stranger");
+    const saved = await mine.save("private-note", { body: "only the owner reads this" });
+
+    expect((await theirs.v2.memory("private-note")).status).toBe(404);
+    expect((await theirs.v2.recallMemory("private-note")).status).toBe(404);
+    expect((await theirs.v2.deleteMemory("private-note")).status).toBe(404);
+
+    const listed = await theirs.v2.memories();
+    const { memories }: { memories: V2Memory[] } = await listed.json();
+    expect(memories).toEqual([]);
+    const found = await theirs.v2.searchMemories({ query: "owner reads this", minScore: -1 });
+    const { hits }: { hits: V2Hit[] } = await found.json();
+    expect(hits).toEqual([]);
+
+    // A write under the same name makes the stranger their own memory and leaves the owner's row
+    // where it stood.
+    expect((await theirs.v2.saveMemory("private-note", { body: "mine now" })).status).toBe(201);
+    const held = await memoryOf(await mine.v2.memory("private-note"));
+    expect(held.memoryId).toBe(saved.memoryId);
+    expect(held.body).toBe("only the owner reads this");
+  });
+
+  it("filters a listing by the type the contract names", async () => {
+    const { user } = await harness();
+    const client = await user("filtering");
+    await corpus(client);
+
+    const references = await client.v2.memories("?type=Reference");
+    expect(references.status).toBe(200);
+    const { memories }: { memories: V2Memory[] } = await references.json();
+    expect(memories.map((memory) => memory.memoryName).sort()).toEqual(["embedding-quantisation", "ranking-fusion"]);
+    expect(memories.every((memory) => memory.type === "Reference")).toBe(true);
+
+    expect((await client.v2.memories("?type=reference")).status).toBe(400);
+  });
+
+  it("answers the same corpus as /v1, listed and ranked alike", async () => {
+    const { user } = await harness();
+    const client = await user("equivalence");
+    await corpus(client);
+
+    const v1Listed: { memories: V1Memory[] } = await (await client.request("GET", "/v1/memories")).json();
+    const v2Listed: { memories: V2Memory[] } = await (await client.v2.memories()).json();
+    expect(v2Listed.memories).toHaveLength(CORPUS.length);
+    expect(v2Listed.memories.map((memory) => memory.memoryId)).toEqual(
+      v1Listed.memories.map((memory) => memory.memoryId),
+    );
+
+    // Ranking is what a careless change breaks without changing a count, so the ids are compared in
+    // the order the two surfaces put them in and never as sets.
+    for (const query of QUERIES) {
+      for (const mode of ["hybrid", "vector", "text"]) {
+        const body = { query, limit: 10, minScore: 0.1, mode };
+        const v1 = await client.request("POST", "/v1/search", { ...body, tags: [], any: true });
+        const v2 = await client.v2.searchMemories({ ...body, mode: `${mode[0]?.toUpperCase()}${mode.slice(1)}` });
+        expect(v1.status).toBe(200);
+        expect(v2.status).toBe(200);
+        const ranked: { hits: V1Hit[] } = await v1.json();
+        const alike: { hits: V2Hit[] } = await v2.json();
+        expect(alike.hits.map((hit) => hit.memory.memoryId)).toEqual(ranked.hits.map((hit) => hit.memory.memoryId));
+        expect(alike.hits.map((hit) => hit.score)).toEqual(ranked.hits.map((hit) => hit.score));
+      }
+    }
+
+    const tagged = { query: "ranking", limit: 10, minScore: 0.1, mode: "hybrid" };
+    const v1Tagged = await client.request("POST", "/v1/search", { ...tagged, tags: ["search"], any: false });
+    const v2Tagged = await client.v2.searchMemories({ ...tagged, tags: ["search"], mode: "Hybrid" });
+    const v1Hits: { hits: V1Hit[]; elsewhere: Array<{ name: string }> } = await v1Tagged.json();
+    const v2Hits: { hits: V2Hit[]; elsewhere: Array<{ memoryName: string }> } = await v2Tagged.json();
+    expect(v2Hits.hits.map((hit) => hit.memory.memoryId)).toEqual(v1Hits.hits.map((hit) => hit.memory.memoryId));
+    expect(v2Hits.elsewhere.map((near) => near.memoryName)).toEqual(v1Hits.elsewhere.map((near) => near.name));
+  });
+});
