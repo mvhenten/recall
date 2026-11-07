@@ -101,17 +101,46 @@ export interface Client {
     through: number,
     body: string | Uint8Array,
   ): Promise<Response>;
+  /// One stretch as every host sends one: the span of the file it accounts for, the bytes gzipped,
+  /// and how many bytes they inflate to.
+  archiveGzip(
+    sessionId: string,
+    file: string,
+    from: number,
+    through: number,
+    body: string | Uint8Array,
+  ): Promise<Response>;
   /// One stretch as a host from before redaction offers it: one offset, meaning a place in the
   /// archive and in the file at once.
   archiveLegacy(sessionId: string, file: string, offset: number, body: string | Uint8Array): Promise<Response>;
   transcript(sessionId: string): Promise<Response>;
   readTranscript(sessionId: string, file: string): Promise<Response>;
+  /// One file read back by a reader that takes the gzip members the archive stores, which is every
+  /// browser and the host's own client.
+  readTranscriptGzip(sessionId: string, file: string): Promise<Response>;
   session(target: string): Promise<Response>;
   searchSessions(query: string, limit?: number): Promise<Response>;
 }
 
 const held = (body: string | Uint8Array): number =>
   typeof body === "string" ? new TextEncoder().encode(body).byteLength : body.byteLength;
+
+const bytesOf = (body: string | Uint8Array): Uint8Array =>
+  typeof body === "string" ? new TextEncoder().encode(body) : body;
+
+// One body as a host sends it and as a reader of the archive reads it back. The members are read
+// with the same stream the browser inflates them with, so a test asserting on a transcript is
+// asserting on the bytes a reader of the dashboard sees.
+export const gzipped = async (body: string | Uint8Array): Promise<Uint8Array> =>
+  new Uint8Array(
+    await new Response(new Blob([bytesOf(body)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer(),
+  );
+
+export const inflated = async (response: Response): Promise<string> => {
+  const body = response.body;
+  if (body === null) throw new Error("the response carries no body to inflate");
+  return new Response(body.pipeThrough(new DecompressionStream("gzip"))).text();
+};
 
 const SESSION_DOCUMENT: Record<string, unknown> = {
   host: "laptop",
@@ -376,6 +405,17 @@ export const harness = async ({
           },
         );
       },
+      async archiveGzip(sessionId, file, from, through, body) {
+        const member = await gzipped(body);
+        return send(
+          `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${from}&through=${through}&inflates=${held(body)}`,
+          {
+            method: "PUT",
+            headers: { ...headers, "content-type": "application/gzip" },
+            body: member,
+          },
+        );
+      },
       archiveLegacy(sessionId, file, offset, body) {
         return send(`/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${offset}`, {
           method: "PUT",
@@ -388,6 +428,11 @@ export const harness = async ({
       },
       readTranscript(sessionId, file) {
         return request("GET", `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}`);
+      },
+      readTranscriptGzip(sessionId, file) {
+        return send(`/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}`, {
+          headers: { ...headers, "accept-encoding": "gzip, br" },
+        });
       },
       session(target) {
         return request("GET", `/v1/sessions/${encodeURIComponent(target)}`);

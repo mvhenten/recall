@@ -1102,6 +1102,11 @@ impl Client {
     /// accounts for and only where nothing is yet, so one already there — a retry, or another
     /// writer that reached the same place first — is refused with how far the archive now reaches.
     /// That is the same answer: it is where the next stretch begins.
+    ///
+    /// The body is one gzip member and `inflates` is how many bytes of the file it holds. Nothing
+    /// reads that length off a member without inflating it, and where a stretch sits in the archive
+    /// is the lengths of the stretches in front of it, so it goes up beside the body and into the
+    /// name the stretch is stored under.
     pub fn append_transcript(
         &self,
         session_id: &str,
@@ -1110,15 +1115,17 @@ impl Client {
         through: i64,
         bytes: &[u8],
     ) -> Result<Appended> {
+        let member = crate::transcripts::packed(bytes)?;
         let path = format!(
-            "{}/transcript?file={}&offset={from}&through={through}",
+            "{}/transcript?file={}&offset={from}&through={through}&inflates={}",
             Self::session_path(session_id),
-            encode(file)
+            encode(file),
+            bytes.len()
         );
         let mut response = self
             .authed(self.agent.put(self.url(&path)))
-            .header("content-type", "application/x-ndjson")
-            .send(bytes)?;
+            .header("content-type", "application/gzip")
+            .send(&member)?;
         if response.status().as_u16() == 409 {
             let extent: Extent = response.body_mut().read_json()?;
             return Ok(Appended::Refused(crate::transcripts::Reach {

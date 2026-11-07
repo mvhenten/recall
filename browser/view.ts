@@ -16,6 +16,7 @@ import {
   followedBatch,
   followedTexts,
   groupedReads,
+  inflatesTo,
   joinedTexts,
   type Plan,
   type PlannedRead,
@@ -157,12 +158,14 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
         why: `Reading ${plan.file} failed: ${error instanceof Error ? error.message : String(error)}.`,
       }));
 
-  const grab = (read: PlannedRead): Promise<Got> =>
-    asked(
-      `${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.at}`,
-      { range: `bytes=${read.skip}-${read.skip + read.bytes - 1}` },
-      read.at,
-    );
+  // One read, fetched off the route that opens one object. A stretch stored gzipped is one gzip
+  // member: there is no part of it to ask for, the manifest never splits a read of one, and the
+  // browser inflates what comes back, so that one is asked for whole and without a range.
+  const grab = (read: PlannedRead): Promise<Got> => {
+    const url = `${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.at}`;
+    if (inflatesTo(read.at) !== null) return asked(url, {}, read.at);
+    return asked(url, { range: `bytes=${read.skip}-${read.skip + read.bytes - 1}` }, read.at);
+  };
 
   const noteFor = (dry: number): string =>
     walkNote({ file: plan.file, bytes: reaches, loaded, shown: list.childElementCount, dry, through: edge === 0 });

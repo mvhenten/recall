@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Run } from "../src/transcript-plan";
 import {
+  compressedStretchName,
   type Fetched,
   followedBatch,
   followedTexts,
   gapsIn,
   groupedReads,
   joinedTexts,
+  legacyStretchName,
   listedRuns,
   MAX_PLANNED_READS,
   type PlannedRead,
@@ -15,7 +17,6 @@ import {
   type Walk,
   walkNote,
 } from "../src/transcript-plan";
-import { legacyStretchName } from "../src/transcripts";
 
 const read = (run: number, offset: number, skip: number, bytes: number): PlannedRead => ({
   run,
@@ -112,6 +113,28 @@ describe("planning a batch", () => {
 
     expect(planned.batch).toEqual([read(0, 0, 0, 100), read(0, 80, 20, 60)]);
     expect(planned).toMatchObject({ edge: 0, pending: 0 });
+  });
+
+  // A stretch stored gzipped is one gzip member, which has no part to ask for: the whole object
+  // comes down and the browser inflates it. Splitting a read of one would fetch and inflate the
+  // same object once per piece, so the budget is spent past rather than inside it.
+  it("takes a compressed stretch whole, however little budget is left", () => {
+    const packed = (at: number, bytes: number): PlannedRead => ({
+      run: 0,
+      at: compressedStretchName(at, at + bytes * 3, bytes),
+      offset: at,
+      skip: 0,
+      bytes,
+    });
+    const reads = [packed(0, 100), packed(100, 100)];
+
+    const first = plannedBatch(reads, 2, 100, 40);
+    expect(first.batch).toEqual([packed(100, 100)]);
+    expect(first).toMatchObject({ edge: 1, pending: 100 });
+
+    const second = plannedBatch(reads, first.edge, first.pending, 40);
+    expect(second.batch).toEqual([packed(0, 100)]);
+    expect(second).toMatchObject({ edge: 0, pending: 0 });
   });
 
   it("stops at the first byte of the file and plans nothing beyond it", () => {

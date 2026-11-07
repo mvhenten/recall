@@ -40,11 +40,17 @@
 //! Whether a file ends for good where it ends now is the caller's to say and nothing this reader
 //! can work out: only a session that has ended writes nothing more.
 //!
+//! A stretch goes up gzipped, and the compression runs after the redaction and never before: the
+//! scanner reads bytes, and nothing of a compressed stretch reads as the secret it holds. The
+//! member is stored as it stands, so what a restore inflates is the bytes this host read, to the
+//! byte. A transcript is prose and JSON, so under a third of them go over the wire.
+//!
 //! The position is kept apart from the mark the usage counter keeps in the session record, so
 //! moving either can neither skip nor replay the other.
 
 use crate::redact;
 use anyhow::{Context, Result, bail};
+use flate2::{Compression, write::GzEncoder};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom};
@@ -356,6 +362,16 @@ fn stretch(path: &Path, offset: i64, pass: Pass, holds: Holds) -> Result<Stretch
     Ok(Stretch::Waiting)
 }
 
+/// One stretch's bytes as they go up: one gzip member of the redacted bytes. The member is what the
+/// archive stores and what a restore inflates, so this is the only place a transcript's bytes are
+/// turned into anything, and it runs over what the scanner has already been through.
+pub fn packed(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).context("gzipping a transcript stretch")?;
+    encoder.finish().context("gzipping a transcript stretch")
+}
+
 /// How far into one file the archive reaches now, and how much of that this pass put there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reached {
@@ -623,6 +639,53 @@ mod tests {
                 .insert((file.to_string(), from, through), bytes.to_vec());
             Ok(Appended::Written(through))
         }
+    }
+
+    /// A transcript shaped the way one is: one JSON record a line, the same keys over and over and
+    /// prose in between.
+    fn turns(count: usize, tag: &str) -> Vec<u8> {
+        let mut text = String::new();
+        for index in 0..count {
+            text.push_str(&format!(
+                "{{\"type\":\"user\",\"timestamp\":\"2026-11-07T12:0{}:00Z\",\"message\":{{\"content\":\"{tag} {index}: the archive holds every byte of this line as it stands.\"}}}}\n",
+                index % 10
+            ));
+        }
+        text.into_bytes()
+    }
+
+    /// The whole reason gzip was chosen over distilling the records: what the archive stores is the
+    /// member, so a restore inflates back to the bytes this host read and the file written to disk
+    /// is the file that was archived, byte for byte. A restore reads a file back as every member of
+    /// it laid end to end, which is one gzip stream, and that is what the HTTP client inflates.
+    #[test]
+    fn a_stretch_inflates_to_the_bytes_it_was_read_from() {
+        let first = turns(40, "first");
+        let second = turns(30, "second");
+        let member = packed(&first).unwrap();
+
+        assert!(
+            member.len() * 2 < first.len(),
+            "a transcript is prose and JSON, so a stretch of it goes up far smaller than it was read: {} of {}",
+            member.len(),
+            first.len()
+        );
+
+        let mut read = Vec::new();
+        flate2::read::MultiGzDecoder::new(&member[..])
+            .read_to_end(&mut read)
+            .unwrap();
+        assert_eq!(read, first, "one member inflates to the stretch, byte for byte");
+
+        let mut stream = member.clone();
+        stream.extend_from_slice(&packed(&second).unwrap());
+        let mut whole = Vec::new();
+        flate2::read::MultiGzDecoder::new(&stream[..])
+            .read_to_end(&mut whole)
+            .unwrap();
+        let mut file = first.clone();
+        file.extend_from_slice(&second);
+        assert_eq!(whole, file, "and the members of a file inflate to the file");
     }
 
     #[test]
