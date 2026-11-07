@@ -705,17 +705,23 @@ export const createApp = (deps: Deps): App => {
     return bite.through;
   };
 
-  // One session, caught up with its archive. The event that wrote the stretch is what brings the
-  // indexer here, so there is no queue to read and no session to pick; a session with nothing new
-  // costs the row that says so. A bite that reaches no further than the last is the end of what
-  // the objects hold, whatever the cache says, and stops the pass rather than repeating it.
+  // One bite of one session, and whether that leaves it caught up with its archive. The event that
+  // wrote the stretch is what brings the indexer here, so there is no queue to read and no session
+  // to pick; a session with nothing new costs the row that says so.
+  //
+  // It is one bite and not every bite the session is behind, because a session hundreds of bites
+  // behind is what a host running a backfill leaves, and taking those in one invocation ran to
+  // over a second of CPU against an invocation ceiling of ten milliseconds. A session still behind
+  // answers so, and the message is sent back for redelivery, which is what brings the next bite.
+  //
+  // A bite that reaches no further than the last is the end of what the objects hold, whatever the
+  // cache says, and answers caught up rather than asking for those bytes again on every event.
   const indexSession = async (env: AppEnv, userId: string, sessionId: string): Promise<boolean> => {
-    for (;;) {
-      const mark = await indexMark(env.DB, userId, sessionId);
-      if (mark === null || mark.indexed >= mark.archived) return true;
-      const through = await indexBite(env, userId, sessionId, mark);
-      if (through <= mark.indexed) return true;
-    }
+    const mark = await indexMark(env.DB, userId, sessionId);
+    if (mark === null || mark.indexed >= mark.archived) return true;
+    const through = await indexBite(env, userId, sessionId, mark);
+    if (through <= mark.indexed) return true;
+    return through >= mark.archived;
   };
 
   const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
@@ -2838,9 +2844,10 @@ export const createApp = (deps: Deps): App => {
     // costs one page of a listing however long the session has run.
     //
     // Indexing is caught per session, and the messages that brought a session here are sent back
-    // for redelivery when it fails: a transcript the indexer cannot get through — a hole in the
-    // archive, an embedding call the model refuses — is tried again on its own while every other
-    // session's message acks.
+    // for redelivery while it is behind: a transcript the indexer cannot get through — a hole in
+    // the archive, an embedding call the model refuses — is tried again on its own while every
+    // other session's message acks, and a session still behind after its bite comes back for the
+    // next one.
     async consume(env: AppEnv, delivered: readonly Delivered[]): Promise<void> {
       const sessions = new Map<string, { stretch: Stretched; messages: Delivered[] }>();
       for (const message of delivered) {
