@@ -73,15 +73,19 @@
       "type": "object",
       "properties": {
         "first": {
-          "type": "string",
-          "maxLength": 200
+          "$ref": "FocusText.json"
         },
         "latest": {
-          "type": "string",
-          "maxLength": 200
+          "$ref": "FocusText.json"
         }
       },
       "required": ["first", "latest"]
+    },
+    "FocusText": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "FocusText.json",
+      "type": "string",
+      "maxLength": 200
     },
     "SessionSync": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -89,25 +93,20 @@
       "type": "object",
       "properties": {
         "host": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "SessionText.json",
+          "minLength": 1
         },
         "cwd": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "repo": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "branch": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "commit": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "startedAt": {
           "type": "string",
@@ -118,9 +117,7 @@
           "format": "date-time"
         },
         "prompts": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 1000000
+          "$ref": "PromptCount.json"
         },
         "focus": {
           "$ref": "SessionFocus.json"
@@ -129,8 +126,7 @@
           "$ref": "SessionMode.json"
         },
         "permissionMode": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "pid": {
           "type": "integer",
@@ -152,6 +148,19 @@
         "pid"
       ]
     },
+    "SessionText": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SessionText.json",
+      "type": "string",
+      "maxLength": 500
+    },
+    "PromptCount": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "PromptCount.json",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000
+    },
     "SessionMode": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$id": "SessionMode.json",
@@ -168,53 +177,38 @@
           "minimum": 0
         },
         "host": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "SessionText.json",
+          "minLength": 1
         },
         "repo": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "provider": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "SessionText.json",
+          "minLength": 1
         },
         "account": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "SessionText.json",
+          "minLength": 1
         },
         "model": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "SessionText.json",
+          "minLength": 1
         },
         "prompts": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 1000000
+          "$ref": "PromptCount.json"
         },
         "inputTokens": {
-          "type": "string",
-          "minimum": 0,
-          "maximum": 1000000000
+          "$ref": "TokenCount.json"
         },
         "outputTokens": {
-          "type": "string",
-          "minimum": 0,
-          "maximum": 1000000000
+          "$ref": "TokenCount.json"
         },
         "cacheWriteTokens": {
-          "type": "string",
-          "minimum": 0,
-          "maximum": 1000000000
+          "$ref": "TokenCount.json"
         },
         "cacheReadTokens": {
-          "type": "string",
-          "minimum": 0,
-          "maximum": 1000000000
+          "$ref": "TokenCount.json"
         },
         "at": {
           "type": "string",
@@ -248,6 +242,13 @@
         "files"
       ]
     },
+    "TokenCount": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "TokenCount.json",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000000
+    },
     "Device": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$id": "Device.json",
@@ -258,24 +259,21 @@
           "minLength": 1
         },
         "name": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "host": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "SessionText.json",
+          "minLength": 1
         },
         "hostLabel": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "SessionText.json",
+          "minLength": 1
         },
         "createdAt": {
-          "type": "string"
+          "type": "integer"
         },
         "lastUsedAt": {
-          "type": "string"
+          "type": "integer"
         },
         "current": {
           "type": "boolean"
@@ -293,40 +291,32 @@
           "minLength": 1
         },
         "name": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "agentName": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "deviceId": {
           "type": "string",
           "minLength": 1
         },
         "host": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "hostLabel": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "cwd": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "repo": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "branch": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "commit": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "startedAt": {
           "type": "string",
@@ -337,9 +327,7 @@
           "format": "date-time"
         },
         "prompts": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 1000000
+          "$ref": "PromptCount.json"
         },
         "focus": {
           "$ref": "SessionFocus.json"
@@ -348,8 +336,7 @@
           "$ref": "SessionMode.json"
         },
         "permissionMode": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "pid": {
           "type": "integer",
@@ -390,32 +377,25 @@
           "minLength": 1
         },
         "name": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "agentName": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "host": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "hostLabel": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "cwd": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "repo": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "branch": {
-          "type": "string",
-          "maxLength": 500
+          "$ref": "SessionText.json"
         },
         "startedAt": {
           "type": "string",
@@ -426,9 +406,7 @@
           "format": "date-time"
         },
         "prompts": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 1000000
+          "$ref": "PromptCount.json"
         },
         "focus": {
           "$ref": "SessionFocus.json"
@@ -558,13 +536,18 @@
       "type": "object",
       "properties": {
         "memoryName": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 100,
-          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          "$ref": "MemoryName.json"
         }
       },
       "required": ["memoryName"]
+    },
+    "MemoryName": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MemoryName.json",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
     },
     "Memory": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -575,26 +558,17 @@
           "type": "string",
           "minLength": 1
         },
-        "userId": {
-          "type": "string",
-          "minLength": 1
-        },
         "memoryName": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 100
+          "$ref": "MemoryName.json"
         },
         "description": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "MemoryDescription.json"
         },
         "type": {
           "$ref": "MemoryType.json"
         },
         "body": {
-          "type": "string",
-          "maxLength": 100000
+          "$ref": "MemoryBody.json"
         },
         "tags": {
           "type": "array",
@@ -604,10 +578,10 @@
           "maxItems": 50
         },
         "createdAt": {
-          "type": "string"
+          "type": "integer"
         },
         "updatedAt": {
-          "type": "string"
+          "type": "integer"
         },
         "recallCount": {
           "type": "integer",
@@ -617,7 +591,6 @@
       },
       "required": [
         "memoryId",
-        "userId",
         "memoryName",
         "description",
         "type",
@@ -628,11 +601,24 @@
         "recallCount"
       ]
     },
+    "MemoryDescription": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MemoryDescription.json",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
     "MemoryType": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$id": "MemoryType.json",
       "type": "string",
       "enum": ["User", "Feedback", "Project", "Reference"]
+    },
+    "MemoryBody": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "MemoryBody.json",
+      "type": "string",
+      "maxLength": 100000
     },
     "MemoryTag": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -648,16 +634,13 @@
       "type": "object",
       "properties": {
         "description": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "MemoryDescription.json"
         },
         "type": {
           "$ref": "MemoryType.json"
         },
         "body": {
-          "type": "string",
-          "maxLength": 100000
+          "$ref": "MemoryBody.json"
         },
         "tags": {
           "type": "array",
@@ -668,6 +651,39 @@
         }
       },
       "required": ["description", "type", "body", "tags"]
+    },
+    "ListMemories": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ListMemories.json",
+      "type": "object",
+      "properties": {
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryTag.json"
+          },
+          "maxItems": 50
+        },
+        "type": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryType.json"
+          }
+        },
+        "since": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "cursor": {
+          "type": "string"
+        }
+      },
+      "required": ["tags", "type", "since", "limit", "cursor"]
     },
     "SearchMemories": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -731,9 +747,7 @@
           "type": "number"
         },
         "memoryName": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 100
+          "$ref": "MemoryName.json"
         },
         "type": {
           "$ref": "MemoryType.json"
@@ -746,9 +760,7 @@
           "maxItems": 50
         },
         "description": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
+          "$ref": "MemoryDescription.json"
         }
       },
       "required": ["score", "memoryName", "type", "tags", "description"]

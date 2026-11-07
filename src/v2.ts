@@ -3,14 +3,14 @@
 // function of a row the store already read, and a parser is a function of a body, so both are read
 // in one place and tested without a request.
 //
-// Every request body is validated by the zod the TypeSpec contract generates. The contract is the
-// source of truth for the shapes, so a validator written beside it would be a second one to keep
-// in step; what is added here is only what the emitter cannot say — that a number the schema
-// bounds is also whole.
+// Every request body is validated by the zod the TypeSpec contract generates, and no shape is
+// restated beside it: the contract is the source of truth, and a validator written here would be a
+// second one to keep in step.
 import type { z } from "zod";
 import {
   AppendRecordsSchema,
   type DeviceSchema,
+  ListMemoriesSchema,
   type MemoryHitSchema,
   MemoryPathSchema,
   type MemorySchema,
@@ -32,7 +32,9 @@ import {
 import type { Device } from "./device";
 import type { SendInput } from "./mailbox";
 import {
+  DEFAULT_PAGE_ROWS,
   fail,
+  type ListInput,
   type Memory,
   type MemoryHit,
   type MemoryType,
@@ -102,14 +104,14 @@ const SEARCH_MODE_IN: Record<V2SearchMode, Mode> = {
   Text: "text",
 };
 
-const isV2MemoryType = (value: string): value is V2MemoryType => Object.hasOwn(MEMORY_TYPE_IN, value);
-
 // A business date as `/v2` writes one: an instant with its offset named, never a count of
 // milliseconds a reader has to know the epoch of. The archive keeps epoch milliseconds, so the
 // conversion is here and nowhere else.
 export const isoOf = (at: number): string => new Date(at).toISOString();
 
 export const epochOf = (iso: string): number => Date.parse(iso);
+
+const EPOCH_ISO = isoOf(0);
 
 // The name to print for a host: the label its owner gave it, and the host's own name where there
 // is none. `/v1` answered an empty string there, which every reader then had to notice and
@@ -177,7 +179,6 @@ export const sessionHitView = (hit: SessionHit, labels: Map<string, string>): V2
 // instant in 1970 to every client that printed it. The column stays where it is.
 export const memoryView = (memory: Memory): V2Memory => ({
   memoryId: memory.memoryId,
-  userId: memory.userId,
   memoryName: memory.name,
   description: memory.description,
   type: MEMORY_TYPE_OUT[memory.type],
@@ -203,23 +204,9 @@ export const nearbyMemoryView = (hit: MemoryHit): V2NearbyMemory => ({
 const complaint = (error: z.ZodError): string =>
   error.issues.map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`).join("; ");
 
-// Every number in a body, whole. The emitter writes a TypeSpec integer as a bounded zod number and
-// has no way to say it is one, so an ordinal of 3.5 would pass the contract's own schema and land
-// in a key no listing could read back. A field the contract really does measure in fractions names
-// itself, since the schema cannot say that either.
-const whole = (body: Record<string, unknown>, fractional: readonly string[]): boolean =>
-  Object.entries(body).every(
-    ([field, value]) => typeof value !== "number" || fractional.includes(field) || Number.isSafeInteger(value),
-  );
-
-const validated = <T extends Record<string, unknown>>(
-  schema: z.ZodType<T>,
-  body: unknown,
-  fractional: readonly string[] = [],
-): Parsed<T> => {
+const validated = <T extends Record<string, unknown>>(schema: z.ZodType<T>, body: unknown): Parsed<T> => {
   const read = schema.safeParse(body);
   if (!read.success) return fail(complaint(read.error));
-  if (!whole(read.data, fractional)) return fail("every number in the body must be whole");
   return { ok: true, value: read.data };
 };
 
@@ -321,7 +308,7 @@ export const parseSaveMemory = (body: unknown): Parsed<SaveInput> => {
 // No `any`. `/v1` took a boolean that had to disagree with the tag list, so the two fields were
 // cross-validated by hand and either one alone was a refusal. An empty tag list means every memory.
 export const parseSearchMemories = (body: unknown): Parsed<SearchInput> => {
-  const read = validated(SearchMemoriesSchema, body, ["minScore"]);
+  const read = validated(SearchMemoriesSchema, body);
   if (!read.ok) return read;
   const input = read.value;
   return {
@@ -336,17 +323,34 @@ export const parseSearchMemories = (body: unknown): Parsed<SearchInput> => {
   };
 };
 
-// A listing is filtered by query parameters, which no body schema covers. The types are the one
-// word `/v2` spells differently, so they are folded back to the store's before the `/v1` listing
-// parser reads the rest.
-export const memoryListParams = (params: URLSearchParams): Parsed<URLSearchParams> => {
-  const folded = new URLSearchParams(params);
-  folded.delete("type");
-  for (const value of params.getAll("type")) {
-    if (!isV2MemoryType(value)) return fail(`type must be one of ${Object.keys(MEMORY_TYPE_IN).join(", ")}`);
-    folded.append("type", MEMORY_TYPE_IN[value]);
-  }
-  return { ok: true, value: folded };
+// A listing is filtered by query parameters, which the contract declares as a model of its own so
+// the filter speaks the same words the search body does: `tags` and not `tag`, a type that names
+// itself, and a `since` carrying its offset. A parameter left blank is a parameter not given.
+export const parseMemoryList = (params: URLSearchParams, sort: string): Parsed<ListInput> => {
+  const given = (name: string): string[] => params.getAll(name).filter((value) => value !== "");
+  const limit = given("limit")[0];
+  const read = validated(ListMemoriesSchema, {
+    tags: given("tags"),
+    type: given("type"),
+    since: given("since")[0] ?? EPOCH_ISO,
+    limit: limit === undefined ? DEFAULT_PAGE_ROWS : Number(limit),
+    cursor: given("cursor")[0] ?? "",
+  });
+  if (!read.ok) return read;
+  const input = read.value;
+  const since = epochOf(input.since);
+  if (!Number.isFinite(since)) return fail("since must be an ISO 8601 instant with its offset named");
+  return {
+    ok: true,
+    value: {
+      tags: tagSet(input.tags),
+      types: [...new Set(input.type.map((type) => MEMORY_TYPE_IN[type]))],
+      since,
+      cursor: input.cursor,
+      limit: input.limit,
+      sort,
+    },
+  };
 };
 
 export const sendInputOf = (input: V2SendInput, toDeviceId: string): SendInput => ({

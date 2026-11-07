@@ -40,18 +40,23 @@
             "minLength": 1
           },
           "name": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "host": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionText"
+              }
+            ],
+            "minLength": 1
           },
           "hostLabel": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionText"
+              }
+            ],
+            "minLength": 1
           },
           "createdAt": {
             "type": "integer",
@@ -66,11 +71,46 @@
           }
         }
       },
+      "FocusText": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "ListMemories": {
+        "type": "object",
+        "required": ["tags", "type", "since", "limit", "cursor"],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryTag"
+            },
+            "maxItems": 50
+          },
+          "type": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryType"
+            }
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string"
+          }
+        }
+      },
       "Memory": {
         "type": "object",
         "required": [
           "memoryId",
-          "userId",
           "memoryName",
           "description",
           "type",
@@ -85,26 +125,17 @@
             "type": "string",
             "minLength": 1
           },
-          "userId": {
-            "type": "string",
-            "minLength": 1
-          },
           "memoryName": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
+            "$ref": "#/components/schemas/MemoryName"
           },
           "description": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "$ref": "#/components/schemas/MemoryDescription"
           },
           "type": {
             "$ref": "#/components/schemas/MemoryType"
           },
           "body": {
-            "type": "string",
-            "maxLength": 100000
+            "$ref": "#/components/schemas/MemoryBody"
           },
           "tags": {
             "type": "array",
@@ -128,6 +159,15 @@
           }
         }
       },
+      "MemoryBody": {
+        "type": "string",
+        "maxLength": 100000
+      },
+      "MemoryDescription": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      },
       "MemoryHit": {
         "type": "object",
         "required": ["memory", "score"],
@@ -141,15 +181,18 @@
           }
         }
       },
+      "MemoryName": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+      },
       "MemoryPath": {
         "type": "object",
         "required": ["memoryName"],
         "properties": {
           "memoryName": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100,
-            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+            "$ref": "#/components/schemas/MemoryName"
           }
         }
       },
@@ -186,9 +229,7 @@
             "format": "double"
           },
           "memoryName": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
+            "$ref": "#/components/schemas/MemoryName"
           },
           "type": {
             "$ref": "#/components/schemas/MemoryType"
@@ -201,9 +242,7 @@
             "maxItems": 50
           },
           "description": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "$ref": "#/components/schemas/MemoryDescription"
           }
         }
       },
@@ -230,32 +269,25 @@
             "minLength": 1
           },
           "name": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "agentName": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "host": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "hostLabel": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "cwd": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "repo": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "branch": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "startedAt": {
             "type": "string",
@@ -266,10 +298,7 @@
             "format": "date-time"
           },
           "prompts": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0,
-            "maximum": 1000000
+            "$ref": "#/components/schemas/PromptCount"
           },
           "focus": {
             "$ref": "#/components/schemas/SessionFocus"
@@ -278,6 +307,12 @@
             "type": "boolean"
           }
         }
+      },
+      "PromptCount": {
+        "type": "integer",
+        "format": "int32",
+        "minimum": 0,
+        "maximum": 1000000
       },
       "RecordsAccepted": {
         "type": "object",
@@ -314,16 +349,13 @@
         "required": ["description", "type", "body", "tags"],
         "properties": {
           "description": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "$ref": "#/components/schemas/MemoryDescription"
           },
           "type": {
             "$ref": "#/components/schemas/MemoryType"
           },
           "body": {
-            "type": "string",
-            "maxLength": 100000
+            "$ref": "#/components/schemas/MemoryBody"
           },
           "tags": {
             "type": "array",
@@ -420,40 +452,32 @@
             "minLength": 1
           },
           "name": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "agentName": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "deviceId": {
             "type": "string",
             "minLength": 1
           },
           "host": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "hostLabel": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "cwd": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "repo": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "branch": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "commit": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "startedAt": {
             "type": "string",
@@ -464,10 +488,7 @@
             "format": "date-time"
           },
           "prompts": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0,
-            "maximum": 1000000
+            "$ref": "#/components/schemas/PromptCount"
           },
           "focus": {
             "$ref": "#/components/schemas/SessionFocus"
@@ -476,8 +497,7 @@
             "$ref": "#/components/schemas/SessionMode"
           },
           "permissionMode": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "pid": {
             "type": "integer",
@@ -511,12 +531,10 @@
         "required": ["first", "latest"],
         "properties": {
           "first": {
-            "type": "string",
-            "maxLength": 200
+            "$ref": "#/components/schemas/FocusText"
           },
           "latest": {
-            "type": "string",
-            "maxLength": 200
+            "$ref": "#/components/schemas/FocusText"
           }
         }
       },
@@ -558,25 +576,24 @@
         ],
         "properties": {
           "host": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionText"
+              }
+            ],
+            "minLength": 1
           },
           "cwd": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "repo": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "branch": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "commit": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "startedAt": {
             "type": "string",
@@ -587,10 +604,7 @@
             "format": "date-time"
           },
           "prompts": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0,
-            "maximum": 1000000
+            "$ref": "#/components/schemas/PromptCount"
           },
           "focus": {
             "$ref": "#/components/schemas/SessionFocus"
@@ -599,8 +613,7 @@
             "$ref": "#/components/schemas/SessionMode"
           },
           "permissionMode": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "pid": {
             "type": "integer",
@@ -608,6 +621,16 @@
             "minimum": 0
           }
         }
+      },
+      "SessionText": {
+        "type": "string",
+        "maxLength": 500
+      },
+      "TokenCount": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0,
+        "maximum": 1000000000
       },
       "TranscriptLine": {
         "type": "string",
@@ -638,58 +661,54 @@
             "minimum": 0
           },
           "host": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionText"
+              }
+            ],
+            "minLength": 1
           },
           "repo": {
-            "type": "string",
-            "maxLength": 500
+            "$ref": "#/components/schemas/SessionText"
           },
           "provider": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionText"
+              }
+            ],
+            "minLength": 1
           },
           "account": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionText"
+              }
+            ],
+            "minLength": 1
           },
           "model": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionText"
+              }
+            ],
+            "minLength": 1
           },
           "prompts": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0,
-            "maximum": 1000000
+            "$ref": "#/components/schemas/PromptCount"
           },
           "inputTokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0,
-            "maximum": 1000000000
+            "$ref": "#/components/schemas/TokenCount"
           },
           "outputTokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0,
-            "maximum": 1000000000
+            "$ref": "#/components/schemas/TokenCount"
           },
           "cacheWriteTokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0,
-            "maximum": 1000000000
+            "$ref": "#/components/schemas/TokenCount"
           },
           "cacheReadTokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0,
-            "maximum": 1000000000
+            "$ref": "#/components/schemas/TokenCount"
           },
           "at": {
             "type": "string",

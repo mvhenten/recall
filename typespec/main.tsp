@@ -21,14 +21,41 @@ const maxMemoryTags = 50;
 const maxMemoryTag = 200;
 const maxMemoryQuery = 2000;
 const maxMemoryHits = 50;
+const maxListRows = 100;
 
 @minLength(1)
 scalar TranscriptLine extends string;
+
+@maxLength(maxSessionText)
+scalar SessionText extends string;
+
+@maxLength(maxFocusText)
+scalar FocusText extends string;
+
+@minValue(0)
+@maxValue(maxPrompts)
+scalar PromptCount extends int32;
+
+@minValue(0)
+@maxValue(maxUsageTokens)
+scalar TokenCount extends int64;
 
 @minLength(1)
 @maxLength(maxMemoryTag)
 @pattern("^[a-z0-9][a-z0-9._:/-]*$")
 scalar MemoryTag extends string;
+
+@minLength(1)
+@maxLength(maxMemoryName)
+@pattern("^[a-z0-9]+(-[a-z0-9]+)*$")
+scalar MemoryName extends string;
+
+@minLength(1)
+@maxLength(maxMemoryDescription)
+scalar MemoryDescription extends string;
+
+@maxLength(maxMemoryBody)
+scalar MemoryBody extends string;
 
 model AppendRecords {
   @minLength(1)
@@ -65,42 +92,24 @@ enum SessionMode {
 }
 
 model SessionFocus {
-  @maxLength(maxFocusText)
-  first: string;
-
-  @maxLength(maxFocusText)
-  latest: string;
+  first: FocusText;
+  latest: FocusText;
 }
 
 model SessionSync {
   @minLength(1)
-  @maxLength(maxSessionText)
-  host: string;
+  host: SessionText;
 
-  @maxLength(maxSessionText)
-  cwd: string;
-
-  @maxLength(maxSessionText)
-  repo: string;
-
-  @maxLength(maxSessionText)
-  branch: string;
-
-  @maxLength(maxSessionText)
-  commit: string;
-
+  cwd: SessionText;
+  repo: SessionText;
+  branch: SessionText;
+  commit: SessionText;
   startedAt: offsetDateTime;
   lastActivityAt: offsetDateTime;
-
-  @minValue(0)
-  @maxValue(maxPrompts)
-  prompts: int32;
-
+  prompts: PromptCount;
   focus: SessionFocus;
   mode: SessionMode;
-
-  @maxLength(maxSessionText)
-  permissionMode: string;
+  permissionMode: SessionText;
 
   @minValue(0)
   pid: safeint;
@@ -111,44 +120,24 @@ model UsageDelta {
   seq: safeint;
 
   @minLength(1)
-  @maxLength(maxSessionText)
-  host: string;
+  host: SessionText;
 
-  @maxLength(maxSessionText)
-  repo: string;
+  repo: SessionText;
 
   @minLength(1)
-  @maxLength(maxSessionText)
-  provider: string;
+  provider: SessionText;
 
   @minLength(1)
-  @maxLength(maxSessionText)
-  account: string;
+  account: SessionText;
 
   @minLength(1)
-  @maxLength(maxSessionText)
-  `model`: string;
+  `model`: SessionText;
 
-  @minValue(0)
-  @maxValue(maxPrompts)
-  prompts: int32;
-
-  @minValue(0)
-  @maxValue(maxUsageTokens)
-  inputTokens: int64;
-
-  @minValue(0)
-  @maxValue(maxUsageTokens)
-  outputTokens: int64;
-
-  @minValue(0)
-  @maxValue(maxUsageTokens)
-  cacheWriteTokens: int64;
-
-  @minValue(0)
-  @maxValue(maxUsageTokens)
-  cacheReadTokens: int64;
-
+  prompts: PromptCount;
+  inputTokens: TokenCount;
+  outputTokens: TokenCount;
+  cacheWriteTokens: TokenCount;
+  cacheReadTokens: TokenCount;
   at: offsetDateTime;
   durable: boolean;
 
@@ -160,16 +149,13 @@ model Device {
   @minLength(1)
   deviceId: string;
 
-  @maxLength(maxSessionText)
-  name: string;
+  name: SessionText;
 
   @minLength(1)
-  @maxLength(maxSessionText)
-  host: string;
+  host: SessionText;
 
   @minLength(1)
-  @maxLength(maxSessionText)
-  hostLabel: string;
+  hostLabel: SessionText;
 
   createdAt: int64;
   lastUsedAt: int64;
@@ -180,45 +166,24 @@ model Session {
   @minLength(1)
   sessionId: string;
 
-  @maxLength(maxSessionText)
-  name: string;
-
-  @maxLength(maxSessionText)
-  agentName: string;
+  name: SessionText;
+  agentName: SessionText;
 
   @minLength(1)
   deviceId: string;
 
-  @maxLength(maxSessionText)
-  host: string;
-
-  @maxLength(maxSessionText)
-  hostLabel: string;
-
-  @maxLength(maxSessionText)
-  cwd: string;
-
-  @maxLength(maxSessionText)
-  repo: string;
-
-  @maxLength(maxSessionText)
-  branch: string;
-
-  @maxLength(maxSessionText)
-  commit: string;
-
+  host: SessionText;
+  hostLabel: SessionText;
+  cwd: SessionText;
+  repo: SessionText;
+  branch: SessionText;
+  commit: SessionText;
   startedAt: offsetDateTime;
   lastActivityAt: offsetDateTime;
-
-  @minValue(0)
-  @maxValue(maxPrompts)
-  prompts: int32;
-
+  prompts: PromptCount;
   focus: SessionFocus;
   mode: SessionMode;
-
-  @maxLength(maxSessionText)
-  permissionMode: string;
+  permissionMode: SessionText;
 
   @minValue(0)
   pid: safeint;
@@ -230,34 +195,16 @@ model PastSession {
   @minLength(1)
   sessionId: string;
 
-  @maxLength(maxSessionText)
-  name: string;
-
-  @maxLength(maxSessionText)
-  agentName: string;
-
-  @maxLength(maxSessionText)
-  host: string;
-
-  @maxLength(maxSessionText)
-  hostLabel: string;
-
-  @maxLength(maxSessionText)
-  cwd: string;
-
-  @maxLength(maxSessionText)
-  repo: string;
-
-  @maxLength(maxSessionText)
-  branch: string;
-
+  name: SessionText;
+  agentName: SessionText;
+  host: SessionText;
+  hostLabel: SessionText;
+  cwd: SessionText;
+  repo: SessionText;
+  branch: SessionText;
   startedAt: offsetDateTime;
   lastActivityAt: offsetDateTime;
-
-  @minValue(0)
-  @maxValue(maxPrompts)
-  prompts: int32;
-
+  prompts: PromptCount;
   focus: SessionFocus;
   running: boolean;
 }
@@ -305,31 +252,17 @@ enum SearchMode {
 }
 
 model MemoryPath {
-  @minLength(1)
-  @maxLength(maxMemoryName)
-  @pattern("^[a-z0-9]+(-[a-z0-9]+)*$")
-  memoryName: string;
+  memoryName: MemoryName;
 }
 
 model Memory {
   @minLength(1)
   memoryId: string;
 
-  @minLength(1)
-  userId: string;
-
-  @minLength(1)
-  @maxLength(maxMemoryName)
-  memoryName: string;
-
-  @minLength(1)
-  @maxLength(maxMemoryDescription)
-  description: string;
-
+  memoryName: MemoryName;
+  description: MemoryDescription;
   type: MemoryType;
-
-  @maxLength(maxMemoryBody)
-  body: string;
+  body: MemoryBody;
 
   @maxItems(maxMemoryTags)
   tags: MemoryTag[];
@@ -342,17 +275,26 @@ model Memory {
 }
 
 model SaveMemory {
-  @minLength(1)
-  @maxLength(maxMemoryDescription)
-  description: string;
-
+  description: MemoryDescription;
   type: MemoryType;
-
-  @maxLength(maxMemoryBody)
-  body: string;
+  body: MemoryBody;
 
   @maxItems(maxMemoryTags)
   tags: MemoryTag[];
+}
+
+model ListMemories {
+  @maxItems(maxMemoryTags)
+  tags: MemoryTag[];
+
+  type: MemoryType[];
+  since: offsetDateTime;
+
+  @minValue(1)
+  @maxValue(maxListRows)
+  limit: int32;
+
+  cursor: string;
 }
 
 model SearchMemories {
@@ -381,17 +323,11 @@ model MemoryHit {
 
 model NearbyMemory {
   score: float64;
-
-  @minLength(1)
-  @maxLength(maxMemoryName)
-  memoryName: string;
-
+  memoryName: MemoryName;
   type: MemoryType;
 
   @maxItems(maxMemoryTags)
   tags: MemoryTag[];
 
-  @minLength(1)
-  @maxLength(maxMemoryDescription)
-  description: string;
+  description: MemoryDescription;
 }

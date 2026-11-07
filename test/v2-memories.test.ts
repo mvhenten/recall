@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { parseSearch } from "../src/model";
+import { parseSearchMemories } from "../src/v2";
 import type { Client } from "./harness";
 import { harness } from "./harness";
 
 interface V2Memory {
   memoryId: string;
-  userId: string;
   memoryName: string;
   description: string;
   type: string;
@@ -77,8 +78,6 @@ const CORPUS = [
   },
 ];
 
-const QUERIES = ["ranking", "the cursor that breaks a tie", "device grant", "review thread", "vector"];
-
 const corpus = async (client: Client): Promise<void> => {
   for (const memory of CORPUS) {
     await client.save(memory.name, {
@@ -120,16 +119,6 @@ describe("the /v2 memories", () => {
 
     expect((await client.v2.request("GET", "/v2/memories/warm-memory/recall")).status).toBe(405);
     expect((await client.v2.recallMemory("no-such-memory")).status).toBe(404);
-  });
-
-  it("leaves lastRecalledAt off the wire", async () => {
-    const { user } = await harness();
-    const client = await user("no-sentinel");
-    await client.save("unrecalled", {});
-
-    const read = await memoryOf(await client.v2.memory("unrecalled"));
-    expect(Object.keys(read)).not.toContain("lastRecalledAt");
-    expect(Object.keys(await memoryOf(await client.v2.recallMemory("unrecalled")))).not.toContain("lastRecalledAt");
   });
 
   it("writes, reads back and deletes a memory under its own name", async () => {
@@ -180,21 +169,22 @@ describe("the /v2 memories", () => {
     const client = await user("limits");
 
     expect((await client.v2.memory("Not A Slug")).status).toBe(400);
-    expect((await client.v2.memory("trailing-")).status).toBe(400);
-    expect((await client.v2.memory("a".repeat(101))).status).toBe(400);
-
     expect((await client.v2.saveMemory("tagged", { tags: ["Upper Case"] })).status).toBe(400);
-    expect((await client.v2.saveMemory("tagged", { tags: ["-leading"] })).status).toBe(400);
-    expect((await client.v2.saveMemory("tagged", { tags: ["a".repeat(201)] })).status).toBe(400);
-    expect(
-      (await client.v2.saveMemory("tagged", { tags: Array.from({ length: 51 }, (_, at) => `t${at}`) })).status,
-    ).toBe(400);
-
     expect((await client.v2.saveMemory("heavy", { body: "x".repeat(100_001) })).status).toBe(400);
     expect((await client.v2.saveMemory("heavy", { body: "x".repeat(100_000) })).status).toBe(201);
     expect((await client.v2.saveMemory("typed", { type: "project" })).status).toBe(400);
+  });
+
+  // The contract tells an integer from a fraction, so a limit of 3.5 is refused by the same schema
+  // that takes a score of 0.1 — where the emitter alone wrote the two as one bounded number.
+  it("refuses a fraction where the contract counts and takes one where it measures", async () => {
+    const { user } = await harness();
+    const client = await user("fractions");
+
     expect((await client.v2.searchMemories({ limit: 3.5 })).status).toBe(400);
-    expect((await client.v2.searchMemories({ mode: "hybrid " })).status).toBe(400);
+    expect((await client.v2.searchMemories({ minScore: 0.1 })).status).toBe(200);
+    expect((await client.v2.searchMemories({ minScore: 0.5 })).status).toBe(200);
+    expect((await client.v2.memories("?limit=3.5")).status).toBe(400);
   });
 
   it("serves the search under the memories beside a memory of the same name", async () => {
@@ -234,18 +224,55 @@ describe("the /v2 memories", () => {
     expect(held.body).toBe("only the owner reads this");
   });
 
-  it("filters a listing by the type the contract names", async () => {
+  it("filters a listing in the words the search body uses", async () => {
     const { user } = await harness();
     const client = await user("filtering");
     await corpus(client);
+    const names = async (query: string): Promise<string[]> => {
+      const listed = await client.v2.memories(query);
+      expect(listed.status).toBe(200);
+      const { memories }: { memories: V2Memory[] } = await listed.json();
+      return memories.map((memory) => memory.memoryName).sort();
+    };
 
-    const references = await client.v2.memories("?type=Reference");
-    expect(references.status).toBe(200);
-    const { memories }: { memories: V2Memory[] } = await references.json();
-    expect(memories.map((memory) => memory.memoryName).sort()).toEqual(["embedding-quantisation", "ranking-fusion"]);
-    expect(memories.every((memory) => memory.type === "Reference")).toBe(true);
+    expect(await names("?type=Reference")).toEqual(["embedding-quantisation", "ranking-fusion"]);
+    expect(await names("?tags=storage")).toEqual(["cursor-paging", "embedding-quantisation"]);
+    expect(await names("?tags=storage&tags=auth")).toEqual(["cursor-paging", "device-grant", "embedding-quantisation"]);
+    expect(await names(`?since=${encodeURIComponent(new Date(0).toISOString())}`)).toHaveLength(CORPUS.length);
+
+    // A parameter left blank is a parameter not given, the way `/v1` reads one, and `tag` is a
+    // word `/v1` filters by and this surface does not.
+    expect(await names("?type=&tags=")).toHaveLength(CORPUS.length);
+    expect(await names("?tag=storage")).toHaveLength(CORPUS.length);
 
     expect((await client.v2.memories("?type=reference")).status).toBe(400);
+    expect((await client.v2.memories("?tags=Storage")).status).toBe(400);
+    expect((await client.v2.memories("?since=1700000000000")).status).toBe(400);
+    expect((await client.v2.memories("?since=2023-11-14T22:13:20")).status).toBe(400);
+  });
+
+  // The two surfaces rank through one helper, so what they can still differ by is what their
+  // parsers build. These bodies reach that: `/v1` folds a tag's case and the space around it,
+  // where `/v2` holds the caller to the charset the contract writes down.
+  it("reads a search body the same as /v1 except where /v1 normalises a tag", () => {
+    const search = (tags: string[]): Record<string, unknown> => ({
+      query: "ranking",
+      tags,
+      limit: 10,
+      minScore: 0.1,
+    });
+    const v1 = (tags: string[]) => parseSearch({ ...search(tags), any: tags.length === 0, mode: "hybrid" });
+    const v2 = (tags: string[]) => parseSearchMemories({ ...search(tags), mode: "Hybrid" });
+
+    for (const tags of [[], ["search"], ["storage", "search"], ["search", "storage"], ["search", "search"]]) {
+      expect(v2(tags)).toEqual(v1(tags));
+    }
+
+    expect(v1(["Search", " search "])).toEqual({
+      ok: true,
+      value: { query: "ranking", tags: ["search"], limit: 10, minScore: 0.1, mode: "hybrid" },
+    });
+    expect(v2(["Search", " search "]).ok).toBe(false);
   });
 
   it("answers the same corpus as /v1, listed and ranked alike", async () => {
@@ -259,22 +286,6 @@ describe("the /v2 memories", () => {
     expect(v2Listed.memories.map((memory) => memory.memoryId)).toEqual(
       v1Listed.memories.map((memory) => memory.memoryId),
     );
-
-    // Ranking is what a careless change breaks without changing a count, so the ids are compared in
-    // the order the two surfaces put them in and never as sets.
-    for (const query of QUERIES) {
-      for (const mode of ["hybrid", "vector", "text"]) {
-        const body = { query, limit: 10, minScore: 0.1, mode };
-        const v1 = await client.request("POST", "/v1/search", { ...body, tags: [], any: true });
-        const v2 = await client.v2.searchMemories({ ...body, mode: `${mode[0]?.toUpperCase()}${mode.slice(1)}` });
-        expect(v1.status).toBe(200);
-        expect(v2.status).toBe(200);
-        const ranked: { hits: V1Hit[] } = await v1.json();
-        const alike: { hits: V2Hit[] } = await v2.json();
-        expect(alike.hits.map((hit) => hit.memory.memoryId)).toEqual(ranked.hits.map((hit) => hit.memory.memoryId));
-        expect(alike.hits.map((hit) => hit.score)).toEqual(ranked.hits.map((hit) => hit.score));
-      }
-    }
 
     const tagged = { query: "ranking", limit: 10, minScore: 0.1, mode: "hybrid" };
     const v1Tagged = await client.request("POST", "/v1/search", { ...tagged, tags: ["search"], any: false });

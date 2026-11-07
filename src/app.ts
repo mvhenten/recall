@@ -305,10 +305,10 @@ import { agentName, readTurns } from "./turns";
 import {
   deviceView,
   memoryHitView,
-  memoryListParams,
   memoryView,
   nearbyMemoryView,
   parseAppendRecords,
+  parseMemoryList,
   parseMemoryName,
   parseSaveMemory,
   parseSearchMemories,
@@ -2750,9 +2750,7 @@ export const createApp = (deps: Deps): App => {
   };
 
   const v2MemoriesList = async (url: URL, db: D1Database, caller: Caller): Promise<Response> => {
-    const params = memoryListParams(url.searchParams);
-    if (!params.ok) return error(400, params.error);
-    const input = parseList(params.value, sortInForce(url, MEMORY_SORTS).sort);
+    const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
     if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
