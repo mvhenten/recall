@@ -8,18 +8,18 @@ export const SearchModeSchema = z.enum(["Hybrid", "Vector", "Text"]);
 
 export const AppendRecordsSchema = z.object({
   file: z.string().min(1),
-  from: z.number().min(0),
+  from: z.int().min(0),
   records: z.array(z.string().min(1)).min(1).max(1000),
 });
 
 export const RecordsAcceptedSchema = z.object({
   file: z.string().min(1),
-  next: z.number().min(0),
+  next: z.int().min(0),
 });
 
 export const RecordsConflictSchema = z.object({
   error: z.string().min(1),
-  next: z.number().min(0),
+  next: z.int().min(0),
 });
 
 export const SessionFocusSchema = z.object({
@@ -35,25 +35,25 @@ export const SessionSyncSchema = z.object({
   commit: z.string().max(500),
   startedAt: z.string().datetime({ offset: true }),
   lastActivityAt: z.string().datetime({ offset: true }),
-  prompts: z.number().min(0).max(1000000),
+  prompts: z.int().min(0).max(1000000),
   focus: SessionFocusSchema,
   mode: SessionModeSchema,
   permissionMode: z.string().max(500),
-  pid: z.number().min(0),
+  pid: z.int().min(0),
 });
 
 export const UsageDeltaSchema = z.object({
-  seq: z.number().min(0),
+  seq: z.int().min(0),
   host: z.string().min(1).max(500),
   repo: z.string().max(500),
   provider: z.string().min(1).max(500),
   account: z.string().min(1).max(500),
   model: z.string().min(1).max(500),
-  prompts: z.number().min(0).max(1000000),
-  inputTokens: z.number().min(0).max(1000000000),
-  outputTokens: z.number().min(0).max(1000000000),
-  cacheWriteTokens: z.number().min(0).max(1000000000),
-  cacheReadTokens: z.number().min(0).max(1000000000),
+  prompts: z.int().min(0).max(1000000),
+  inputTokens: z.int().min(0).max(1000000000),
+  outputTokens: z.int().min(0).max(1000000000),
+  cacheWriteTokens: z.int().min(0).max(1000000000),
+  cacheReadTokens: z.int().min(0).max(1000000000),
   at: z.string().datetime({ offset: true }),
   durable: z.boolean(),
   files: z.array(z.string()).max(500),
@@ -64,8 +64,8 @@ export const DeviceSchema = z.object({
   name: z.string().max(500),
   host: z.string().min(1).max(500),
   hostLabel: z.string().min(1).max(500),
-  createdAt: z.number(),
-  lastUsedAt: z.number(),
+  createdAt: z.int(),
+  lastUsedAt: z.int(),
   current: z.boolean(),
 });
 
@@ -82,11 +82,11 @@ export const SessionSchema = z.object({
   commit: z.string().max(500),
   startedAt: z.string().datetime({ offset: true }),
   lastActivityAt: z.string().datetime({ offset: true }),
-  prompts: z.number().min(0).max(1000000),
+  prompts: z.int().min(0).max(1000000),
   focus: SessionFocusSchema,
   mode: SessionModeSchema,
   permissionMode: z.string().max(500),
-  pid: z.number().min(0),
+  pid: z.int().min(0),
   current: z.boolean(),
 });
 
@@ -101,7 +101,7 @@ export const PastSessionSchema = z.object({
   branch: z.string().max(500),
   startedAt: z.string().datetime({ offset: true }),
   lastActivityAt: z.string().datetime({ offset: true }),
-  prompts: z.number().min(0).max(1000000),
+  prompts: z.int().min(0).max(1000000),
   focus: SessionFocusSchema,
   running: z.boolean(),
 });
@@ -140,8 +140,11 @@ export const MemoryPathSchema = z.object({
 
 export const MemorySchema = z.object({
   memoryId: z.string().min(1),
-  userId: z.string().min(1),
-  memoryName: z.string().min(1).max(100),
+  memoryName: z
+    .string()
+    .regex(/^[a-z0-9]+(-[a-z0-9]+)*$/)
+    .min(1)
+    .max(100),
   description: z.string().min(1).max(500),
   type: MemoryTypeSchema,
   body: z.string().max(100000),
@@ -154,9 +157,9 @@ export const MemorySchema = z.object({
         .max(200),
     )
     .max(50),
-  createdAt: z.number(),
-  updatedAt: z.number(),
-  recallCount: z.number().min(0),
+  createdAt: z.int(),
+  updatedAt: z.int(),
+  recallCount: z.int().min(0),
 });
 
 export const SaveMemorySchema = z.object({
@@ -174,6 +177,22 @@ export const SaveMemorySchema = z.object({
     .max(50),
 });
 
+export const ListMemoriesSchema = z.object({
+  tags: z
+    .array(
+      z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+        .min(1)
+        .max(200),
+    )
+    .max(50),
+  type: z.array(MemoryTypeSchema),
+  since: z.string().datetime({ offset: true }),
+  limit: z.int().min(1).max(100),
+  cursor: z.string(),
+});
+
 export const SearchMemoriesSchema = z.object({
   query: z.string().min(1).max(2000),
   tags: z
@@ -185,7 +204,7 @@ export const SearchMemoriesSchema = z.object({
         .max(200),
     )
     .max(50),
-  limit: z.number().min(1).max(50),
+  limit: z.int().min(1).max(50),
   minScore: z.number().min(-1).max(1),
   mode: SearchModeSchema,
 });
@@ -197,7 +216,11 @@ export const MemoryHitSchema = z.object({
 
 export const NearbyMemorySchema = z.object({
   score: z.number(),
-  memoryName: z.string().min(1).max(100),
+  memoryName: z
+    .string()
+    .regex(/^[a-z0-9]+(-[a-z0-9]+)*$/)
+    .min(1)
+    .max(100),
   type: MemoryTypeSchema,
   tags: z
     .array(

@@ -14,4 +14,5 @@ options:
   "@typespec/json-schema":
     file-type: json
     bundleId: recall.json
+    int64-strategy: number
     emitter-output-dir: "{project-root}/generated"

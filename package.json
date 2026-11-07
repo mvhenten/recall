@@ -7,7 +7,7 @@
   },
   "scripts": {
     "build:browser": "node npm-scripts/build-browser.mjs",
-    "generate": "tsp compile typespec && biome check --write typespec/generated",
+    "generate": "tsp compile typespec && node npm-scripts/whole-numbers.mjs && biome check --write typespec/generated",
     "generate:check": "npm run generate && git diff --exit-code typespec/generated",
     "prepare": "npm run build:browser",
     "lint": "biome check .",
