@@ -7,30 +7,26 @@ using TypeSpec.JsonSchema;
 @jsonSchema
 namespace Recall;
 
-enum Speaker {
-  User,
-  Model,
-  Machinery,
-}
+const maxRecordsPerAppend = 1000;
 
-model TranscriptRecord {
-  ordinal: int32;
-  recordId: string;
-  line: string;
-}
+@minLength(1)
+scalar TranscriptLine extends string;
 
 model AppendRecords {
+  @minLength(1)
   file: string;
-  from: int64;
-  records: TranscriptRecord[];
+
+  @minValue(0)
+  from: int32;
+
+  @maxItems(maxRecordsPerAppend)
+  records: TranscriptLine[];
 }
 
 model RecordsAccepted {
+  @minLength(1)
   file: string;
-  next: int64;
-}
 
-model FileReach {
-  file: string;
-  bytes: int64;
+  @minValue(0)
+  next: int32;
 }

@@ -2,18 +2,19 @@ import { describe, expect, it } from "vitest";
 import { AppendRecordsSchema } from "../typespec/generated/schemas";
 import record from "./fixtures/redacted-record.json";
 
-// The generated validator, put to the shape a host actually sends: a verbatim redacted transcript
-// line, carried by the record that names where it sits. A property TypeSpec declared required has
-// to be required here too, or the Worker boundary would take a body the models say cannot exist.
-
 describe("the generated append body", () => {
   it("accepts a redacted transcript line", () => {
-    const body = { file: "main", from: 0, records: [record] };
+    const body = { file: "main", from: 0, records: [record.line] };
     expect(AppendRecordsSchema.parse(body)).toEqual(body);
   });
 
-  it("rejects a record with no recordId", () => {
-    const body = { file: "main", from: 0, records: [{ ordinal: record.ordinal, line: record.line }] };
+  it("rejects an ordinal before the start of the file", () => {
+    const body = { file: "main", from: -5, records: [record.line] };
+    expect(AppendRecordsSchema.safeParse(body).success).toBe(false);
+  });
+
+  it("rejects a batch over the record limit", () => {
+    const body = { file: "main", from: 0, records: Array(1001).fill(record.line) };
     expect(AppendRecordsSchema.safeParse(body).success).toBe(false);
   });
 });

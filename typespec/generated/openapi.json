@@ -13,30 +13,20 @@
         "required": ["file", "from", "records"],
         "properties": {
           "file": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "from": {
             "type": "integer",
-            "format": "int64"
+            "format": "int32",
+            "minimum": 0
           },
           "records": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/TranscriptRecord"
-            }
-          }
-        }
-      },
-      "FileReach": {
-        "type": "object",
-        "required": ["file", "bytes"],
-        "properties": {
-          "file": {
-            "type": "string"
-          },
-          "bytes": {
-            "type": "integer",
-            "format": "int64"
+              "$ref": "#/components/schemas/TranscriptLine"
+            },
+            "maxItems": 1000
           }
         }
       },
@@ -45,33 +35,19 @@
         "required": ["file", "next"],
         "properties": {
           "file": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "next": {
             "type": "integer",
-            "format": "int64"
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
-      "Speaker": {
+      "TranscriptLine": {
         "type": "string",
-        "enum": ["User", "Model", "Machinery"]
-      },
-      "TranscriptRecord": {
-        "type": "object",
-        "required": ["ordinal", "recordId", "line"],
-        "properties": {
-          "ordinal": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "recordId": {
-            "type": "string"
-          },
-          "line": {
-            "type": "string"
-          }
-        }
+        "minLength": 1
       }
     }
   }

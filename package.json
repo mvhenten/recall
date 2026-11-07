@@ -8,19 +8,23 @@
   "scripts": {
     "build:browser": "node npm-scripts/build-browser.mjs",
     "generate": "tsp compile typespec && biome check --write typespec/generated",
+    "generate:check": "npm run generate && git diff --exit-code typespec/generated",
     "prepare": "npm run build:browser",
     "lint": "biome check .",
     "typecheck": "tsc --noEmit && tsc --noEmit -p browser",
-    "pretypecheck": "npm run build:browser && npm run generate",
+    "pretypecheck": "npm run build:browser",
     "fix": "biome check --write .",
-    "pretest": "npm run build:browser && npm run generate",
+    "pretest": "npm run build:browser",
     "test": "vitest run && node --test --test-timeout=10000 hooks/*.test.mjs npm-scripts/*.test.mjs",
-    "predeploy": "npm run build:browser && npm run generate",
+    "predeploy": "npm run build:browser",
     "deploy": "node npm-scripts/deploy.mjs",
     "presetup": "npm run build:browser",
     "setup": "node npm-scripts/setup.mjs",
     "release": "node npm-scripts/release.mjs",
     "recompress-archive": "node npm-scripts/recompress-archive.mjs"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.0",
@@ -35,8 +39,7 @@
     "jose": "^6.2.14",
     "typescript": "^5.9.0",
     "vitest": "^5.0.0",
-    "wrangler": "^4.150.0",
-    "zod": "^4.6.7"
+    "wrangler": "^4.150.0"
   },
   "allowScripts": {
     "workerd@1.20261023.1": true,
