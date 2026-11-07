@@ -13,12 +13,13 @@
     "pretypecheck": "npm run build:browser",
     "fix": "biome check --write .",
     "pretest": "npm run build:browser",
-    "test": "vitest run && node --test --test-timeout=10000 hooks/*.test.mjs",
+    "test": "vitest run && node --test --test-timeout=10000 hooks/*.test.mjs npm-scripts/*.test.mjs",
     "predeploy": "npm run build:browser",
     "deploy": "node npm-scripts/deploy.mjs",
     "presetup": "npm run build:browser",
     "setup": "node npm-scripts/setup.mjs",
-    "release": "node npm-scripts/release.mjs"
+    "release": "node npm-scripts/release.mjs",
+    "recompress-archive": "node npm-scripts/recompress-archive.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.0",
