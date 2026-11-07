@@ -40,37 +40,42 @@ export const compressedStretchName = (from: number, through: number, inflates: n
 // and in the archive alike.
 export const legacyStretchName = (place: number): string => padded(place);
 
-// The places one stretch's name carries, and nothing at all where the name is not one the archive
-// wrote. Only `from` is ever named on its own: a host from before redaction stored a stretch under
-// one place, meaning a place in the file and in the archive at once, and left its end to the
-// object's own size.
-export interface NamedStretch {
-  from: number;
-  through: number | null;
-  inflates: number | null;
-}
+// Which of the three forms one stretch's name is in, and nothing at all where the name is not one
+// the archive wrote. A `place` is what a host from before redaction stored a stretch under: one
+// number meaning a place in the file and in the archive at once, with the stretch running to the
+// object's own size in both. A `span` names where in the file the stretch begins and ends over an
+// object holding those bytes as they stand. A `packed` names the same span over one gzip member,
+// and says how many bytes it inflates to as well.
+export type NamedStretch =
+  | { form: "place"; from: number }
+  | { form: "span"; from: number; through: number }
+  | { form: "packed"; from: number; through: number; inflates: number };
 
 export const namedStretch = (name: string): NamedStretch | null => {
   const found = STRETCH_NAME.exec(name);
   const opens = found?.[1];
   if (opens === undefined) return null;
+  const from = Number(opens);
   const ends = found?.[2];
+  if (ends === undefined) return { form: "place", from };
+  const through = Number(ends);
   const inflates = found?.[3];
-  return {
-    from: Number(opens),
-    through: ends === undefined ? null : Number(ends),
-    inflates: inflates === undefined ? null : Number(inflates),
-  };
+  if (inflates === undefined) return { form: "span", from, through };
+  return { form: "packed", from, through, inflates: Number(inflates) };
 };
 
 // Whether one name is a stretch's, which is what says a key is one the archive wrote.
 export const isStretchName = (name: string): boolean => namedStretch(name) !== null;
 
-// How many bytes of the file one stretch's object inflates to, and nothing at all where the object
-// holds those bytes as they are. It is the whole of how a reader tells the two apart: a compressed
-// stretch is one gzip member, which has no inner range, so it is read whole and inflated where an
-// uncompressed one is ranged inside.
-export const inflatesTo = (name: string): number | null => namedStretch(name)?.inflates ?? null;
+export type PackedStretch = Extract<NamedStretch, { form: "packed" }>;
+
+// One name read as a stretch stored gzipped, and nothing at all for either of the other two forms.
+// It is the whole of how a reader tells them apart: a gzip member has no inner range, so it is read
+// whole and inflated where a stretch stored as it stands is ranged inside.
+export const packedStretch = (name: string): PackedStretch | null => {
+  const named = namedStretch(name);
+  return named !== null && named.form === "packed" ? named : null;
+};
 
 // One ranged read of one stretch: which object to open, where that object's first byte falls in
 // the archive, how much of its head to pass over, and how many bytes to take. `at` names the
@@ -215,7 +220,7 @@ export const plannedBatch = (reads: PlannedRead[], edge: number, pending: number
   while (budget > 0 && left > 0) {
     const read = reads[at - 1];
     if (read === undefined) break;
-    const take = inflatesTo(read.at) === null ? Math.min(left, budget) : left;
+    const take = packedStretch(read.at) === null ? Math.min(left, budget) : left;
     batch.unshift({ run: read.run, at: read.at, offset: read.offset, skip: read.skip + left - take, bytes: take });
     budget -= take;
     left -= take;

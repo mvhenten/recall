@@ -101,8 +101,8 @@ export interface Client {
     through: number,
     body: string | Uint8Array,
   ): Promise<Response>;
-  /// One stretch as every host sends one: the span of the file it accounts for, the bytes gzipped,
-  /// and how many bytes they inflate to.
+  /// One stretch as every host sends one: the span of the file it accounts for, and the bytes
+  /// gzipped.
   archiveGzip(
     sessionId: string,
     file: string,
@@ -408,7 +408,7 @@ export const harness = async ({
       async archiveGzip(sessionId, file, from, through, body) {
         const member = await gzipped(body);
         return send(
-          `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${from}&through=${through}&inflates=${held(body)}`,
+          `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${from}&through=${through}`,
           {
             method: "PUT",
             headers: { ...headers, "content-type": "application/gzip" },

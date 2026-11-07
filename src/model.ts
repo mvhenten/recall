@@ -592,15 +592,13 @@ export const parseStretchCursor = (value: string | null): Parsed<string> =>
     ? { ok: true, value: value ?? "" }
     : fail("after must name a stretch, as <start>, <start>.<end> or <start>.<end>.<inflates> in sixteen digits each");
 
-// Which stretch of a file an append is offering: where it begins in the file on disk, where it ends
-// there, and — where the body is one gzip member — how many bytes of the file it inflates to. A
-// host that names only `offset` is one from before a redacted stretch could run to another length
-// than the file it was read from, and means a place in the archive by it; its stretches are stored
-// and read back on those terms.
-export type StretchSpan =
-  | { kind: "plain"; from: number; through: number }
-  | { kind: "gzip"; from: number; through: number; inflates: number }
-  | { kind: "archive"; from: number };
+// Which stretch of a file an append is offering: where it begins in the file on disk and where it
+// ends there. Whether the body is one gzip member or the bytes of the file is the body's own to say
+// and never a caller's: a name claiming a length the body does not hold would place every stretch
+// past it in the wrong part of the archive. A host that names only `offset` is one from before a
+// redacted stretch could run to another length than the file it was read from, and means a place in
+// the archive by it; its stretches are stored and read back on those terms.
+export type StretchSpan = { kind: "span"; from: number; through: number } | { kind: "archive"; from: number };
 
 export const parseStretchSpan = (params: URLSearchParams): Parsed<StretchSpan> => {
   const offset = parseStretchOffset(params.get("offset"));
@@ -611,12 +609,7 @@ export const parseStretchSpan = (params: URLSearchParams): Parsed<StretchSpan> =
   if (!isInteger(through, offset.value + 1, offset.value + MAX_STRETCH_BYTES)) {
     return fail(`through must be past offset, by at most ${MAX_STRETCH_BYTES} bytes`);
   }
-  const packed = params.get("inflates");
-  if (packed === null) return { ok: true, value: { kind: "plain", from: offset.value, through } };
-  const inflates = Number(packed);
-  return isInteger(inflates, 1, MAX_STRETCH_BYTES)
-    ? { ok: true, value: { kind: "gzip", from: offset.value, through, inflates } }
-    : fail(`inflates must be how many bytes the gzipped body holds, 1 to ${MAX_STRETCH_BYTES}`);
+  return { ok: true, value: { kind: "span", from: offset.value, through } };
 };
 
 const BYTE_RANGE = /^bytes=([0-9]{1,16})-([0-9]{1,16})$/;

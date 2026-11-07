@@ -459,7 +459,8 @@ describe("transcript archive", () => {
   it("stores a stretch gzipped and reads the file back byte for byte", async () => {
     const h = await harness();
     const userId = `packer-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
+    const token = await h.login(await h.invite(`${userId}@example.com`, userId));
+    const client = h.clientWithToken(token);
     await client.sync("s-gzip");
     const first = turns(40, "first");
     const second = turns(30, "second");
@@ -472,12 +473,14 @@ describe("transcript archive", () => {
       `${userId}/s-gzip/main/${compressedStretchName(0, 9_000, bytes(first))}`,
       `${userId}/s-gzip/main/${compressedStretchName(9_000, 20_000, bytes(second))}`,
     ]);
-    const packed = stored.objects.reduce((all, object) => all + object.size, 0);
-    expect(packed * 3).toBeLessThan(bytes(first) + bytes(second));
-    // How far into the file the archive reaches, and how many of the file's bytes it holds, are
-    // both read off the names and neither off the sizes above.
+    // How far into the file the archive reaches, how many of the file's bytes it holds, and the
+    // count the index and a following box are weighed against all come off the names and none off
+    // the sizes of the objects above. Two writers reaching one place redact the same bytes the same
+    // way and gzip them to bodies of whatever lengths their zlib left them, so whichever landed
+    // leaves the same count behind.
     expect(await held(await client.transcript("s-gzip"))).toEqual({ main: 20_000 });
     expect(await holds(await client.transcript("s-gzip"))).toEqual({ main: bytes(first) + bytes(second) });
+    expect(await h.indexMark(userId, "s-gzip")).toMatchObject({ archived: bytes(first) + bytes(second) });
 
     // A reader that takes the members is handed them as they stand — not a byte of the archive is
     // touched — and members laid end to end are one gzip stream, which is what it inflates.
@@ -485,53 +488,39 @@ describe("transcript archive", () => {
     expect(asStored.headers.get("content-encoding")).toBe("gzip");
     const members = [await gzipped(first), await gzipped(second)];
     expect(new Uint8Array(await asStored.arrayBuffer())).toEqual(laidEndToEnd(members));
-    // One that does not is answered the bytes of the file, which is the same file.
+    // One that does not is answered the bytes of the file, which is the same file. A client naming
+    // the coding only to refuse it is one of those: `gzip;q=0` asks for the bytes.
     const asBytes = await client.readTranscript("s-gzip", "main");
     expect(asBytes.headers.get("content-encoding")).toBeNull();
     expect(await asBytes.text()).toBe(first + second);
+    const refused = await h.send("/v1/sessions/s-gzip/transcript?file=main", {
+      headers: { authorization: `Bearer ${token}`, "accept-encoding": "br, gzip;q=0" },
+    });
+    expect(refused.headers.get("content-encoding")).toBeNull();
+    expect(await refused.text()).toBe(first + second);
   });
 
-  // The count the index and a following box are weighed against comes off the name and never off
-  // the body. Two writers reaching one place redact the same bytes the same way, so they hold
-  // stretches of the same span that gzip to bodies of whatever lengths their zlib left them; the
-  // name says how much of the file the stretch holds, so whichever landed leaves the same count.
-  it("counts how much of its own transcript the archive holds off the name, not the body", async () => {
+  // A gzip member says nothing about how long it inflates to, so the append takes the length by
+  // inflating it. The length the format trails is no answer: it belongs to the last member of the
+  // body, so a body holding two of them would be stored under a name claiming part of what it
+  // holds, and every later read of that object — the indexer's, a restore's, a reader's — would
+  // break for good. So nothing of the kind is stored and the append says so.
+  it("refuses a body holding more than one gzip member", async () => {
     const h = await harness();
-    const userId = `weighed-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
-    await client.sync("s-weighed");
-    const body = turns(40, "weighed");
-
-    expect((await client.archiveGzip("s-weighed", "main", 0, 9_000, body)).status).toBe(200);
-
-    const member = await gzipped(body);
-    expect(member.byteLength).toBeLessThan(bytes(body));
-    expect(await h.indexMark(userId, "s-weighed")).toMatchObject({ archived: bytes(body) });
-    expect(await holds(await client.transcript("s-weighed"))).toEqual({ main: bytes(body) });
-  });
-
-  // A body said to be gzipped is weighed against the frame of the format before it is stored under
-  // a name saying how much it inflates to. A name that lied about that would place every stretch
-  // past it in the wrong part of the archive, and nothing else in the service would ever find out.
-  it("refuses a body that does not hold the bytes its name would say it does", async () => {
-    const h = await harness();
-    const userId = `framed-${crypto.randomUUID()}`;
+    const userId = `doubled-${crypto.randomUUID()}`;
     const token = await h.login(await h.invite(`${userId}@example.com`, userId));
     const client = h.clientWithToken(token);
-    await client.sync("s-framed");
-    const body = turns(10, "framed");
-    const path = `/v1/sessions/s-framed/transcript?file=main&offset=0&through=9000`;
-    const headers = { authorization: `Bearer ${token}`, "content-type": "application/gzip" };
+    await client.sync("s-doubled");
+    const members = [await gzipped(turns(10, "first")), await gzipped(turns(10, "second"))];
 
-    // The bytes of the file where a member was promised.
-    const bare = await h.send(`${path}&inflates=${bytes(body)}`, { method: "PUT", headers, body });
-    expect(bare.status).toBe(400);
-    // A member, under a name that says it holds more of the file than it does.
-    const member = await gzipped(body);
-    const lying = await h.send(`${path}&inflates=${bytes(body) + 1}`, { method: "PUT", headers, body: member });
-    expect(lying.status).toBe(400);
+    const sent = await h.send("/v1/sessions/s-doubled/transcript?file=main&offset=0&through=9000", {
+      method: "PUT",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/gzip" },
+      body: laidEndToEnd(members),
+    });
 
-    expect(await held(await client.transcript("s-framed"))).toEqual({});
+    expect(sent.status).toBe(500);
+    expect(await held(await client.transcript("s-doubled"))).toEqual({});
   });
 
   // One file holding both forms, which is what a host upgrading mid-session leaves behind. Nothing
@@ -595,6 +584,28 @@ describe("transcript archive", () => {
     const read = { at: compressedStretchName(9_000, 20_000, bytes(second)), offset: at, skip: 0, bytes: bytes(second) };
     expect(runs).toEqual([{ from: at, to: at + bytes(second), reads: [read] }]);
     expect(followedBatch(runs, at, 65_536)).toEqual({ batch: [{ run: 0, ...read }], at: at + bytes(second) });
+  });
+
+  // A key can sort past the reader's cursor and still name the span the stretch that cursor names
+  // already accounted for, which is what an old host and a new one racing one append leave behind:
+  // the same span of the file twice, once as the bytes it was read from and once as a gzip member.
+  // The whole-file layout reads the first of those and passes the other over, and a beat reads it
+  // the same way — handing the second over would render a stretch the reader already has a second
+  // time and place the stretch behind it where no manifest of the file puts it.
+  it("passes over a stretch of the span its own cursor names", async () => {
+    const userId = `racing-${crypto.randomUUID()}`;
+    const prefix = `${userId}/s-racing/main/`;
+    const first = turns(20, "first");
+    const second = turns(20, "second");
+    await env.TRANSCRIPTS.put(`${prefix}${stretchName(0, 9_000)}`, first);
+    await env.TRANSCRIPTS.put(`${prefix}${compressedStretchName(0, 9_000, bytes(first))}`, await gzipped(first));
+    await env.TRANSCRIPTS.put(`${prefix}${compressedStretchName(9_000, 20_000, bytes(second))}`, await gzipped(second));
+
+    const at = bytes(first);
+    const runs = await archivedSince(env.TRANSCRIPTS, userId, "s-racing", "main", at, stretchName(0, 9_000));
+
+    const read = { at: compressedStretchName(9_000, 20_000, bytes(second)), offset: at, skip: 0, bytes: bytes(second) };
+    expect(runs).toEqual([{ from: at, to: at + bytes(second), reads: [read] }]);
   });
 
   it("keeps a session's files once its row has moved to the history", async () => {

@@ -267,24 +267,23 @@ import {
   TOOLS,
   toolArguments,
 } from "./tools";
-import { inflatesTo, legacyStretchName, type Reach } from "./transcript-plan";
+import { legacyStretchName, packedStretch, type Reach } from "./transcript-plan";
 import {
   appendStretch,
   archivedFiles,
   archivedSince,
   archivedTranscript,
   cacheArchived,
-  gzipInflatesTo,
   MAIN_FILE,
   MAX_STRETCH_BYTES,
   openStretch,
-  openWholeStretch,
   parseStretchKey,
   putStretch,
   readStretch,
   readTranscript,
   type StretchBody,
   type Stretched,
+  storedStretch,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
 
@@ -340,8 +339,18 @@ const readJson = (request: Request): Promise<unknown> => request.json().catch(()
 
 // Whether a reader of the archive takes the gzip members a stretch is stored as. Every browser does
 // and so does the host's own client, which is the whole of why nothing is inflated here for them;
-// one that does not is answered the bytes of the file.
-const takesGzip = (request: Request): boolean => (request.headers.get("accept-encoding") ?? "").includes("gzip");
+// one that does not is answered the bytes of the file. A client that names the coding only to
+// refuse it — `gzip;q=0` — is one of those, and is answered what it asked for rather than what it
+// named.
+const takesGzip = (request: Request): boolean => {
+  for (const coding of (request.headers.get("accept-encoding") ?? "").split(",")) {
+    const [named, ...params] = coding.split(";").map((part) => part.trim().toLowerCase());
+    if (named !== "gzip") continue;
+    const quality = params.find((param) => param.startsWith("q="));
+    return quality === undefined || Number(quality.slice(2)) > 0;
+  }
+  return false;
+};
 
 const embeddingText = (name: string, description: string, body: string): string => `${name}\n${description}\n\n${body}`;
 
@@ -787,16 +796,10 @@ export const createApp = (deps: Deps): App => {
     // that file; one that named an archive offset is answered in those. So the deploy that takes
     // the span strands no host that has yet to learn to send one.
     if (asked.kind !== "archive") {
-      // A body said to be gzipped is weighed against the frame of the format before it is stored
-      // under a name saying how much it inflates to. Nothing else proves the two agree, and a name
-      // that lied about it would place every stretch past it in the wrong part of the archive.
-      if (asked.kind === "gzip" && gzipInflatesTo(body) !== asked.inflates) {
-        return error(400, `a gzipped stretch must be one gzip member holding the ${asked.inflates} bytes it names`);
-      }
-      const stored: StretchBody =
-        asked.kind === "gzip"
-          ? { kind: "gzip", bytes: body, inflates: asked.inflates }
-          : { kind: "plain", bytes: body };
+      // A gzip member is inflated once here and the length taken, which is the one number the name
+      // of the stretch carries beyond its span. Reading it off the frame instead would take a body
+      // holding two members for one holding part of what it holds, and the archive would place
+      // every stretch past it wrongly for good.
       const landed = await appendStretch(
         env.TRANSCRIPTS,
         caller.userId,
@@ -804,7 +807,7 @@ export const createApp = (deps: Deps): App => {
         file.value,
         asked.from,
         asked.through,
-        stored,
+        await storedStretch(body),
       );
       if (landed.kind === "refused") {
         return json(
@@ -1788,7 +1791,8 @@ export const createApp = (deps: Deps): App => {
   // One stretch stored gzipped, handed over as it stands. A gzip member has no inner range, so the
   // manifest never splits a read of one and the whole object is the answer: the browser inflates
   // it, which leaves this reading no byte of the archive to touch and puts under a third of them on
-  // the wire. A reader that does not take gzip is answered the bytes of the file.
+  // the wire. This route sits behind the Access assertion, so every reader of it is a browser and
+  // every browser takes gzip — `fetch` cannot drop the header — and the member goes over as it is.
   const compressedStretch = async (
     request: Request,
     env: AppEnv,
@@ -1801,16 +1805,15 @@ export const createApp = (deps: Deps): App => {
     if (request.headers.get("range") !== null) {
       return error(416, `the stretch at ${name} is one gzip member, so it is read whole, as ${inflates} bytes`);
     }
-    const object = await openWholeStretch(env.TRANSCRIPTS, userId, sessionId, file, name);
+    const object = await openStretch(env.TRANSCRIPTS, userId, sessionId, file, name);
     if (object === null) {
       return error(404, `the archive holds no stretch of ${file} at ${name} of session ${sessionId}`);
     }
-    const stored = takesGzip(request);
-    return new Response(stored ? object.body : object.body.pipeThrough(new DecompressionStream("gzip")), {
+    return new Response(object.body, {
       headers: {
         "content-type": "application/x-ndjson",
         "cache-control": "no-store",
-        ...(stored ? { "content-encoding": "gzip" } : {}),
+        "content-encoding": "gzip",
       },
     });
   };
@@ -1832,9 +1835,9 @@ export const createApp = (deps: Deps): App => {
     if (!file.ok) return error(400, file.error);
     const at = parseStretchName(url.searchParams.get("at"));
     if (!at.ok) return error(400, at.error);
-    const inflates = inflatesTo(at.value);
-    if (inflates !== null) {
-      return compressedStretch(request, env, userId, session.value, file.value, at.value, inflates);
+    const packed = packedStretch(at.value);
+    if (packed !== null) {
+      return compressedStretch(request, env, userId, session.value, file.value, at.value, packed.inflates);
     }
     const asked = parseByteRange(request.headers.get("range"));
     if (!asked.ok) return error(416, asked.error);

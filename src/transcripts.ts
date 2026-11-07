@@ -27,9 +27,10 @@
 // JSON and compresses to under a third of itself, and a gzip member has no inner range: nothing can
 // read one part way, and nothing reads how long it inflates to without inflating it. So the name
 // says that too, and the one number every placing of a stretch in the archive rests on comes off the
-// listing rather than off the object. A key of two segments is a stretch stored as it stands, which
-// is everything the archive holds from before this and every stretch a host that has yet to learn to
-// compress one sends; both forms are read and neither is rewritten.
+// listing rather than off the object. The append takes it by inflating the member once, since no
+// caller may say how much of the file a body it sends holds. A key of two segments is a stretch
+// stored as it stands, which is everything the archive holds from before this and every stretch a
+// host that has yet to learn to compress one sends; both forms are read and neither is rewritten.
 //
 // The key says everything about one object: who, which session, which file and where in it. An
 // append weighs its stretch against one listing of the file's prefix, and the one number worth
@@ -43,6 +44,7 @@ import {
   compressedStretchName,
   isStretchName,
   legacyStretchName,
+  type NamedStretch,
   namedStretch,
   type Run,
   stretchName,
@@ -97,47 +99,54 @@ interface Span {
   to: number;
 }
 
-// One stretch of one file: the name it is stored under, whether the object holds its bytes gzipped,
-// the span of the file it accounts for, the span of the archive those bytes occupy, and whether its
-// name said both ends of the first of those or left it to be read off its own size.
+// One stretch of one file: the name it is stored under, which of the three forms that name is in,
+// the span of the file it accounts for, and the span of the archive those bytes occupy.
 interface Stretch {
   name: string;
-  gzip: boolean;
+  form: NamedStretch["form"];
   source: Span;
   archive: Span;
-  named: boolean;
 }
 
 // One object of one file's prefix, read off its name and its size and nothing else. It is the one
 // reading of a name there is: every layout below is handed these.
 interface Listed {
   name: string;
-  /// How many bytes of the archive this object accounts for: what it inflates to where it is stored
-  /// gzipped, and its own size where it holds those bytes as they stand.
+  form: NamedStretch["form"];
+  /// How many bytes of the archive this object accounts for: what its name says it inflates to
+  /// where it is stored gzipped, and its own size where it holds those bytes as they stand.
   holds: number;
-  gzip: boolean;
   source: Span;
-  named: boolean;
 }
 
 const listedStretch = (name: string, size: number): Listed | null => {
-  const places = namedStretch(name);
-  if (places === null) return null;
-  const { from, through, inflates } = places;
-  return {
-    name,
-    holds: inflates ?? size,
-    gzip: inflates !== null,
-    source: { from, to: through ?? from + size },
-    named: through !== null,
-  };
+  const named = namedStretch(name);
+  if (named === null) return null;
+  if (named.form === "place") {
+    return { name, form: "place", holds: size, source: { from: named.from, to: named.from + size } };
+  }
+  if (named.form === "span") {
+    return { name, form: "span", holds: size, source: { from: named.from, to: named.through } };
+  }
+  return { name, form: "packed", holds: named.inflates, source: { from: named.from, to: named.through } };
 };
 
-// How the stretches of one file lay out, in the order the file puts them, from `opens` in the
-// archive. A one-segment name is read on the terms it was written under: it names a place in the
-// file and in the archive at once, and the stretch runs to its own size in both, which is what
-// lets one overlapping the stretch in front of it be trimmed back to the bytes the file has not
-// already had.
+// Where a page of a listing that does not open at a file's first object begins: how far into the
+// archive and how far into the file the stretches in front of the page already reach. A page read
+// from the first object needs neither, and a page the reader's cursor opens needs both — a key can
+// sort past that cursor and still name a span the stretch the cursor names already accounted for,
+// which is what two writers racing one append leave behind.
+interface Opens {
+  archive: number;
+  source: number;
+}
+
+const FIRST_OBJECT: Opens = { archive: 0, source: 0 };
+
+// How the stretches of one file lay out, in the order the file puts them, from `opens`. A
+// one-segment name is read on the terms it was written under: it names a place in the file and in
+// the archive at once, and the stretch runs to its own size in both, which is what lets one
+// overlapping the stretch in front of it be trimmed back to the bytes the file has not already had.
 //
 // A name of two segments or three says where in the file the stretch begins and ends, and where it
 // sits in the archive is the lengths of the stretches in front of it — each of those its own size
@@ -153,18 +162,18 @@ const listedStretch = (name: string, size: number): Listed | null => {
 // past it is passed over. Mixing them would lay the same file out as runs with holes between them
 // and place reads inside the wrong objects, and nothing in the archive says which of two numbers at
 // one place means which.
-const laidOut = (listed: Listed[], opens = 0): Stretch[] => {
+const laidOut = (listed: Listed[], opens: Opens = FIRST_OBJECT): Stretch[] => {
   const parsed = [...listed].sort(
     (left, right) => left.source.from - right.source.from || right.source.to - left.source.to,
   );
   const held: Stretch[] = [];
-  let source = 0;
-  let archive = opens;
+  let source = opens.source;
+  let archive = opens.archive;
   let spanned = false;
   for (const part of parsed) {
-    if (!part.named) {
+    if (part.form === "place") {
       if (spanned) continue;
-      held.push({ name: part.name, gzip: part.gzip, source: part.source, archive: part.source, named: false });
+      held.push({ name: part.name, form: part.form, source: part.source, archive: part.source });
       source = Math.max(source, part.source.to);
       archive = Math.max(archive, part.source.to);
       continue;
@@ -173,10 +182,9 @@ const laidOut = (listed: Listed[], opens = 0): Stretch[] => {
     if (part.source.from < source) continue;
     held.push({
       name: part.name,
-      gzip: part.gzip,
+      form: part.form,
       source: part.source,
       archive: { from: archive, to: archive + part.holds },
-      named: true,
     });
     source = part.source.to;
     archive += part.holds;
@@ -225,10 +233,11 @@ const stretchBytes = async (
   length: number,
 ): Promise<Uint8Array> => {
   const key = keyOf(userId, sessionId, file, part.name);
-  const object = part.gzip ? await bucket.get(key) : await bucket.get(key, { range: { offset, length } });
+  const packed = part.form === "packed";
+  const object = packed ? await bucket.get(key) : await bucket.get(key, { range: { offset, length } });
   if (object === null) throw new Error(`the archive lost ${part.name} of ${file}`);
   const body = await object.arrayBuffer();
-  return part.gzip ? (await inflated(body)).subarray(offset, offset + length) : new Uint8Array(body);
+  return packed ? (await inflated(body)).subarray(offset, offset + length) : new Uint8Array(body);
 };
 
 // One of a session's transcript files, and whether what comes back is the gzip members it is stored
@@ -259,7 +268,7 @@ export const readTranscript = async (
   const byName = new Map(parts.map((part) => [part.name, part]));
   const reads = runsOf(parts).flatMap((run) => run.reads);
   if (reads.length === 0) return null;
-  const gzip = takesGzip && reads.every((read) => byName.get(read.at)?.gzip === true);
+  const gzip = takesGzip && reads.every((read) => byName.get(read.at)?.form === "packed");
   let next = 0;
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -304,7 +313,8 @@ export interface Bite {
 //
 // This is the one reading of the archive that inflates a stretch in the service. It is the indexer,
 // which wants a window of the prose in the middle of an object and no gzip member can be opened
-// there; every other reader is handed the member and inflates it itself.
+// there; every other reader is handed the member and inflates it itself. The append inflates one
+// too, to take the length its name carries, and keeps no byte of what comes out.
 export const readStretch = async (
   bucket: R2Bucket,
   userId: string,
@@ -360,7 +370,7 @@ const extentOf = (parts: Stretch[]): Extent =>
   parts.reduce<Extent>(
     (reach, part) => ({
       through: Math.max(reach.through, part.source.to),
-      named: reach.named && part.named,
+      named: reach.named && part.form !== "place",
     }),
     { through: 0, named: true },
   );
@@ -454,6 +464,12 @@ const TAIL_LISTED_READS = 1_000;
 // names that stretch. The page starts past it and the first object in it opens at `from`. Both
 // numbers come off the manifest the archive itself wrote, so neither is the reader's arithmetic.
 //
+// The cursor places the page in the file as well as in the archive, since a key can sort past it
+// and still name a span the stretch it names already accounted for — an old host and a new one
+// racing one append leave two keys over the same span, one of each form. Handing that one over
+// would render a stretch the reader already has a second time and put the stretch behind it at the
+// wrong place in the archive, so it is passed over the way the whole-file layout passes it over.
+//
 // A one-segment cursor is read on its own terms: the key names a place in the archive, so the page
 // reaches one stretch back from the reader instead — no stretch holds more than MAX_STRETCH_BYTES,
 // so a key below that floor cannot reach past the reader, and a stretch landing below a key the
@@ -467,22 +483,24 @@ export const archivedSince = async (
   after: string,
 ): Promise<Run[]> => {
   const prefix = filePrefix(userId, sessionId, file);
-  const spanned = after !== "" && listedStretch(after, 0)?.named === true;
-  const floor = spanned ? 0 : Math.max(0, from - MAX_STRETCH_BYTES);
-  const opens = spanned ? `${prefix}${after}` : `${prefix}${legacyStretchName(floor - 1)}`;
+  const named = after === "" ? null : namedStretch(after);
+  const cursor = named !== null && named.form !== "place" ? named : null;
+  const floor = cursor !== null ? 0 : Math.max(0, from - MAX_STRETCH_BYTES);
+  const key = cursor !== null ? `${prefix}${after}` : `${prefix}${legacyStretchName(floor - 1)}`;
   const page = await bucket.list({
     prefix,
     limit: TAIL_LISTED_READS,
-    ...(spanned || floor > 0 ? { startAfter: opens } : {}),
+    ...(cursor !== null || floor > 0 ? { startAfter: key } : {}),
   });
   const listed: Listed[] = [];
   for (const object of page.objects) {
     const stretch = listedStretch(object.key.slice(prefix.length), object.size);
     if (stretch !== null) listed.push(stretch);
   }
+  const opens: Opens = cursor === null ? FIRST_OBJECT : { archive: from, source: cursor.through };
   const kept: Run[] = [];
   let budget = TAIL_LISTED_READS;
-  for (const run of runsOf(laidOut(listed, spanned ? from : 0))) {
+  for (const run of runsOf(laidOut(listed, opens))) {
     if (budget <= 0) break;
     const reads = run.reads.filter((read) => read.offset + read.skip + read.bytes > from).slice(0, budget);
     const head = reads[0];
@@ -494,26 +512,19 @@ export const archivedSince = async (
   return kept;
 };
 
-// One stretch, opened by the name it is stored under and ranged by what the caller asked for.
-// Nothing is listed and nothing is parsed: a manifest already said which stretches a file holds,
-// and this hands back the bytes of one of them.
+// One stretch, opened by the name it is stored under and ranged by what the caller asked for, or
+// whole where it asked for no range — which is how a gzip member is read, since it has no part to
+// ask for. Nothing is listed and nothing is parsed: a manifest already said which stretches a file
+// holds, and this hands back the bytes of one of them.
 export const openStretch = (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
   name: string,
-  range: R2Range,
-): Promise<R2ObjectBody | null> => bucket.get(keyOf(userId, sessionId, file, name), { range });
-
-// One stretch, opened whole. A gzip member has no part to ask for, so this is how one is read.
-export const openWholeStretch = (
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-  name: string,
-): Promise<R2ObjectBody | null> => bucket.get(keyOf(userId, sessionId, file, name));
+  range?: R2Range,
+): Promise<R2ObjectBody | null> =>
+  bucket.get(keyOf(userId, sessionId, file, name), range === undefined ? undefined : { range });
 
 // One stretch as it is stored: the bytes of the object, and — where those are gzipped — how many
 // bytes of the file they inflate to. Nothing reads that length off a gzip member, so the name
@@ -530,18 +541,36 @@ const nameOf = (from: number, through: number, body: StretchBody): string =>
 
 const GZIP_MAGIC = 0x1f8b;
 
-// The shortest gzip member there is: a ten-byte header, the stored block, and an eight-byte trailer.
-const GZIP_FRAME_BYTES = 18;
+// How many bytes one gzip member inflates to, counted by inflating it. The length the format
+// trails is no answer: it belongs to the last member of the body, so a body holding two of them
+// would be stored under a name claiming part of what it holds, and every later read of that object
+// would break for good. Nothing of the inflated bytes is kept — the member is what the archive
+// stores — and a body inflating past what one stretch may hold is stopped here, as is one holding a
+// second member, which the stream refuses outright.
+const inflatedLength = async (body: ArrayBuffer): Promise<number> => {
+  const reader = new Blob([body]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
+  let held = 0;
+  for (;;) {
+    const taken = await reader.read();
+    if (taken.done) return held;
+    held += taken.value.byteLength;
+    if (held > MAX_STRETCH_BYTES) {
+      await reader.cancel();
+      throw new Error(`a gzipped transcript stretch must inflate to at most ${MAX_STRETCH_BYTES} bytes`);
+    }
+  }
+};
 
-// How many bytes a body says it inflates to, and nothing at all where it does not frame as one gzip
-// member: the two bytes the format opens with, and the length it closes with. It is read off the
-// frame and never by inflating, so a body something on the way up inflated, or a host that
-// mislabelled one, is refused before it is stored under a name saying it inflates.
-export const gzipInflatesTo = (body: ArrayBuffer): number | null => {
-  if (body.byteLength < GZIP_FRAME_BYTES) return null;
-  const framed = new DataView(body);
-  if (framed.getUint16(0) !== GZIP_MAGIC) return null;
-  return framed.getUint32(body.byteLength - 4, true);
+// One appended body as the archive stores it. A gzip member goes up as it stands, so a reader is
+// handed the member and inflates it, and the one number every placing of a stretch in the archive
+// rests on is taken here and written into the name. A transcript stretch is prose and JSON and
+// never opens with the two bytes gzip does, so the two forms tell themselves apart: a host that has
+// yet to learn to compress one sends the bytes of the file and they are stored as they stand.
+export const storedStretch = async (body: ArrayBuffer): Promise<StretchBody> => {
+  if (body.byteLength < 2 || new DataView(body).getUint16(0) !== GZIP_MAGIC) {
+    return { kind: "plain", bytes: body };
+  }
+  return { kind: "gzip", bytes: body, inflates: await inflatedLength(body) };
 };
 
 // The one write an append from a host before redaction makes, and it lands only where nothing is

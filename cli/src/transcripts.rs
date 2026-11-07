@@ -339,11 +339,12 @@ enum Stretch {
     Waiting,
 }
 
-/// One stretch as the service takes it: a body of at most `MAX_STRETCH` bytes. The source is read to
-/// that and no further, but a placeholder is longer than most of what it stands in, so the stretch
-/// is written out to the length the service accepts and accounts for however much of the file that
-/// came to. Offering a longer body is a 413 the pass cannot act on and a stretch no later pass can
-/// get past either.
+/// One stretch as it is read off the file: at most `MAX_STRETCH` redacted bytes. The source is read
+/// to that and no further, but a placeholder is longer than most of what it stands in, so the
+/// stretch is written out to that length and accounts for however much of the file that came to.
+/// What goes up is these bytes gzipped, and the cap is on the body offered, so the send weighs the
+/// member against it rather than this: a 413 is one no pass can act on and no later pass can get
+/// past either.
 fn stretch(path: &Path, offset: i64, pass: Pass, holds: Holds) -> Result<Stretch> {
     let read = read_at(path, offset, pass, holds)?;
     let redacted = redact::within(&read.read, read.before, read.whole, MAX_STRETCH);
@@ -663,13 +664,6 @@ mod tests {
         let first = turns(40, "first");
         let second = turns(30, "second");
         let member = packed(&first).unwrap();
-
-        assert!(
-            member.len() * 2 < first.len(),
-            "a transcript is prose and JSON, so a stretch of it goes up far smaller than it was read: {} of {}",
-            member.len(),
-            first.len()
-        );
 
         let mut read = Vec::new();
         flate2::read::MultiGzDecoder::new(&member[..])

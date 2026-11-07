@@ -16,10 +16,10 @@ import {
   followedBatch,
   followedTexts,
   groupedReads,
-  inflatesTo,
   joinedTexts,
   type Plan,
   type PlannedRead,
+  packedStretch,
   plannedBatch,
   type Reach,
   tailNote,
@@ -163,7 +163,7 @@ const boot = ({ box, list, note, tail, more }: Parts, plan: Plan): void => {
   // browser inflates what comes back, so that one is asked for whole and without a range.
   const grab = (read: PlannedRead): Promise<Got> => {
     const url = `${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.at}`;
-    if (inflatesTo(read.at) !== null) return asked(url, {}, read.at);
+    if (packedStretch(read.at) !== null) return asked(url, {}, read.at);
     return asked(url, { range: `bytes=${read.skip}-${read.skip + read.bytes - 1}` }, read.at);
   };
 
