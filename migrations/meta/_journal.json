@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1762000000000,
+      "tag": "0021_session_chunks_fts_delete",
+      "breakpoints": true
+    }
+  ]
+}

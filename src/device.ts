@@ -1,3 +1,7 @@
+import { and, asc, eq, gt, lte, sql } from "drizzle-orm";
+import type { AccountDb } from "./db";
+import { deviceCodes, devices, principals } from "./schema/account";
+
 export const DEVICE_CODE_TTL_MS = 600_000;
 export const POLL_INTERVAL_S = 5;
 const SLOW_DOWN_STEP_S = 5;
@@ -94,8 +98,11 @@ export const sameSecret = (a: string, b: string): boolean => {
   return left.byteLength === right.byteLength && crypto.subtle.timingSafeEqual(left, right);
 };
 
+// The two limits are counted inside the insert rather than read first, so two requests racing for
+// the last free slot cannot both be told they have it. An insert guarded by a count of the table
+// it writes is not a shape drizzle's insert builder can take.
 export const startDeviceCode = async (
-  db: D1Database,
+  db: AccountDb,
   deviceName: string,
   clientIp: string,
   limits: DeviceCodeLimits,
@@ -105,82 +112,82 @@ export const startDeviceCode = async (
   const userCode = newUserCode();
   const expiresAt = now + DEVICE_CODE_TTL_MS;
   const [, inserted] = await db.batch([
-    db.prepare("DELETE FROM device_codes WHERE expires_at <= ?").bind(now),
+    db.delete(deviceCodes).where(lte(deviceCodes.expiresAt, now)),
     db
-      .prepare(
-        `INSERT INTO device_codes (device_code_sha256, user_code, device_name, client_ip, status, user_id, created_at, expires_at, interval_s, last_polled_at)
-         SELECT ?1, ?2, ?3, ?4, 'pending', '', ?5, ?6, ?7, ?5
-         WHERE (SELECT count(*) FROM device_codes WHERE expires_at > ?5) < ?8
-           AND (SELECT count(*) FROM device_codes WHERE client_ip = ?4 AND expires_at > ?5) < ?9`,
+      .insert(deviceCodes)
+      .select(
+        sql`SELECT ${await sha256Hex(deviceCode)}, ${userCode}, ${deviceName}, ${clientIp}, 'pending', '', ${now},
+          ${expiresAt}, ${POLL_INTERVAL_S}, ${now}
+        WHERE (SELECT count(*) FROM ${deviceCodes} WHERE ${deviceCodes.expiresAt} > ${now}) < ${limits.total}
+          AND (SELECT count(*) FROM ${deviceCodes}
+               WHERE ${deviceCodes.clientIp} = ${clientIp}
+                 AND ${deviceCodes.expiresAt} > ${now}) < ${limits.perClient}`,
       )
-      .bind(
-        await sha256Hex(deviceCode),
-        userCode,
-        deviceName,
-        clientIp,
-        now,
-        expiresAt,
-        POLL_INTERVAL_S,
-        limits.total,
-        limits.perClient,
-      ),
+      .returning({ userCode: deviceCodes.userCode }),
   ]);
-  return inserted?.meta.changes === 1 ? { deviceCode, userCode, expiresAt } : null;
+  return inserted.length === 1 ? { deviceCode, userCode, expiresAt } : null;
+};
+
+const DEVICE_CODE_FIELDS = {
+  userCode: deviceCodes.userCode,
+  deviceName: deviceCodes.deviceName,
+  status: deviceCodes.status,
+  expiresAt: deviceCodes.expiresAt,
+  intervalS: deviceCodes.intervalS,
+  lastPolledAt: deviceCodes.lastPolledAt,
 };
 
 interface DeviceCodeRow {
-  user_code: string;
-  device_name: string;
+  userCode: string;
+  deviceName: string;
   status: DeviceCodeStatus;
-  expires_at: number;
-  interval_s: number;
-  last_polled_at: number;
+  expiresAt: number;
+  intervalS: number;
+  lastPolledAt: number;
 }
 
 const toDeviceCode = (row: DeviceCodeRow): DeviceCode => ({
-  userCode: row.user_code,
-  deviceName: row.device_name,
+  userCode: row.userCode,
+  deviceName: row.deviceName,
   status: row.status,
-  expiresAt: row.expires_at,
-  intervalS: row.interval_s,
-  lastPolledAt: row.last_polled_at,
+  expiresAt: row.expiresAt,
+  intervalS: row.intervalS,
+  lastPolledAt: row.lastPolledAt,
 });
 
-export const pendingDeviceCode = async (db: D1Database, userCode: string, now: number): Promise<DeviceCode | null> => {
+export const pendingDeviceCode = async (db: AccountDb, userCode: string, now: number): Promise<DeviceCode | null> => {
   const row = await db
-    .prepare(
-      `SELECT user_code, device_name, status, expires_at, interval_s, last_polled_at FROM device_codes
-       WHERE user_code = ? AND status = 'pending' AND expires_at > ?`,
-    )
-    .bind(userCode, now)
-    .first<DeviceCodeRow>();
-  return row ? toDeviceCode(row) : null;
+    .select(DEVICE_CODE_FIELDS)
+    .from(deviceCodes)
+    .where(and(eq(deviceCodes.userCode, userCode), eq(deviceCodes.status, "pending"), gt(deviceCodes.expiresAt, now)))
+    .get();
+  return row === undefined ? null : toDeviceCode(row);
 };
 
 export const decideDeviceCode = async (
-  db: D1Database,
+  db: AccountDb,
   userCode: string,
   decision: "approved" | "denied",
   userId: string,
   now: number,
 ): Promise<boolean> => {
-  const result = await db
-    .prepare(
-      `UPDATE device_codes SET status = ?, user_id = ?
-       WHERE user_code = ? AND status = 'pending' AND expires_at > ?`,
-    )
-    .bind(decision, userId, userCode, now)
-    .run();
-  return result.meta.changes === 1;
+  const decided = await db
+    .update(deviceCodes)
+    .set({ status: decision, userId })
+    .where(and(eq(deviceCodes.userCode, userCode), eq(deviceCodes.status, "pending"), gt(deviceCodes.expiresAt, now)))
+    .returning({ userCode: deviceCodes.userCode })
+    .all();
+  return decided.length === 1;
 };
 
 const suffixed = (name: string, suffix: number): string => `${name}-${suffix}`;
 
-const freeDeviceName = async (db: D1Database, userId: string, wanted: string): Promise<string> => {
-  const { results } = await db
-    .prepare("SELECT name FROM devices WHERE user_id = ? AND kind = 'host'")
-    .bind(userId)
-    .all<{ name: string }>();
+const freeDeviceName = async (db: AccountDb, userId: string, wanted: string): Promise<string> => {
+  const results = await db
+    .select({ name: devices.name })
+    .from(devices)
+    .where(and(eq(devices.userId, userId), eq(devices.kind, "host")))
+    .all();
   const taken = new Set(results.map((row) => row.name));
   if (!taken.has(wanted)) return wanted;
   let suffix = 2;
@@ -188,126 +195,134 @@ const freeDeviceName = async (db: D1Database, userId: string, wanted: string): P
   return suffixed(wanted, suffix);
 };
 
-export const pollDeviceCode = async (db: D1Database, deviceCode: string, now: number): Promise<PollOutcome> => {
+export const pollDeviceCode = async (db: AccountDb, deviceCode: string, now: number): Promise<PollOutcome> => {
   const codeHash = await sha256Hex(deviceCode);
   const row = await db
-    .prepare(
-      `SELECT user_code, device_name, user_id, status, expires_at, interval_s, last_polled_at FROM device_codes
-       WHERE device_code_sha256 = ?`,
-    )
-    .bind(codeHash)
-    .first<DeviceCodeRow & { user_id: string }>();
-  if (!row) return { ok: false, error: "invalid_grant" };
+    .select({ ...DEVICE_CODE_FIELDS, userId: deviceCodes.userId })
+    .from(deviceCodes)
+    .where(eq(deviceCodes.deviceCodeSha256, codeHash))
+    .get();
+  if (row === undefined) return { ok: false, error: "invalid_grant" };
   const code = toDeviceCode(row);
+  const byHash = eq(deviceCodes.deviceCodeSha256, codeHash);
   if (now >= code.expiresAt) {
-    await db.prepare("DELETE FROM device_codes WHERE device_code_sha256 = ?").bind(codeHash).run();
+    await db.delete(deviceCodes).where(byHash).run();
     return { ok: false, error: "expired_token" };
   }
   if (now - code.lastPolledAt < code.intervalS * 1000) {
     await db
-      .prepare("UPDATE device_codes SET interval_s = ?, last_polled_at = ? WHERE device_code_sha256 = ?")
-      .bind(code.intervalS + SLOW_DOWN_STEP_S, now, codeHash)
+      .update(deviceCodes)
+      .set({ intervalS: code.intervalS + SLOW_DOWN_STEP_S, lastPolledAt: now })
+      .where(byHash)
       .run();
     return { ok: false, error: "slow_down" };
   }
   if (code.status === "pending") {
-    await db
-      .prepare("UPDATE device_codes SET last_polled_at = ? WHERE device_code_sha256 = ?")
-      .bind(now, codeHash)
-      .run();
+    await db.update(deviceCodes).set({ lastPolledAt: now }).where(byHash).run();
     return { ok: false, error: "authorization_pending" };
   }
   if (code.status === "denied") {
-    await db.prepare("DELETE FROM device_codes WHERE device_code_sha256 = ?").bind(codeHash).run();
+    await db.delete(deviceCodes).where(byHash).run();
     return { ok: false, error: "access_denied" };
   }
   const accessToken = randomToken();
-  const name = await freeDeviceName(db, row.user_id, code.deviceName);
+  const name = await freeDeviceName(db, row.userId, code.deviceName);
+  // The login is written out of the approved code row, so the account it lands under is the one
+  // that approved it and never one the poller named, and the name is claimed in the same statement
+  // that reads the code: two polls racing cannot both take it.
   const [issued] = await db.batch([
     db
-      .prepare(
-        `INSERT INTO devices (device_id, token_sha256, user_id, name, host, kind, created_at, last_used_at)
-         SELECT ?1, ?2, user_id, ?3, ?6, 'host', ?4, ?4 FROM device_codes
-         WHERE device_code_sha256 = ?5 AND status = 'approved'
-           AND NOT EXISTS (
-             SELECT 1 FROM devices
-             WHERE devices.user_id = device_codes.user_id AND devices.name = ?3 AND devices.kind = 'host'
-           )`,
+      .insert(devices)
+      .select(
+        sql`SELECT ${crypto.randomUUID()}, ${await sha256Hex(accessToken)}, ${deviceCodes.userId}, ${name},
+          ${now}, ${now}, ${code.deviceName}, 'host'
+        FROM ${deviceCodes}
+        WHERE ${deviceCodes.deviceCodeSha256} = ${codeHash} AND ${deviceCodes.status} = 'approved'
+          AND NOT EXISTS (SELECT 1 FROM ${devices}
+            WHERE ${devices.userId} = ${deviceCodes.userId} AND ${devices.name} = ${name}
+              AND ${devices.kind} = 'host')`,
       )
-      .bind(crypto.randomUUID(), await sha256Hex(accessToken), name, now, codeHash, code.deviceName),
-    db.prepare("DELETE FROM device_codes WHERE device_code_sha256 = ?").bind(codeHash),
+      .returning({ deviceId: devices.deviceId }),
+    db.delete(deviceCodes).where(byHash),
   ]);
-  if (issued?.meta.changes !== 1) return { ok: false, error: "invalid_grant" };
+  if (issued.length !== 1) return { ok: false, error: "invalid_grant" };
   return { ok: true, accessToken };
 };
 
-export const userForEmail = async (db: D1Database, email: string): Promise<string | null> => {
-  const row = await db
-    .prepare("SELECT user_id FROM principals WHERE email = ?")
-    .bind(email)
-    .first<{ user_id: string }>();
-  return row ? row.user_id : null;
+export const userForEmail = async (db: AccountDb, email: string): Promise<string | null> => {
+  const row = await db.select({ userId: principals.userId }).from(principals).where(eq(principals.email, email)).get();
+  return row === undefined ? null : row.userId;
 };
 
-export const deviceForToken = async (db: D1Database, token: string, now: number): Promise<Caller | null> => {
+export const deviceForToken = async (db: AccountDb, token: string, now: number): Promise<Caller | null> => {
   const row = await db
-    .prepare(
-      "SELECT device_id, user_id, name, host, last_used_at FROM devices WHERE token_sha256 = ? AND kind = 'host'",
-    )
-    .bind(await sha256Hex(token))
-    .first<{ device_id: string; user_id: string; name: string; host: string; last_used_at: number }>();
-  if (!row) return null;
-  if (now - row.last_used_at >= LAST_USED_RESOLUTION_MS) {
-    await db.prepare("UPDATE devices SET last_used_at = ? WHERE device_id = ?").bind(now, row.device_id).run();
+    .select({
+      deviceId: devices.deviceId,
+      userId: devices.userId,
+      name: devices.name,
+      host: devices.host,
+      lastUsedAt: devices.lastUsedAt,
+    })
+    .from(devices)
+    .where(and(eq(devices.tokenSha256, await sha256Hex(token)), eq(devices.kind, "host")))
+    .get();
+  if (row === undefined) return null;
+  if (now - row.lastUsedAt >= LAST_USED_RESOLUTION_MS) {
+    await db.update(devices).set({ lastUsedAt: now }).where(eq(devices.deviceId, row.deviceId)).run();
   }
-  return { userId: row.user_id, deviceId: row.device_id, name: row.name, host: row.host };
+  return { userId: row.userId, deviceId: row.deviceId, name: row.name, host: row.host };
 };
 
-export const listDevices = async (db: D1Database, userId: string): Promise<Device[]> => {
-  const { results } = await db
-    .prepare(
-      `SELECT device_id, name, host, created_at, last_used_at FROM devices
-       WHERE user_id = ? AND kind = 'host' ORDER BY created_at, device_id`,
-    )
-    .bind(userId)
-    .all<{ device_id: string; name: string; host: string; created_at: number; last_used_at: number }>();
-  return results.map((row) => ({
-    deviceId: row.device_id,
-    name: row.name,
-    host: row.host,
-    createdAt: row.created_at,
-    lastUsedAt: row.last_used_at,
-  }));
-};
+export const listDevices = async (db: AccountDb, userId: string): Promise<Device[]> =>
+  db
+    .select({
+      deviceId: devices.deviceId,
+      name: devices.name,
+      host: devices.host,
+      createdAt: devices.createdAt,
+      lastUsedAt: devices.lastUsedAt,
+    })
+    .from(devices)
+    .where(and(eq(devices.userId, userId), eq(devices.kind, "host")))
+    .orderBy(asc(devices.createdAt), asc(devices.deviceId))
+    .all();
 
-export const hasDevice = async (db: D1Database, userId: string, deviceId: string): Promise<boolean> => {
+export const hasDevice = async (db: AccountDb, userId: string, deviceId: string): Promise<boolean> => {
   const row = await db
-    .prepare("SELECT device_id FROM devices WHERE user_id = ? AND device_id = ? AND kind = 'host'")
-    .bind(userId, deviceId)
-    .first<{ device_id: string }>();
-  return row !== null;
+    .select({ deviceId: devices.deviceId })
+    .from(devices)
+    .where(and(eq(devices.userId, userId), eq(devices.deviceId, deviceId), eq(devices.kind, "host")))
+    .get();
+  return row !== undefined;
 };
 
-export const revokeDevice = async (db: D1Database, userId: string, deviceId: string): Promise<boolean> => {
-  const result = await db
-    .prepare("DELETE FROM devices WHERE user_id = ? AND device_id = ? AND kind = 'host'")
-    .bind(userId, deviceId)
-    .run();
-  return result.meta.changes === 1;
+export const revokeDevice = async (db: AccountDb, userId: string, deviceId: string): Promise<boolean> => {
+  const revoked = await db
+    .delete(devices)
+    .where(and(eq(devices.userId, userId), eq(devices.deviceId, deviceId), eq(devices.kind, "host")))
+    .returning({ deviceId: devices.deviceId })
+    .all();
+  return revoked.length === 1;
 };
 
 // The row the MCP endpoint acts as. Its token column holds the digest of a string no issued token
 // can hash to, so the connector is reachable through Access alone and never through a bearer token.
-export const connectorDevice = async (db: D1Database, userId: string, now: number): Promise<Caller> => {
+export const connectorDevice = async (db: AccountDb, userId: string, now: number): Promise<Caller> => {
   const row = await db
-    .prepare(
-      `INSERT INTO devices (device_id, token_sha256, user_id, name, host, kind, created_at, last_used_at)
-       VALUES (?1, ?2, ?3, ?4, ?4, 'connector', ?5, ?5)
-       ON CONFLICT (token_sha256) DO UPDATE SET last_used_at = excluded.last_used_at
-       RETURNING device_id`,
-    )
-    .bind(crypto.randomUUID(), await sha256Hex(`connector:${userId}`), userId, CONNECTOR_NAME, now)
-    .first<{ device_id: string }>();
-  if (row === null) throw new Error(`no connector device for ${userId}`);
-  return { userId, deviceId: row.device_id, name: CONNECTOR_NAME, host: CONNECTOR_NAME };
+    .insert(devices)
+    .values({
+      deviceId: crypto.randomUUID(),
+      tokenSha256: await sha256Hex(`connector:${userId}`),
+      userId,
+      name: CONNECTOR_NAME,
+      host: CONNECTOR_NAME,
+      kind: "connector",
+      createdAt: now,
+      lastUsedAt: now,
+    })
+    .onConflictDoUpdate({ target: devices.tokenSha256, set: { lastUsedAt: sql`excluded.last_used_at` } })
+    .returning({ deviceId: devices.deviceId })
+    .get();
+  if (row === undefined) throw new Error(`no connector device for ${userId}`);
+  return { userId, deviceId: row.deviceId, name: CONNECTOR_NAME, host: CONNECTOR_NAME };
 };

@@ -41,7 +41,9 @@
 // standing ahead of the objects where one of them is lost outright. Nothing derived is ever asked
 // a question the objects can answer, so every reading that must not lag lists them.
 
-import type { SqlDb, SqlStatement } from "./tenant-sql";
+import { sql } from "drizzle-orm";
+import type { TenantDb } from "./db";
+import { sessionIndex } from "./schema/tenant";
 import {
   compressedStretchName,
   isStretchName,
@@ -693,19 +695,21 @@ export const appendStretch = async (
 // a time. Opening it level leaves the first stretch the only gap there is, and the archive behind
 // it is reached by a replay and nothing else. A session already carrying a row is left where its
 // own passes put it, since the seed is the insert alone.
-export const cacheArchived = (
-  db: SqlDb,
+export const cacheArchived = async (
+  db: TenantDb,
   userId: string,
   sessionId: string,
   archived: number,
   held: number,
-): SqlStatement =>
-  db
-    .prepare(
-      `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, ?4, 0)
-       ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
-    )
-    .bind(userId, sessionId, archived, held);
+): Promise<void> => {
+  db.insert(sessionIndex)
+    .values({ userId, sessionId, archived, bytes: held, chunks: 0 })
+    .onConflictDoUpdate({
+      target: [sessionIndex.userId, sessionIndex.sessionId],
+      set: { archived: sql`MAX(${sessionIndex.archived}, excluded.archived)` },
+    })
+    .run();
+};
 
 // How far into each of a session's files the archive reaches, counted off the objects and nothing
 // else. Every caller that acts on the answer reads it here — a host working out where to send the
