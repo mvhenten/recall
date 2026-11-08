@@ -62,7 +62,7 @@ pub const TOOL_RESULT: &str = "tool-results.";
 /// How many records one append carries, and how many bytes the body of one may hold. Both are the
 /// ceiling the service answers 413 against.
 pub const MAX_RECORDS: usize = 1_000;
-pub const MAX_APPEND_BYTES: usize = 1_048_576;
+pub const MAX_APPEND_BYTES: usize = 5_242_880;
 
 const NEWLINE: u8 = b'\n';
 
@@ -1365,7 +1365,7 @@ mod tests {
     #[test]
     fn a_backlog_several_times_the_byte_ceiling_goes_up_as_the_appends_it_takes() {
         let sandbox = Sandbox::new("backlog");
-        let text = heavy(40, 90_000);
+        let text = heavy(40, MAX_APPEND_BYTES / 10);
         let transcript = sandbox.transcript("s-1", &text);
         let service = Fake::default();
 

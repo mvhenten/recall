@@ -17,10 +17,11 @@
 import type { HeldFile } from "./transcripts";
 
 // How many records one append may carry, and how many bytes of them. Both are the ceiling the
-// endpoint answers 413 against, and the byte ceiling is the one the byte path already holds a
-// stretch to.
+// endpoint answers 413 against. A record is one line and cannot be split, so the byte ceiling is
+// also the longest line the archive can ever take: a `Read` of an image embeds base64 and runs to
+// well over a megabyte, and a file holding one would never archive under a lower ceiling.
 export const MAX_RECORDS_PER_APPEND = 1000;
-export const MAX_RECORDS_BYTES = 1_048_576;
+export const MAX_RECORDS_BYTES = 5_242_880;
 
 export const RECORDS_PREFIX = "records";
 
