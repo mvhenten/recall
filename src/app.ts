@@ -110,6 +110,7 @@ import {
 } from "./mailbox";
 import { render } from "./markdown";
 import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
+import { copyMemories } from "./memory-copy";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -267,6 +268,7 @@ import {
   shareCountsFor,
   sharesFor,
   startCursor,
+  TEXT_CANDIDATES,
   textCandidates,
   userForServiceClient,
   vectorCandidates,
@@ -397,8 +399,8 @@ const workerEnv = (env: AppEnv): WorkerEnv => ({ ...env, DB: accountStoreOf(env.
 
 // What the tenant half reads. `DB` is this account's own store and nobody else's; `ACCOUNT` is the
 // account store, which holds the rows a request reads before it knows whose it is — the
-// invitations, the devices, the claim on an artifact name and the shares on it — and this
-// account's memories, which a later step moves across.
+// invitations, the devices, the claim on an artifact name and the shares on it. The copy that
+// brings the memories across is the one reader of this one that touches a tenant's own rows.
 export interface TenantEnv {
   DB: TenantDb;
   ACCOUNT: AccountDb;
@@ -1817,15 +1819,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return statsPage(email, live, stats, labels, now);
   };
 
-  const insightsTab = async (
-    db: TenantDb,
-    account: AccountDb,
-    userId: string,
-    email: string,
-    live: Live,
-    now: number,
-  ): Promise<Response> =>
-    insightsPage(email, live, await readInsights(db, account, userId, dayWindow(now, USAGE_CHART_DAYS), now), now);
+  const insightsTab = async (db: TenantDb, userId: string, email: string, live: Live, now: number): Promise<Response> =>
+    insightsPage(email, live, await readInsights(db, userId, dayWindow(now, USAGE_CHART_DAYS), now), now);
 
   // A page link cut from an order a reader has since left behind, or one a hand edited, reads as
   // page one rather than as an error: the address still names the list it names.
@@ -1870,7 +1865,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   const memoryBody = async (
     rawName: string,
-    db: AccountDb,
+    db: TenantDb,
     userId: string,
     email: string,
     live: Live,
@@ -1958,7 +1953,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   const memoryTab = async (
     url: URL,
-    db: AccountDb,
+    db: TenantDb,
     userId: string,
     email: string,
     live: Live,
@@ -1990,7 +1985,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return memorySearchPage(email, live, url, filter, counts, found, now);
   };
 
-  const save = async (request: Request, db: AccountDb, userId: string, name: string): Promise<Response> => {
+  const save = async (request: Request, db: TenantDb, userId: string, name: string): Promise<Response> => {
     const input = parseSave(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
@@ -2392,7 +2387,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ artifact: viewOf(host, record, await sharesHeld(account, host, record, userId, now)) });
   };
 
-  const list = async (url: URL, db: AccountDb, userId: string): Promise<Response> => {
+  const list = async (url: URL, db: TenantDb, userId: string): Promise<Response> => {
     const input = parseList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
@@ -2401,7 +2396,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const vectorRankings = async (
-    db: AccountDb,
+    db: TenantDb,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
@@ -2419,20 +2414,20 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const textRankings = async (
-    db: AccountDb,
+    db: TenantDb,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
   ): Promise<{ inScope: string[]; elsewhere: string[] }> => {
     const match = ftsQuery(input.query);
-    const candidates = match ? await textCandidates(db, userId, input.tags, types, match) : [];
+    const candidates = match ? await textCandidates(db, userId, input.tags, types, match, TEXT_CANDIDATES) : [];
     return {
       inScope: candidates.filter((candidate) => candidate.inScope).map((candidate) => candidate.memoryId),
       elsewhere: candidates.filter((candidate) => !candidate.inScope).map((candidate) => candidate.memoryId),
     };
   };
 
-  const rank = async (db: AccountDb, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
+  const rank = async (db: TenantDb, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
     if (input.mode === "vector") return vectorRankings(db, userId, input, types);
     if (input.mode === "text") {
       const text = await textRankings(db, userId, input, types);
@@ -2449,7 +2444,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     };
   };
 
-  const hits = async (db: AccountDb, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
+  const hits = async (db: TenantDb, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
     const top = ranking.slice(0, limit);
     if (top.length === 0) return [];
     const described = await describeMemories(
@@ -2467,7 +2462,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // What a query finds: the memories in scope of its tags, and the ones it would have found had the
   // tags not been named. Both surfaces rank the same way and differ only in how they write a hit.
   const ranked = async (
-    db: AccountDb,
+    db: TenantDb,
     userId: string,
     input: SearchInput,
   ): Promise<{ shown: MemoryHit[]; nearby: MemoryHit[] }> => {
@@ -2479,7 +2474,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return { shown, nearby };
   };
 
-  const searched = async (db: AccountDb, userId: string, input: SearchInput): Promise<unknown> => {
+  const searched = async (db: TenantDb, userId: string, input: SearchInput): Promise<unknown> => {
     const { shown, nearby } = await ranked(db, userId, input);
     const elsewhere = nearby.map(({ memory, score }) => ({
       score,
@@ -2491,13 +2486,13 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return { hits: shown, elsewhere };
   };
 
-  const search = async (request: Request, db: AccountDb, userId: string): Promise<Response> => {
+  const search = async (request: Request, db: TenantDb, userId: string): Promise<Response> => {
     const parsed = parseSearch(await readJson(request));
     if (!parsed.ok) return error(400, parsed.error);
     return json(await searched(db, userId, parsed.value));
   };
 
-  const v2MemoriesList = async (url: URL, db: AccountDb, caller: Caller): Promise<Response> => {
+  const v2MemoriesList = async (url: URL, db: TenantDb, caller: Caller): Promise<Response> => {
     const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
@@ -2506,14 +2501,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ memories: page.memories.map(memoryView), nextCursor: page.nextCursor });
   };
 
-  const v2MemorySearch = async (request: Request, db: AccountDb, caller: Caller): Promise<Response> => {
+  const v2MemorySearch = async (request: Request, db: TenantDb, caller: Caller): Promise<Response> => {
     const input = parseSearchMemories(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const { shown, nearby } = await ranked(db, caller.userId, input.value);
     return json({ hits: shown.map(memoryHitView), elsewhere: nearby.map(nearbyMemoryView) });
   };
 
-  const v2MemorySave = async (request: Request, db: AccountDb, caller: Caller, name: string): Promise<Response> => {
+  const v2MemorySave = async (request: Request, db: TenantDb, caller: Caller, name: string): Promise<Response> => {
     const input = parseSaveMemory(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
@@ -2525,7 +2520,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // Recalling a memory is a write, so it is a POST and the GET beside it is a read and nothing
   // more. `/v1` folded the two into one GET behind a query parameter, which left every reader of a
   // memory deciding whether it meant to count as one.
-  const v2MemoryRecall = async (db: AccountDb, caller: Caller, name: string): Promise<Response> => {
+  const v2MemoryRecall = async (db: TenantDb, caller: Caller, name: string): Promise<Response> => {
     const memory = await getMemory(db, caller.userId, name);
     if (!memory) return error(404, `no memory named ${name}`);
     const [recalled] = await recall(db, caller.userId, [memory.memoryId], deps.now());
@@ -2538,7 +2533,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2Memories = async (
     request: Request,
     url: URL,
-    db: AccountDb,
+    db: TenantDb,
     caller: Caller,
     rawName: string | undefined,
     word: string | undefined,
@@ -2566,8 +2561,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const runTool = (env: TenantEnv, caller: Caller): RunTool => {
-    // Every tool but the send one reads or writes a memory, which is an account row.
-    const db = env.ACCOUNT;
+    // Every tool but the send one reads or writes a memory, which is a row of this account's own.
+    const db = env.DB;
     const { userId } = caller;
     const refused = (reason: string): ToolResult => ({ ok: false, error: `recall: ${reason}` });
     const document = (value: unknown): ToolResult => ({ ok: true, text: JSON.stringify(value) });
@@ -3068,14 +3063,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (segments.length > 0 || !url.pathname.startsWith(prefix)) {
         return lost(404, "No such page", "The dashboard has no page at this address.");
       }
-      return memoryBody(url.pathname.slice(prefix.length), env.ACCOUNT, userId, email, live, lost);
+      return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
     }
     if (tab.path === BOARD_TAB.path) return boardTab(request, url, env, userId, email, live, now);
-    if (tab.path === MEMORY_TAB.path) return memoryTab(url, env.ACCOUNT, userId, email, live, lost);
+    if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
     if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(url, db, env.ACCOUNT, userId, email, live, lost);
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
     if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
-    if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, env.ACCOUNT, userId, email, live, now);
+    if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
     if (tab.path === LABELS_TAB.path) return labelsTab(request, db, userId, email, live);
     const [listed, labels] = await Promise.all([listSessions(db, userId, now), readLabels(db, userId)]);
     return sessionsPage(email, live, url, listed, labels, now);
@@ -3100,26 +3095,34 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
     }
     const { userId } = caller;
-    const account = env.ACCOUNT;
+    const db = env.DB;
     if (collection === "search" && rawName === undefined) {
-      return request.method === "POST" ? search(request, account, userId) : error(405, "method not allowed");
+      return request.method === "POST" ? search(request, db, userId) : error(405, "method not allowed");
     }
     if (collection !== "memories") return error(404, "not found");
     if (rawName === undefined) {
-      return request.method === "GET" ? list(url, account, userId) : error(405, "method not allowed");
+      return request.method === "GET" ? list(url, db, userId) : error(405, "method not allowed");
+    }
+    // The one-shot copy of this account's memories out of D1 and into its own object, run once
+    // against a running deployment by `npm run copy-memories` and by nothing else. A memory
+    // answers a GET, a PUT and a DELETE at its own name and never a POST, so a memory named copy
+    // shadows nothing. It is here rather than on a read path because a read path must never
+    // migrate anything.
+    if (rawName === "copy" && rest.length === 0 && request.method === "POST") {
+      return json(await copyMemories(db, env.ACCOUNT, userId, deps.embedder));
     }
     const name = parseName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
-    if (request.method === "PUT") return save(request, account, userId, name.value);
+    if (request.method === "PUT") return save(request, db, userId, name.value);
     if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
-    const memory = await getMemory(account, userId, name.value);
+    const memory = await getMemory(db, userId, name.value);
     if (!memory) return error(404, `no memory named ${name.value}`);
     if (request.method === "GET" && url.searchParams.get("recall") !== "true") return json({ memory });
     if (request.method === "GET") {
-      const [recalled] = await recall(account, userId, [memory.memoryId], deps.now());
+      const [recalled] = await recall(db, userId, [memory.memoryId], deps.now());
       return recalled ? json({ memory: recalled }) : error(404, `no memory named ${name.value}`);
     }
-    await deleteMemory(account, userId, memory.memoryId);
+    await deleteMemory(db, userId, memory.memoryId);
     return new Response(null, { status: 204 });
   };
 
@@ -3142,7 +3145,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (rawName !== undefined) return error(404, "not found");
       return v2History(request, url, db, caller);
     }
-    if (collection === "memories") return v2Memories(request, url, env.ACCOUNT, caller, rawName, rest[0]);
+    if (collection === "memories") return v2Memories(request, url, db, caller, rawName, rest[0]);
     if (collection !== "messages") return error(404, "not found");
     if (rawName !== undefined) return error(404, "not found");
     return request.method === "POST" ? v2SendMessage(request, env, caller) : error(405, "method not allowed");

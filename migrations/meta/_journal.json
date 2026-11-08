@@ -15,6 +15,13 @@
       "when": 1762000000000,
       "tag": "0022_artifact_names",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1762000000000,
+      "tag": "0023_memories_moved",
+      "breakpoints": true
     }
   ]
 }

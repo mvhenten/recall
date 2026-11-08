@@ -238,6 +238,43 @@ export const artifactRevisions = sqliteTable(
   (table) => [primaryKey({ columns: [table.userId, table.name] })],
 );
 
+// What this account remembers. `memory_seq` is `memories_fts`'s `content_rowid`, so it is an
+// INTEGER PRIMARY KEY and the copy out of D1 preserves it: bm25 scores two rows of one query
+// alike and leaves the rowid to settle them, so a re-numbered corpus answers the same query in
+// another order with nothing failing anywhere.
+//
+// `embedding` is a quantized int8 vector bound as a blob and read back byte for byte. A vector
+// re-encoded on the way across would shift every score a search computes from it.
+export const memories = sqliteTable(
+  "memories",
+  {
+    memorySeq: integer("memory_seq").primaryKey(),
+    memoryId: text("memory_id").notNull().unique(),
+    userId: text("user_id").notNull(),
+    name: text("name").notNull(),
+    description: text("description").notNull(),
+    type: text("type", { enum: ["user", "feedback", "project", "reference"] }).notNull(),
+    body: text("body").notNull(),
+    embedding: vector("embedding").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    recallCount: integer("recall_count").notNull(),
+    lastRecalledAt: integer("last_recalled_at").notNull(),
+  },
+  (table) => [unique().on(table.userId, table.name)],
+);
+
+export const memoryTags = sqliteTable(
+  "memory_tags",
+  {
+    memoryId: text("memory_id")
+      .notNull()
+      .references(() => memories.memoryId, { onDelete: "cascade" }),
+    tag: text("tag").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.memoryId, table.tag] })],
+);
+
 // WITHOUT ROWID likewise. The primary key is the whole of the single-taker guarantee.
 export const boardPickups = sqliteTable(
   "board_pickups",
