@@ -70,14 +70,28 @@ pub struct UsageFile {
 /// share of the delta, and it is sent as the hooks wrote it: the reading is theirs, and nothing
 /// here parses or recomputes it. `files`, `high_water` and `prompts` are where the next stretch
 /// starts, and they move only once every event has been taken.
+///
+/// `files` is absent on a delta the hooks fixed before the files were read apart. Reading that as
+/// none rather than refusing the whole record is what keeps a session live across the update that
+/// added it: the stretch still goes out, and it names no file, because the record never said
+/// which ones it read.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsagePending {
     pub seq: i64,
     pub high_water: i64,
     pub prompts: i64,
+    #[serde(default)]
     pub files: BTreeMap<String, UsageFile>,
     pub events: Vec<serde_json::Value>,
+}
+
+impl UsagePending {
+    /// The transcript files this delta read, which is what says their tokens are counted. A delta
+    /// naming none read none, so nothing is counted against a file on its account.
+    pub fn files_read(&self) -> Vec<String> {
+        self.files.keys().cloned().collect()
+    }
 }
 
 /// How `hooks/session-start.mjs` left one Claude Code session. It writes
@@ -96,18 +110,33 @@ pub struct UsagePending {
 pub struct Record {
     pub cwd: PathBuf,
     pub pid: i32,
+    /// Absent on a record written before the registry described a session rather than just
+    /// addressing one. Every field a later release added reads as empty rather than throwing away
+    /// a record a running session still depends on; only `cwd`, `pid` and `state`, which the
+    /// registry has always carried, are required, so a record malformed in any other way is still
+    /// refused.
+    #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub repo: String,
+    #[serde(default)]
     pub branch: String,
+    #[serde(default)]
     pub commit: String,
+    #[serde(default)]
     pub started_at: i64,
+    #[serde(default)]
     pub last_activity_at: i64,
+    #[serde(default)]
     pub prompts: i64,
+    #[serde(default)]
     pub focus: Focus,
+    #[serde(default)]
     pub mode: String,
+    #[serde(default)]
     pub permission_mode: String,
-    /// Absent on a record written before the archive existed, which simply has nothing to send.
     #[serde(default)]
     pub transcript_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,6 +327,11 @@ pub fn forget(dir: &Path, session_id: &str) {
 /// from its own JSON rather than from `Record`, which models only what this binary reads, so the
 /// fields the hooks own survive. A record that is gone is a session that ended under the send, and
 /// nothing about it is worth keeping.
+///
+/// A delta naming no file moved no file along, so the marks are left where the hooks put them. A
+/// delta the hooks fixed before the files were read apart is the only one that can, and writing
+/// an empty set over its marks would have the next pass read every transcript from the top and
+/// count again what it has already counted.
 pub fn commit_usage(dir: &Path, session_id: &str, pending: &UsagePending) -> Result<()> {
     let path = record_path(dir, session_id);
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -308,7 +342,9 @@ pub fn commit_usage(dir: &Path, session_id: &str, pending: &UsagePending) -> Res
     let Some(fields) = document.as_object_mut() else {
         bail!("the record of session {session_id} is not a JSON object");
     };
-    fields.insert("usageFiles".to_string(), serde_json::to_value(&pending.files)?);
+    if !pending.files.is_empty() {
+        fields.insert("usageFiles".to_string(), serde_json::to_value(&pending.files)?);
+    }
     fields.insert("usageHighWater".to_string(), pending.high_water.into());
     fields.insert("usagePrompts".to_string(), pending.prompts.into());
     fields.remove("usagePending");
@@ -1185,6 +1221,101 @@ mod tests {
             "an event is passed on as the hooks wrote it"
         );
         assert_eq!(pending.events[0]["cacheReadTokens"], 44);
+    }
+
+    /// What a binary that counted a session's transcript as one whole file left behind: the delta
+    /// names `end` and `messageId` where the current one names `files`, and the mark it reads from
+    /// sits on the record itself.
+    const OLD_RECORD: &str = r#"{
+      "state": "off",
+      "pid": 42,
+      "cwd": "/src/recall",
+      "sessionId": "s-old",
+      "host": "laptop",
+      "repo": "repo:github.com/mvhenten/recall",
+      "branch": "work",
+      "commit": "feat(usage): count what a session spends",
+      "startedAt": 1762000000000,
+      "lastActivityAt": 1762000060000,
+      "syncStartedAt": 1762000060000,
+      "prompts": 2,
+      "focus": { "first": "count the tokens", "latest": "count the tokens" },
+      "mode": "interactive",
+      "permissionMode": "default",
+      "transcriptPath": "/home/you/.claude/projects/recall/s-old.jsonl",
+      "usageOffset": 1200,
+      "usageMessageId": "msg-1",
+      "usageHighWater": 6,
+      "usagePrompts": 1,
+      "usagePending": {
+        "seq": 6,
+        "end": 4800,
+        "highWater": 8,
+        "prompts": 2,
+        "messageId": "msg-3",
+        "events": [{ "seq": 6, "model": "claude-opus-4", "prompts": 2, "inputTokens": 11 }]
+      }
+    }"#;
+
+    #[test]
+    fn a_session_live_across_the_update_that_added_the_files_is_still_listed() {
+        let sandbox = Sandbox::new("usage-old-shape");
+        let mine = std::process::id() as i32;
+        std::fs::write(
+            sandbox.sessions().join("s-old.json"),
+            OLD_RECORD.replace("\"pid\": 42", &format!("\"pid\": {mine}")),
+        )
+        .unwrap();
+
+        let record = record(&sandbox.sessions(), "s-old").expect("a delta written without files still parses");
+        let pending = record.usage_pending.expect("the delta it never sent is still there");
+        assert!(pending.files.is_empty());
+        assert_eq!(pending.events.len(), 1);
+        assert_eq!(
+            status(&sandbox.sessions())
+                .iter()
+                .map(|(_, listed)| listed.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s-old"],
+            "the session is listed, not dropped over the one field its binary never wrote"
+        );
+    }
+
+    #[test]
+    fn a_delta_in_the_current_shape_still_names_the_files_it_read() {
+        let sandbox = Sandbox::new("usage-current-shape");
+        std::fs::write(sandbox.sessions().join("s-usage.json"), HOOK_RECORD).unwrap();
+
+        let pending = record(&sandbox.sessions(), "s-usage").unwrap().usage_pending.unwrap();
+
+        assert_eq!(pending.files_read(), vec!["agent-7f21", "main"]);
+    }
+
+    #[test]
+    fn a_delta_naming_no_file_counts_against_none_and_leaves_the_marks_alone() {
+        let sandbox = Sandbox::new("usage-old-commit");
+        let path = sandbox.sessions().join("s-old.json");
+        std::fs::write(&path, OLD_RECORD).unwrap();
+        let pending = record(&sandbox.sessions(), "s-old").unwrap().usage_pending.unwrap();
+
+        assert!(
+            pending.files_read().is_empty(),
+            "an absent set of files is no file, not one standing in for them all"
+        );
+
+        commit_usage(&sandbox.sessions(), "s-old", &pending).unwrap();
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            written.get("usageFiles").is_none(),
+            "no file moved on, so the mark the hooks read is left where they put it"
+        );
+        assert_eq!(written["usageOffset"], 1200);
+        assert_eq!(written["usageHighWater"], 8);
+        assert!(
+            written.get("usagePending").is_none(),
+            "a delta that landed is not sent again"
+        );
     }
 
     #[test]
