@@ -88,11 +88,11 @@ const some = (list) => (list.length === 0 ? "none" : list.join(", "));
 // so a call that answered at all got to the end of them, and no count of the object could stand in
 // — it holds the rows it wrote after the cutover beside the copied ones. A run that opens without
 // the flag writes them once more, which is what finishes a call that died in the middle.
-const call = async (after, metadata) => {
-  const flag = metadata ? "&metadata=complete" : "";
-  const response = await fetch(`${endpoint}/v1/sessions/copy?after=${after}${flag}`, {
+const call = async (after, metadataComplete) => {
+  const response = await fetch(`${endpoint}/v1/sessions/copy`, {
     method: "POST",
-    headers: { authorization: `Bearer ${token}` },
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ after, metadataComplete }),
     signal: AbortSignal.timeout(600_000),
   });
   const body = await response.text();
@@ -109,7 +109,7 @@ const call = async (after, metadata) => {
 // further than its own report. Only the run can say whether the corpus crossed, so the totals are
 // kept here: a call that read forty chunks whose vector did not survive the crossing is the whole
 // point of the check, and reading them off the last report would throw it away.
-const run = { walked: 0, copied: 0, missing: 0, embeddings: [], moved: 0, shifted: 0, calls: 0 };
+const run = { walked: 0, stored: 0, missing: 0, embeddings: [], moved: 0, shifted: 0, calls: 0 };
 
 let after = opened;
 // The opening call of this process writes the metadata however it was invoked, so an interrupted
@@ -123,33 +123,51 @@ const written = report.tables;
 for (;;) {
   const { chunks } = report;
   run.calls += 1;
-  run.walked += chunks.copied + chunks.held;
-  run.copied += chunks.copied;
+  run.walked += chunks.stored + chunks.alreadyStored;
+  run.stored += chunks.stored;
   run.moved += chunks.moved;
   run.shifted += chunks.shifted;
   run.missing += report.checks.missingChunks;
   run.embeddings.push(...report.checks.embeddings);
   if (chunks.done) break;
-  say(`${report.userId}: ${chunks.copied} chunks this call, up to chunk_seq ${chunks.frontier}`);
+  say(`${report.userId}: ${chunks.stored} chunks this call, up to chunk_seq ${chunks.frontier}`);
   after = chunks.frontier;
-  report = await call(after, report.metadata.complete);
+  report = await call(after, report.metadataComplete);
 }
 
 const { userId, chunks, checks } = report;
-const wroteOf = (table) => written.find((row) => row.table === table) ?? { copied: 0, held: 0 };
+const wroteOf = (table) => written.find((row) => row.table === table) ?? { stored: 0, alreadyStored: 0 };
 if (run.calls > 1) say(`${userId}: the prose took ${run.calls} calls; the counts below are from the last of them`);
 
-// What was copied comes from the call that did the copying and what each store holds from the
-// last one, because a continuation writes no metadata and so tallies none.
+// What the object answered for each row comes from the call that offered them, and what each
+// store holds from the last one, because a continuation offers no metadata and is answered for none.
+let blocked = 0;
+let collided = 0;
 for (const row of report.tables) {
-  const did = row.table === "chunks" ? { copied: run.copied, held: run.walked - run.copied } : wroteOf(row.table);
+  const did =
+    row.table === "Chunks" ? { stored: run.stored, alreadyStored: run.walked - run.stored } : wroteOf(row.table);
+  const wrote = written.find((one) => one.table === row.table) ?? row;
+  blocked += wrote.blocked;
+  collided += wrote.collided;
   say(
-    `${userId}: ${row.table}: copied ${did.copied}, left ${did.held} already held; ${row.account} in D1, ${row.tenant} in the object`,
+    `${userId}: ${row.table}: stored ${did.stored}, already stored ${did.alreadyStored}, blocked ${wrote.blocked}; ${row.inAccount} in D1, ${row.inTenant} in the object`,
   );
+  if (wrote.blocked > 0) {
+    say(
+      `${userId}: ${row.table}: ${wrote.blocked} rows of D1 did not cross, another row standing where each belongs. Read them out of D1 by their id: ${some(wrote.blockedIds)}${wrote.blocked > wrote.blockedIds.length ? ` (and ${wrote.blocked - wrote.blockedIds.length} more)` : ""}`,
+    );
+  }
+  if (wrote.collided > 0) {
+    // A different fault with a different remedy: two of D1's own rows written out the same way,
+    // which would hide a row that never crossed behind one that did. Nothing is wrong with the
+    // copy until the serialiser tells these two rows apart.
+    say(
+      `${userId}: ${row.table}: ${wrote.collided} ids are shared by two of D1's own rows, which the serialiser must tell apart before this run means anything: ${some(wrote.collidedIds)}${wrote.collided > wrote.collidedIds.length ? ` (and ${wrote.collided - wrote.collidedIds.length} more)` : ""}`,
+    );
+  }
 }
-say(`${userId}: tables the object is short of: ${some(checks.short)}`);
 say(`${userId}: missing ${some(checks.missing)}; held only by the object: ${some(checks.extra)}`);
-say(`${userId}: ${run.walked} of D1's ${chunks.account} chunks were walked over this run`);
+say(`${userId}: ${run.walked} of D1's ${chunks.inAccount} chunks were walked over this run`);
 say(`${userId}: chunks that did not arrive: ${run.missing}`);
 say(`${userId}: embeddings that did not round-trip byte for byte: ${some(run.embeddings)}`);
 
@@ -195,13 +213,21 @@ if (run.shifted > 0) {
 // What the last call could not answer: whether the run walked the whole of D1's prose. The object
 // holds the chunks it indexed itself as well as the ones it was given, so its row count is
 // satisfied by an account nothing was ever copied into — only the walk accounts for the corpus.
-if (run.walked < chunks.account) {
+if (run.walked < chunks.inAccount) {
   die(
-    `${userId}: the run walked ${run.walked} of D1's ${chunks.account} chunks, so the prose did not all cross. Run again from --after=0. Nothing in D1 was changed.`,
+    `${userId}: the run walked ${run.walked} of D1's ${chunks.inAccount} chunks, so the prose did not all cross. Run again from --after=0. Nothing in D1 was changed.`,
   );
 }
 if (run.missing > 0 || run.embeddings.length > 0) {
   die(`${userId}: the prose does not verify against D1; nothing in D1 was changed`);
+}
+if (collided > 0) {
+  die(
+    `${userId}: ${collided} ids are shared by rows D1 holds, so this run proves nothing about the tables they are in; nothing in D1 was changed`,
+  );
+}
+if (blocked > 0) {
+  die(`${userId}: ${blocked} rows of D1 did not cross; nothing in D1 was changed`);
 }
 if (!checks.ok) die(`${userId}: the copy does not verify against D1; nothing in D1 was changed`);
 say(`${userId}: verified`);

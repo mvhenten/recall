@@ -9,6 +9,7 @@
 import type { z } from "zod";
 import {
   AppendRecordsSchema,
+  CopySessionsSchema,
   type DeviceSchema,
   ListMemoriesSchema,
   type MemoryHitSchema,
@@ -58,6 +59,7 @@ export type V2Session = z.infer<typeof SessionSchema>;
 export type V2PastSession = z.infer<typeof PastSessionSchema>;
 export type V2SessionHit = z.infer<typeof SessionHitSchema>;
 export type V2RecordsAccepted = z.infer<typeof RecordsAcceptedSchema>;
+export type V2CopySessions = z.infer<typeof CopySessionsSchema>;
 export type V2RecordsConflict = z.infer<typeof RecordsConflictSchema>;
 export type V2SendInput = z.infer<typeof SendMessageSchema>;
 export type V2AppendRecords = z.infer<typeof AppendRecordsSchema>;
@@ -211,6 +213,10 @@ const validated = <T extends Record<string, unknown>>(schema: z.ZodType<T>, body
 };
 
 export const parseAppendRecords = (body: unknown): Parsed<V2AppendRecords> => validated(AppendRecordsSchema, body);
+
+// What one call of the session copy is told. It is a body rather than a query string because both
+// of its fields are the run's own state carried between calls, and a contract is what says so.
+export const parseCopySessions = (body: unknown): Parsed<V2CopySessions> => validated(CopySessionsSchema, body);
 
 export const parseSessionSync = (body: unknown): Parsed<SessionInput> => {
   const read = validated(SessionSyncSchema, body);

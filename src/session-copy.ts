@@ -1,6 +1,16 @@
 import { and, asc, eq, sql } from "drizzle-orm";
 import type { SQLiteColumn, SQLiteTable } from "drizzle-orm/sqlite-core";
+import type { z } from "zod";
+import type {
+  CopiedRowSchema,
+  CopiedTableSchema,
+  CopyIndexCheckSchema,
+  CopySessionsSchema,
+  CopyTableSchema,
+  SessionCopySchema,
+} from "../typespec/generated/schemas";
 import type { AccountDb, TenantDb, TenantTx } from "./db";
+import { rowUuid } from "./row-digest";
 import { toBytes } from "./schema/columns";
 import { sessionChunksFts, sessionHistoryFts } from "./schema/fts";
 import {
@@ -68,95 +78,18 @@ type Owned = SQLiteTable & { userId: SQLiteColumn };
 // A column of that table and of no other, so an order cannot name one the query never reads.
 type ColumnOf<T extends SQLiteTable> = T["_"]["columns"][keyof T["_"]["columns"]];
 
-// What one table did, and what each store holds of it afterwards. The counts are the half the
-// tallies cannot say: every insert of a table conflicting reads as `copied: 0, held: N`, which is
-// exactly what a table that arrived twice over reads as too.
-export interface TableReport {
-  table: string;
-  copied: number;
-  held: number;
-  account: number;
-  tenant: number;
-}
+// Everything the copy answers with comes off the contract rather than being restated here, so a
+// field the route adds and `typespec/main.tsp` does not know about is a type error.
+export type CopiedRow = z.infer<typeof CopiedRowSchema>;
+export type CopiedTable = z.infer<typeof CopiedTableSchema>;
+export type CopySessionsInput = z.infer<typeof CopySessionsSchema>;
+export type SessionCopyReport = z.infer<typeof SessionCopySchema>;
+export type CopyIndexCheck = z.infer<typeof CopyIndexCheckSchema>;
+type CopyTable = z.infer<typeof CopyTableSchema>;
 
-export interface SessionCopyChecks {
-  // The tables the object holds fewer rows of than D1, which is what says a table did not arrive.
-  // It may hold more of any of them: a session started after the cutover is its own.
-  //
-  // `session_chunks` is deliberately not among them. The object counts the prose it indexed itself
-  // alongside the prose it was given, so an account whose own chunks outnumber D1's satisfies
-  // `tenant >= account` having copied nothing at all. What accounts for the prose is how much of
-  // D1's the run walked, which is `chunks.copied + chunks.held` summed over every call of it and
-  // so is the caller's to add up — one call cannot see a run.
-  short: string[];
-  // Session ids D1 holds that the object does not.
-  missing: string[];
-  // Session ids the object holds that D1 does not, which a session started after the cutover
-  // accounts for.
-  extra: string[];
-  // D1 chunks this call walked with no row in the object under the `chunk_seq` they were written
-  // with. Like `embeddings`, it is this call's own and the caller sums it over the run.
-  missingChunks: number;
-  // The chunks this call wrote whose embedding does not come back out of the object as the bytes
-  // D1 holds. A vector is quantized int8, so one re-encoded byte moves every score computed from
-  // it. A chunk an earlier call brought over is left out: its vector was held against D1's then.
-  embeddings: number[];
-  // What SQLite makes of `session_chunks_fts` against `session_chunks`. The index is
-  // external-content and the copy moves rowids by hand, so this is the one thing no count can
-  // see: an entry left at a mover's old rowid answers a later query with the copied chunk that
-  // now holds it.
-  chunkIndex: IndexCheck;
-  // The same read of `session_history_fts`, which stores its own copy of the text.
-  historyIndex: IndexCheck;
-  // What this call can account for, which is everything but how much of the prose the run has
-  // walked. The caller holds that, and `npm run copy-sessions` is what adds it up.
-  ok: boolean;
-}
-
-// What the integrity check made of an index, and whether the check ran at all. A statement that
-// fails for any other reason leaves the index unread, which is not the same finding as an index
-// and its rows disagreeing and does not read as one.
-export interface IndexCheck {
-  corrupt: boolean;
-  error: string;
-}
-
-export interface SessionCopyReport {
-  userId: string;
-  // One per table the cutover moved, `session_chunks` last.
-  tables: TableReport[];
-  // Whether every table but the prose has been read out of D1 and written, which this report
-  // existing is the proof of: the phase runs to its end before a response is built, so a call that
-  // died in the middle of it answered nothing at all. A continuation is handed this back and skips
-  // the phase on it. Nothing about the object says it — the object holds its own post-cutover rows
-  // beside the copied ones, so a count of either table is satisfied without a D1 row having
-  // crossed.
-  metadata: { complete: boolean };
-  chunks: {
-    // What this call walked of D1's prose. The two together are how much of it this call accounts
-    // for, and summed over the run they are what says the whole corpus crossed — the object's own
-    // row count cannot say it, since the object holds the prose it indexed itself as well.
-    copied: number;
-    held: number;
-    // How many chunks D1 holds for this account, so the caller has what to sum against.
-    account: number;
-    // The copied chunks that could not keep the ordinal D1 gave them, because the object already
-    // indexes that ordinal of that session.
-    shifted: number;
-    // The object's own chunks moved up the sequence to free a `chunk_seq` a copied one came in
-    // under.
-    moved: number;
-    // The `chunk_seq` this call read up to, which the next one is given as `after`.
-    frontier: number;
-    // Whether the frontier is the end of D1's chunks.
-    done: boolean;
-  };
-  // The sessions both stores held when the run opened: the object's row is the later one and
-  // stands, and what D1 holds of them that the object does not is added beside it. Only the call
-  // that opens the run can say which those were, so a continuation names none.
-  straddling: string[];
-  checks: SessionCopyChecks;
-}
+// How many ids a table names when its rows did not cross, or when two of D1's own share one. The
+// count beside each list is exact; the list is what an operator reads a row back out of D1 with.
+const MAX_IDS = 50;
 
 // One page of a table nothing writes any more, taken by offset. A keyset walk would say the same
 // thing against a still side and cost a composite comparison per table.
@@ -181,22 +114,63 @@ const allOf = async <T extends Owned>(
   }
 };
 
-// The rows of one table, written one statement at a time and in batches the object commits whole.
-// A row the object already holds conflicts with itself and is left exactly as it stands, which is
-// what makes the object's row the one that wins and a second run cost nothing.
-const copyTable = <T extends Owned>(db: TenantDb, table: T, rows: ReadonlyArray<T["$inferInsert"]>): number => {
-  let copied = 0;
-  for (let start = 0; start < rows.length; start += WRITE_BATCH) {
-    const batch = rows.slice(start, start + WRITE_BATCH);
+// One row of D1 under the id the object will be asked for it by.
+interface Offered<T> {
+  row: T;
+  rowId: string;
+}
+
+// The rows of one table, each looked up by its id before the object is asked to take it, and each
+// answered for in its own right. A row the object already holds is refused and said to be refused;
+// a row that lands is said to have landed; a row that does neither — another row standing where it
+// belongs — is named rather than passed over.
+//
+// That third answer is why the write reads before it writes. An insert that merely did nothing on
+// a conflict cannot tell the three apart, and a table whose every row conflicted then reads
+// exactly as a table copied twice over does: `stored: 0` either way, with nothing to say which.
+//
+// Written one statement at a time, never one insert of many rows, for the hundred-parameter
+// ceiling on the object's SQLite, and in batches the object commits whole.
+const storeRows = <T extends Owned>(
+  db: TenantDb,
+  table: T,
+  offered: ReadonlyArray<Offered<T["$inferInsert"]>>,
+  held: ReadonlySet<string>,
+): CopiedRow[] => {
+  const answered: CopiedRow[] = [];
+  for (let start = 0; start < offered.length; start += WRITE_BATCH) {
+    const batch = offered.slice(start, start + WRITE_BATCH);
     db.transaction((tx) => {
-      for (const row of batch) {
-        // Whichever column is returned, what is read of it is that a row landed rather than
-        // conflicting with one the object already holds.
-        copied += tx.insert(table).values(row).onConflictDoNothing().returning({ owner: table.userId }).all().length;
+      for (const one of batch) {
+        if (held.has(one.rowId)) {
+          answered.push({ rowId: one.rowId, outcome: "AlreadyStored" });
+          continue;
+        }
+        const landed = tx
+          .insert(table)
+          .values(one.row)
+          .onConflictDoNothing()
+          .returning({ owner: table.userId })
+          .all().length;
+        answered.push({ rowId: one.rowId, outcome: landed === 1 ? "Stored" : "Blocked" });
       }
     });
   }
-  return copied;
+  return answered;
+};
+
+// Every row of one table the object holds, under the ids the write is weighed against. It is read
+// whole because an id is a reading of a row and cannot be looked up by a key — and these are the
+// tables the cutover moved rather than the prose, so reading one costs what reading D1's copy of
+// it already costs.
+const heldIds = async (
+  db: TenantDb,
+  table: Owned,
+  userId: string,
+  only: ReadonlySet<string> | null,
+): Promise<Set<string>> => {
+  const rows = db.select().from(table).where(eq(table.userId, userId)).all();
+  return new Set(await Promise.all(rows.map((row) => rowUuid(table, row, only))));
 };
 
 const accountCount = async (db: AccountDb, table: Owned, userId: string): Promise<number> => {
@@ -246,8 +220,8 @@ const accountChunkPage = async (db: AccountDb, userId: string, after: number): P
 
 // What the copy carries from one page of chunks to the next.
 interface ChunkState {
-  copied: number;
-  held: number;
+  stored: number;
+  alreadyStored: number;
   shifted: number;
   moved: number;
   missing: number;
@@ -345,7 +319,7 @@ const placeChunk = (tx: TenantTx, userId: string, row: LegacyChunk, state: Chunk
       .returning({ chunkSeq: sessionChunks.chunkSeq })
       .all().length === 1;
   if (landed(row.ordinal)) {
-    state.copied += 1;
+    state.stored += 1;
     return { ordinal: row.ordinal, held: false };
   }
   const standing = tx
@@ -364,14 +338,14 @@ const placeChunk = (tx: TenantTx, userId: string, row: LegacyChunk, state: Chunk
     standing.text === row.text &&
     standing.at === row.at
   ) {
-    state.held += 1;
+    state.alreadyStored += 1;
     return { ordinal: standing.ordinal, held: true };
   }
   if (standing !== undefined) {
     moveChunk(tx, userId, row.chunkSeq, standing.text, highest);
     state.moved += 1;
     if (landed(row.ordinal)) {
-      state.copied += 1;
+      state.stored += 1;
       return { ordinal: row.ordinal, held: false };
     }
   }
@@ -379,7 +353,7 @@ const placeChunk = (tx: TenantTx, userId: string, row: LegacyChunk, state: Chunk
   if (!landed(ordinal)) {
     throw new Error(`chunk ${row.chunkSeq} of session ${row.sessionId} found no free ordinal in the object`);
   }
-  state.copied += 1;
+  state.stored += 1;
   state.shifted += 1;
   return { ordinal, held: false };
 };
@@ -438,8 +412,8 @@ const copyChunks = async (
   after: number,
 ): Promise<ChunkPass> => {
   const state: ChunkState = {
-    copied: 0,
-    held: 0,
+    stored: 0,
+    alreadyStored: 0,
     shifted: 0,
     moved: 0,
     missing: 0,
@@ -486,7 +460,7 @@ const indexIntegrity = (
   db: TenantDb,
   table: typeof sessionChunksFts | typeof sessionHistoryFts,
   rank: 0 | 1,
-): IndexCheck => {
+): CopyIndexCheck => {
   try {
     db.run(
       rank === 1
@@ -567,65 +541,160 @@ export const copySessions = async (
   // own account and read as arrived having never been written to. Taken without the flag — a
   // resumed `--after`, a hand-run call — the phase runs again, which costs one pass and is what
   // finishes a call that died in the middle of it.
+  //
+  // `key` is the columns a row is known by where the whole row cannot be: a table whose
+  // object-side row deliberately wins on a session both stores held has content that differs
+  // there by design, and an id over the whole row would read that as a row that never crossed.
+  // Given `null`, the id is over every column, which is what proves the content arrived and not
+  // merely that something sits at the key.
   const moved = async <A extends Owned, T extends Owned>(
-    table: string,
+    table: CopyTable,
     from: A & { $inferSelect: T["$inferInsert"] },
     into: T,
     order: ReadonlyArray<ColumnOf<A>>,
-  ): Promise<TableReport> => {
-    const counted = async (copied: number, held: number): Promise<TableReport> => ({
-      table,
-      copied,
-      held,
-      account: await accountCount(account, from, userId),
-      tenant: tenantCount(tenant, into, userId),
-    });
-    if (metadataComplete) return counted(0, 0);
+    key: ReadonlyArray<ColumnOf<A>> | null,
+  ): Promise<CopiedTable> => {
+    const counted = async (answered: readonly CopiedRow[], collided: string[]): Promise<CopiedTable> => {
+      const of = (outcome: string): CopiedRow[] => answered.filter((one) => one.outcome === outcome);
+      const blocked = of("Blocked").map((one) => one.rowId);
+      return {
+        table,
+        stored: of("Stored").length,
+        alreadyStored: of("AlreadyStored").length,
+        blocked: blocked.length,
+        blockedIds: blocked.slice(0, MAX_IDS),
+        collided: collided.length,
+        collidedIds: collided.slice(0, MAX_IDS),
+        inAccount: await accountCount(account, from, userId),
+        inTenant: tenantCount(tenant, into, userId),
+      };
+    };
+    if (metadataComplete) return counted([], []);
+    const only = key === null ? null : new Set(key.map((column) => column.name));
     const rows = await allOf(account, from, userId, order);
-    const copied = copyTable(tenant, into, rows);
-    return counted(copied, rows.length - copied);
+    const offered = await Promise.all(rows.map(async (row) => ({ row, rowId: await rowUuid(from, row, only) })));
+    // Two of D1's own rows under one id cannot happen: every column that identifies a row is
+    // written into its id, and these tables are keyed. A repeat is the serialiser collapsing two
+    // rows into one, which would hide a row that never crossed behind one that did.
+    const seen = new Map<string, number>();
+    for (const one of offered) seen.set(one.rowId, (seen.get(one.rowId) ?? 0) + 1);
+    const collided = [...seen.entries()]
+      .filter(([, times]) => times > 1)
+      .map(([rowId]) => rowId)
+      .sort();
+    return counted(storeRows(tenant, into, offered, await heldIds(tenant, into, userId, only)), collided);
   };
 
-  const tables: TableReport[] = [
-    await moved("sessions", legacySessions, sessions, [legacySessions.sessionId]),
-    await moved("history", legacySessionHistory, sessionHistory, [legacySessionHistory.sessionId]),
-    await moved("index", legacySessionIndex, sessionIndex, [legacySessionIndex.sessionId]),
-    await moved("records", legacySessionRecords, sessionRecords, [
-      legacySessionRecords.sessionId,
-      legacySessionRecords.file,
-    ]),
-    await moved("openChunks", legacySessionOpenChunks, sessionOpenChunks, [
-      legacySessionOpenChunks.sessionId,
-      legacySessionOpenChunks.file,
-      legacySessionOpenChunks.speaker,
-    ]),
-    await moved("countedFiles", legacyCountedFiles, countedFiles, [
-      legacyCountedFiles.sessionId,
-      legacyCountedFiles.file,
-    ]),
-    await moved("usageEvents", legacyUsageEvents, usageEvents, [legacyUsageEvents.sessionId, legacyUsageEvents.seq]),
-    await moved("usageDaily", legacyUsageDaily, usageDaily, [
-      legacyUsageDaily.day,
-      legacyUsageDaily.host,
-      legacyUsageDaily.repo,
-      legacyUsageDaily.account,
-      legacyUsageDaily.provider,
-      legacyUsageDaily.model,
-    ]),
-    await moved("labels", legacyLabels, labels, [legacyLabels.kind, legacyLabels.value]),
-    await moved("boardMessages", legacyBoardMessages, boardMessages, [legacyBoardMessages.messageId]),
-    await moved("boardPickups", legacyBoardPickups, boardPickups, [legacyBoardPickups.messageId]),
+  const tables: CopiedTable[] = [
+    // The seven the object's own row wins on, compared by what identifies them. A session both
+    // stores held keeps the object's row, and its focus, its reach, its mark and its label all
+    // move on after the cutover by design.
+    await moved(
+      "Sessions",
+      legacySessions,
+      sessions,
+      [legacySessions.sessionId],
+      [legacySessions.userId, legacySessions.sessionId],
+    ),
+    await moved(
+      "History",
+      legacySessionHistory,
+      sessionHistory,
+      [legacySessionHistory.sessionId],
+      [legacySessionHistory.userId, legacySessionHistory.sessionId],
+    ),
+    await moved(
+      "Index",
+      legacySessionIndex,
+      sessionIndex,
+      [legacySessionIndex.sessionId],
+      [legacySessionIndex.userId, legacySessionIndex.sessionId],
+    ),
+    await moved(
+      "Records",
+      legacySessionRecords,
+      sessionRecords,
+      [legacySessionRecords.sessionId, legacySessionRecords.file],
+      [legacySessionRecords.userId, legacySessionRecords.sessionId, legacySessionRecords.file],
+    ),
+    await moved(
+      "OpenChunks",
+      legacySessionOpenChunks,
+      sessionOpenChunks,
+      [legacySessionOpenChunks.sessionId, legacySessionOpenChunks.file, legacySessionOpenChunks.speaker],
+      [
+        legacySessionOpenChunks.userId,
+        legacySessionOpenChunks.sessionId,
+        legacySessionOpenChunks.file,
+        legacySessionOpenChunks.speaker,
+      ],
+    ),
+    await moved(
+      "UsageDaily",
+      legacyUsageDaily,
+      usageDaily,
+      [
+        legacyUsageDaily.day,
+        legacyUsageDaily.host,
+        legacyUsageDaily.repo,
+        legacyUsageDaily.account,
+        legacyUsageDaily.provider,
+        legacyUsageDaily.model,
+      ],
+      [
+        legacyUsageDaily.userId,
+        legacyUsageDaily.day,
+        legacyUsageDaily.host,
+        legacyUsageDaily.repo,
+        legacyUsageDaily.account,
+        legacyUsageDaily.provider,
+        legacyUsageDaily.model,
+      ],
+    ),
+    await moved(
+      "Labels",
+      legacyLabels,
+      labels,
+      [legacyLabels.kind, legacyLabels.value],
+      [legacyLabels.userId, legacyLabels.kind, legacyLabels.value],
+    ),
+    // The four nothing rewrites. A counted file, a usage event, a board message and the pickup
+    // that took it are each written once and never moved on, so the whole row is the id and a row
+    // of another content standing in its place is a finding and not a design.
+    await moved(
+      "CountedFiles",
+      legacyCountedFiles,
+      countedFiles,
+      [legacyCountedFiles.sessionId, legacyCountedFiles.file],
+      null,
+    ),
+    await moved(
+      "UsageEvents",
+      legacyUsageEvents,
+      usageEvents,
+      [legacyUsageEvents.sessionId, legacyUsageEvents.seq],
+      null,
+    ),
+    await moved("BoardMessages", legacyBoardMessages, boardMessages, [legacyBoardMessages.messageId], null),
+    await moved("BoardPickups", legacyBoardPickups, boardPickups, [legacyBoardPickups.messageId], null),
   ];
 
   const highest = await highestChunkSeq(account, userId);
   const chunks = await copyChunks(tenant, account, userId, highest, after);
   const inD1 = await accountCount(account, legacySessionChunks, userId);
   tables.push({
-    table: "chunks",
-    copied: chunks.copied,
-    held: chunks.held,
-    account: inD1,
-    tenant: tenantCount(tenant, sessionChunks, userId),
+    table: "Chunks",
+    stored: chunks.stored,
+    alreadyStored: chunks.alreadyStored,
+    // The prose answers for itself a chunk at a time, by its key, its text and the instant it
+    // opened on: a chunk that did not land is one `missingChunks` counts and `embeddings` would
+    // have read the vector of. Nothing of it is blocked or collided.
+    blocked: 0,
+    blockedIds: [],
+    collided: 0,
+    collidedIds: [],
+    inAccount: inD1,
+    inTenant: tenantCount(tenant, sessionChunks, userId),
   });
 
   const heldAfter = tenantSessionIds(tenant, userId);
@@ -633,25 +702,21 @@ export const copySessions = async (
   const extra = [...heldAfter].filter((sessionId) => !fromD1.has(sessionId)).sort();
   const chunkIndex = indexIntegrity(tenant, sessionChunksFts, 1);
   const historyIndex = indexIntegrity(tenant, sessionHistoryFts, 0);
-  // A table the object holds fewer rows of than D1 did not arrive, whatever its tally said. It is
-  // a floor and not a proof, for the reason the prose is left out of it altogether: the object
-  // holds the rows it wrote after the cutover beside the copied ones, so a table it has outgrown
-  // D1 on satisfies `tenant >= account` whether or not a D1 row ever crossed. What carries the
-  // metadata is the phase having run to its end, which is `metadata.complete`; what carries the
-  // prose is the walk, which only the caller can add up over the run.
-  const short = tables
-    .filter((row) => row.table !== "chunks" && row.tenant < row.account)
-    .map((row) => row.table)
-    .sort();
+  // Two conditions, loud apart because the remedy is not the same one. A blocked row is a row of
+  // D1 that did not cross and the object holds something else in its place; a collided id is the
+  // serialiser writing two rows out the same way, which would hide a blocked row behind a stored
+  // one and is a fault in this file rather than in the copy.
+  const blocked = tables.reduce((total, row) => total + row.blocked, 0);
+  const collided = tables.reduce((total, row) => total + row.collided, 0);
 
   return {
     userId,
     tables,
-    metadata: { complete: true },
+    metadataComplete: true,
     chunks: {
-      copied: chunks.copied,
-      held: chunks.held,
-      account: inD1,
+      stored: chunks.stored,
+      alreadyStored: chunks.alreadyStored,
+      inAccount: inD1,
       shifted: chunks.shifted,
       moved: chunks.moved,
       frontier: chunks.frontier,
@@ -659,7 +724,6 @@ export const copySessions = async (
     },
     straddling,
     checks: {
-      short,
       missing,
       extra,
       missingChunks: chunks.missing,
@@ -668,7 +732,8 @@ export const copySessions = async (
       historyIndex,
       ok:
         chunks.done &&
-        short.length === 0 &&
+        blocked === 0 &&
+        collided === 0 &&
         missing.length === 0 &&
         chunks.missing === 0 &&
         chunks.embeddings.length === 0 &&
