@@ -22,6 +22,7 @@ const maxMemoryTag = 200;
 const maxMemoryQuery = 2000;
 const maxMemoryHits = 50;
 const maxListRows = 100;
+const maxCopyIds = 50;
 
 @doc("""
   One line of a transcript file, redacted, under the ordinal it holds in that file. A line that is
@@ -345,4 +346,191 @@ model NearbyMemory {
   tags: MemoryTag[];
 
   description: MemoryDescription;
+}
+
+@doc("""
+  The id one row of either store is known by: a version 5 uuid over the row written out by
+  `src/row-digest.ts`. The copy derives it on the server from the row itself and never takes one
+  from a caller, so an id is a reading of a row and not a claim about one.
+  """)
+@pattern("^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+scalar RowId extends string;
+
+@doc("What became of one row the copy offered the object.")
+enum CopyOutcome {
+  @doc("The object held no row under this id and holds one now.")
+  Stored,
+
+  @doc("""
+    The object already held this row, so the copy refused it rather than writing over it. An
+    expected answer and not a fault: a second pass of the copy reads it for every row it brought
+    over the first time.
+    """)
+  AlreadyStored,
+
+  @doc("""
+    Another row stands where this one belongs. The object neither held this row nor took it, so
+    what D1 holds did not cross and the id says which row to read.
+    """)
+  Blocked,
+}
+
+model CopiedRow {
+  rowId: RowId;
+  outcome: CopyOutcome;
+}
+
+@doc("The tables the move into a tenant's own object left behind in D1, in the order the copy walks them.")
+enum CopyTable {
+  Sessions,
+  History,
+  Index,
+  Records,
+  OpenChunks,
+  UsageDaily,
+  Labels,
+  CountedFiles,
+  UsageEvents,
+  BoardMessages,
+  BoardPickups,
+  Chunks,
+}
+
+@doc("What a row of a table is known by, which is what a row that did not cross means.")
+enum CopyIdentity {
+  @doc("""
+    The columns that identify the row, which are its key. A table whose object-side row
+    deliberately wins on a session both stores held is read this way, its content having moved on
+    there by design. A row of one that did not cross had its key taken while the copy ran, since
+    a row standing at that key would have answered as one the object already held.
+    """)
+  Key,
+
+  @doc("""
+    The whole row, which is what proves the content arrived and not merely that the key is taken.
+    A row of one that did not cross has another row of other content standing where it belongs.
+    """)
+  WholeRow,
+
+  @doc("The prose, walked chunk by chunk and answered for by its key, its text and the instant it opened on.")
+  Walked,
+}
+
+@doc("""
+  What one table did. `stored` and `alreadyStored` are counted off the answer the object gave for
+  each row and nothing else; `blocked` is the rows that did not cross, and `blockedIds` names as
+  many of them as the cap allows so an operator can read them out of D1. The two row counts are
+  there to be looked at and carry nothing: the object writes its own rows into these tables after
+  the cutover, so a table it has outgrown D1 on reads as arrived whether or not a row ever crossed.
+  """)
+model CopiedTable {
+  table: CopyTable;
+  stored: safeint;
+  alreadyStored: safeint;
+  blocked: safeint;
+
+  @maxItems(maxCopyIds)
+  blockedIds: RowId[];
+
+  @doc("""
+    Ids D1's own rows share, which two rows of one table cannot do: every column that identifies a
+    row is written into its id. A repeat is the serialiser collapsing two rows into one id, which
+    would hide a row that never crossed, and is a different fault to a row that did not cross.
+    """)
+  collided: safeint;
+
+  @maxItems(maxCopyIds)
+  collidedIds: RowId[];
+
+  @doc("What a row of this table was known by, which is what `blocked` means for it.")
+  identity: CopyIdentity;
+
+  inAccount: safeint;
+  inTenant: safeint;
+}
+
+model CopySessions {
+  @doc("Where the walk of the prose opens: the chunk sequence a call of this run answered with.")
+  @minValue(0)
+  after: safeint;
+
+  @doc("""
+    Whether a call of this run has already written every table but the prose. Only a call that
+    answered can say so — the tables are written before a response is built — and no count of the
+    object could stand in for it.
+    """)
+  metadataComplete: boolean;
+}
+
+@doc("A full-text index SQLite read against the rows it indexes and found nothing to say about.")
+model IndexSound {
+  state: "Sound";
+}
+
+@doc("""
+  An index and the rows it indexes disagree. The chunks' index is external-content and the copy
+  moves rowids by hand, so an entry left behind at a mover's old key would answer a later query
+  with the chunk that now holds it.
+  """)
+model IndexCorrupt {
+  state: "Corrupt";
+
+  @minLength(1)
+  error: string;
+}
+
+@doc("""
+  The check did not run, so the index is neither sound nor known to be otherwise. A different thing
+  to tell an operator than an index that disagrees with its rows, and a different thing to do about.
+  """)
+model IndexUnread {
+  state: "Unread";
+
+  @minLength(1)
+  error: string;
+}
+
+@doc("What SQLite made of a full-text index against the rows it indexes, or that it never read it.")
+union CopyIndexCheck {
+  sound: IndexSound,
+  corrupt: IndexCorrupt,
+  unread: IndexUnread,
+}
+
+model CopiedChunks {
+  stored: safeint;
+  alreadyStored: safeint;
+  inAccount: safeint;
+
+  @doc("Copied chunks that could not keep the ordinal D1 gave them, the object holding that one already.")
+  shifted: safeint;
+
+  @doc("The object's own chunks moved up the sequence to free a key a copied one came in under.")
+  moved: safeint;
+
+  frontier: safeint;
+  done: boolean;
+}
+
+model CopyChecks {
+  missing: string[];
+  extra: string[];
+  missingChunks: safeint;
+  embeddings: safeint[];
+  chunkIndex: CopyIndexCheck;
+  historyIndex: CopyIndexCheck;
+
+  @doc("What this call can account for, which is everything but how much of the prose the run walked.")
+  ok: boolean;
+}
+
+model SessionCopy {
+  @minLength(1)
+  userId: string;
+
+  tables: CopiedTable[];
+  metadataComplete: boolean;
+  chunks: CopiedChunks;
+  straddling: string[];
+  checks: CopyChecks;
 }

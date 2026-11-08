@@ -769,6 +769,304 @@
         }
       },
       "required": ["score", "memoryName", "type", "tags", "description"]
+    },
+    "CopiedRow": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopiedRow.json",
+      "type": "object",
+      "properties": {
+        "rowId": {
+          "$ref": "RowId.json"
+        },
+        "outcome": {
+          "$ref": "CopyOutcome.json"
+        }
+      },
+      "required": ["rowId", "outcome"]
+    },
+    "RowId": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "RowId.json",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "The id one row of either store is known by: a version 5 uuid over the row written out by\n`src/row-digest.ts`. The copy derives it on the server from the row itself and never takes one\nfrom a caller, so an id is a reading of a row and not a claim about one."
+    },
+    "CopyOutcome": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopyOutcome.json",
+      "type": "string",
+      "enum": ["Stored", "AlreadyStored", "Blocked"],
+      "description": "What became of one row the copy offered the object."
+    },
+    "CopiedTable": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopiedTable.json",
+      "type": "object",
+      "properties": {
+        "table": {
+          "$ref": "CopyTable.json"
+        },
+        "stored": {
+          "type": "integer"
+        },
+        "alreadyStored": {
+          "type": "integer"
+        },
+        "blocked": {
+          "type": "integer"
+        },
+        "blockedIds": {
+          "type": "array",
+          "items": {
+            "$ref": "RowId.json"
+          },
+          "maxItems": 50
+        },
+        "collided": {
+          "type": "integer",
+          "description": "Ids D1's own rows share, which two rows of one table cannot do: every column that identifies a\nrow is written into its id. A repeat is the serialiser collapsing two rows into one id, which\nwould hide a row that never crossed, and is a different fault to a row that did not cross."
+        },
+        "collidedIds": {
+          "type": "array",
+          "items": {
+            "$ref": "RowId.json"
+          },
+          "maxItems": 50
+        },
+        "identity": {
+          "$ref": "CopyIdentity.json",
+          "description": "What a row of this table was known by, which is what `blocked` means for it."
+        },
+        "inAccount": {
+          "type": "integer"
+        },
+        "inTenant": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "table",
+        "stored",
+        "alreadyStored",
+        "blocked",
+        "blockedIds",
+        "collided",
+        "collidedIds",
+        "identity",
+        "inAccount",
+        "inTenant"
+      ],
+      "description": "What one table did. `stored` and `alreadyStored` are counted off the answer the object gave for\neach row and nothing else; `blocked` is the rows that did not cross, and `blockedIds` names as\nmany of them as the cap allows so an operator can read them out of D1. The two row counts are\nthere to be looked at and carry nothing: the object writes its own rows into these tables after\nthe cutover, so a table it has outgrown D1 on reads as arrived whether or not a row ever crossed."
+    },
+    "CopyTable": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopyTable.json",
+      "type": "string",
+      "enum": [
+        "Sessions",
+        "History",
+        "Index",
+        "Records",
+        "OpenChunks",
+        "UsageDaily",
+        "Labels",
+        "CountedFiles",
+        "UsageEvents",
+        "BoardMessages",
+        "BoardPickups",
+        "Chunks"
+      ],
+      "description": "The tables the move into a tenant's own object left behind in D1, in the order the copy walks them."
+    },
+    "CopyIdentity": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopyIdentity.json",
+      "type": "string",
+      "enum": ["Key", "WholeRow", "Walked"],
+      "description": "What a row of a table is known by, which is what a row that did not cross means."
+    },
+    "CopySessions": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopySessions.json",
+      "type": "object",
+      "properties": {
+        "after": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Where the walk of the prose opens: the chunk sequence a call of this run answered with."
+        },
+        "metadataComplete": {
+          "type": "boolean",
+          "description": "Whether a call of this run has already written every table but the prose. Only a call that\nanswered can say so — the tables are written before a response is built — and no count of the\nobject could stand in for it."
+        }
+      },
+      "required": ["after", "metadataComplete"]
+    },
+    "IndexSound": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "IndexSound.json",
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "const": "Sound"
+        }
+      },
+      "required": ["state"],
+      "description": "A full-text index SQLite read against the rows it indexes and found nothing to say about."
+    },
+    "IndexCorrupt": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "IndexCorrupt.json",
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "const": "Corrupt"
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["state", "error"],
+      "description": "An index and the rows it indexes disagree. The chunks' index is external-content and the copy\nmoves rowids by hand, so an entry left behind at a mover's old key would answer a later query\nwith the chunk that now holds it."
+    },
+    "IndexUnread": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "IndexUnread.json",
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "const": "Unread"
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["state", "error"],
+      "description": "The check did not run, so the index is neither sound nor known to be otherwise. A different thing\nto tell an operator than an index that disagrees with its rows, and a different thing to do about."
+    },
+    "CopiedChunks": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopiedChunks.json",
+      "type": "object",
+      "properties": {
+        "stored": {
+          "type": "integer"
+        },
+        "alreadyStored": {
+          "type": "integer"
+        },
+        "inAccount": {
+          "type": "integer"
+        },
+        "shifted": {
+          "type": "integer",
+          "description": "Copied chunks that could not keep the ordinal D1 gave them, the object holding that one already."
+        },
+        "moved": {
+          "type": "integer",
+          "description": "The object's own chunks moved up the sequence to free a key a copied one came in under."
+        },
+        "frontier": {
+          "type": "integer"
+        },
+        "done": {
+          "type": "boolean"
+        }
+      },
+      "required": ["stored", "alreadyStored", "inAccount", "shifted", "moved", "frontier", "done"]
+    },
+    "CopyChecks": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopyChecks.json",
+      "type": "object",
+      "properties": {
+        "missing": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extra": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "missingChunks": {
+          "type": "integer"
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "chunkIndex": {
+          "$ref": "CopyIndexCheck.json"
+        },
+        "historyIndex": {
+          "$ref": "CopyIndexCheck.json"
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "What this call can account for, which is everything but how much of the prose the run walked."
+        }
+      },
+      "required": ["missing", "extra", "missingChunks", "embeddings", "chunkIndex", "historyIndex", "ok"]
+    },
+    "CopyIndexCheck": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopyIndexCheck.json",
+      "anyOf": [
+        {
+          "$ref": "IndexSound.json"
+        },
+        {
+          "$ref": "IndexCorrupt.json"
+        },
+        {
+          "$ref": "IndexUnread.json"
+        }
+      ],
+      "description": "What SQLite made of a full-text index against the rows it indexes, or that it never read it."
+    },
+    "SessionCopy": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SessionCopy.json",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tables": {
+          "type": "array",
+          "items": {
+            "$ref": "CopiedTable.json"
+          }
+        },
+        "metadataComplete": {
+          "type": "boolean"
+        },
+        "chunks": {
+          "$ref": "CopiedChunks.json"
+        },
+        "straddling": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "checks": {
+          "$ref": "CopyChecks.json"
+        }
+      },
+      "required": ["userId", "tables", "metadataComplete", "chunks", "straddling", "checks"]
     }
   }
 }

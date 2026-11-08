@@ -1,3 +1,4 @@
+import { SessionCopySchema } from "../typespec/generated/schemas";
 import { EMAIL_ONLY, emailOf } from "./access";
 import {
   type ArtifactChrome,
@@ -182,6 +183,7 @@ import {
   recordsFault,
   recordsReach,
 } from "./records";
+import { copySessions } from "./session-copy";
 import {
   ARTIFACT_PREFIX,
   FILE_SEGMENT,
@@ -321,6 +323,7 @@ import {
   memoryView,
   nearbyMemoryView,
   parseAppendRecords,
+  parseCopySessions,
   parseMemoryList,
   parseMemoryName,
   parseSaveMemory,
@@ -870,6 +873,34 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
           current: session.deviceId === caller.deviceId,
         })),
       });
+    }
+    // The copy of this account's sessions out of D1 and into its own object, run against a running
+    // deployment by `npm run copy-sessions` and by nothing else. A session answers a GET, a PUT
+    // and a DELETE at its own id and never a POST, so a session id of `copy` shadows nothing. It
+    // is here rather than on a read path because a read path must never migrate anything.
+    //
+    // `after` opens the walk of the prose where the call before it left off, so a corpus too big
+    // for one request's budget is finished by calling again rather than by a run that restarts and
+    // re-reads what it already copied. `metadataComplete` says a call of the same run already
+    // wrote every table but the prose, which only a report of that call can tell the caller; false,
+    // those tables are read and written again, which costs one pass and finishes a call that died
+    // in the middle of them.
+    //
+    // The report is held against the contract on the way out, which is the one route that does.
+    // Everything an operator reads the run's soundness off is in it, the caps on its id lists
+    // included, and a report that has drifted from what the contract says should stop the run
+    // rather than be read as one that verified.
+    if (rawSessionId === "copy" && subresource === undefined && request.method === "POST") {
+      const input = parseCopySessions(await readJson(request));
+      if (!input.ok) return error(400, input.error);
+      const report = await copySessions(
+        db,
+        env.ACCOUNT,
+        caller.userId,
+        input.value.after,
+        input.value.metadataComplete,
+      );
+      return json(SessionCopySchema.parse(report));
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);
