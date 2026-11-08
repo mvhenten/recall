@@ -4,15 +4,20 @@ import {
   compressedStretchName,
   type Fetched,
   followedBatch,
+  followedRecords,
   followedTexts,
   gapsIn,
+  gapsInSpans,
   groupedReads,
   joinedTexts,
   legacyStretchName,
   listedRuns,
+  listedSpans,
   MAX_PLANNED_READS,
   type PlannedRead,
   plannedBatch,
+  plannedRecords,
+  type RecordSpan,
   tailNote,
   type Walk,
   walkNote,
@@ -330,5 +335,111 @@ describe("joining what came back", () => {
       { run: 0, at: 0, text: "abcd" },
       { run: 1, at: 50, text: "ef" },
     ]);
+  });
+});
+
+// A file the record path holds, written as so many objects of so many records each. A record is
+// one whole line, so an object weighs what its records weigh and the walk counts in both.
+const spans = (sizes: number[], bytes: number): RecordSpan[] => {
+  const written: RecordSpan[] = [];
+  let from = 0;
+  for (const held of sizes) {
+    written.push({ from, held, bytes: held * bytes });
+    from += held;
+  }
+  return written;
+};
+
+describe("planning a window of records", () => {
+  it("takes whole objects walking backwards, and opens where the one it stopped at opens", () => {
+    const written = spans([4, 4, 4], 10);
+
+    const first = plannedRecords(written, 12, 100);
+    expect(first).toEqual({ from: 0, through: 12, bytes: 120 });
+
+    const held = plannedRecords(written, 12, 50);
+    expect(held).toEqual({ from: 4, through: 12, bytes: 80 });
+    expect(plannedRecords(written, held.from, 50)).toEqual({ from: 0, through: 4, bytes: 40 });
+  });
+
+  // A walk that could not take an object weighing more than a step would never reach the start of
+  // a file one big append wrote, and the box would stop on a window it refetched for ever.
+  it("takes one object however little budget is left", () => {
+    expect(plannedRecords(spans([3], 1_000), 3, 10)).toEqual({ from: 0, through: 3, bytes: 3_000 });
+  });
+
+  // A window the objects do not tile is a read no archive can answer, so neither direction asks
+  // for one. Stopping at the hole instead would put every record on the far side of it out of
+  // reach, with the box saying it had read the file to the end; a beat that stopped would bring
+  // nothing back for as long as the session ran.
+  it("steps over a hole rather than stopping in front of it", () => {
+    const held = [
+      { from: 0, held: 2, bytes: 20 },
+      { from: 5, held: 2, bytes: 20 },
+    ];
+
+    expect(plannedRecords(held, 7, 1_000)).toEqual({ from: 5, through: 7, bytes: 20 });
+    expect(plannedRecords(held, 5, 1_000)).toEqual({ from: 0, through: 2, bytes: 20 });
+    expect(plannedRecords(held, 0, 1_000)).toEqual({ from: 0, through: 0, bytes: 0 });
+
+    expect(followedRecords(held, 2, 1_000)).toEqual({ from: 5, through: 7, bytes: 20 });
+    expect(followedRecords(held, 7, 1_000)).toEqual({ from: 7, through: 7, bytes: 0 });
+  });
+
+  it("counts the records of a listing that sit in no object, and where they are missing from", () => {
+    const listed = listedSpans([
+      { from: 0, held: 2, bytes: 20 },
+      { from: 5, held: 2, bytes: 20 },
+      { from: 9, held: 1, bytes: 10 },
+    ]);
+
+    expect(gapsInSpans(listed)).toEqual({ records: 5, places: 2 });
+    expect(gapsInSpans(listedSpans(spans([4, 4], 10)))).toEqual({ records: 0, places: 0 });
+  });
+
+  // A listing the ceiling did not hold back names the file from its first record, so an object
+  // opening past zero has a hole in front of it and not a manifest stopping short. Reading it the
+  // other way tells the reader the page held records back when the archive never had them.
+  it("counts a hole at the start of a file the ceiling did not hold back", () => {
+    const late = listedSpans([{ from: 3, held: 2, bytes: 20 }]);
+
+    expect(late.from).toBe(0);
+    expect(gapsInSpans(late)).toEqual({ records: 3, places: 1 });
+
+    const trimmed = listedSpans(
+      Array.from({ length: MAX_PLANNED_READS + 1 }, (_, at) => ({
+        from: at * 2,
+        held: 2,
+        bytes: 20,
+      })),
+    );
+    expect(trimmed.from).toBe(2);
+    expect(gapsInSpans(trimmed)).toEqual({ records: 0, places: 0 });
+  });
+
+  it("reads forward from where the box has got to, and passes over the records it has", () => {
+    const written = spans([4, 4, 4, 4], 10);
+
+    expect(followedRecords(written, 4, 1_000)).toEqual({ from: 4, through: 16, bytes: 120 });
+    const held = followedRecords(written, 4, 50);
+    expect(held).toEqual({ from: 4, through: 12, bytes: 80 });
+    expect(followedRecords(written, held.through, 50)).toEqual({ from: 12, through: 16, bytes: 40 });
+  });
+
+  it("reads nothing forward where nothing has landed since the box last looked", () => {
+    expect(followedRecords(spans([4], 10), 4, 1_000)).toEqual({ from: 4, through: 4, bytes: 0 });
+  });
+
+  it("names the newest spans of a file too long to name whole, and says where it opens", () => {
+    const written = spans(
+      Array.from({ length: MAX_PLANNED_READS + 3 }, () => 2),
+      10,
+    );
+    const listed = listedSpans(written);
+
+    expect(listed.spans).toHaveLength(MAX_PLANNED_READS);
+    expect(listed.from).toBe(6);
+    expect(listed.readable).toBe(MAX_PLANNED_READS * 2);
+    expect(listed.bytes).toBe(MAX_PLANNED_READS * 20);
   });
 });

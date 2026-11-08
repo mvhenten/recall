@@ -143,24 +143,54 @@ export const listedRuns = (runs: Run[]): Listing => {
   return { runs: kept, from: kept[0]?.from ?? 0, readable: readableIn(kept) };
 };
 
-// Where the box starts following a file still being written, and how often it beats. `from` is a
-// place in the archive — the end of the manifest the page was handed — and never a place in the
-// file: the two part company the moment a stretch redacts to another length than its span.
+// Where the box starts following a file still being written, and how often it beats. `from` is
+// the end of the manifest the page was handed, in whatever places that manifest counts: a place
+// in the archive for a file held as bytes, which is never a place in the file — the two part
+// company the moment a stretch redacts to another length than its span — and an ordinal for a
+// file held as records, which is a place in both.
 export interface Follow {
   from: number;
   every: number;
 }
 
-// What the page hands the browser: the route a stretch is read off, the manifest the walk is
-// planned against, and where to pick a file still being written up from.
-export interface Plan {
+// One object of a file held as records, as the window of the file it answers for: the ordinal its
+// first record carries, how many it holds, and what those weigh in the transcript they join back
+// to, counting the break that closes the last of them.
+//
+// A record is addressed by its ordinal and an object is the unit the archive hands back, so these
+// are what a window of the file is planned against: every window opens and ends on an object
+// boundary, and nothing asks for a byte of one.
+export interface RecordSpan {
+  from: number;
+  held: number;
+  bytes: number;
+}
+
+interface Box {
   path: string;
   file: string;
-  readable: number;
   step: number;
-  runs: Run[];
   follow: Follow | null;
 }
+
+// What the page hands the browser: the route a window of the file is read off, the manifest the
+// walk is planned against, and where to pick a file still being written up from. The two paths the
+// archive takes a transcript on are read apart, because a stretch names bytes of the file on disk
+// and a record names a line of it; `held` is what says which manifest the box is holding.
+export interface BytePlan extends Box {
+  held: "bytes";
+  readable: number;
+  runs: Run[];
+}
+
+export interface RecordPlan extends Box {
+  held: "records";
+  /// What the listed records weigh, which is a length of the archive and no place in the file.
+  bytes: number;
+  spans: RecordSpan[];
+}
+
+export type Plan = BytePlan | RecordPlan;
 
 // What a beat is answered with: whether anyone is still running the session, and how the end of
 // its file lays out around and past where the reader has read.
@@ -168,6 +198,122 @@ export interface Reach {
   running: boolean;
   runs: Run[];
 }
+
+// What a beat over a file held as records is answered with: the objects holding records the
+// reader has not read, which is what the window it asks for next is planned against.
+export interface RecordReach {
+  running: boolean;
+  spans: RecordSpan[];
+}
+
+export interface SpanListing {
+  spans: RecordSpan[];
+  /// Where the listing begins, and zero when it names the file from its first record. A listing
+  /// the ceiling did not hold back names the whole file however late its first object opens, so
+  /// what sits in front of that object is a hole in the archive and not a manifest stopping short.
+  from: number;
+  /// How many records it can read, and what they weigh.
+  readable: number;
+  bytes: number;
+}
+
+// The newest spans of a file, up to the same ceiling the byte path's reads are held to. A session
+// appending a record at a time holds one object per record, and a page carrying every one of them
+// would ship a manifest nobody scrolls far enough back to spend.
+export const listedSpans = (spans: RecordSpan[]): SpanListing => {
+  const held = spans.length > MAX_PLANNED_READS;
+  const kept = held ? spans.slice(spans.length - MAX_PLANNED_READS) : spans;
+  return {
+    spans: kept,
+    from: held ? (kept[0]?.from ?? 0) : 0,
+    readable: kept.reduce((all, span) => all + span.held, 0),
+    bytes: kept.reduce((all, span) => all + span.bytes, 0),
+  };
+};
+
+// One window of a file held as records: the ordinal it opens at, the one past its last record,
+// and what the records in it weigh. A window never spans a hole — the objects covering one have to
+// tile it exactly for the archive to answer it at all — so both ends sit in the same run of
+// records, and a walk that has a hole in front of it steps over it and opens the far side.
+export interface RecordWindow {
+  from: number;
+  through: number;
+  bytes: number;
+}
+
+const nothingAt = (place: number): RecordWindow => ({ from: place, through: place, bytes: 0 });
+
+// The next window to fetch walking backwards, and the whole of what the walk needs to know once it
+// has landed: the walk carries on from `from`. Whole objects are taken until the budget is spent,
+// and at least one always is, so a walk cannot stall on an object weighing more than a step.
+//
+// Where the span below the cursor does not reach it, the records between the two are in no object
+// and the window opens on the far side of them rather than asking for a span the archive cannot
+// tile. Stopping at the hole instead would leave every record in front of it unreachable, with the
+// box saying it had read the file to the end.
+export const plannedRecords = (spans: readonly RecordSpan[], edge: number, step: number): RecordWindow => {
+  let at = spans.length - 1;
+  while (at >= 0 && (spans[at]?.from ?? edge) >= edge) at -= 1;
+  const span = spans[at];
+  if (span === undefined) return nothingAt(edge);
+  const through = span.from + span.held;
+  let from = through;
+  let bytes = 0;
+  for (; at >= 0; at -= 1) {
+    const one = spans[at];
+    if (one === undefined) continue;
+    if (one.from + one.held !== from) break;
+    if (bytes >= step) break;
+    from = one.from;
+    bytes += one.bytes;
+  }
+  return { from, through, bytes };
+};
+
+// The next window of a file a session is still writing, reading forward from where the reader has
+// got to. Every record already read is passed over, so nothing on screen is rendered twice, and
+// the window ends on an object boundary, so the next beat opens exactly where this one stopped.
+//
+// A hole in front of the cursor is stepped over the same way: the window opens at the first object
+// holding a record the reader has not read. A beat that stopped at the hole would read nothing for
+// as long as the session ran, and a box beating on in silence is one a reader reads as stopped.
+export const followedRecords = (spans: readonly RecordSpan[], at: number, step: number): RecordWindow => {
+  const opens = spans.find((span) => span.from + span.held > at);
+  if (opens === undefined) return nothingAt(at);
+  const from = Math.max(at, opens.from);
+  let through = from;
+  let bytes = 0;
+  for (const span of spans) {
+    if (span.from + span.held <= through) continue;
+    if (span.from !== through) break;
+    if (bytes >= step) break;
+    through = span.from + span.held;
+    bytes += span.bytes;
+  }
+  return { from, through, bytes };
+};
+
+export interface SpanGaps {
+  records: number;
+  places: number;
+}
+
+// The records of the listed span that sit in no object at all, and how many runs of them there
+// are. The span begins where the listing begins, so a listing held back at the ceiling does not
+// count what it deliberately left off.
+export const gapsInSpans = (listing: SpanListing): SpanGaps => {
+  let records = 0;
+  let places = 0;
+  let at = listing.from;
+  for (const span of listing.spans) {
+    if (span.from > at) {
+      records += span.from - at;
+      places += 1;
+    }
+    at = span.from + span.held;
+  }
+  return { records, places };
+};
 
 export interface Gaps {
   bytes: number;
