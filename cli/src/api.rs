@@ -373,6 +373,16 @@ fn check(mut response: Response<ureq::Body>, what: &str) -> Result<Response<ureq
     bail!("{what} failed with {status}: {message}{hint}")
 }
 
+/// The bytes one append crosses as, which is what the sender weighs against the ceiling the
+/// service answers 413 with. It is built here and nowhere else because `send_json` writes pretty
+/// JSON: a thousand records carry a line break and four spaces each that nothing on this side ever
+/// counted, so an append weighed under the ceiling went over it on the wire and the service
+/// refused a file that could never be sent any other way.
+pub fn append_body(file: &str, from: i64, records: &[String], closed: bool) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "file": file, "from": from, "records": records, "closed": closed }))
+        .expect("an append of strings serializes")
+}
+
 /// An artifact runs to 64 MB, and a long session's transcript to several; neither fits in the
 /// twenty seconds every other call gets.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1252,9 +1262,10 @@ impl Client {
         let mut response = self
             .authed(
                 self.agent
-                    .post(self.url(&format!("{}/records", Self::session_path(session_id)))),
+                    .post(self.url(&format!("{}/records", Self::session_path(session_id))))
+                    .header("content-type", "application/json"),
             )
-            .send_json(serde_json::json!({ "file": file, "from": from, "records": records, "closed": closed }))?;
+            .send(&append_body(file, from, records, closed)[..])?;
         if response.status().as_u16() == 409 {
             // Every refusal of a run of records carries the ordinal to send from, because the only
             // thing a host can do with one is send again from there. A session the byte path wrote
