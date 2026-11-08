@@ -117,6 +117,7 @@ describe("copying the memories an account held before they moved", () => {
     expect(report.checks.extra).toEqual([]);
     expect(report.checks.missingTags).toEqual([]);
     expect(report.checks.embeddings).toEqual([]);
+    expect(report.checks.index).toBe("");
     expect(report.checks.queries).toBeGreaterThan(0);
     expect(report.checks.ranking).toEqual([]);
     expect(report.checks.ok).toBe(true);
@@ -221,6 +222,9 @@ describe("copying the memories an account held before they moved", () => {
     expect(report.memories.copied).toBe(seeded.length);
     expect(report.checks.missing).toEqual([]);
     expect(report.checks.extra).toEqual([fresh.memoryId]);
+    // SQLite's own read of the index `makeRoom` hand-wrote: no entry left at the rowid the mover
+    // vacated, and the one it moved to is there.
+    expect(report.checks.index).toBe("");
     expect(report.checks.ok).toBe(true);
 
     // Every copied row kept the key D1 ranks it by, and the moved one sits above all of them.
@@ -246,8 +250,10 @@ describe("copying the memories an account held before they moved", () => {
   });
 
   // A memory re-saved after the cutover is the later truth. The D1 row holds the same name under
-  // another id, and writing it over the save would hand the account back prose it replaced.
-  it("leaves a memory saved after the cutover standing where D1 holds its name", async () => {
+  // another id, and writing it over the save would hand the account back prose it replaced. It is
+  // also the one row the copy leaves behind, so the run does not certify itself: D1 holds the only
+  // copy of that prose, and an operator reads it before anything drops the row.
+  it("leaves a memory saved after the cutover standing where D1 holds its name, and does not verify", async () => {
     const h = await harness();
     const { client } = await owner(h);
     const suffix = crypto.randomUUID().slice(0, 8);
@@ -260,9 +266,37 @@ describe("copying the memories an account held before they moved", () => {
     expect(report.memories.superseded).toEqual([seeded.memoryId]);
     expect(report.memories.copied).toBe(0);
     expect(report.checks.missing).toEqual([]);
-    expect(report.checks.ok).toBe(true);
+    expect(report.checks.index).toBe("");
+    expect(report.checks.ok).toBe(false);
     expect((await client.get(seeded.name)).body).toBe("what the account says now");
     expect(resaved.memoryId).not.toBe(seeded.memoryId);
+  });
+
+  // The failure no replayed ranking can see. `makeRoom` writes index entries by hand, and one left
+  // behind at a mover's old rowid would answer a later query with the copied memory that now holds
+  // that rowid — a memory the ranking comparison leaves out, because D1 never ranked the mover.
+  // So the gate asks SQLite instead, and this stands an index in exactly that state: a term under
+  // a rowid `memories` does not carry.
+  it("fails the run when the full-text index and the rows it indexes disagree", async () => {
+    const h = await harness();
+    const { client } = await owner(h);
+    await seedCorpus(client.userId, crypto.randomUUID().slice(0, 8));
+    expect((await copy(client)).checks.index).toBe("");
+
+    await tenantRows(
+      client.userId,
+      "INSERT INTO memories_fts (rowid, name, description, body) VALUES (99999, ?1, ?1, ?1)",
+      "a term no row carries",
+    );
+
+    const report = await copy(client);
+    expect(report.checks.index).not.toBe("");
+    expect(report.checks.ok).toBe(false);
+    // Everything the gate could already see still passes, which is what says the index check is
+    // the only thing standing between a corrupt index and a run reported as verified.
+    expect(report.checks.missing).toEqual([]);
+    expect(report.checks.embeddings).toEqual([]);
+    expect(report.checks.ranking).toEqual([]);
   });
 
   it("leaves every D1 row exactly where it was", async () => {

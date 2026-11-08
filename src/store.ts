@@ -367,12 +367,18 @@ export const vectorCandidates = async (
   }));
 };
 
+// How deep a text match a search reads. The limit is the caller's because it bounds the rows the
+// statement returns, not the rows the caller keeps: a caller that drops some of them afterwards
+// has to ask for them on top.
+export const TEXT_CANDIDATES = 50;
+
 export const textCandidates = async (
   db: TenantDb,
   userId: string,
   tags: string[],
   types: MemoryType[],
   query: string,
+  limit: number,
 ): Promise<TextCandidate[]> => {
   const results = db
     .select({ memoryId: memories.memoryId, inScope: tagFilter(tags).mapWith(Number).as("in_scope") })
@@ -380,7 +386,7 @@ export const textCandidates = async (
     .innerJoin(memories, eq(memories.memorySeq, memoriesFts.rowid))
     .where(and(sql`${memoriesFts} MATCH ${query}`, eq(memories.userId, userId), typeFilter(types)))
     .orderBy(sql`in_scope DESC, bm25(${memoriesFts}, 5.0, 2.0, 1.0)`)
-    .limit(50)
+    .limit(limit)
     .all();
   return results.map((row) => ({ memoryId: row.memoryId, inScope: row.inScope === 1 }));
 };

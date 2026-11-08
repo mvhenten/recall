@@ -45,10 +45,18 @@ export interface MemoryCopyChecks {
   // The memories whose embedding does not come back out of the object as the bytes D1 holds. A
   // vector is quantized int8, so one re-encoded byte moves every score computed from it.
   embeddings: string[];
+  // What SQLite makes of `memories_fts` against `memories`, empty when the two agree. This is the
+  // one thing a replayed ranking cannot see: `makeRoom` writes index entries by hand, and one left
+  // behind at a mover's old rowid answers a later query with the copied memory that now holds it —
+  // a memory the comparison leaves out, because D1 never ranked the mover at all.
+  index: string;
   queries: number;
   // The queries whose ranked memory ids differ between the two stores, written `<mode>/<word>` and
   // `<mode>/<word> in <tag>` for the ones a tag scopes.
   ranking: string[];
+  // Whether the corpus is accounted for. It also covers the memories passed over, which arrived
+  // nowhere: D1 holds the only copy of their prose, so dropping those rows is a decision an
+  // operator makes and not one a verified run can carry.
   ok: boolean;
 }
 
@@ -303,6 +311,23 @@ const tenantEmbeddings = (db: TenantDb, userId: string): Map<string, Uint8Array>
 const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
   left.length === right.length && left.every((byte, index) => byte === right[index]);
 
+// SQLite's own read of the index the copy hand-writes. `rank` is the argument that makes
+// `integrity-check` an external-content check: at 0, and with no argument at all, it only reads
+// the index against itself and a term under a rowid `memories` does not carry passes. At 1 it
+// rebuilds what `memories` implies and holds the two against each other, raising
+// SQLITE_CORRUPT_VTAB either way round — a term no row carries, a row whose terms are not indexed.
+//
+// Caught rather than thrown, so a corrupt index is reported with the rest of the checks instead of
+// ending the run as a failed request that says nothing about any of them.
+const indexIntegrity = (db: TenantDb): string => {
+  try {
+    db.run(sql`INSERT INTO ${memoriesFts} (${memoriesFts}, rank) VALUES ('integrity-check', 1)`);
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+
 // The two filters the shipped reader scopes a search with, against D1's copy of the tables. They
 // render the same SQL the tenant's do — the table and column names never changed — but the two
 // handles refuse each other in the type system, which is the point.
@@ -388,12 +413,22 @@ const rankedIds = async (
 // — so the scores differ between the two stores whatever the copy does. For a single term that
 // difference is one factor applied to every row alike and the order is untouched, which is what
 // makes a ranked comparison across the two stores mean anything.
+//
+// Which twenty is spread across the sorted set rather than taken off its front, because the front
+// of an alphabetical corpus is digits and `a`. It remains a sample: the embedding bytes and the id
+// sets are what account for the corpus, and the ranking says the order survived for the words it
+// was replayed with.
 const queriesFor = (rows: readonly LegacyMemory[]): string[] => {
   const words = new Set<string>();
   for (const row of rows) {
     for (const word of `${row.name} ${row.description}`.toLowerCase().match(TOKEN) ?? []) words.add(word);
   }
-  return [...words].sort().slice(0, MAX_QUERIES);
+  const sorted = [...words].sort();
+  if (sorted.length <= MAX_QUERIES) return sorted;
+  const step = sorted.length / MAX_QUERIES;
+  return Array.from({ length: MAX_QUERIES }, (_, nth) => sorted[Math.floor(nth * step)]).filter(
+    (word): word is string => word !== undefined,
+  );
 };
 
 // The scopes a query is replayed under: no tag, and the first tag the account uses. A tagged query
@@ -416,6 +451,7 @@ const rankingChecks = async (
   rows: readonly LegacyMemory[],
   tags: readonly Tag[],
   shared: ReadonlySet<string>,
+  extra: number,
   embedder: Embedder,
 ): Promise<{ queries: number; ranking: string[] }> => {
   const words = queriesFor(rows);
@@ -427,7 +463,10 @@ const rankingChecks = async (
   };
   const tenantSide: Side = {
     vectors: (scope) => vectorCandidates(tenant, userId, scope, []),
-    text: (scope, match) => textCandidates(tenant, userId, scope, [], match),
+    // The object's own post-cutover rows match too and are dropped below, after the limit has
+    // already counted them. Read that many deeper, or a corpus with more matches than the limit
+    // reports a difference the copy did not make.
+    text: (scope, match) => textCandidates(tenant, userId, scope, [], match, RANK_LIMIT + extra),
   };
   const ranking: string[] = [];
   let replayed = 0;
@@ -491,21 +530,30 @@ const checksFor = async (
     .filter((tag) => heldIds.has(tag.memoryId) && !heldTags.has(`${tag.memoryId}/${tag.tag}`))
     .map((tag) => `${tag.memoryId}/${tag.tag}`)
     .sort();
+  const extra = held
+    .filter((row) => !before.has(row.memoryId))
+    .map((row) => row.memoryId)
+    .sort();
   const shared = new Set(rows.filter((row) => heldIds.has(row.memoryId)).map((row) => row.memoryId));
-  const { queries, ranking } = await rankingChecks(account, tenant, userId, rows, tags, shared, embedder);
+  const index = indexIntegrity(tenant);
+  const { queries, ranking } = await rankingChecks(account, tenant, userId, rows, tags, shared, extra.length, embedder);
   return {
     rows: { account: rows.length, tenant: held.length },
     tags: { account: tags.length, tenant: tenantTagCount(tenant, userId) },
     missing,
-    extra: held
-      .filter((row) => !before.has(row.memoryId))
-      .map((row) => row.memoryId)
-      .sort(),
+    extra,
     missingTags,
     embeddings: mismatched,
+    index,
     queries,
     ranking,
-    ok: missing.length === 0 && missingTags.length === 0 && mismatched.length === 0 && ranking.length === 0,
+    ok:
+      missing.length === 0 &&
+      missingTags.length === 0 &&
+      mismatched.length === 0 &&
+      index === "" &&
+      superseded.length === 0 &&
+      ranking.length === 0,
   };
 };
 

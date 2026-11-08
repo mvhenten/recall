@@ -268,6 +268,7 @@ import {
   shareCountsFor,
   sharesFor,
   startCursor,
+  TEXT_CANDIDATES,
   textCandidates,
   userForServiceClient,
   vectorCandidates,
@@ -2419,7 +2420,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     types: MemoryType[],
   ): Promise<{ inScope: string[]; elsewhere: string[] }> => {
     const match = ftsQuery(input.query);
-    const candidates = match ? await textCandidates(db, userId, input.tags, types, match) : [];
+    const candidates = match ? await textCandidates(db, userId, input.tags, types, match, TEXT_CANDIDATES) : [];
     return {
       inScope: candidates.filter((candidate) => candidate.inScope).map((candidate) => candidate.memoryId),
       elsewhere: candidates.filter((candidate) => !candidate.inScope).map((candidate) => candidate.memoryId),

@@ -14,6 +14,7 @@ import {
   saveMemory,
   searchArtifacts,
   searchSessionHistory,
+  TEXT_CANDIDATES,
   textCandidates,
   vectorCandidates,
 } from "../src/store";
@@ -266,7 +267,7 @@ describe("the tenant store", () => {
         (row) => row.memory_id,
       );
       expect(ranked, query).not.toEqual([]);
-      const found = await inStore(userId, (db) => textCandidates(db, userId, ["search"], [], query));
+      const found = await inStore(userId, (db) => textCandidates(db, userId, ["search"], [], query, TEXT_CANDIDATES));
       expect(found.map((candidate) => candidate.memoryId)).toEqual(ranked);
       const scope = found.map((candidate) => candidate.inScope);
       expect(scope).toEqual([...scope].sort((left, right) => Number(right) - Number(left)));

@@ -22,9 +22,11 @@
 //
 // It prints what it did for the account it ran against and then what it checked: the row and tag
 // count on each side, the memory ids each side holds, whether every embedding comes back out of
-// the object as the bytes D1 holds, and the memory ids a fixed query set ranks out of each store
-// in hybrid, vector and text mode, tagged and untagged. It exits non-zero when any of those
-// disagree.
+// the object as the bytes D1 holds, what SQLite makes of the full-text index against the rows it
+// indexes, and the memory ids a query set drawn from the corpus ranks out of each store in hybrid,
+// vector and text mode, tagged and untagged. It exits non-zero when any of those disagree, and on
+// a memory passed over: that one is D1's alone, and the operator reads it before anything drops
+// the row.
 
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
@@ -88,6 +90,7 @@ say(`${userId}: ${checks.tags.account} tags in D1, ${checks.tags.tenant} in the 
 say(`${userId}: missing ${some(checks.missing)}; held only by the object: ${some(checks.extra)}`);
 say(`${userId}: tags that did not arrive: ${some(checks.missingTags)}`);
 say(`${userId}: embeddings that did not round-trip byte for byte: ${some(checks.embeddings)}`);
+say(`${userId}: full-text index against the rows it indexes: ${checks.index === "" ? "sound" : checks.index}`);
 say(`${userId}: ${checks.queries} rankings replayed, ranked differently: ${some(checks.ranking)}`);
 
 if (moved.length > 0) {
@@ -96,8 +99,8 @@ if (moved.length > 0) {
   );
 }
 if (memories.superseded.length > 0) {
-  say(
-    `${userId}: passed over ${some(memories.superseded)}. Each is a D1 memory whose name the object already holds under another id, which is a save made after the cutover; the later save stands and the D1 row was not written over it.`,
+  die(
+    `${userId}: passed over ${some(memories.superseded)}. Each is a D1 memory whose name the object already holds under another id, which is a save made after the cutover; the later save stands and the D1 row was not written over it. D1 holds the only copy of the prose in those rows, so read them before anything drops them. Nothing in D1 was changed.`,
   );
 }
 if (!checks.ok) die(`${userId}: the copy does not verify against D1; nothing in D1 was changed`);
