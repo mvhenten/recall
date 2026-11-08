@@ -62,7 +62,7 @@ pub const TOOL_RESULT: &str = "tool-results.";
 /// How many records one append carries, and how many bytes the body of one may hold. Both are the
 /// ceiling the service answers 413 against.
 pub const MAX_RECORDS: usize = 1_000;
-pub const MAX_APPEND_BYTES: usize = 1_048_576;
+pub const MAX_APPEND_BYTES: usize = 5_242_880;
 
 const NEWLINE: u8 = b'\n';
 
