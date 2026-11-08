@@ -43,7 +43,7 @@ pub fn listen_url(endpoint: &str) -> Result<String> {
         "http" | "ws" => "ws",
         other => bail!("{other}:// is not a recall endpoint; use https://<your recall host>"),
     };
-    Ok(format!("{scheme}://{rest}/v1/messages/listen"))
+    Ok(format!("{scheme}://{rest}/v2/messages/listen"))
 }
 
 /// What this host writes back about an order: the session that took it, or that it has no session
@@ -165,11 +165,11 @@ mod tests {
     fn the_endpoint_becomes_the_listen_url() {
         assert_eq!(
             listen_url("https://recall.test/").unwrap(),
-            "wss://recall.test/v1/messages/listen"
+            "wss://recall.test/v2/messages/listen"
         );
         assert_eq!(
             listen_url("http://127.0.0.1:8787").unwrap(),
-            "ws://127.0.0.1:8787/v1/messages/listen"
+            "ws://127.0.0.1:8787/v2/messages/listen"
         );
         assert!(listen_url("recall.test").unwrap_err().to_string().contains("not a URL"));
     }
@@ -193,13 +193,13 @@ mod tests {
 
     #[test]
     fn the_upgrade_carries_the_device_token_the_api_client_sends() {
-        let request = listen_request("wss://recall.test/v1/messages/listen", "t-token").unwrap();
+        let request = listen_request("wss://recall.test/v2/messages/listen", "t-token").unwrap();
         assert_eq!(request.headers().get("authorization").unwrap(), "Bearer t-token");
     }
 
     #[test]
     fn the_upgrade_declares_that_this_daemon_reads_the_kind_of_a_message() {
-        let request = listen_request("wss://recall.test/v1/messages/listen", "t-token").unwrap();
+        let request = listen_request("wss://recall.test/v2/messages/listen", "t-token").unwrap();
         assert_eq!(request.headers().get(ORDERS_HEADER).unwrap(), "1");
     }
 
@@ -219,7 +219,7 @@ mod tests {
             answered.is_ok()
         });
 
-        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v1/messages/listen"), "t-token")
+        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v2/messages/listen"), "t-token")
             .await
             .unwrap();
         let mut delivered = Vec::new();
@@ -259,7 +259,7 @@ mod tests {
             replies
         });
 
-        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v1/messages/listen"), "t-token")
+        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v2/messages/listen"), "t-token")
             .await
             .unwrap();
         let mut answered = 0;
@@ -307,7 +307,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v1/messages/listen"), "t-token")
+        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v2/messages/listen"), "t-token")
             .await
             .unwrap();
         let ended = pump(&mut socket, async |_: Message| None).await.unwrap();

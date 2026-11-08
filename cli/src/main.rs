@@ -257,22 +257,28 @@ enum Command {
         backfill: bool,
         #[arg(
             long,
-            value_name = "NAME",
             conflicts_with_all = ["sync", "end", "adopt", "backfill"],
+            help = "Read every session the archive holds back out of it and send it again as records"
+        )]
+        replay: bool,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "replay"],
             help = "Print one session, by its name, its handle or its Claude Code session id"
         )]
         find: Option<String>,
         #[arg(
             long,
             value_name = "QUERY",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find"],
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "replay", "find"],
             help = "Find sessions on every host by what was said in them"
         )]
         search: Option<String>,
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search"],
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "replay", "find", "search"],
             help = "Write a stored session's transcript back onto this host, so claude --resume takes it"
         )]
         restore: Option<String>,
@@ -656,7 +662,7 @@ fn sync_session(session_id: &str) -> Result<()> {
     // a file waits for the pass that holds the whole of it.
     let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path, Pass::Open)?;
     if archived > 0 {
-        println!("archived {archived} transcript bytes for {session_id}");
+        println!("archived {archived} transcript records for {session_id}");
     }
     Ok(())
 }
@@ -678,7 +684,7 @@ fn end_session(session_id: &str) -> Result<()> {
         let archived =
             transcripts::Archive::default().send(&client, session_id, &record.transcript_path, Pass::Final)?;
         if archived > 0 {
-            println!("archived {archived} transcript bytes for {session_id}");
+            println!("archived {archived} transcript records for {session_id}");
         }
     }
     let ended = client.end_session(session_id)?;
@@ -733,19 +739,8 @@ fn adopt_sessions() -> Result<ExitCode> {
 }
 
 impl transcripts::Store for Client {
-    fn held(&self, session_id: &str) -> Result<transcripts::Held> {
-        self.transcript_held(session_id)
-    }
-
-    fn append(
-        &self,
-        session_id: &str,
-        file: &str,
-        from: i64,
-        through: i64,
-        bytes: &[u8],
-    ) -> Result<transcripts::Appended> {
-        self.append_transcript(session_id, file, from, through, bytes)
+    fn append(&self, session_id: &str, file: &str, from: i64, records: &[String]) -> Result<transcripts::Appended> {
+        self.append_records(session_id, file, from, records)
     }
 }
 
@@ -768,6 +763,10 @@ impl backfill::Service for Client {
     fn end(&self, session_id: &str) -> Result<()> {
         self.end_session(session_id).map(|_| ())
     }
+
+    fn counted(&self, session_id: &str) -> Result<std::collections::HashSet<String>> {
+        Ok(self.transcript_files(session_id)?.counted)
+    }
 }
 
 /// Every past session this host holds a transcript for, sent as the session it was: its history,
@@ -787,17 +786,88 @@ fn backfill_sessions() -> Result<ExitCode> {
     }
     let mut touched = 0;
     backfill::send(&client, &past, &account, |session_id, sent| {
-        if sent.events == 0 && sent.bytes == 0 {
+        if sent.events == 0 && sent.records == 0 {
             return;
         }
         touched += 1;
         println!(
-            "backfilled {session_id} with {} usage deltas and {} transcript bytes",
-            sent.events, sent.bytes
+            "backfilled {session_id} with {} usage deltas and {} transcript records",
+            sent.events, sent.records
         );
     })?;
     println!("backfilled {touched} of {} past sessions", past.len());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Every session the archive holds and nothing is still writing, read back out of the archive and
+/// sent again as the records it is made of. It is how a session written before this host spoke
+/// `/v2` reaches the record path, and it reads the file back through the very reader the live
+/// sender uses, so a replayed session and a live one cannot be cut into records differently.
+///
+/// A session still running is left alone: the host writing it is the one that archives it. A file
+/// the record path already holds refuses the first run of records with the ordinal it waits at,
+/// which costs one call and sends nothing. A session the byte path wrote is refused outright —
+/// the service holds the two as two paths — and that, like any other failure, is reported and
+/// passed over rather than stopping the run.
+fn replay_sessions(client: &Client) -> Result<ExitCode> {
+    let live: std::collections::HashSet<String> = client
+        .sessions()?
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+    let cold: Vec<String> = {
+        let mut held: Vec<String> = client
+            .session_history_ids()?
+            .into_iter()
+            .filter(|session_id| !live.contains(session_id))
+            .collect();
+        held.sort();
+        held
+    };
+    if cold.is_empty() {
+        println!("no session needs replaying");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut replayed = 0;
+    let mut skipped = 0;
+    for session_id in &cold {
+        let held = match client.transcript_files(session_id) {
+            Ok(held) => held,
+            Err(error) => {
+                skipped += 1;
+                eprintln!("recall: skipped {session_id}: {error:#}");
+                continue;
+            }
+        };
+        for file in &held.files {
+            match replay_file(client, session_id, &file.file) {
+                Ok(sent) => {
+                    replayed += 1;
+                    println!(
+                        "replayed {} of {session_id}: {} records sent, {} lines dropped, waiting at {}",
+                        file.file, sent.records, sent.dropped, sent.next
+                    );
+                }
+                Err(error) => {
+                    skipped += 1;
+                    eprintln!("recall: skipped {} of {session_id}: {error:#}", file.file);
+                }
+            }
+        }
+    }
+    println!(
+        "replayed {replayed} files of {} sessions, skipped {skipped}",
+        cold.len()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One archived file, read back as it is served and sent again as records. The session wrote it
+/// long ago, so the end of the file is the end for good.
+fn replay_file(client: &Client, session_id: &str, file: &str) -> Result<transcripts::Sent> {
+    let body = client.transcript_body(session_id, file)?;
+    let mut reader = transcripts::Reader::new(std::io::BufReader::new(body), transcripts::holds_of(file), Pass::Final);
+    transcripts::send_from(client, session_id, file, &mut reader, transcripts::Place::nothing())
 }
 
 /// Says which session a name settled on when it named more than one. The service answers with the
@@ -972,6 +1042,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             end,
             adopt,
             backfill,
+            replay,
             find,
             search,
             restore,
@@ -989,6 +1060,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if backfill {
                 return backfill_sessions();
+            }
+            if replay {
+                return replay_sessions(&client()?);
             }
             if let Some(target) = find {
                 return find_session(&client()?, &target, cli.json);
@@ -1076,7 +1150,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Logout => {
-            match client()?.revoke_device("current") {
+            match client()?.revoke_this_device() {
                 Ok(true) => {}
                 Ok(false) => eprintln!("recall: this device was already revoked"),
                 Err(error) => eprintln!(
@@ -1104,7 +1178,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!(
                         "{}  {}  created {}  last used {}{}",
                         device.device_id,
-                        markdown::host_column(&device.label, &device.name),
+                        markdown::host_column(&device.host_label, &device.host),
                         markdown::iso(device.created_at),
                         markdown::iso(device.last_used_at),
                         if device.current { "  (this device)" } else { "" }
@@ -1192,7 +1266,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let result = client()?.search(&api::SearchRequest {
                 query: &query,
                 tags: &tags,
-                any: filter.any,
+
                 limit,
                 min_score,
                 mode: &mode,

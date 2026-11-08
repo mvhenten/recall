@@ -367,7 +367,7 @@ fn archive(
     let started = Instant::now();
     match archive.send(client, session_id, transcript, pass) {
         Ok(0) => {}
-        Ok(bytes) => log(&format!("sessions:archived:{session_id}:{bytes}"), started.elapsed()),
+        Ok(records) => log(&format!("sessions:archived:{session_id}:{records}"), started.elapsed()),
         Err(error) => log(
             &format!("sessions:archive-failed:{session_id}:{error:#}"),
             started.elapsed(),

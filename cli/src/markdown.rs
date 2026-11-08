@@ -108,7 +108,7 @@ pub fn parse_since(value: &str) -> Option<i64> {
 
 pub fn render(memory: &Memory) -> String {
     format!(
-        "---\nname: {}\ndescription: {}\ntype: {}\ntags: [{}]\ncreated: {}\nupdated: {}\nrecalled: {} times, last {}\n---\n\n{}\n",
+        "---\nname: {}\ndescription: {}\ntype: {}\ntags: [{}]\ncreated: {}\nupdated: {}\nrecalled: {} times\n---\n\n{}\n",
         memory.name,
         memory.description,
         memory.kind,
@@ -116,7 +116,6 @@ pub fn render(memory: &Memory) -> String {
         iso(memory.created_at),
         iso(memory.updated_at),
         memory.recall_count,
-        iso(memory.last_recalled_at),
         memory.body.trim_end()
     )
 }

@@ -34,7 +34,7 @@ fn the_reader_holds_what_the_shared_file_says() {
     assert_eq!(text(&shared["mainFile"]), crate::transcripts::MAIN);
     assert_eq!(
         number(&shared["maxStretchBytes"]),
-        crate::transcripts::MAX_STRETCH as u64
+        crate::transcripts::MAX_APPEND_BYTES as u64
     );
     assert_eq!(number(&shared["headBytes"]), crate::adopt::HEAD as u64);
     assert_eq!(
