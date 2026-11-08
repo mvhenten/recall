@@ -208,7 +208,9 @@ export interface RecordReach {
 
 export interface SpanListing {
   spans: RecordSpan[];
-  /// The ordinal the listing opens at, and zero where it names the file from its first record.
+  /// Where the listing begins, and zero when it names the file from its first record. A listing
+  /// the ceiling did not hold back names the whole file however late its first object opens, so
+  /// what sits in front of that object is a hole in the archive and not a manifest stopping short.
   from: number;
   /// How many records it can read, and what they weigh.
   readable: number;
@@ -219,10 +221,11 @@ export interface SpanListing {
 // appending a record at a time holds one object per record, and a page carrying every one of them
 // would ship a manifest nobody scrolls far enough back to spend.
 export const listedSpans = (spans: RecordSpan[]): SpanListing => {
-  const kept = spans.length <= MAX_PLANNED_READS ? spans : spans.slice(spans.length - MAX_PLANNED_READS);
+  const held = spans.length > MAX_PLANNED_READS;
+  const kept = held ? spans.slice(spans.length - MAX_PLANNED_READS) : spans;
   return {
     spans: kept,
-    from: kept[0]?.from ?? 0,
+    from: held ? (kept[0]?.from ?? 0) : 0,
     readable: kept.reduce((all, span) => all + span.held, 0),
     bytes: kept.reduce((all, span) => all + span.bytes, 0),
   };

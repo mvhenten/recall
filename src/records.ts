@@ -138,7 +138,12 @@ interface RecordObject {
 // take the whole page down — so it reads what it can and the walk says what it could not reach.
 type Unwritten = "fail" | "skip";
 
-const readObject = (prefix: string, key: string, size: number, metadata: Record<string, string> | undefined) => {
+const readObject = (
+  prefix: string,
+  key: string,
+  size: number,
+  metadata: Record<string, string> | undefined,
+): RecordObject | null => {
   const [file, name, ...rest] = key.slice(prefix.length).split("/");
   const from = Number(name);
   const held = Number(metadata?.[HELD]);
@@ -160,36 +165,69 @@ const readObject = (prefix: string, key: string, size: number, metadata: Record<
   return { key, file, from, held, bytes: size, closes: closes === "1" };
 };
 
-// Every record object of one file, or of a whole session where no file is named, in the order the
-// records were written. A file named here is listed under its own prefix rather than filtered out
-// of the session's: a session holds one prefix per file, so a reader after one of them pays for
-// that file's objects and not for every delegated turn beside it.
+// How many objects one beat of a following box is handed. A reader takes what its own step allows
+// and comes straight back for the rest, so a tab that woke to a day of writing catches up over
+// several beats rather than being handed every append of it at once.
+const TAIL_LISTED_SPANS = 1_000;
+
+// Which objects of a file a listing is to name. A reader that knows where it is in the file opens
+// the listing there rather than filtering what came back: an ordinal is zero-padded, so a key
+// sorts in the order the records were written and `startAfter` places the first object exactly.
+// `through` stops the listing as soon as a key sorts past the window asked for, and `most` bounds
+// what a beat pays for however long the file has run — between them, a reader after the end of a
+// file of ten thousand objects pays what one after the end of a file of ten pays.
+interface RecordsAsked {
+  from: number;
+  through: number | null;
+  most: number | null;
+}
+
+// A listing of a whole file, which is what every reader of one as a whole asks for, and the only
+// shape a listing across a session's files can take: a key under the session's prefix opens with
+// the file it belongs to, so the ordinals of two files interleave there and no one of them places
+// a cursor.
+const WHOLE_FILE: RecordsAsked = { from: 0, through: null, most: null };
+
+// Every record object a reader asked for, in the order the records were written. A file named here
+// is listed under its own prefix rather than filtered out of the session's: a session holds one
+// prefix per file, so a reader after one of them pays for that file's objects and not for every
+// delegated turn beside it.
 const listRecords = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string | null,
   unwritten: Unwritten,
+  asked: RecordsAsked,
 ): Promise<RecordObject[]> => {
   // The file sits inside the key a listing is read against, so a listing of one file opens its own
   // prefix and the key is still read from the session's, which is what keeps one reader of a key.
   const session = sessionPrefix(userId, sessionId);
   const prefix = file === null ? session : filePrefix(userId, sessionId, file);
+  const opens = file !== null && asked.from > 0 ? `${prefix}${ordinalName(asked.from - 1)}` : null;
   const objects: RecordObject[] = [];
+  const sorted = (): RecordObject[] => objects.sort((left, right) => left.from - right.from);
   let cursor: string | undefined;
   do {
-    const page = await bucket.list({ prefix, cursor, include: ["customMetadata"] });
+    const page = await bucket.list({
+      prefix,
+      cursor,
+      include: ["customMetadata"],
+      ...(cursor === undefined && opens !== null ? { startAfter: opens } : {}),
+      ...(asked.most === null ? {} : { limit: asked.most }),
+    });
     for (const object of page.objects) {
       const read = readObject(session, object.key, object.size, object.customMetadata);
       if (read === null) {
         if (unwritten === "fail") throw new Error(`${object.key} is no record object this archive wrote`);
         continue;
       }
+      if (asked.through !== null && read.from >= asked.through) return sorted();
       objects.push(read);
     }
     cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
-  return objects.sort((left, right) => left.from - right.from);
+  } while (cursor !== undefined && (asked.most === null || objects.length < asked.most));
+  return sorted();
 };
 
 // Where one file ends, counted off the objects and nothing else: how many records of it the
@@ -208,7 +246,7 @@ export const recordsEnd = async (
   sessionId: string,
   file: string,
 ): Promise<RecordsEnd> => {
-  const objects = await listRecords(bucket, userId, sessionId, file, "fail");
+  const objects = await listRecords(bucket, userId, sessionId, file, "fail", WHOLE_FILE);
   const last = objects.at(-1);
   return {
     reach: objects.reduce((reach, object) => Math.max(reach, object.from + object.held), 0),
@@ -251,7 +289,7 @@ const spansOf = (objects: readonly RecordObject[]): RecordSpan[] =>
 // archive and no place in the file the host holds. How many records of the file the archive has is
 // the one count that is a place in both, and a restore weighs a local file against that.
 export const recordFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<RecordedFile[]> =>
-  filesOf(await listRecords(bucket, userId, sessionId, null, "skip"));
+  filesOf(await listRecords(bucket, userId, sessionId, null, "skip", WHOLE_FILE));
 
 // What a page drawing one file of a session needs, off the one listing that answers both: which
 // files the record path holds, and where every object of the chosen one sits. Two listings would
@@ -267,20 +305,28 @@ export const recordedTranscript = async (
   sessionId: string,
   file: string,
 ): Promise<RecordedTranscript> => {
-  const objects = await listRecords(bucket, userId, sessionId, null, "skip");
+  const objects = await listRecords(bucket, userId, sessionId, null, "skip", WHOLE_FILE);
   return { files: filesOf(objects), spans: spansOf(objects.filter((object) => object.file === file)) };
 };
 
-// Where every object of one file sits in its records, in the order they were written. A reader
-// that wants a window of the file rather than the whole of it plans it against these: a window
-// opens and ends on an object boundary and nowhere else, which is the one shape a read of one can
-// answer, and the weight of each is what the window costs on the wire.
-export const recordSpans = async (
+// Where the objects holding the records past an ordinal sit, which is what a box following a file
+// plans its next window against: a window opens and ends on an object boundary and nowhere else,
+// and the weight of each is what it costs on the wire.
+//
+// It is one page of the file from the reader's cursor on, however long the file has run. The
+// cursor is always an object boundary — a window is taken whole or not at all — and an ordinal is
+// zero-padded, so the key one record below it is exactly where the listing opens and nothing in
+// front of the reader is named, paid for or filtered out.
+export const recordSpansSince = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
-): Promise<RecordSpan[]> => spansOf(await listRecords(bucket, userId, sessionId, file, "skip"));
+  since: number,
+): Promise<RecordSpan[]> =>
+  spansOf(
+    await listRecords(bucket, userId, sessionId, file, "skip", { from: since, through: null, most: TAIL_LISTED_SPANS }),
+  );
 
 // One file of a session's transcript, read back out of its records. Each object is handed over in
 // ordinal order followed by the break that closed its last record, which is the file the host
@@ -312,7 +358,7 @@ export const readRecords = async (
   sessionId: string,
   file: string,
 ): Promise<ReadableStream<Uint8Array> | null> => {
-  const objects = await listRecords(bucket, userId, sessionId, file, "fail");
+  const objects = await listRecords(bucket, userId, sessionId, file, "fail", WHOLE_FILE);
   if (objects.length === 0) return null;
   return streamed(bucket, objects, file);
 };
@@ -333,9 +379,7 @@ export const readRecordWindow = async (
   from: number,
   through: number,
 ): Promise<ReadableStream<Uint8Array> | null> => {
-  const objects = (await listRecords(bucket, userId, sessionId, file, "skip")).filter(
-    (object) => object.from + object.held > from && object.from < through,
-  );
+  const objects = await listRecords(bucket, userId, sessionId, file, "skip", { from, through, most: null });
   let at = from;
   for (const object of objects) {
     if (object.from !== at) return null;
@@ -376,9 +420,7 @@ export const readRecordsBetween = async (
   through: number,
 ): Promise<string[]> => {
   if (through <= from) return [];
-  const objects = (await listRecords(bucket, userId, sessionId, file, "fail")).filter(
-    (object) => object.from + object.held > from && object.from < through,
-  );
+  const objects = await listRecords(bucket, userId, sessionId, file, "fail", { from, through, most: null });
   const records: string[] = [];
   let at = from;
   for (const object of objects) {

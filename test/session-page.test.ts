@@ -7,7 +7,6 @@ import {
   followedBatch,
   followedRecords,
   type Plan,
-  plannedRecords,
   type Reach,
   type Read,
   type RecordPlan,
@@ -677,20 +676,27 @@ describe("a session page over a transcript held as records", () => {
     expect(html).toContain("The archive never got 3 records of this file, in 1 place.");
     const plan = recordPlanOf(html);
 
-    // The walk reads the far side of the hole and then steps over it, so every record the archive
-    // holds is reachable and the box only says it is through once it is.
-    const newest = plannedRecords(plan.spans, 7, TRANSCRIPT_STEP_BYTES);
-    expect(newest).toEqual({ from: 5, through: 7, bytes: plan.spans[1]?.bytes });
-    const earlier = plannedRecords(plan.spans, newest.from, TRANSCRIPT_STEP_BYTES);
-    expect(earlier).toMatchObject({ from: 0, through: 2 });
-
-    expect(await (await windowOf(h, plan, newest.from, newest.through, you.assertion)).text()).toBe(recordedText(tail));
-    expect(await (await windowOf(h, plan, earlier.from, earlier.through, you.assertion)).text()).toBe(
-      recordedText(head),
-    );
-    // A window spanning the hole is a read the archive cannot answer, and it says so rather than
-    // handing back the records either side of it as though they joined up.
+    // Both sides of the hole are reachable, and a window spanning it is a read the archive cannot
+    // answer: it says so rather than handing back the records either side as though they joined up.
+    expect(await (await windowOf(h, plan, 5, 7, you.assertion)).text()).toBe(recordedText(tail));
+    expect(await (await windowOf(h, plan, 0, 2, you.assertion)).text()).toBe(recordedText(head));
     expect((await windowOf(h, plan, 0, 7, you.assertion)).status).toBe(404);
+  });
+
+  // A file the archive caught late opens past ordinal zero with nothing listed behind it. The page
+  // must say the archive never got those records, not that it held them back at its own ceiling:
+  // one is a gap nobody can close and the other is a control the reader could have clicked.
+  it("calls a hole at the start of a file a hole, and not a manifest held back", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const written = [entry(3), entry(4)];
+    expect((await you.laptop.sync("cafe0108")).status).toBe(204);
+    expect(await h.storeRecords(you.userId, "cafe0108", "main", 3, written)).toBe(true);
+
+    const html = await read(h, "/dashboard/sessions/cafe0108", you.assertion);
+    expect(html).toContain("The archive never got 3 records of this file, in 1 place.");
+    expect(html).not.toContain("so the box stops short of the start of the session");
+    expect(await rejoined(h, recordPlanOf(html), you.assertion)).toBe(recordedText(written));
   });
 
   // A record is addressed by its ordinal, so the box follows the file by counting records and

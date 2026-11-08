@@ -176,7 +176,7 @@ import {
   readRecordWindow,
   recordedTranscript,
   recordFiles,
-  recordSpans,
+  recordSpansSince,
   recordsAgree,
   recordsEnd,
   recordsFault,
@@ -1767,7 +1767,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   //
   // The objects are listed only where the mark says records landed, because a window the reader
   // asks for opens and ends on an object boundary and nowhere else, and nothing but the listing
-  // says where those fall.
+  // says where those fall. That listing is one page of the file from the reader's own cursor on,
+  // so a beat over a session of twelve thousand appends costs what one over a session of ten
+  // costs.
   const transcriptRecordTail = async (
     url: URL,
     env: TenantEnv,
@@ -1786,9 +1788,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     ]);
     const spans =
       marked > since.value
-        ? (await recordSpans(env.TRANSCRIPTS, userId, session.value, file.value)).filter(
-            (span) => span.from + span.held > since.value,
-          )
+        ? await recordSpansSince(env.TRANSCRIPTS, userId, session.value, file.value, since.value)
         : [];
     const reach: RecordReach = { running: device !== null, spans };
     return json(reach, 200, { "cache-control": "no-store" });

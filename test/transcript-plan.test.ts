@@ -397,6 +397,26 @@ describe("planning a window of records", () => {
     expect(gapsInSpans(listedSpans(spans([4, 4], 10)))).toEqual({ records: 0, places: 0 });
   });
 
+  // A listing the ceiling did not hold back names the file from its first record, so an object
+  // opening past zero has a hole in front of it and not a manifest stopping short. Reading it the
+  // other way tells the reader the page held records back when the archive never had them.
+  it("counts a hole at the start of a file the ceiling did not hold back", () => {
+    const late = listedSpans([{ from: 3, held: 2, bytes: 20 }]);
+
+    expect(late.from).toBe(0);
+    expect(gapsInSpans(late)).toEqual({ records: 3, places: 1 });
+
+    const trimmed = listedSpans(
+      Array.from({ length: MAX_PLANNED_READS + 1 }, (_, at) => ({
+        from: at * 2,
+        held: 2,
+        bytes: 20,
+      })),
+    );
+    expect(trimmed.from).toBe(2);
+    expect(gapsInSpans(trimmed)).toEqual({ records: 0, places: 0 });
+  });
+
   it("reads forward from where the box has got to, and passes over the records it has", () => {
     const written = spans([4, 4, 4, 4], 10);
 
