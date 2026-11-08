@@ -833,6 +833,10 @@
           },
           "maxItems": 50
         },
+        "identity": {
+          "$ref": "CopyIdentity.json",
+          "description": "What a row of this table was known by, which is what `blocked` means for it."
+        },
         "inAccount": {
           "type": "integer"
         },
@@ -848,6 +852,7 @@
         "blockedIds",
         "collided",
         "collidedIds",
+        "identity",
         "inAccount",
         "inTenant"
       ],
@@ -863,15 +868,22 @@
         "Index",
         "Records",
         "OpenChunks",
-        "CountedFiles",
-        "UsageEvents",
         "UsageDaily",
         "Labels",
+        "CountedFiles",
+        "UsageEvents",
         "BoardMessages",
         "BoardPickups",
         "Chunks"
       ],
       "description": "The tables the move into a tenant's own object left behind in D1, in the order the copy walks them."
+    },
+    "CopyIdentity": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopyIdentity.json",
+      "type": "string",
+      "enum": ["Key", "WholeRow", "Walked"],
+      "description": "What a row of a table is known by, which is what a row that did not cross means."
     },
     "CopySessions": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -890,20 +902,52 @@
       },
       "required": ["after", "metadataComplete"]
     },
-    "CopyIndexCheck": {
+    "IndexSound": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "$id": "CopyIndexCheck.json",
+      "$id": "IndexSound.json",
       "type": "object",
       "properties": {
-        "corrupt": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
+        "state": {
+          "type": "string",
+          "const": "Sound"
         }
       },
-      "required": ["corrupt", "error"],
-      "description": "What SQLite made of a full-text index against the rows it indexes, and whether it read it at all."
+      "required": ["state"],
+      "description": "A full-text index SQLite read against the rows it indexes and found nothing to say about."
+    },
+    "IndexCorrupt": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "IndexCorrupt.json",
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "const": "Corrupt"
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["state", "error"],
+      "description": "An index and the rows it indexes disagree. The chunks' index is external-content and the copy\nmoves rowids by hand, so an entry left behind at a mover's old key would answer a later query\nwith the chunk that now holds it."
+    },
+    "IndexUnread": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "IndexUnread.json",
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "const": "Unread"
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["state", "error"],
+      "description": "The check did not run, so the index is neither sound nor known to be otherwise. A different thing\nto tell an operator than an index that disagrees with its rows, and a different thing to do about."
     },
     "CopiedChunks": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -974,6 +1018,22 @@
         }
       },
       "required": ["missing", "extra", "missingChunks", "embeddings", "chunkIndex", "historyIndex", "ok"]
+    },
+    "CopyIndexCheck": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "CopyIndexCheck.json",
+      "anyOf": [
+        {
+          "$ref": "IndexSound.json"
+        },
+        {
+          "$ref": "IndexCorrupt.json"
+        },
+        {
+          "$ref": "IndexUnread.json"
+        }
+      ],
+      "description": "What SQLite made of a full-text index against the rows it indexes, or that it never read it."
     },
     "SessionCopy": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

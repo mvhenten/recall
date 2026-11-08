@@ -14,14 +14,16 @@ export const CopyTableSchema = z.enum([
   "Index",
   "Records",
   "OpenChunks",
-  "CountedFiles",
-  "UsageEvents",
   "UsageDaily",
   "Labels",
+  "CountedFiles",
+  "UsageEvents",
   "BoardMessages",
   "BoardPickups",
   "Chunks",
 ]);
+
+export const CopyIdentitySchema = z.enum(["Key", "WholeRow", "Walked"]);
 
 export const AppendRecordsSchema = z.object({
   file: z.string().min(1),
@@ -269,6 +271,7 @@ export const CopiedTableSchema = z.object({
   collidedIds: z
     .array(z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/))
     .max(50),
+  identity: CopyIdentitySchema,
   inAccount: z.int(),
   inTenant: z.int(),
 });
@@ -278,9 +281,18 @@ export const CopySessionsSchema = z.object({
   metadataComplete: z.boolean(),
 });
 
-export const CopyIndexCheckSchema = z.object({
-  corrupt: z.boolean(),
-  error: z.string(),
+export const IndexSoundSchema = z.object({
+  state: z.literal("Sound"),
+});
+
+export const IndexCorruptSchema = z.object({
+  state: z.literal("Corrupt"),
+  error: z.string().min(1),
+});
+
+export const IndexUnreadSchema = z.object({
+  state: z.literal("Unread"),
+  error: z.string().min(1),
 });
 
 export const CopiedChunksSchema = z.object({
@@ -298,8 +310,8 @@ export const CopyChecksSchema = z.object({
   extra: z.array(z.string()),
   missingChunks: z.int(),
   embeddings: z.array(z.number()),
-  chunkIndex: CopyIndexCheckSchema,
-  historyIndex: CopyIndexCheckSchema,
+  chunkIndex: z.union([IndexSoundSchema, IndexCorruptSchema, IndexUnreadSchema]),
+  historyIndex: z.union([IndexSoundSchema, IndexCorruptSchema, IndexUnreadSchema]),
   ok: z.boolean(),
 });
 

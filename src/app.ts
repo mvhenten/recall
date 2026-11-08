@@ -1,3 +1,4 @@
+import { SessionCopySchema } from "../typespec/generated/schemas";
 import { EMAIL_ONLY, emailOf } from "./access";
 import {
   type ArtifactChrome,
@@ -848,10 +849,22 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     // wrote every table but the prose, which only a report of that call can tell the caller; false,
     // those tables are read and written again, which costs one pass and finishes a call that died
     // in the middle of them.
+    //
+    // The report is held against the contract on the way out, which is the one route that does.
+    // Everything an operator reads the run's soundness off is in it, the caps on its id lists
+    // included, and a report that has drifted from what the contract says should stop the run
+    // rather than be read as one that verified.
     if (rawSessionId === "copy" && subresource === undefined && request.method === "POST") {
       const input = parseCopySessions(await readJson(request));
       if (!input.ok) return error(400, input.error);
-      return json(await copySessions(db, env.ACCOUNT, caller.userId, input.value.after, input.value.metadataComplete));
+      const report = await copySessions(
+        db,
+        env.ACCOUNT,
+        caller.userId,
+        input.value.after,
+        input.value.metadataComplete,
+      );
+      return json(SessionCopySchema.parse(report));
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);

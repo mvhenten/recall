@@ -1,13 +1,12 @@
 import { and, asc, eq, sql } from "drizzle-orm";
 import type { SQLiteColumn, SQLiteTable } from "drizzle-orm/sqlite-core";
-import type { z } from "zod";
-import type {
-  CopiedRowSchema,
+import { z } from "zod";
+import {
+  type CopiedRowSchema,
   CopiedTableSchema,
-  CopyIndexCheckSchema,
-  CopySessionsSchema,
-  CopyTableSchema,
-  SessionCopySchema,
+  type CopySessionsSchema,
+  type CopyTableSchema,
+  type SessionCopySchema,
 } from "../typespec/generated/schemas";
 import type { AccountDb, TenantDb, TenantTx } from "./db";
 import { rowUuid } from "./row-digest";
@@ -84,12 +83,22 @@ export type CopiedRow = z.infer<typeof CopiedRowSchema>;
 export type CopiedTable = z.infer<typeof CopiedTableSchema>;
 export type CopySessionsInput = z.infer<typeof CopySessionsSchema>;
 export type SessionCopyReport = z.infer<typeof SessionCopySchema>;
-export type CopyIndexCheck = z.infer<typeof CopyIndexCheckSchema>;
+export type CopyIndexCheck = SessionCopyReport["checks"]["chunkIndex"];
 type CopyTable = z.infer<typeof CopyTableSchema>;
 
 // How many ids a table names when its rows did not cross, or when two of D1's own share one. The
 // count beside each list is exact; the list is what an operator reads a row back out of D1 with.
-const MAX_IDS = 50;
+//
+// The cap is the contract's, read off it rather than written down twice. A contract that stopped
+// capping the list would be a contract this no longer answers to, so it is a throw and not a
+// default.
+const MAX_IDS = ((): number => {
+  const shape = z.toJSONSchema(CopiedTableSchema);
+  const capped = shape.properties?.blockedIds;
+  const most = typeof capped === "object" && "maxItems" in capped ? capped.maxItems : undefined;
+  if (typeof most !== "number") throw new Error("the contract caps no list of row ids");
+  return most;
+})();
 
 // One page of a table nothing writes any more, taken by offset. A keyset walk would say the same
 // thing against a still side and cost a composite comparison per table.
@@ -453,9 +462,10 @@ const copyChunks = async (
 // against, which is the one-argument form.
 //
 // Caught rather than thrown, so a corrupt index is reported with the rest of the checks instead of
-// ending the run as a failed request that says nothing about any of them. Corruption is the one
-// class this names: a statement that fails for any other reason leaves the index unread, which is
-// a different thing to tell an operator than an index that disagrees with its rows.
+// ending the run as a failed request that says nothing about any of them. It answers with which of
+// three things happened and never with an empty message standing for the first: an index SQLite
+// read and had nothing to say about, an index that disagrees with its rows, and a check that did
+// not run and so read nothing at all.
 const indexIntegrity = (
   db: TenantDb,
   table: typeof sessionChunksFts | typeof sessionHistoryFts,
@@ -467,10 +477,11 @@ const indexIntegrity = (
         ? sql`INSERT INTO ${table} (${table}, rank) VALUES ('integrity-check', 1)`
         : sql`INSERT INTO ${table} (${table}) VALUES ('integrity-check')`,
     );
-    return { corrupt: false, error: "" };
+    return { state: "Sound" };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return { corrupt: /corrupt|malformed/i.test(message), error: message };
+    const said = message === "" ? "SQLite refused the check and said nothing" : message;
+    return /corrupt|malformed/i.test(said) ? { state: "Corrupt", error: said } : { state: "Unread", error: said };
   }
 };
 
@@ -547,6 +558,12 @@ export const copySessions = async (
   // there by design, and an id over the whole row would read that as a row that never crossed.
   // Given `null`, the id is over every column, which is what proves the content arrived and not
   // merely that something sits at the key.
+  //
+  // Which of the two a table was read by is answered with, because it is what a row that did not
+  // cross means. Where the id is the key, a row standing at that key would have been recognised as
+  // one the object already holds — so a row that neither landed nor was recognised had its key
+  // taken while this ran, and the next run takes it. Where the id is the whole row, another row of
+  // other content stands where it belongs, and that is a thing to go and read.
   const moved = async <A extends Owned, T extends Owned>(
     table: CopyTable,
     from: A & { $inferSelect: T["$inferInsert"] },
@@ -565,6 +582,7 @@ export const copySessions = async (
         blockedIds: blocked.slice(0, MAX_IDS),
         collided: collided.length,
         collidedIds: collided.slice(0, MAX_IDS),
+        identity: key === null ? "WholeRow" : "Key",
         inAccount: await accountCount(account, from, userId),
         inTenant: tenantCount(tenant, into, userId),
       };
@@ -693,6 +711,7 @@ export const copySessions = async (
     blockedIds: [],
     collided: 0,
     collidedIds: [],
+    identity: "Walked",
     inAccount: inD1,
     inTenant: tenantCount(tenant, sessionChunks, userId),
   });
@@ -737,8 +756,8 @@ export const copySessions = async (
         missing.length === 0 &&
         chunks.missing === 0 &&
         chunks.embeddings.length === 0 &&
-        chunkIndex.error === "" &&
-        historyIndex.error === "",
+        chunkIndex.state === "Sound" &&
+        historyIndex.state === "Sound",
     },
   };
 };

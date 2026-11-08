@@ -175,8 +175,8 @@ describe("copying the sessions an account held before they moved", () => {
     expect(report.checks.extra).toEqual([]);
     expect(report.checks.missingChunks).toBe(0);
     expect(report.checks.embeddings).toEqual([]);
-    expect(report.checks.chunkIndex).toEqual({ corrupt: false, error: "" });
-    expect(report.checks.historyIndex).toEqual({ corrupt: false, error: "" });
+    expect(report.checks.chunkIndex).toEqual({ state: "Sound" });
+    expect(report.checks.historyIndex).toEqual({ state: "Sound" });
     expect(report.checks.ok).toBe(true);
 
     // Every row D1 holds was answered for by its id, and none was blocked by another row standing
@@ -184,6 +184,24 @@ describe("copying the sessions an account held before they moved", () => {
     // conflicted holds as many rows as D1 does and reads as copied twice over.
     expect(blockedOf(report)).toEqual([]);
     expect(collidedOf(report)).toEqual([]);
+
+    // How each table was read, which is what a row that did not cross would mean for it. The
+    // seven the object's own row wins on are read by what identifies the row; the four nothing
+    // rewrites by the whole of it; the prose by its own walk.
+    expect(report.tables.map((row) => [row.table, row.identity])).toEqual([
+      ["Sessions", "Key"],
+      ["History", "Key"],
+      ["Index", "Key"],
+      ["Records", "Key"],
+      ["OpenChunks", "Key"],
+      ["UsageDaily", "Key"],
+      ["Labels", "Key"],
+      ["CountedFiles", "WholeRow"],
+      ["UsageEvents", "WholeRow"],
+      ["BoardMessages", "WholeRow"],
+      ["BoardPickups", "WholeRow"],
+      ["Chunks", "Walked"],
+    ]);
 
     // Every chunk kept the key D1 wrote it under, which is what `session_chunks_fts` ranks by and
     // what the vector scan reads as recency.
@@ -227,7 +245,7 @@ describe("copying the sessions an account held before they moved", () => {
     expect(tallyOf(again, "Chunks")).toEqual({ stored: 0, alreadyStored: PROSE.length });
     expect(again.chunks.shifted).toBe(0);
     expect(again.chunks.moved).toBe(0);
-    expect(again.checks.chunkIndex).toEqual({ corrupt: false, error: "" });
+    expect(again.checks.chunkIndex).toEqual({ state: "Sound" });
     expect(again.checks.ok).toBe(true);
     expect(await tenantChunks(client.userId)).toEqual(after);
 
@@ -343,7 +361,7 @@ describe("copying the sessions an account held before they moved", () => {
     expect(report.chunks.shifted).toBeGreaterThan(0);
     // SQLite's own read of the index the move hand-wrote: no entry left at the rowid the mover
     // vacated, and the one it moved to is there.
-    expect(report.checks.chunkIndex).toEqual({ corrupt: false, error: "" });
+    expect(report.checks.chunkIndex).toEqual({ state: "Sound" });
     expect(report.checks.missingChunks).toBe(0);
     expect(report.checks.embeddings).toEqual([]);
     expect(report.checks.ok).toBe(true);
@@ -484,6 +502,9 @@ describe("copying the sessions an account held before they moved", () => {
     expect(usage?.alreadyStored).toBe(0);
     expect(usage?.blocked).toBe(1);
     expect(usage?.blockedIds).toHaveLength(1);
+    // Read by the whole row, so a blocked one means another row of other content is in its place
+    // — the thing to go and read, rather than a key taken while the run was going.
+    expect(usage?.identity).toBe("WholeRow");
     expect(report.checks.ok).toBe(false);
     // Nothing else is dragged down with it: the tables that did cross still read as crossed.
     expect(tallyOf(report, "Sessions")).toEqual({ stored: 1, alreadyStored: 0 });

@@ -153,8 +153,17 @@ for (const row of report.tables) {
     `${userId}: ${row.table}: stored ${did.stored}, already stored ${did.alreadyStored}, blocked ${wrote.blocked}; ${row.inAccount} in D1, ${row.inTenant} in the object`,
   );
   if (wrote.blocked > 0) {
+    const andMore =
+      wrote.blocked > wrote.blockedIds.length ? ` (and ${wrote.blocked - wrote.blockedIds.length} more)` : "";
+    // What a row that did not cross means is not the same for the two ways a row is known, and
+    // nor is what to do about it. Where the id is the row's key, a row standing at that key would
+    // have been recognised as one the object already holds — so this is a key taken while the run
+    // was going, and the next run takes it. Where the id is the whole row, something of other
+    // content is sitting where D1's row belongs, and that is a thing to go and read.
     say(
-      `${userId}: ${row.table}: ${wrote.blocked} rows of D1 did not cross, another row standing where each belongs. Read them out of D1 by their id: ${some(wrote.blockedIds)}${wrote.blocked > wrote.blockedIds.length ? ` (and ${wrote.blocked - wrote.blockedIds.length} more)` : ""}`,
+      wrote.identity === "Key"
+        ? `${userId}: ${row.table}: ${wrote.blocked} rows of D1 did not cross because the object took their key while this ran. Nothing is wrong with them; run again and they will. Their ids: ${some(wrote.blockedIds)}${andMore}`
+        : `${userId}: ${row.table}: ${wrote.blocked} rows of D1 did not cross, another row of other content standing where each belongs. Read them out of D1 by their id and settle which the account should keep: ${some(wrote.blockedIds)}${andMore}`,
     );
   }
   if (wrote.collided > 0) {
@@ -171,19 +180,28 @@ say(`${userId}: ${run.walked} of D1's ${chunks.inAccount} chunks were walked ove
 say(`${userId}: chunks that did not arrive: ${run.missing}`);
 say(`${userId}: embeddings that did not round-trip byte for byte: ${some(run.embeddings)}`);
 
+// The one number the copy knowingly leaves short. The day the release cut over has a usage row in
+// each store, and the object's stands: summing two counters it cannot tell apart on a second run
+// is not something this copier should invent. So the stats page reads low for that one day by
+// whatever was recorded before the deploy. Nothing is lost — D1 keeps its row, and usage_events
+// carries every event of the day on both sides of the cut.
+say(
+  `${userId}: the usage of the day the release cut over will read low on the stats page. Both stores hold a row for it and the object's stands; D1 keeps its own, and usage_events holds every event of that day.`,
+);
+
 for (const [name, check] of [
   ["chunk", checks.chunkIndex],
   ["history", checks.historyIndex],
 ]) {
-  if (check.error === "") {
-    say(`${userId}: ${name} index against the rows it indexes: sound`);
-    continue;
-  }
   // A check that did not run is not the same finding as an index that disagrees with its rows,
   // and reading one as the other would have an operator looking for a corruption that is not
   // there — or taking a real one for a bad statement.
+  if (check.state === "Sound") {
+    say(`${userId}: ${name} index against the rows it indexes: sound`);
+    continue;
+  }
   say(
-    check.corrupt
+    check.state === "Corrupt"
       ? `${userId}: ${name} index and the rows it indexes DISAGREE: ${check.error}`
       : `${userId}: ${name} index was NOT CHECKED, the check itself failed: ${check.error}`,
   );

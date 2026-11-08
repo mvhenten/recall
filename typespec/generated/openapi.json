@@ -92,6 +92,7 @@
           "blockedIds",
           "collided",
           "collidedIds",
+          "identity",
           "inAccount",
           "inTenant"
         ],
@@ -129,6 +130,14 @@
               "$ref": "#/components/schemas/RowId"
             },
             "maxItems": 50
+          },
+          "identity": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CopyIdentity"
+              }
+            ],
+            "description": "What a row of this table was known by, which is what `blocked` means for it."
           },
           "inAccount": {
             "type": "integer",
@@ -180,18 +189,24 @@
           }
         }
       },
+      "CopyIdentity": {
+        "type": "string",
+        "enum": ["Key", "WholeRow", "Walked"],
+        "description": "What a row of a table is known by, which is what a row that did not cross means."
+      },
       "CopyIndexCheck": {
-        "type": "object",
-        "required": ["corrupt", "error"],
-        "properties": {
-          "corrupt": {
-            "type": "boolean"
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/IndexSound"
           },
-          "error": {
-            "type": "string"
+          {
+            "$ref": "#/components/schemas/IndexCorrupt"
+          },
+          {
+            "$ref": "#/components/schemas/IndexUnread"
           }
-        },
-        "description": "What SQLite made of a full-text index against the rows it indexes, and whether it read it at all."
+        ],
+        "description": "What SQLite made of a full-text index against the rows it indexes, or that it never read it."
       },
       "CopyOutcome": {
         "type": "string",
@@ -222,10 +237,10 @@
           "Index",
           "Records",
           "OpenChunks",
-          "CountedFiles",
-          "UsageEvents",
           "UsageDaily",
           "Labels",
+          "CountedFiles",
+          "UsageEvents",
           "BoardMessages",
           "BoardPickups",
           "Chunks"
@@ -275,6 +290,47 @@
       "FocusText": {
         "type": "string",
         "maxLength": 200
+      },
+      "IndexCorrupt": {
+        "type": "object",
+        "required": ["state", "error"],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["Corrupt"]
+          },
+          "error": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "description": "An index and the rows it indexes disagree. The chunks' index is external-content and the copy\nmoves rowids by hand, so an entry left behind at a mover's old key would answer a later query\nwith the chunk that now holds it."
+      },
+      "IndexSound": {
+        "type": "object",
+        "required": ["state"],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["Sound"]
+          }
+        },
+        "description": "A full-text index SQLite read against the rows it indexes and found nothing to say about."
+      },
+      "IndexUnread": {
+        "type": "object",
+        "required": ["state", "error"],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["Unread"]
+          },
+          "error": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "description": "The check did not run, so the index is neither sound nor known to be otherwise. A different thing\nto tell an operator than an index that disagrees with its rows, and a different thing to do about."
       },
       "ListMemories": {
         "type": "object",

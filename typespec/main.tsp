@@ -387,13 +387,33 @@ enum CopyTable {
   Index,
   Records,
   OpenChunks,
-  CountedFiles,
-  UsageEvents,
   UsageDaily,
   Labels,
+  CountedFiles,
+  UsageEvents,
   BoardMessages,
   BoardPickups,
   Chunks,
+}
+
+@doc("What a row of a table is known by, which is what a row that did not cross means.")
+enum CopyIdentity {
+  @doc("""
+    The columns that identify the row, which are its key. A table whose object-side row
+    deliberately wins on a session both stores held is read this way, its content having moved on
+    there by design. A row of one that did not cross had its key taken while the copy ran, since
+    a row standing at that key would have answered as one the object already held.
+    """)
+  Key,
+
+  @doc("""
+    The whole row, which is what proves the content arrived and not merely that the key is taken.
+    A row of one that did not cross has another row of other content standing where it belongs.
+    """)
+  WholeRow,
+
+  @doc("The prose, walked chunk by chunk and answered for by its key, its text and the instant it opened on.")
+  Walked,
 }
 
 @doc("""
@@ -422,6 +442,9 @@ model CopiedTable {
   @maxItems(maxCopyIds)
   collidedIds: RowId[];
 
+  @doc("What a row of this table was known by, which is what `blocked` means for it.")
+  identity: CopyIdentity;
+
   inAccount: safeint;
   inTenant: safeint;
 }
@@ -439,10 +462,39 @@ model CopySessions {
   metadataComplete: boolean;
 }
 
-@doc("What SQLite made of a full-text index against the rows it indexes, and whether it read it at all.")
-model CopyIndexCheck {
-  corrupt: boolean;
+@doc("A full-text index SQLite read against the rows it indexes and found nothing to say about.")
+model IndexSound {
+  state: "Sound";
+}
+
+@doc("""
+  An index and the rows it indexes disagree. The chunks' index is external-content and the copy
+  moves rowids by hand, so an entry left behind at a mover's old key would answer a later query
+  with the chunk that now holds it.
+  """)
+model IndexCorrupt {
+  state: "Corrupt";
+
+  @minLength(1)
   error: string;
+}
+
+@doc("""
+  The check did not run, so the index is neither sound nor known to be otherwise. A different thing
+  to tell an operator than an index that disagrees with its rows, and a different thing to do about.
+  """)
+model IndexUnread {
+  state: "Unread";
+
+  @minLength(1)
+  error: string;
+}
+
+@doc("What SQLite made of a full-text index against the rows it indexes, or that it never read it.")
+union CopyIndexCheck {
+  sound: IndexSound,
+  corrupt: IndexCorrupt,
+  unread: IndexUnread,
 }
 
 model CopiedChunks {
