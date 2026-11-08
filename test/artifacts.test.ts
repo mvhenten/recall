@@ -1,9 +1,10 @@
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { type ArtifactView, RAW_INLINE_BYTES } from "../src/artifacts";
-import { accountStoreOf } from "../src/db";
+import { tenantStoreOf } from "../src/db";
 import { claimRevision } from "../src/store";
-import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
+import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness, tenantRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -149,12 +150,14 @@ describe("publishing", () => {
   it("hands two claims on one name revisions of their own", async () => {
     const { h, email } = await publisher();
     const userId = await h.userIdFor(email);
-    const db = accountStoreOf(env.DB);
-    const claimed = await Promise.all([
-      claimRevision(db, userId, "contested"),
-      claimRevision(db, userId, "contested"),
-      claimRevision(db, userId, "contested"),
-    ]);
+    const claimed = await runInDurableObject(env.TENANT.get(env.TENANT.idFromName(userId)), (_instance, state) => {
+      const db = tenantStoreOf(state.storage);
+      return Promise.all([
+        claimRevision(db, userId, "contested"),
+        claimRevision(db, userId, "contested"),
+        claimRevision(db, userId, "contested"),
+      ]);
+    });
     expect([...claimed].sort((left, right) => left - right)).toEqual([1, 2, 3]);
   });
 
@@ -578,6 +581,138 @@ describe("a write permission", () => {
     });
     expect(replaced.status).toBe(200);
     expect(await (await h.sendToArtifactHost("/a/shared-ledger", assertion)).text()).toBe("<p>theirs</p>");
+  });
+});
+
+// Where the rows now are, and what the account store keeps of them. A name on the artifact
+// hostname carries no user segment, so one row of `artifact_names` routes it to an account and
+// that account's own object answers for what the name holds. Nothing reads another tenant's
+// artifact rows, and the claim is what a second account-readable publish of one name is refused
+// by.
+describe("resolving a name across two tenants", () => {
+  const twoAccounts = async () => {
+    const { h, email, alice, assertion } = await publisher();
+    const bobEmail = `bob-${crypto.randomUUID()}@example.com`;
+    await h.invite(bobEmail);
+    const bob = h.clientWithToken(await h.login(bobEmail));
+    return {
+      h,
+      alice,
+      bob,
+      assertion,
+      aliceId: await h.userIdFor(email),
+      bobId: await h.userIdFor(bobEmail),
+      bobAssertion: await h.assertionFor(bobEmail, ARTIFACT_AUDIENCE),
+    };
+  };
+
+  const claims = (name: string): Promise<Array<{ user_id: string; read_perm: string }>> =>
+    env.DB.prepare("SELECT user_id, read_perm FROM artifact_names WHERE name = ?")
+      .bind(name)
+      .all<{ user_id: string; read_perm: string }>()
+      .then((read) => read.results);
+
+  const heldBy = (userId: string, name: string): Promise<Array<{ name: string }>> =>
+    tenantRows<{ name: string }>(userId, "SELECT name FROM artifacts WHERE user_id = ? AND name = ?", userId, name);
+
+  it("routes an account-readable name through one claim and reads it out of the owner's object", async () => {
+    const { h, alice, aliceId, bobId, bobAssertion } = await twoAccounts();
+    await alice.publishArtifact("shared-plan", {
+      read: "account",
+      files: [{ path: "index.html", body: "<p>alice</p>" }],
+    });
+
+    expect(await claims("shared-plan")).toEqual([{ user_id: aliceId, read_perm: "account" }]);
+    expect(await heldBy(aliceId, "shared-plan")).toEqual([{ name: "shared-plan" }]);
+    expect(await heldBy(bobId, "shared-plan")).toEqual([]);
+
+    const read = await h.sendToArtifactHost("/a/shared-plan", bobAssertion);
+    expect(read.status).toBe(200);
+    expect(await read.text()).toBe("<p>alice</p>");
+  });
+
+  it("answers another account's private artifact with the 404 an unpublished name answers", async () => {
+    const { h, alice, aliceId, bobAssertion } = await twoAccounts();
+    await alice.publishArtifact("private-plan", { files: [{ path: "index.html", body: "<p>alice</p>" }] });
+
+    expect(await claims("private-plan")).toEqual([{ user_id: aliceId, read_perm: "private" }]);
+    const refused = await h.sendToArtifactHost("/a/private-plan", bobAssertion);
+    const missing = await h.sendToArtifactHost("/a/no-such-plan", bobAssertion);
+    expect(refused.status).toBe(404);
+    expect(await refused.text()).toBe(await missing.text());
+    expect((await h.sendToArtifactHost("/a/private-plan/f/index.html", bobAssertion)).status).toBe(404);
+  });
+
+  it("refuses the second account-readable publish of one name and writes nothing for it", async () => {
+    const { alice, bob, aliceId, bobId } = await twoAccounts();
+    await alice.publishArtifact("one-address", {
+      read: "account",
+      files: [{ path: "index.html", body: "<p>alice</p>" }],
+    });
+
+    const refused = await bob.publishArtifact("one-address", {
+      read: "account",
+      files: [{ path: "index.html", body: "<p>bob</p>" }],
+    });
+    expect(refused.status).toBe(409);
+    const body: { error: string } = await refused.json();
+    expect(body.error).toContain("another account publishes one-address");
+    expect(body.error).toContain("one address per name");
+
+    expect(await claims("one-address")).toEqual([{ user_id: aliceId, read_perm: "account" }]);
+    expect(await heldBy(bobId, "one-address")).toEqual([]);
+  });
+
+  it("hands the name back when its owner unpublishes it, and refuses nobody after that", async () => {
+    const { alice, bob, bobId } = await twoAccounts();
+    await alice.publishArtifact("handed-back", {
+      read: "account",
+      files: [{ path: "index.html", body: "<p>alice</p>" }],
+    });
+    expect((await alice.request("DELETE", "/v1/artifacts/handed-back")).status).toBe(204);
+    expect(await claims("handed-back")).toEqual([]);
+
+    const theirs = await bob.publishArtifact("handed-back", {
+      read: "account",
+      files: [{ path: "index.html", body: "<p>bob</p>" }],
+    });
+    expect(theirs.status).toBe(200);
+    expect(await claims("handed-back")).toEqual([{ user_id: bobId, read_perm: "account" }]);
+  });
+
+  it("lets a name another account holds privately be claimed for the whole account to read", async () => {
+    const { h, alice, bob, bobId, assertion, bobAssertion } = await twoAccounts();
+    await alice.publishArtifact("ledger", { files: [{ path: "index.html", body: "<p>alice</p>" }] });
+    const theirs = await bob.publishArtifact("ledger", {
+      read: "account",
+      files: [{ path: "index.html", body: "<p>bob</p>" }],
+    });
+    expect(theirs.status).toBe(200);
+    expect(await claims("ledger")).toEqual([{ user_id: bobId, read_perm: "account" }]);
+
+    // Each account still reads its own under that name, and the claim is what every other reader
+    // of the hostname resolves to.
+    expect(await (await h.sendToArtifactHost("/a/ledger", assertion)).text()).toBe("<p>alice</p>");
+    expect(await (await h.sendToArtifactHost("/a/ledger", bobAssertion)).text()).toBe("<p>bob</p>");
+  });
+
+  it("opens a share link against the owner's object and never another account's name", async () => {
+    const { h, alice, bob, bobId } = await twoAccounts();
+    await alice.publishArtifact("report", {
+      type: "document",
+      files: [{ path: "notes.md", body: "# alice\n" }],
+    });
+    await bob.publishArtifact("report", { type: "document", files: [{ path: "notes.md", body: "# bob\n" }] });
+    expect(await heldBy(bobId, "report")).toEqual([{ name: "report" }]);
+
+    const made = await alice.request("POST", "/v1/artifacts/report/shares", { mode: "link" });
+    expect(made.status).toBe(200);
+    const { address }: { address: string } = await made.json();
+    const page = await h.sendToSharePrefix(new URL(address).pathname, null);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain("alice");
+    expect(html).not.toContain("bob");
   });
 });
 

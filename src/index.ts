@@ -30,9 +30,10 @@ export interface Env {
   // artifacts and share none. It is the email share application's audience, and binding it is what
   // turns both share modes on.
   ARTIFACT_SHARE_ACCESS_AUD?: string;
-  // Both arrive together, or not at all: a deployment that serves no connector binds neither.
+  // The connector's Access audience, and the whole of what a deployment binds to serve one: which
+  // service token acts for which account is a row in `mcp_clients`, so adding a tenant to the
+  // connector is a write rather than a config edit and a deploy.
   MCP_ACCESS_AUD?: string;
-  MCP_SERVICE_CLIENTS?: string;
 }
 
 const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
@@ -73,20 +74,10 @@ const artifactHost = (env: Env, keys: KeySource, issuer: string): ArtifactHost |
   };
 };
 
-// The service-token map is a JSON object of Access client id to user id. A deployment that serves
-// the connector to browser sign-ins alone writes an empty object rather than leaving it unbound.
-const serviceClients = (raw: string): Map<string, string> => {
-  const parsed: unknown = JSON.parse(raw);
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("MCP_SERVICE_CLIENTS must be a JSON object of Access client id to user id");
-  }
-  return new Map(Object.entries(parsed).map(([client, userId]) => [client, String(userId)]));
-};
-
 const mcpHost = (env: Env, keys: KeySource, issuer: string): McpHost | null => {
-  const { MCP_ACCESS_AUD: audience, MCP_SERVICE_CLIENTS: clients } = env;
-  if (!audience || clients === undefined) return null;
-  return { verify: accessVerifier(keys, issuer, audience), serviceClients: serviceClients(clients) };
+  const { MCP_ACCESS_AUD: audience } = env;
+  if (!audience) return null;
+  return { verify: accessVerifier(keys, issuer, audience) };
 };
 
 const appFor = (env: Env): ReturnType<typeof createApp> => {

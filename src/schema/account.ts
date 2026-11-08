@@ -69,41 +69,36 @@ export const devices = sqliteTable("devices", {
     .default("host"),
 });
 
-export const artifacts = sqliteTable(
-  "artifacts",
-  {
-    artifactSeq: integer("artifact_seq").primaryKey(),
-    userId: text("user_id").notNull(),
-    name: text("name").notNull(),
-    rev: integer("rev").notNull(),
-    type: text("type", { enum: ["site", "document", "audio"] }).notNull(),
-    title: text("title").notNull(),
-    description: text("description").notNull(),
-    readPerm: text("read_perm", { enum: ["private", "account"] }).notNull(),
-    writePerm: text("write_perm", { enum: ["owner", "account"] }).notNull(),
-    entryPath: text("entry_path").notNull(),
-    files: text("files").notNull(),
-    fileCount: integer("file_count").notNull(),
-    bytes: integer("bytes").notNull(),
-    createdAt: integer("created_at").notNull(),
-    updatedAt: integer("updated_at").notNull(),
-    lastWriterUserId: text("last_writer_user_id").notNull(),
-  },
-  (table) => [unique().on(table.userId, table.name)],
-);
+// Which account a name on the artifact hostname belongs to. The hostname has no user segment, so
+// the address space of names is the deployment's and not an account's: this row is the claim on
+// one of them, and resolving a name is this one read followed by the owner's object.
+//
+// The claim is first come. An account-readable publish takes a free name, a name this account
+// already holds, or one another account holds privately — it may not take a name another account
+// publishes for the whole account to read, and that refusal is this table's primary key rather
+// than a check a second publish can race. A private publish that finds the name held writes no
+// row at all and is reachable through its owner's object alone, which is how two accounts keep
+// private artifacts of one name.
+//
+// WITHOUT ROWID in `migrations/0022_artifact_names.sql`, which drizzle's schema cannot say.
+export const artifactNames = sqliteTable("artifact_names", {
+  name: text("name").primaryKey(),
+  userId: text("user_id").notNull(),
+  readPerm: text("read_perm", { enum: ["private", "account"] }).notNull(),
+});
 
-// WITHOUT ROWID in `migrations/0012_artifacts.sql`, which drizzle's schema cannot say.
-export const artifactRevisions = sqliteTable(
-  "artifact_revisions",
-  {
-    userId: text("user_id").notNull(),
-    name: text("name").notNull(),
-    revNext: integer("rev_next").notNull(),
-  },
-  (table) => [primaryKey({ columns: [table.userId, table.name] })],
-);
+// Which account an Access service token acts for. It was a JSON object in the Worker's env, which
+// made adding a tenant a config edit and a redeploy; it is a row so that it is a write.
+//
+// WITHOUT ROWID likewise.
+export const mcpClients = sqliteTable("mcp_clients", {
+  clientId: text("client_id").primaryKey(),
+  userId: text("user_id").notNull(),
+});
 
-// WITHOUT ROWID in `migrations/0016_artifact_shares.sql`.
+// WITHOUT ROWID in `migrations/0016_artifact_shares.sql`. It does not follow the artifacts into
+// the tenant object: nothing joins a share to a tenant table, and splitting the routing from the
+// metadata would make one revoke two writes against two stores.
 export const artifactShares = sqliteTable("artifact_shares", {
   shareId: text("share_id").primaryKey(),
   userId: text("user_id").notNull(),

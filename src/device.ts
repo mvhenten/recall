@@ -254,6 +254,20 @@ export const userForEmail = async (db: AccountDb, email: string): Promise<string
   return row === undefined ? null : row.userId;
 };
 
+// The account's first address, which is as precise as a writer can be named: a device token
+// carries a user and `principals` maps several emails to one. An account whose addresses have all
+// been withdrawn names none, and the empty string is what the row then carries.
+export const emailForUser = async (db: AccountDb, userId: string): Promise<string> => {
+  const row = await db
+    .select({ email: principals.email })
+    .from(principals)
+    .where(eq(principals.userId, userId))
+    .orderBy(asc(principals.email))
+    .limit(1)
+    .get();
+  return row?.email ?? "";
+};
+
 export const deviceForToken = async (db: AccountDb, token: string, now: number): Promise<Caller | null> => {
   const row = await db
     .select({
