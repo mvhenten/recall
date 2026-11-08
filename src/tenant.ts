@@ -1,11 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { createTenant, type TenantApi, type TenantCall, type TenantEnv } from "./app";
+import { accountStoreOf, type TenantDb, tenantStoreOf } from "./db";
 import type { Caller } from "./device";
 import { migrateDurableObject } from "./durable-migrate";
 import type { Env } from "./index";
 import type { ToolCall, ToolResult } from "./mcp";
 import { TENANT_MIGRATIONS } from "./tenant-migrations";
-import { type SqlDb, tenantSql } from "./tenant-sql";
 
 // One account's own rows, in one object addressed by its user id. The Worker proves who is asking
 // and then calls in here; everything below the device token runs against this object's SQLite,
@@ -15,11 +15,11 @@ import { type SqlDb, tenantSql } from "./tenant-sql";
 // listening host in a single-threaded object, and a store read queued behind a socket event would
 // be a listing waiting on somebody else's message.
 export class Tenant extends DurableObject<Env> {
-  private readonly db: SqlDb;
+  private readonly db: TenantDb;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.db = tenantSql(ctx.storage);
+    this.db = tenantStoreOf(ctx.storage);
     // A tenant comes into being empty, so the first touch lays the schema down and every touch
     // after reads one row to find there is nothing to do.
     void ctx.blockConcurrencyWhile(async () => {
@@ -46,7 +46,7 @@ export class Tenant extends DurableObject<Env> {
   private store(): TenantEnv {
     return {
       DB: this.db,
-      ACCOUNT: this.env.DB,
+      ACCOUNT: accountStoreOf(this.env.DB),
       MAILBOX: this.env.MAILBOX,
       TRANSCRIPTS: this.env.TRANSCRIPTS,
     };

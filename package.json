@@ -9,6 +9,8 @@
     "build:browser": "node npm-scripts/build-browser.mjs",
     "generate": "tsp compile typespec && node npm-scripts/whole-numbers.mjs && biome check --write typespec/generated",
     "generate:check": "npm run generate && git diff --exit-code typespec/generated",
+    "migrations:account": "node npm-scripts/generate-migrations.mjs drizzle.config.ts",
+    "migrations:tenant": "node npm-scripts/generate-migrations.mjs drizzle.tenant.config.ts --listed-in=src/tenant-migrations.ts",
     "prepare": "npm run build:browser",
     "lint": "biome check .",
     "typecheck": "tsc --noEmit && tsc --noEmit -p browser",
@@ -24,6 +26,7 @@
     "recompress-archive": "node npm-scripts/recompress-archive.mjs"
   },
   "dependencies": {
+    "drizzle-orm": "^0.45.4",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -35,6 +38,7 @@
     "@typespec/compiler": "^1.17.0",
     "@typespec/json-schema": "^1.17.0",
     "@typespec/openapi3": "^1.17.0",
+    "drizzle-kit": "^0.31.11",
     "esbuild": "^0.28.2",
     "jose": "^6.2.14",
     "typescript": "^5.9.0",

@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { type ArtifactView, RAW_INLINE_BYTES } from "../src/artifacts";
+import { accountStoreOf } from "../src/db";
 import { claimRevision } from "../src/store";
 import { ARTIFACT_AUDIENCE, ARTIFACT_HOSTNAME, type Client, harness } from "./harness";
 
@@ -148,10 +149,11 @@ describe("publishing", () => {
   it("hands two claims on one name revisions of their own", async () => {
     const { h, email } = await publisher();
     const userId = await h.userIdFor(email);
+    const db = accountStoreOf(env.DB);
     const claimed = await Promise.all([
-      claimRevision(env.DB, userId, "contested"),
-      claimRevision(env.DB, userId, "contested"),
-      claimRevision(env.DB, userId, "contested"),
+      claimRevision(db, userId, "contested"),
+      claimRevision(db, userId, "contested"),
+      claimRevision(db, userId, "contested"),
     ]);
     expect([...claimed].sort((left, right) => left - right)).toEqual([1, 2, 3]);
   });

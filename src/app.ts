@@ -75,6 +75,7 @@ import {
   tabForPath,
   transcriptScript,
 } from "./dashboard";
+import { type AccountDb, accountStoreOf, type TenantDb } from "./db";
 import {
   type Caller,
   connectorDevice,
@@ -196,7 +197,7 @@ import {
   adoptArtifacts,
   artifactCounts,
   artifactCursorDirection,
-  artifactShares,
+  artifactShareList,
   type ChunkCandidate,
   type Cursor,
   chunkExcerpts,
@@ -273,7 +274,6 @@ import {
   writeLabels,
 } from "./store";
 import type { Tenant } from "./tenant";
-import type { SqlDb } from "./tenant-sql";
 import {
   editedMemory,
   parseEditArgs,
@@ -386,11 +386,19 @@ export interface AppEnv {
   TRANSCRIPTS: R2Bucket;
 }
 
+// The same bindings with the account store open on D1. It is opened once a request rather than
+// once a read, and its type is what keeps a tenant query from ever being handed this one.
+interface WorkerEnv extends Omit<AppEnv, "DB"> {
+  DB: AccountDb;
+}
+
+const workerEnv = (env: AppEnv): WorkerEnv => ({ ...env, DB: accountStoreOf(env.DB) });
+
 // What the tenant half reads. `DB` is this account's own store and nobody else's; `ACCOUNT` is the
-// D1 that still holds its artifacts and its memories, which later steps move across.
+// account store that still holds its artifacts and its memories, which later steps move across.
 export interface TenantEnv {
-  DB: SqlDb;
-  ACCOUNT: D1Database;
+  DB: TenantDb;
+  ACCOUNT: AccountDb;
   MAILBOX: DurableObjectNamespace<Mailbox>;
   TRANSCRIPTS: R2Bucket;
 }
@@ -425,7 +433,7 @@ export interface AccountApi {
   artifacts(
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     caller: Caller,
     rawName: string | undefined,
     rest: readonly string[],
@@ -633,7 +641,7 @@ const sharedArtifactName = (pathname: string): string | null => {
   return `/${segments[1]}/${segments[2]}` === ARTIFACTS_TAB.path ? (segments[3] ?? null) : null;
 };
 
-const tenantOf = (env: AppEnv, userId: string): DurableObjectStub<Tenant> =>
+const tenantOf = (env: Pick<AppEnv, "TENANT">, userId: string): DurableObjectStub<Tenant> =>
   env.TENANT.get(env.TENANT.idFromName(userId));
 
 // Everything the dashboard reads off an address before it knows who is asking: which tab the
@@ -820,7 +828,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return new Response(null, { status: 204 });
   };
 
-  const sessionHistoryIds = async (url: URL, db: SqlDb, caller: Caller): Promise<Response> =>
+  const sessionHistoryIds = async (url: URL, db: TenantDb, caller: Caller): Promise<Response> =>
     json(await listSessionHistoryIds(db, caller.userId, url.searchParams.get("cursor") ?? ""));
 
   // One session, addressed by its Claude Code session id, by the name the harness gave it, or by
@@ -864,7 +872,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // was asked for a thing outranks one that merely mentioned it. The full-text pass leading is
   // what bounds the scan — the alternative was reading every chunk on record, which cost a
   // search more every week the archive grew.
-  const sessionSearchHits = async (url: URL, db: SqlDb, userId: string): Promise<Parsed<SessionHit[]>> => {
+  const sessionSearchHits = async (url: URL, db: TenantDb, userId: string): Promise<Parsed<SessionHit[]>> => {
     const parsed = parseSessionSearch(url.searchParams);
     if (!parsed.ok) return parsed;
     const input = parsed.value;
@@ -920,7 +928,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return { ok: true, value: hits };
   };
 
-  const searchSessions = async (url: URL, db: SqlDb, userId: string): Promise<Response> => {
+  const searchSessions = async (url: URL, db: TenantDb, userId: string): Promise<Response> => {
     const hits = await sessionSearchHits(url, db, userId);
     return hits.ok ? json({ hits: hits.value }) : error(400, hits.error);
   };
@@ -978,7 +986,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return through >= mark.archived;
   };
 
-  const usage = async (request: Request, db: SqlDb, caller: Caller, sessionId: string): Promise<Response> => {
+  const usage = async (request: Request, db: TenantDb, caller: Caller, sessionId: string): Promise<Response> => {
     if (request.method !== "POST") return error(405, "method not allowed");
     const now = deps.now();
     const input = parseUsage(await readJson(request), now);
@@ -1067,7 +1075,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       // already paid for. The row is what a following box and the indexer are weighed against, so
       // it goes down before the storage event wakes either of them.
       if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived, landed.held).run();
+        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived, landed.held);
       }
       return json({ file: file.value, through: landed.through });
     }
@@ -1081,7 +1089,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       // at all. It is folded in with MAX, so a stretch landing below one already there leaves the
       // row where the further one put it.
       if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength, asked.from).run();
+        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength, asked.from);
       }
       return json({ file: file.value, offset: asked.from + body.byteLength });
     }
@@ -1103,7 +1111,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   // The handle is minted the same way the sessions listing mints it, so `recall send` takes it back
   // verbatim. A sender naming a session it does not have live is named by its host alone.
-  const senderOf = async (db: SqlDb, caller: Caller, fromSessionId: string, now: number): Promise<Sender> => {
+  const senderOf = async (db: TenantDb, caller: Caller, fromSessionId: string, now: number): Promise<Sender> => {
     const labels = await readLabels(db, caller.userId);
     const named =
       fromSessionId !== "" && (await sessionOnDevice(db, caller.userId, fromSessionId, caller.deviceId, now));
@@ -1151,7 +1159,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return request.method === "POST" ? postToBoard(request, env, caller, read) : error(405, "method not allowed");
   };
 
-  const readBoard = async (url: URL, db: SqlDb, userId: string): Promise<Response> => {
+  const readBoard = async (url: URL, db: TenantDb, userId: string): Promise<Response> => {
     const cursor = decodeCursor(url.searchParams.get("cursor") ?? "", "desc");
     if (cursor === null) return error(400, "cursor must be one this listing issued");
     return json(await listBoard(db, userId, BOARD_PAGE, cursor, deps.now()));
@@ -1203,7 +1211,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // session is the caller's: a session-addressed message is only taken from the device that session
   // runs on. The check lives in the claim rather than here because a session the hook has not
   // synced yet must leave its message waiting instead of having the pickup refused.
-  const pickUpBoard = async (request: Request, db: SqlDb, caller: Caller): Promise<Response> => {
+  const pickUpBoard = async (request: Request, db: TenantDb, caller: Caller): Promise<Response> => {
     const body = await readJson(request);
     const asked = isRecord(body) ? body.sessionId : undefined;
     if (typeof asked !== "string") return error(400, "sessionId must be the id of the session taking the messages");
@@ -1271,7 +1279,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // under is the dashboard's own notice; a private artifact of another account resolves to
   // neither, so the reader learns nothing about it.
   const shareTarget = async (
-    db: D1Database,
+    db: AccountDb,
     url: URL,
     userId: string,
     email: string,
@@ -1336,7 +1344,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const sharesTab = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1348,7 +1356,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (host === null || !host.sharing) return sharesPage(email, live, url, { kind: "off" });
     const target = await shareTarget(db, url, userId, email, live, rawName, lost);
     if (target instanceof Response) return target;
-    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
+    const shares = (await artifactShareList(db, userId, target.name, now)).map(shareViewOf);
     const { ask, flash } = askFor(url, shares);
     const state: ShareState = { shares, flash, minted: null, ask, emailDraft: "" };
     const page = sharePageOf(host, target, state, pageToken(request), now);
@@ -1359,7 +1367,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // redirect: the response carries the page, because a minted address exists on that one response
   // and nowhere else.
   const shareMutation = async (
-    db: D1Database,
+    db: AccountDb,
     host: ArtifactSurface,
     record: ArtifactRecord,
     shares: ShareView[],
@@ -1463,7 +1471,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const sharesPost = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1476,7 +1484,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const posted = await formPost(request, url);
     const target = await shareTarget(db, url, userId, email, live, rawName, lost);
     if (target instanceof Response) return target;
-    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
+    const shares = (await artifactShareList(db, userId, target.name, now)).map(shareViewOf);
     const csrf = pageToken(request);
     // Nothing is created, extended or revoked for a post that did not come from this page, and the
     // refusal says nothing the page does not already draw.
@@ -1596,7 +1604,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   const labelsTab = async (
     request: Request,
-    db: SqlDb,
+    db: TenantDb,
     userId: string,
     email: string,
     live: Live,
@@ -1608,7 +1616,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const saveLabels = async (
     request: Request,
     url: URL,
-    db: SqlDb,
+    db: TenantDb,
     userId: string,
     lost: Refusal,
   ): Promise<Response> => {
@@ -1768,7 +1776,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     });
   };
 
-  const statsTab = async (db: SqlDb, userId: string, email: string, live: Live, now: number): Promise<Response> => {
+  const statsTab = async (db: TenantDb, userId: string, email: string, live: Live, now: number): Promise<Response> => {
     const windows: StatsWindows = {
       month: dayWindow(now, USAGE_MONTH_DAYS),
       fortnight: dayWindow(now, USAGE_CHART_DAYS),
@@ -1780,8 +1788,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const insightsTab = async (
-    db: SqlDb,
-    account: D1Database,
+    db: TenantDb,
+    account: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1796,7 +1804,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   const historyTab = async (
     url: URL,
-    db: SqlDb,
+    db: TenantDb,
     userId: string,
     email: string,
     live: Live,
@@ -1832,7 +1840,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   const memoryBody = async (
     rawName: string,
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1847,7 +1855,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // One page of the shelf's rows and the counts the chips and the heading print. No bytes are read
   // and the bucket is not listed.
   const artifactRows = async (
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     input: ArtifactListInput,
     cursor: Cursor,
@@ -1871,7 +1879,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // by name rather than read per row, so the read is bounded by the page and not by the account.
   // Where sharing is off it does not run at all and every count is zero.
   const shelfFor = async (
-    db: D1Database,
+    db: AccountDb,
     host: ArtifactSurface,
     userId: string,
     input: ArtifactListInput,
@@ -1900,7 +1908,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // publishing and unpublishing stay with `recall publish` and `recall unpublish`.
   const artifactsTab = async (
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1918,7 +1926,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   const memoryTab = async (
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1950,7 +1958,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return memorySearchPage(email, live, url, filter, counts, found, now);
   };
 
-  const save = async (request: Request, db: D1Database, userId: string, name: string): Promise<Response> => {
+  const save = async (request: Request, db: AccountDb, userId: string, name: string): Promise<Response> => {
     const input = parseSave(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
@@ -1985,7 +1993,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // publish under it. A caller who does mean to replace reaches the account-readable one, and the
   // write permission decides whether they may.
   const writeTarget = async (
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     name: string,
     replacing: boolean,
@@ -2020,7 +2028,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const publish = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     host: ArtifactSurface,
     caller: Caller,
     name: string,
@@ -2103,7 +2111,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ artifact: viewOf(host, saved, shares), ownedByAnother: owner !== caller.userId });
   };
 
-  const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
+  const unpublish = async (db: AccountDb, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
     const target = await writeTarget(db, caller.userId, name, true);
     if (target instanceof Response) return target;
     if (target === null) {
@@ -2121,7 +2129,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   const artifactsListing = async (
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     host: ArtifactSurface,
     userId: string,
     now: number,
@@ -2149,7 +2157,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // How many live shares one artifact holds, read for its owner alone: an account reading somebody
   // else's account-readable artifact learns nothing about who else holds a share on it.
   const sharesHeld = async (
-    db: D1Database,
+    db: AccountDb,
     host: ArtifactSurface,
     record: ArtifactRecord,
     userId: string,
@@ -2183,7 +2191,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const artifactShareRoutes = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     host: ArtifactSurface,
     userId: string,
     name: string,
@@ -2196,7 +2204,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const record = await resolveArtifact(db, userId, name);
     if (record === null) return error(404, `no artifact named ${name}`);
     if (record.ownerUserId !== userId) return error(403, "only an artifact's owner shares it");
-    const remaining = async (): Promise<ShareView[]> => (await artifactShares(db, userId, name, now)).map(shareViewOf);
+    const remaining = async (): Promise<ShareView[]> =>
+      (await artifactShareList(db, userId, name, now)).map(shareViewOf);
     if (rawShareId !== undefined) {
       if (request.method !== "DELETE") return error(405, "method not allowed");
       const revoked = await revokeShares(db, userId, name, { kind: "one", shareId: rawShareId });
@@ -2215,7 +2224,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (!isRecord(body)) return error(400, "a share names a mode of link or email");
     const expiresAt = now + SHARE_WINDOW_MS;
     if (body.mode === "link") {
-      const shares = await artifactShares(db, userId, name, now);
+      const shares = await artifactShareList(db, userId, name, now);
       const token = newShareToken();
       const share = await replaceLinkShare(db, {
         shareId: newShareId(),
@@ -2234,7 +2243,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (body.mode !== "email") return error(400, "a share names a mode of link or email");
     const address = parseShareAddress(body.address);
     if (!address.ok) return error(400, address.error);
-    const shares = await artifactShares(db, userId, name, now);
+    const shares = await artifactShareList(db, userId, name, now);
     const addresses = shares.filter((one) => one.mode === "email");
     if (!addresses.some((one) => one.subject === address.value) && addresses.length >= MAX_EMAIL_SHARES) {
       return error(409, `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes`);
@@ -2258,7 +2267,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const artifacts = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     caller: Caller,
     rawName: string | undefined,
     rest: readonly string[],
@@ -2309,7 +2318,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ artifact: viewOf(host, record, await sharesHeld(db, host, record, userId, now)) });
   };
 
-  const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+  const list = async (url: URL, db: AccountDb, userId: string): Promise<Response> => {
     const input = parseList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
@@ -2318,7 +2327,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const vectorRankings = async (
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
@@ -2336,7 +2345,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const textRankings = async (
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
@@ -2349,7 +2358,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     };
   };
 
-  const rank = async (db: D1Database, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
+  const rank = async (db: AccountDb, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
     if (input.mode === "vector") return vectorRankings(db, userId, input, types);
     if (input.mode === "text") {
       const text = await textRankings(db, userId, input, types);
@@ -2366,7 +2375,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     };
   };
 
-  const hits = async (db: D1Database, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
+  const hits = async (db: AccountDb, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
     const top = ranking.slice(0, limit);
     if (top.length === 0) return [];
     const described = await describeMemories(
@@ -2384,7 +2393,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // What a query finds: the memories in scope of its tags, and the ones it would have found had the
   // tags not been named. Both surfaces rank the same way and differ only in how they write a hit.
   const ranked = async (
-    db: D1Database,
+    db: AccountDb,
     userId: string,
     input: SearchInput,
   ): Promise<{ shown: MemoryHit[]; nearby: MemoryHit[] }> => {
@@ -2396,7 +2405,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return { shown, nearby };
   };
 
-  const searched = async (db: D1Database, userId: string, input: SearchInput): Promise<unknown> => {
+  const searched = async (db: AccountDb, userId: string, input: SearchInput): Promise<unknown> => {
     const { shown, nearby } = await ranked(db, userId, input);
     const elsewhere = nearby.map(({ memory, score }) => ({
       score,
@@ -2408,13 +2417,13 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return { hits: shown, elsewhere };
   };
 
-  const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
+  const search = async (request: Request, db: AccountDb, userId: string): Promise<Response> => {
     const parsed = parseSearch(await readJson(request));
     if (!parsed.ok) return error(400, parsed.error);
     return json(await searched(db, userId, parsed.value));
   };
 
-  const v2MemoriesList = async (url: URL, db: D1Database, caller: Caller): Promise<Response> => {
+  const v2MemoriesList = async (url: URL, db: AccountDb, caller: Caller): Promise<Response> => {
     const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
@@ -2423,14 +2432,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ memories: page.memories.map(memoryView), nextCursor: page.nextCursor });
   };
 
-  const v2MemorySearch = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
+  const v2MemorySearch = async (request: Request, db: AccountDb, caller: Caller): Promise<Response> => {
     const input = parseSearchMemories(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const { shown, nearby } = await ranked(db, caller.userId, input.value);
     return json({ hits: shown.map(memoryHitView), elsewhere: nearby.map(nearbyMemoryView) });
   };
 
-  const v2MemorySave = async (request: Request, db: D1Database, caller: Caller, name: string): Promise<Response> => {
+  const v2MemorySave = async (request: Request, db: AccountDb, caller: Caller, name: string): Promise<Response> => {
     const input = parseSaveMemory(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
@@ -2442,7 +2451,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // Recalling a memory is a write, so it is a POST and the GET beside it is a read and nothing
   // more. `/v1` folded the two into one GET behind a query parameter, which left every reader of a
   // memory deciding whether it meant to count as one.
-  const v2MemoryRecall = async (db: D1Database, caller: Caller, name: string): Promise<Response> => {
+  const v2MemoryRecall = async (db: AccountDb, caller: Caller, name: string): Promise<Response> => {
     const memory = await getMemory(db, caller.userId, name);
     if (!memory) return error(404, `no memory named ${name}`);
     const [recalled] = await recall(db, caller.userId, [memory.memoryId], deps.now());
@@ -2455,7 +2464,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2Memories = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     caller: Caller,
     rawName: string | undefined,
     word: string | undefined,
@@ -2610,7 +2619,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return new Response(null, { status: 204 });
   };
 
-  const v2SessionsList = async (db: SqlDb, caller: Caller): Promise<Response> => {
+  const v2SessionsList = async (db: TenantDb, caller: Caller): Promise<Response> => {
     const [listed, labels] = await Promise.all([
       listSessions(db, caller.userId, deps.now()),
       readLabels(db, caller.userId),
@@ -2633,7 +2642,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return [...recorded, ...byBytes].sort((left, right) => left.file.localeCompare(right.file));
   };
 
-  const v2Session = async (bucket: R2Bucket, db: SqlDb, caller: Caller, target: string): Promise<Response> => {
+  const v2Session = async (bucket: R2Bucket, db: TenantDb, caller: Caller, target: string): Promise<Response> => {
     const found = await findSession(db, caller.userId, target, deps.now());
     if (!found) return error(404, `no session named ${target}`);
     const [files, labels] = await Promise.all([
@@ -2648,7 +2657,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2Files = async (
     request: Request,
     bucket: R2Bucket,
-    db: SqlDb,
+    db: TenantDb,
     caller: Caller,
     sessionId: string,
   ): Promise<Response> => {
@@ -2667,7 +2676,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     request: Request,
     url: URL,
     bucket: R2Bucket,
-    db: SqlDb,
+    db: TenantDb,
     caller: Caller,
     sessionId: string,
   ): Promise<Response> => {
@@ -2692,7 +2701,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return ndjson(archived.body, archived.gzip);
   };
 
-  const v2Usage = async (request: Request, db: SqlDb, caller: Caller, sessionId: string): Promise<Response> => {
+  const v2Usage = async (request: Request, db: TenantDb, caller: Caller, sessionId: string): Promise<Response> => {
     if (request.method !== "POST") return error(405, "method not allowed");
     const now = deps.now();
     const input = parseUsageDelta(await readJson(request), now, USAGE_EPOCH, DAY_MS);
@@ -2714,7 +2723,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2Records = async (
     request: Request,
     bucket: R2Bucket,
-    db: SqlDb,
+    db: TenantDb,
     caller: Caller,
     sessionId: string,
   ): Promise<Response> => {
@@ -2859,7 +2868,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // lost its commit leaves the archive ahead of the mark, and the gap fold that would have carried
   // the index over it only runs on another append; where the session ended there, the end of it is
   // the append that never came.
-  const closeSession = async (bucket: R2Bucket, db: SqlDb, userId: string, sessionId: string): Promise<void> => {
+  const closeSession = async (bucket: R2Bucket, db: TenantDb, userId: string, sessionId: string): Promise<void> => {
     const [open, held, chunkFrom, reach] = await Promise.all([
       openChunks(db, userId, sessionId, MAIN_FILE),
       recordReach(db, userId, sessionId, MAIN_FILE),
@@ -2888,7 +2897,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     request: Request,
     url: URL,
     bucket: R2Bucket,
-    db: SqlDb,
+    db: TenantDb,
     caller: Caller,
     rawSessionId: string | undefined,
     subresource: string | undefined,
@@ -2921,7 +2930,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // Every session the account has on record, and the ones a query finds by meaning. It is its own
   // collection rather than a scope of the sessions listing because `history` is a legal session id
   // and `/v2/sessions/history` would have answered two things depending on which one was meant.
-  const v2History = async (request: Request, url: URL, db: SqlDb, caller: Caller): Promise<Response> => {
+  const v2History = async (request: Request, url: URL, db: TenantDb, caller: Caller): Promise<Response> => {
     if (request.method !== "GET") return error(405, "method not allowed");
     const { userId } = caller;
     if (url.searchParams.get("q") === null) {
@@ -3089,7 +3098,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 };
 
 export const createApp = (deps: Deps): App => {
-  const authenticate = async (request: Request, db: D1Database): Promise<Caller | Response> => {
+  const authenticate = async (request: Request, db: AccountDb): Promise<Caller | Response> => {
     const authorization = request.headers.get("authorization") ?? "";
     const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     if (!TOKEN_PATTERN.test(token)) {
@@ -3110,7 +3119,7 @@ export const createApp = (deps: Deps): App => {
     return typeof body === "object" && body !== null && !Array.isArray(body) ? { ...body } : {};
   };
 
-  const startDevice = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
+  const startDevice = async (request: Request, url: URL, db: AccountDb): Promise<Response> => {
     const { device_name: deviceName } = await readParams(request);
     if (typeof deviceName !== "string" || !/^[\p{L}\p{N} ._'()-]{1,100}$/u.test(deviceName)) {
       return grantError("invalid_request", "device_name must hold 1 to 100 letters, digits, spaces or . _ ' ( ) -");
@@ -3137,7 +3146,7 @@ export const createApp = (deps: Deps): App => {
     });
   };
 
-  const pollDevice = async (request: Request, db: D1Database): Promise<Response> => {
+  const pollDevice = async (request: Request, db: AccountDb): Promise<Response> => {
     const { grant_type: grantType, device_code: deviceCode } = await readParams(request);
     if (grantType !== DEVICE_GRANT) return grantError("unsupported_grant_type", `grant_type must be ${DEVICE_GRANT}`);
     if (typeof deviceCode !== "string" || !TOKEN_PATTERN.test(deviceCode)) {
@@ -3148,7 +3157,7 @@ export const createApp = (deps: Deps): App => {
     return grantError(outcome.error, GRANT_ERRORS[outcome.error]);
   };
 
-  const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+  const listen = (request: Request, env: WorkerEnv, caller: Caller): Promise<Response> => {
     const upgrade = new Request(request.url, {
       headers: {
         upgrade: "websocket",
@@ -3174,7 +3183,7 @@ export const createApp = (deps: Deps): App => {
     return verified.principal.email;
   };
 
-  const invited = async (db: D1Database, email: string, refuse: Refusal): Promise<string | Response> => {
+  const invited = async (db: AccountDb, email: string, refuse: Refusal): Promise<string | Response> => {
     const userId = await userForEmail(db, email);
     return userId ?? refuse(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
   };
@@ -3283,7 +3292,7 @@ export const createApp = (deps: Deps): App => {
   // audio artifact, in a deployment that has turned sharing on; everything else is an account
   // reading somebody's artifact and gets an empty slot.
   const audienceFor = async (
-    db: D1Database,
+    db: AccountDb,
     host: ArtifactHost,
     record: ArtifactRecord,
     userId: string,
@@ -3301,7 +3310,7 @@ export const createApp = (deps: Deps): App => {
     };
   };
 
-  const artifactSite = async (request: Request, url: URL, db: D1Database, host: ArtifactHost): Promise<Response> => {
+  const artifactSite = async (request: Request, url: URL, db: AccountDb, host: ArtifactHost): Promise<Response> => {
     const notice = (refusal: ArtifactRefusal): Response => artifactNotice(refusal, host.dashboard);
     const lost = (): Response => notice({ kind: "lost" });
     if (request.method !== "GET") return notice({ kind: "method" });
@@ -3365,7 +3374,7 @@ export const createApp = (deps: Deps): App => {
   const shareFor = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    db: AccountDb,
     sharing: { verify: Verify },
     lane: { mode: ShareMode; credential: string },
     now: number,
@@ -3399,7 +3408,7 @@ export const createApp = (deps: Deps): App => {
   // they are one path: a share names its owner and the row is read directly rather than through
   // the account-readable fallback, so a share can never reach another account's artifact of the
   // same name.
-  const sharedSite = async (request: Request, url: URL, db: D1Database, host: ArtifactHost): Promise<Response> => {
+  const sharedSite = async (request: Request, url: URL, db: AccountDb, host: ArtifactHost): Promise<Response> => {
     const gone = (): Response => shareNotice({ kind: "gone" });
     if (request.method !== "GET") return shareNotice({ kind: "method" });
     const { sharing } = host;
@@ -3422,7 +3431,7 @@ export const createApp = (deps: Deps): App => {
     return artifactView(request, url, host, record, chrome, route, gone);
   };
 
-  const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
+  const devicePage = async (request: Request, url: URL, db: AccountDb): Promise<Response> => {
     if (request.method !== "GET" && request.method !== "POST") return error(405, "method not allowed");
     const email = await approver(request, deps.verify);
     if (email instanceof Response) return email;
@@ -3458,7 +3467,7 @@ export const createApp = (deps: Deps): App => {
       : messagePage(200, "Device denied", "The device gets no access. You can close this page.");
   };
 
-  const mcpCaller = async (request: Request, env: AppEnv, host: McpHost): Promise<Caller | Response> => {
+  const mcpCaller = async (request: Request, env: WorkerEnv, host: McpHost): Promise<Caller | Response> => {
     const assertion = request.headers.get("cf-access-jwt-assertion");
     const sentServiceHeaders = request.headers.get("cf-access-client-id") !== null;
     if (assertion === null) {
@@ -3504,7 +3513,7 @@ export const createApp = (deps: Deps): App => {
     return connectorDevice(env.DB, userId, deps.now());
   };
 
-  const mcp = (request: Request, env: AppEnv): Promise<Response> =>
+  const mcp = (request: Request, env: WorkerEnv): Promise<Response> =>
     mcpEndpoint(request, async () => {
       const host = deps.mcpHost;
       if (host === null) {
@@ -3548,7 +3557,7 @@ export const createApp = (deps: Deps): App => {
           },
   });
 
-  const dashboard = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
+  const dashboard = async (request: Request, url: URL, env: WorkerEnv): Promise<Response> => {
     const lost = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Back to the dashboard");
     const signIn = (status: number, title: string, text: string): Response =>
@@ -3577,7 +3586,7 @@ export const createApp = (deps: Deps): App => {
   const routeV2 = async (
     request: Request,
     url: URL,
-    env: AppEnv,
+    env: WorkerEnv,
     collection: string | undefined,
     rawName: string | undefined,
     rest: readonly string[],
@@ -3610,7 +3619,7 @@ export const createApp = (deps: Deps): App => {
     return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 
-  const route = async (request: Request, env: AppEnv): Promise<Response> => {
+  const route = async (request: Request, env: WorkerEnv): Promise<Response> => {
     const url = new URL(request.url);
     const host = deps.artifactHost;
     if (host !== null && url.hostname === host.hostname) {
@@ -3709,7 +3718,7 @@ export const createApp = (deps: Deps): App => {
       }
     },
     async fetch(request: Request, env: AppEnv): Promise<Response> {
-      return route(request, env).catch((failure: unknown) => {
+      return route(request, workerEnv(env)).catch((failure: unknown) => {
         const requestId = crypto.randomUUID();
         const message = failure instanceof Error ? failure.message : String(failure);
         console.error(
