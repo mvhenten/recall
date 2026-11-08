@@ -1,3 +1,4 @@
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { accessVerifier, type KeySource, localKeys } from "../src/access";
@@ -149,6 +150,17 @@ export interface Client {
   session(target: string): Promise<Response>;
   searchSessions(query: string, limit?: number): Promise<Response>;
 }
+
+// What the account's own rows look like from outside. They live in that account's Durable Object
+// now, so a test reading them reaches into the object rather than into D1.
+const inTenant = <T>(userId: string, read: (sql: SqlStorage) => T): Promise<T> =>
+  runInDurableObject(env.TENANT.get(env.TENANT.idFromName(userId)), (_instance, state) => read(state.storage.sql));
+
+// One statement against one account's own store, for a test standing a state no route writes or
+// reading one no route answers. The rows of every other account are in other objects entirely.
+export const tenantRows = <T>(userId: string, query: string, ...binds: SqlStorageValue[]): Promise<T[]> =>
+  // The row shape is the caller's assertion, the way `.all<Row>()` is on D1.
+  inTenant(userId, (sql) => sql.exec<Record<string, SqlStorageValue>>(query, ...binds).toArray() as T[]);
 
 const held = (body: string | Uint8Array): number =>
   typeof body === "string" ? new TextEncoder().encode(body).byteLength : body.byteLength;
@@ -691,18 +703,27 @@ export const harness = async ({
     dropArtifactFile: async (userId: string, name: string, rev: number, path: string): Promise<void> => {
       await env.ARTIFACTS.delete(`${userId}/${name}/${rev}/${path}`);
     },
-    indexMark: async (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
-      env.DB.prepare("SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?")
-        .bind(userId, sessionId)
-        .first<Record<string, number>>(),
-    chunks: async (userId: string, sessionId: string): Promise<string[]> => {
-      const { results } = await env.DB.prepare(
-        "SELECT text FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
-      )
-        .bind(userId, sessionId)
-        .all<{ text: string }>();
-      return results.map((row) => row.text);
-    },
+    indexMark: (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
+      inTenant(userId, (sql) =>
+        sql
+          .exec<Record<string, number>>(
+            "SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?",
+            userId,
+            sessionId,
+          )
+          .toArray(),
+      ).then((rows) => rows[0] ?? null),
+    chunks: (userId: string, sessionId: string): Promise<string[]> =>
+      inTenant(userId, (sql) =>
+        sql
+          .exec<{ text: string }>(
+            "SELECT text FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
+            userId,
+            sessionId,
+          )
+          .toArray()
+          .map((row) => row.text),
+      ),
     tick: (ms: number) => {
       clock += ms;
       return clock;

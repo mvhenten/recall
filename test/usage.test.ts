@@ -1,7 +1,6 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { MAX_USAGE_TOKENS, USAGE_EPOCH, USAGE_RETENTION_MS, usageDay } from "../src/model";
-import { type Client, harness } from "./harness";
+import { type Client, harness, tenantRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -36,25 +35,21 @@ const account = async (h: Harness, label: string): Promise<{ userId: string; cli
   return { userId, client: h.clientWithToken(await h.login(email, "laptop")) };
 };
 
-const daily = async (userId: string): Promise<DailyRow[]> => {
-  const { results } = await env.DB.prepare(
+const daily = (userId: string): Promise<DailyRow[]> =>
+  tenantRows<DailyRow>(
+    userId,
     `SELECT day, host, repo, account, provider, model, prompts, input_tokens, output_tokens,
        cache_write_tokens, cache_read_tokens
      FROM usage_daily WHERE user_id = ? ORDER BY day, model`,
-  )
-    .bind(userId)
-    .all<DailyRow>();
-  return results;
-};
+    userId,
+  );
 
-const events = async (userId: string): Promise<Array<{ session_id: string; seq: number; at: number }>> => {
-  const { results } = await env.DB.prepare(
+const events = (userId: string): Promise<Array<{ session_id: string; seq: number; at: number }>> =>
+  tenantRows<{ session_id: string; seq: number; at: number }>(
+    userId,
     "SELECT session_id, seq, at FROM usage_events WHERE user_id = ? ORDER BY session_id, seq",
-  )
-    .bind(userId)
-    .all<{ session_id: string; seq: number; at: number }>();
-  return results;
-};
+    userId,
+  );
 
 describe("usage", () => {
   it("counts a delta once however often the client resends it", async () => {

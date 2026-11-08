@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { sha256Hex } from "../src/device";
-import { harness } from "./harness";
+import { harness, tenantRows } from "./harness";
 
 interface ListedDevice {
   deviceId: string;
@@ -92,9 +92,13 @@ describe("device login", () => {
     const owner = await h.invite(email("owner"), userId);
     await h.login(owner, "ip-10-0-7-31");
     const client = h.clientWithToken(await h.login(owner, "tower"));
-    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
-      .bind(userId, "ip-10-0-7-31", "core")
-      .run();
+    await tenantRows(
+      userId,
+      "INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)",
+      userId,
+      "ip-10-0-7-31",
+      "core",
+    );
 
     expect(
       (await devicesOf(await client.request("GET", "/v1/devices"))).map((device) => [device.name, device.label]),
@@ -110,9 +114,13 @@ describe("device login", () => {
     const owner = await h.invite(email("owner"), userId);
     await h.login(owner, "core-box");
     const client = h.clientWithToken(await h.login(owner, "core-box"));
-    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
-      .bind(userId, "core-box", "core")
-      .run();
+    await tenantRows(
+      userId,
+      "INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)",
+      userId,
+      "core-box",
+      "core",
+    );
 
     expect(
       (await devicesOf(await client.request("GET", "/v1/devices"))).map((device) => [device.name, device.label]),

@@ -68,6 +68,7 @@ import {
   sharesPage,
   sharesPath,
   statsPage,
+  type Tab,
   TRANSCRIPT_SCRIPT_PATH,
   TRANSCRIPT_SEGMENT,
   type TranscriptPlan,
@@ -271,6 +272,8 @@ import {
   writeChunks,
   writeLabels,
 } from "./store";
+import type { Tenant } from "./tenant";
+import type { SqlDb } from "./tenant-sql";
 import {
   editedMemory,
   parseEditArgs,
@@ -329,13 +332,20 @@ import {
 // How a surface reads the address off a board post. The two differ only there.
 type PostReader = (input: unknown, userId: string) => Parsed<BoardPost>;
 
-export interface ArtifactHost {
+// What a request below the device token knows about artifacts: the addresses they answer on, the
+// bytes behind them, and whether this deployment shares any at all. The artifact hostname is the
+// Worker's to answer, so no assertion is proved below this.
+export interface ArtifactSurface {
   hostname: string;
-  verify: Verify;
   bucket: R2Bucket;
   // Where an artifact page's footer points. The artifact hostname answers artifacts and nothing
   // else, so the dashboard is a second host and this is the only place its address is known.
   dashboard: string;
+  sharing: boolean;
+}
+
+export interface ArtifactHost extends Omit<ArtifactSurface, "sharing"> {
+  verify: Verify;
   // One binding gates both share modes. `verify` is bound to the email share application's
   // audience and no other, so an assertion minted for the host's own application opens no share;
   // the link lane mints no assertion at all and its credential is the token in the address.
@@ -359,10 +369,39 @@ export interface Deps {
   now: () => number;
 }
 
+// What the tenant half is built with, which is the whole of what it depends on: nothing below the
+// device token proves an assertion, mints a device code or serves the connector's own endpoint.
+export interface TenantDeps {
+  embedder: Embedder;
+  artifacts: ArtifactSurface | null;
+  now: () => number;
+}
+
+// The Worker's bindings. `DB` is D1, which holds what a request reads before it knows whose
+// request it is: the invitations, the device codes and the devices.
 export interface AppEnv {
   DB: D1Database;
+  TENANT: DurableObjectNamespace<Tenant>;
   MAILBOX: DurableObjectNamespace<Mailbox>;
   TRANSCRIPTS: R2Bucket;
+}
+
+// What the tenant half reads. `DB` is this account's own store and nobody else's; `ACCOUNT` is the
+// D1 that still holds its artifacts and its memories, which later steps move across.
+export interface TenantEnv {
+  DB: SqlDb;
+  ACCOUNT: D1Database;
+  MAILBOX: DurableObjectNamespace<Mailbox>;
+  TRANSCRIPTS: R2Bucket;
+}
+
+// What crosses to a tenant object on every call. The clock is the one the Worker read, so one
+// request is one moment however many handlers read it; the embedder is handed over because the
+// deployment's model is the Worker's to name, and the artifact surface for the same reason.
+export interface TenantCall {
+  now: number;
+  embed(texts: string[]): Promise<Float32Array[]>;
+  artifacts: { hostname: string; dashboard: string; sharing: boolean } | null;
 }
 
 export type Delivered = Pick<Message<unknown>, "body" | "ack" | "retry">;
@@ -370,6 +409,27 @@ export type Delivered = Pick<Message<unknown>, "body" | "ack" | "retry">;
 export interface App {
   fetch(request: Request, env: AppEnv): Promise<Response>;
   consume(env: AppEnv, delivered: readonly Delivered[]): Promise<void>;
+}
+
+export interface TenantApi {
+  api(request: Request, env: TenantEnv, caller: Caller): Promise<Response>;
+  dashboard(request: Request, env: TenantEnv, userId: string, email: string): Promise<Response>;
+  tool(made: ToolCall, env: TenantEnv, caller: Caller): Promise<ToolResult>;
+  index(env: TenantEnv, userId: string, sessionId: string): Promise<boolean>;
+}
+
+// The artifacts collection, which the Worker answers for itself. Its rows are the account's and
+// its bytes are R2's, so nothing it does reads a row the tenant object holds, and a publish routed
+// through the object would stream a multipart body Worker to object to R2 for no gain.
+export interface AccountApi {
+  artifacts(
+    request: Request,
+    url: URL,
+    db: D1Database,
+    caller: Caller,
+    rawName: string | undefined,
+    rest: readonly string[],
+  ): Promise<Response>;
 }
 
 type Refusal = (status: number, title: string, text: string) => Response;
@@ -452,7 +512,7 @@ const MANIFEST_BYTES = 64 * 1024;
 // built and the reason a name can never collide with a route on that hostname.
 const artifactBase = (name: string): string => `${ARTIFACT_PREFIX}/${encodeURIComponent(name)}`;
 
-const viewOf = (host: ArtifactHost, record: ArtifactRecord, shares: number): ArtifactView => ({
+const viewOf = (host: ArtifactSurface, record: ArtifactRecord, shares: number): ArtifactView => ({
   name: record.name,
   url: `https://${host.hostname}${artifactBase(record.name)}`,
   type: record.type,
@@ -520,76 +580,185 @@ const decodeSegment = (segment: string): string | null => {
   }
 };
 
-export const createApp = (deps: Deps): App => {
-  const authenticate = async (request: Request, db: D1Database): Promise<Caller | Response> => {
-    const authorization = request.headers.get("authorization") ?? "";
-    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-    if (!TOKEN_PATTERN.test(token)) {
-      return error(401, "missing or malformed Authorization: Bearer <device token>; run recall login");
-    }
-    const caller = await deviceForToken(db, token, deps.now());
-    return caller ?? error(401, "this device token is unknown or revoked; run recall login");
+const mailboxFor = (env: { MAILBOX: DurableObjectNamespace<Mailbox> }, userId: string): DurableObjectStub<Mailbox> =>
+  env.MAILBOX.get(env.MAILBOX.idFromName(userId));
+
+// One file of one artifact, streamed. The request's own headers are handed to R2, so the slice is
+// R2's to compute and a seek in a long track never waits for the bytes before it. The manifest
+// names the content type, and a path the manifest does not name is a 404 whoever asks.
+// A file carries the policy a site's page does, because a document may hold HTML or SVG of its
+// publisher's and an address under a name is navigated to as readily as the name itself.
+// `sandbox` binds the document a navigation makes, and a subresource the player or a rendered
+// document asks for is fetched under the asking page's policy, so a track still plays and a
+// range still answers.
+const artifactFile = async (
+  request: Request,
+  bucket: R2Bucket,
+  record: ArtifactRecord,
+  path: string,
+  lost: () => Response,
+): Promise<Response> => {
+  const asked = parseFilePath(path);
+  if (!asked.ok) return lost();
+  const entry = record.files.find((file) => file.path === asked.value);
+  if (entry === undefined) return lost();
+  const object = await bucket.get(fileKey(record.ownerUserId, record.name, record.rev, entry.path), {
+    range: request.headers,
+    onlyIf: request.headers,
+  });
+  if (object === null) return lost();
+  const headers: Record<string, string> = {
+    "content-type": entry.contentType,
+    "cache-control": "private, no-cache",
+    "content-security-policy": ARTIFACT_CSP,
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    "accept-ranges": "bytes",
   };
+  if (!("body" in object)) return new Response(null, { status: 304, headers });
+  if (!request.headers.has("range")) return new Response(object.body, { headers });
+  return new Response(object.body, {
+    status: 206,
+    headers: { ...headers, "content-range": contentRangeOf(object.range, object.size) },
+  });
+};
 
-  const grantError = (code: string, description: string): Response =>
-    json({ error: code, error_description: description }, 400);
+// The artifact a share page is about, as the address holds it, and null where the address is no
+// share page at all. The segment is not decoded here: a state drawn for no artifact echoes the
+// address unrewritten, which is the page's to do.
+const sharedArtifactName = (pathname: string): string | null => {
+  const segments = pathname.replace(/\/$/, "").split("/");
+  if (segments.length !== 5 || segments[4] !== SHARES_SEGMENT) return null;
+  return `/${segments[1]}/${segments[2]}` === ARTIFACTS_TAB.path ? (segments[3] ?? null) : null;
+};
 
-  const readParams = async (request: Request): Promise<Record<string, unknown>> => {
-    if ((request.headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded")) {
-      return Object.fromEntries(new URLSearchParams(await request.text()));
-    }
-    const body = await readJson(request);
-    return typeof body === "object" && body !== null && !Array.isArray(body) ? { ...body } : {};
+const tenantOf = (env: AppEnv, userId: string): DurableObjectStub<Tenant> =>
+  env.TENANT.get(env.TENANT.idFromName(userId));
+
+// Everything the dashboard reads off an address before it knows who is asking: which tab the
+// address names, which session, and which of the four POSTs it is. The Worker weighs the method
+// against it and the tenant object draws the page from it, so the two never disagree about what
+// an address meant.
+interface DashboardAsk {
+  tab: Tab | null;
+  segments: string[];
+  rawSessionId: string;
+  bytes: boolean;
+  shareName: string | null;
+  saving: boolean;
+  posting: boolean;
+  sending: boolean;
+  sharing: boolean;
+}
+
+const dashboardAsk = (request: Request, url: URL): DashboardAsk => {
+  const tab = tabForPath(url.pathname);
+  const sessionPrefix = `${SESSIONS_PATH}/`;
+  const segments = url.pathname.startsWith(sessionPrefix) ? url.pathname.slice(sessionPrefix.length).split("/") : [];
+  const shareName = sharedArtifactName(url.pathname);
+  const posted = request.method === "POST";
+  return {
+    tab,
+    segments,
+    rawSessionId: segments[0] ?? "",
+    bytes: segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT,
+    shareName,
+    saving: posted && tab?.path === LABELS_TAB.path,
+    posting: posted && tab?.path === BOARD_TAB.path,
+    sending: posted && segments.length === 1,
+    sharing: posted && shareName !== null,
   };
+};
 
-  const startDevice = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
-    const { device_name: deviceName } = await readParams(request);
-    if (typeof deviceName !== "string" || !/^[\p{L}\p{N} ._'()-]{1,100}$/u.test(deviceName)) {
-      return grantError("invalid_request", "device_name must hold 1 to 100 letters, digits, spaces or . _ ' ( ) -");
-    }
-    const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown";
-    const started = await startDeviceCode(db, deviceName, clientIp, deps.deviceCodeLimits, deps.now());
-    if (!started) {
-      return json(
-        {
-          error: "slow_down",
-          error_description: "too many sign-ins are waiting for approval; try again in ten minutes",
-        },
-        429,
-      );
-    }
-    const userCode = formatUserCode(started.userCode);
-    return json({
-      device_code: started.deviceCode,
-      user_code: userCode,
-      verification_uri: `${url.origin}/device`,
-      verification_uri_complete: `${url.origin}/device?code=${userCode}`,
-      expires_in: DEVICE_CODE_TTL_MS / 1000,
-      interval: POLL_INTERVAL_S,
-    });
-  };
+// One stretch stored gzipped, handed over as it stands. A gzip member has no inner range, so the
+// manifest never splits a read of one and the whole object is the answer: the browser inflates it,
+// which leaves this reading no byte of the archive to touch and puts under a third of them on the
+// wire. This route sits behind the Access assertion, so every reader of it is a browser and every
+// browser takes gzip — `fetch` cannot drop the header — and the member goes over as it is.
+const compressedStretch = async (
+  request: Request,
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  name: string,
+  inflates: number,
+): Promise<Response> => {
+  if (request.headers.get("range") !== null) {
+    return error(416, `the stretch at ${name} is one gzip member, so it is read whole, as ${inflates} bytes`);
+  }
+  const object = await openStretch(bucket, userId, sessionId, file, name);
+  if (object === null) {
+    return error(404, `the archive holds no stretch of ${file} at ${name} of session ${sessionId}`);
+  }
+  return new Response(object.body, {
+    headers: {
+      "content-type": "application/x-ndjson",
+      "cache-control": "no-store",
+      "content-encoding": "gzip",
+    },
+  });
+};
 
-  const pollDevice = async (request: Request, db: D1Database): Promise<Response> => {
-    const { grant_type: grantType, device_code: deviceCode } = await readParams(request);
-    if (grantType !== DEVICE_GRANT) return grantError("unsupported_grant_type", `grant_type must be ${DEVICE_GRANT}`);
-    if (typeof deviceCode !== "string" || !TOKEN_PATTERN.test(deviceCode)) {
-      return grantError("invalid_request", "device_code is missing or malformed");
-    }
-    const outcome = await pollDeviceCode(db, deviceCode, deps.now());
-    if (outcome.ok) return json({ access_token: outcome.accessToken, token_type: "Bearer" });
-    return grantError(outcome.error, GRANT_ERRORS[outcome.error]);
-  };
+// The bytes of one stretch, streamed as they come off the archive. The key is built from the user
+// the Access assertion resolved to, so a caller reaches nothing outside its own prefix, and the
+// range is the browser's to choose: this reads no listing, joins no stretches and parses nothing,
+// which is the whole of why the window the reader sees is the browser's own business.
+//
+// It is answered in the Worker because it reads the archive and nothing else. A reader scrolling a
+// long transcript sends thousands of these, and routing each through the tenant object would buy
+// nothing it does not already have.
+const transcriptBytes = async (
+  request: Request,
+  url: URL,
+  bucket: R2Bucket,
+  userId: string,
+  rawSessionId: string,
+): Promise<Response> => {
+  const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+  if (!session.ok) return error(400, session.error);
+  const file = parseTranscriptFile(url.searchParams.get("file"));
+  if (!file.ok) return error(400, file.error);
+  const at = parseStretchName(url.searchParams.get("at"));
+  if (!at.ok) return error(400, at.error);
+  const packed = packedStretch(at.value);
+  if (packed !== null) {
+    return compressedStretch(request, bucket, userId, session.value, file.value, at.value, packed.inflates);
+  }
+  const asked = parseByteRange(request.headers.get("range"));
+  if (!asked.ok) return error(416, asked.error);
+  const { offset, length } = asked.value;
+  const object = await openStretch(bucket, userId, session.value, file.value, at.value, { offset, length });
+  if (object === null) {
+    return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
+  }
+  if (offset + length > object.size) {
+    return error(416, `the stretch at ${at.value} holds ${object.size} bytes`);
+  }
+  return new Response(object.body, {
+    status: 206,
+    headers: {
+      "content-type": "application/x-ndjson",
+      "cache-control": "no-store",
+      "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
+    },
+  });
+};
 
+export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const devices = async (
     request: Request,
-    env: AppEnv,
+    env: TenantEnv,
     caller: Caller,
     deviceId: string | undefined,
   ): Promise<Response> => {
-    const db = env.DB;
     if (deviceId === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
-      const [listed, labels] = await Promise.all([listDevices(db, caller.userId), readLabels(db, caller.userId)]);
+      const [listed, labels] = await Promise.all([
+        listDevices(env.ACCOUNT, caller.userId),
+        readLabels(env.DB, caller.userId),
+      ]);
       return json({
         devices: listed.map((device) => ({
           ...device,
@@ -600,7 +769,7 @@ export const createApp = (deps: Deps): App => {
     }
     if (request.method !== "DELETE") return error(405, "method not allowed");
     const target = deviceId === "current" ? caller.deviceId : deviceId;
-    if (!(await revokeDevice(db, caller.userId, target))) return error(404, `no device ${target}`);
+    if (!(await revokeDevice(env.ACCOUNT, caller.userId, target))) return error(404, `no device ${target}`);
     await mailboxFor(env, caller.userId).revoke(target);
     return new Response(null, { status: 204 });
   };
@@ -608,7 +777,7 @@ export const createApp = (deps: Deps): App => {
   const sessions = async (
     request: Request,
     url: URL,
-    env: AppEnv,
+    env: TenantEnv,
     caller: Caller,
     rawSessionId: string | undefined,
     subresource: string | undefined,
@@ -651,7 +820,7 @@ export const createApp = (deps: Deps): App => {
     return new Response(null, { status: 204 });
   };
 
-  const sessionHistoryIds = async (url: URL, db: D1Database, caller: Caller): Promise<Response> =>
+  const sessionHistoryIds = async (url: URL, db: SqlDb, caller: Caller): Promise<Response> =>
     json(await listSessionHistoryIds(db, caller.userId, url.searchParams.get("cursor") ?? ""));
 
   // One session, addressed by its Claude Code session id, by the name the harness gave it, or by
@@ -659,7 +828,7 @@ export const createApp = (deps: Deps): App => {
   // a host restoring the session asks once and then reads them. Those are counted off the objects:
   // a restore writes the files it is given to disk, so a count a second behind would write a
   // session short of its last stretch.
-  const session = async (env: AppEnv, caller: Caller, target: string): Promise<Response> => {
+  const session = async (env: TenantEnv, caller: Caller, target: string): Promise<Response> => {
     const db = env.DB;
     const found = await findSession(db, caller.userId, target, deps.now());
     if (!found) return error(404, `no session named ${target}`);
@@ -695,7 +864,7 @@ export const createApp = (deps: Deps): App => {
   // was asked for a thing outranks one that merely mentioned it. The full-text pass leading is
   // what bounds the scan — the alternative was reading every chunk on record, which cost a
   // search more every week the archive grew.
-  const sessionSearchHits = async (url: URL, db: D1Database, userId: string): Promise<Parsed<SessionHit[]>> => {
+  const sessionSearchHits = async (url: URL, db: SqlDb, userId: string): Promise<Parsed<SessionHit[]>> => {
     const parsed = parseSessionSearch(url.searchParams);
     if (!parsed.ok) return parsed;
     const input = parsed.value;
@@ -751,7 +920,7 @@ export const createApp = (deps: Deps): App => {
     return { ok: true, value: hits };
   };
 
-  const searchSessions = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+  const searchSessions = async (url: URL, db: SqlDb, userId: string): Promise<Response> => {
     const hits = await sessionSearchHits(url, db, userId);
     return hits.ok ? json({ hits: hits.value }) : error(400, hits.error);
   };
@@ -761,7 +930,7 @@ export const createApp = (deps: Deps): App => {
   // where the bite ended in the file and never how much it read, so a pass over a hole in the
   // archive moves on rather than reading the same bite again. The pass answers where it reached,
   // which is what says whether there is more.
-  const indexBite = async (env: AppEnv, userId: string, sessionId: string, mark: IndexMark): Promise<number> => {
+  const indexBite = async (env: TenantEnv, userId: string, sessionId: string, mark: IndexMark): Promise<number> => {
     const bite = await readStretch(
       env.TRANSCRIPTS,
       userId,
@@ -801,7 +970,7 @@ export const createApp = (deps: Deps): App => {
   //
   // A bite that reaches no further than the last is the end of what the objects hold, whatever the
   // cache says, and answers caught up rather than asking for those bytes again on every event.
-  const indexSession = async (env: AppEnv, userId: string, sessionId: string): Promise<boolean> => {
+  const indexSession = async (env: TenantEnv, userId: string, sessionId: string): Promise<boolean> => {
     const mark = await indexMark(env.DB, userId, sessionId);
     if (mark === null || mark.indexed >= mark.archived) return true;
     const through = await indexBite(env, userId, sessionId, mark);
@@ -809,7 +978,7 @@ export const createApp = (deps: Deps): App => {
     return through >= mark.archived;
   };
 
-  const usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
+  const usage = async (request: Request, db: SqlDb, caller: Caller, sessionId: string): Promise<Response> => {
     if (request.method !== "POST") return error(405, "method not allowed");
     const now = deps.now();
     const input = parseUsage(await readJson(request), now);
@@ -830,7 +999,7 @@ export const createApp = (deps: Deps): App => {
   const transcript = async (
     request: Request,
     url: URL,
-    env: AppEnv,
+    env: TenantEnv,
     caller: Caller,
     sessionId: string,
   ): Promise<Response> => {
@@ -898,7 +1067,7 @@ export const createApp = (deps: Deps): App => {
       // already paid for. The row is what a following box and the indexer are weighed against, so
       // it goes down before the storage event wakes either of them.
       if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived).run();
+        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived, landed.held).run();
       }
       return json({ file: file.value, through: landed.through });
     }
@@ -912,7 +1081,7 @@ export const createApp = (deps: Deps): App => {
       // at all. It is folded in with MAX, so a stretch landing below one already there leaves the
       // row where the further one put it.
       if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength).run();
+        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength, asked.from).run();
       }
       return json({ file: file.value, offset: asked.from + body.byteLength });
     }
@@ -932,12 +1101,9 @@ export const createApp = (deps: Deps): App => {
     );
   };
 
-  const mailboxFor = (env: AppEnv, userId: string): DurableObjectStub<Mailbox> =>
-    env.MAILBOX.get(env.MAILBOX.idFromName(userId));
-
   // The handle is minted the same way the sessions listing mints it, so `recall send` takes it back
   // verbatim. A sender naming a session it does not have live is named by its host alone.
-  const senderOf = async (db: D1Database, caller: Caller, fromSessionId: string, now: number): Promise<Sender> => {
+  const senderOf = async (db: SqlDb, caller: Caller, fromSessionId: string, now: number): Promise<Sender> => {
     const labels = await readLabels(db, caller.userId);
     const named =
       fromSessionId !== "" && (await sessionOnDevice(db, caller.userId, fromSessionId, caller.deviceId, now));
@@ -948,7 +1114,7 @@ export const createApp = (deps: Deps): App => {
     };
   };
 
-  const sendMessage = async (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
+  const sendMessage = async (request: Request, env: TenantEnv, caller: Caller): Promise<Response> => {
     const input = parseSend(await readJson(request));
     if (!input.ok) return error(400, input.error);
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
@@ -956,7 +1122,7 @@ export const createApp = (deps: Deps): App => {
     }
     const { toDeviceId, toSessionId, fromSessionId } = input.value;
     const now = deps.now();
-    if (!(await hasDevice(env.DB, caller.userId, toDeviceId))) return error(404, `no device ${toDeviceId}`);
+    if (!(await hasDevice(env.ACCOUNT, caller.userId, toDeviceId))) return error(404, `no device ${toDeviceId}`);
     if (toSessionId !== "" && !(await sessionOnDevice(env.DB, caller.userId, toSessionId, toDeviceId, now))) {
       return error(404, `no session ${toSessionId} on device ${toDeviceId}`);
     }
@@ -972,20 +1138,20 @@ export const createApp = (deps: Deps): App => {
   const board = async (
     request: Request,
     url: URL,
-    db: D1Database,
+    env: TenantEnv,
     caller: Caller,
     segment: string | undefined,
     read: PostReader,
   ): Promise<Response> => {
     if (segment === "pickup") {
-      return request.method === "POST" ? pickUpBoard(request, db, caller) : error(405, "method not allowed");
+      return request.method === "POST" ? pickUpBoard(request, env.DB, caller) : error(405, "method not allowed");
     }
     if (segment !== undefined) return error(404, "not found");
-    if (request.method === "GET") return readBoard(url, db, caller.userId);
-    return request.method === "POST" ? postToBoard(request, db, caller, read) : error(405, "method not allowed");
+    if (request.method === "GET") return readBoard(url, env.DB, caller.userId);
+    return request.method === "POST" ? postToBoard(request, env, caller, read) : error(405, "method not allowed");
   };
 
-  const readBoard = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+  const readBoard = async (url: URL, db: SqlDb, userId: string): Promise<Response> => {
     const cursor = decodeCursor(url.searchParams.get("cursor") ?? "", "desc");
     if (cursor === null) return error(400, "cursor must be one this listing issued");
     return json(await listBoard(db, userId, BOARD_PAGE, cursor, deps.now()));
@@ -995,31 +1161,31 @@ export const createApp = (deps: Deps): App => {
   // waiting on a device or a session that is not this account's would sit on the board for a week
   // with nobody who could ever take it.
   const addressFor = async (
-    db: D1Database,
+    env: TenantEnv,
     userId: string,
     address: BoardAddress,
   ): Promise<BoardAddress | Response> => {
-    if (address.scope === "host" && !(await hasDevice(db, userId, address.target))) {
+    if (address.scope === "host" && !(await hasDevice(env.ACCOUNT, userId, address.target))) {
       return error(404, `no device ${address.target}`);
     }
-    if (address.scope === "session" && !(await sessionOnRecord(db, userId, address.target))) {
+    if (address.scope === "session" && !(await sessionOnRecord(env.DB, userId, address.target))) {
       return error(404, `no session ${address.target}`);
     }
     return address;
   };
 
-  const postToBoard = async (request: Request, db: D1Database, caller: Caller, read: PostReader): Promise<Response> => {
+  const postToBoard = async (request: Request, env: TenantEnv, caller: Caller, read: PostReader): Promise<Response> => {
     const input = read(await readJson(request), caller.userId);
     if (!input.ok) return error(400, input.error);
     if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
       return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
     }
     const now = deps.now();
-    const address = await addressFor(db, caller.userId, input.value.address);
+    const address = await addressFor(env, caller.userId, input.value.address);
     if (address instanceof Response) return address;
-    const from = await senderOf(db, caller, input.value.fromSessionId, now);
+    const from = await senderOf(env.DB, caller, input.value.fromSessionId, now);
     return json(
-      await postBoardMessage(db, {
+      await postBoardMessage(env.DB, {
         userId: caller.userId,
         messageId: crypto.randomUUID(),
         address,
@@ -1037,7 +1203,7 @@ export const createApp = (deps: Deps): App => {
   // session is the caller's: a session-addressed message is only taken from the device that session
   // runs on. The check lives in the claim rather than here because a session the hook has not
   // synced yet must leave its message waiting instead of having the pickup refused.
-  const pickUpBoard = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
+  const pickUpBoard = async (request: Request, db: SqlDb, caller: Caller): Promise<Response> => {
     const body = await readJson(request);
     const asked = isRecord(body) ? body.sessionId : undefined;
     if (typeof asked !== "string") return error(400, "sessionId must be the id of the session taking the messages");
@@ -1051,6 +1217,1935 @@ export const createApp = (deps: Deps): App => {
       pickedUpAt: now,
     };
     return json({ messages: await claimBoardMessages(db, caller.userId, taker, now) });
+  };
+
+  // The token every dashboard form posts back. A browser holds one cookie for the whole site, so
+  // a page that minted a fresh one on each view would invalidate the form of every page already
+  // open; the cookie it arrived with is the token it keeps.
+  const pageToken = (request: Request): string =>
+    readCookie(request.headers.get("cookie"), CSRF_COOKIE) ?? randomToken();
+
+  // What a dashboard form post is worth: the fields it carries, and whether it came from a page
+  // of this site holding the cookie's token. The caller decides how to answer an untrusted one.
+  const formPost = async (request: Request, url: URL): Promise<{ form: URLSearchParams; trusted: boolean }> => {
+    const form = new URLSearchParams(await request.text());
+    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
+    const trusted =
+      request.headers.get("origin") === url.origin && cookie !== null && sameSecret(cookie, form.get("csrf") ?? "");
+    return { form, trusted };
+  };
+
+  // The whole address a share answers on, built in one place. For a link it exists on the one
+  // response that mints it and nowhere else, because storage holds only the token's hash.
+  const shareAddress = (host: ArtifactSurface, mode: ShareMode, credential: string): string =>
+    `https://${host.hostname}${mode === "link" ? SHARE_LINK_PREFIX : SHARE_EMAIL_PREFIX}/${credential}`;
+
+  const dayOf = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
+  const GONE_FLASH: ShareFlash = { tone: "refused", text: "That share is already gone." };
+
+  const UNTRUSTED_FLASH: ShareFlash = {
+    tone: "refused",
+    text: "This form did not come from this page, so nothing was created, extended or revoked; reload the page and try again.",
+  };
+
+  // Where a row the mutation just wrote belongs in the list the page already read: the link first,
+  // then the addresses oldest first, which is the order the index supplies. The list is rebuilt
+  // rather than read again, so a POST costs the page's two reads and its one write and no more.
+  const sameSubject = (left: ShareView, right: ShareView): boolean => {
+    if (left.shareId === right.shareId) return true;
+    if (left.mode === "link" && right.mode === "link") return true;
+    return left.mode === "email" && right.mode === "email" && left.address === right.address;
+  };
+
+  const relisted = (shares: readonly ShareView[], written: ShareView): ShareView[] => {
+    const others = shares.filter((one) => !sameSubject(one, written));
+    const link = written.mode === "link" ? written : others.find((one) => one.mode === "link");
+    const addresses = [...(written.mode === "email" ? [written] : []), ...others.filter((one) => one.mode === "email")];
+    addresses.sort((left, right) => left.createdAt - right.createdAt);
+    return [...(link === undefined ? [] : [link]), ...addresses];
+  };
+
+  // The artifact a share page draws, or the state it draws instead of one, off one read. A name
+  // this account does not own answers the 403 the API answers, and a name it holds no artifact
+  // under is the dashboard's own notice; a private artifact of another account resolves to
+  // neither, so the reader learns nothing about it.
+  const shareTarget = async (
+    db: D1Database,
+    url: URL,
+    userId: string,
+    email: string,
+    live: Live,
+    rawName: string,
+    lost: Refusal,
+  ): Promise<ArtifactRecord | Response> => {
+    const name = parseName(decodeSegment(rawName) ?? "");
+    const record = name.ok ? await resolveArtifact(db, userId, name.value) : null;
+    if (record === null) {
+      return lost(404, "No such artifact", "This recall publishes no artifact under this name.");
+    }
+    if (record.ownerUserId !== userId) return sharesPage(email, live, url, { kind: "foreign" });
+    return record;
+  };
+
+  // The question the query asks, against the shares the page holds. An id naming no live share is
+  // not a question at all: the page says so and lists what remains.
+  const askFor = (url: URL, shares: readonly ShareView[]): { ask: ShareAsk | null; flash: ShareFlash | null } => {
+    if (url.searchParams.get("relink") === "1") {
+      return shares.some((share) => share.mode === "link")
+        ? { ask: { kind: "relink" }, flash: null }
+        : { ask: null, flash: GONE_FLASH };
+    }
+    const revoke = url.searchParams.get("revoke");
+    if (revoke === null) return { ask: null, flash: null };
+    if (revoke === "all") {
+      return shares.length === 0
+        ? { ask: null, flash: GONE_FLASH }
+        : { ask: { kind: "revoke-all", count: shares.length }, flash: null };
+    }
+    const share = shares.find((one) => one.shareId === revoke);
+    return share === undefined ? { ask: null, flash: GONE_FLASH } : { ask: { kind: "revoke", share }, flash: null };
+  };
+
+  interface ShareState {
+    shares: ShareView[];
+    flash: ShareFlash | null;
+    minted: Minted | null;
+    ask: ShareAsk | null;
+    emailDraft: string;
+  }
+
+  const sharePageOf = (
+    host: ArtifactSurface,
+    record: ArtifactRecord,
+    state: ShareState,
+    csrf: string,
+    now: number,
+  ): SharePage => ({
+    artifact: viewOf(host, record, state.shares.length),
+    shares: state.shares,
+    csrf,
+    flash: state.flash,
+    minted: state.minted,
+    ask: state.ask,
+    emailDraft: state.emailDraft,
+    emailFull: state.shares.filter((share) => share.mode === "email").length >= MAX_EMAIL_SHARES,
+    now,
+  });
+
+  const sharesTab = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    rawName: string,
+    now: number,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const host = deps.artifacts;
+    if (host === null || !host.sharing) return sharesPage(email, live, url, { kind: "off" });
+    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
+    if (target instanceof Response) return target;
+    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
+    const { ask, flash } = askFor(url, shares);
+    const state: ShareState = { shares, flash, minted: null, ask, emailDraft: "" };
+    const page = sharePageOf(host, target, state, pageToken(request), now);
+    return sharesPage(email, live, url, { kind: "page", page });
+  };
+
+  // Every mutation the page posts, each one write against the artifact's own shares. Nothing is a
+  // redirect: the response carries the page, because a minted address exists on that one response
+  // and nowhere else.
+  const shareMutation = async (
+    db: D1Database,
+    host: ArtifactSurface,
+    record: ArtifactRecord,
+    shares: ShareView[],
+    form: URLSearchParams,
+    now: number,
+  ): Promise<ShareState> => {
+    const { ownerUserId: userId, name } = record;
+    const expiresAt = now + SHARE_WINDOW_MS;
+    const kept = (extra: Partial<ShareState>): ShareState => ({
+      shares,
+      flash: null,
+      minted: null,
+      ask: null,
+      emailDraft: "",
+      ...extra,
+    });
+    const mintedLink = async (replacing: boolean): Promise<ShareState> => {
+      const token = newShareToken();
+      const input = { shareId: newShareId(), userId, name, subject: await hashShareToken(token), at: now, expiresAt };
+      const made = replacing ? await replaceLinkShare(db, input) : await createLinkShare(db, input);
+      // A live link refused the write, which is the one reload worth catching: the page asks
+      // whether to retire the address already in use rather than minting a second one.
+      if (made === null) return kept({ ask: { kind: "relink" } });
+      return kept({
+        shares: relisted(shares, shareViewOf(made)),
+        minted: { mode: "link", address: shareAddress(host, "link", token), expiresAt: made.expiresAt },
+      });
+    };
+    const todo = form.get("do") ?? "";
+    if (todo === "email") {
+      const typed = form.get("address") ?? "";
+      const address = parseShareAddress(typed);
+      if (!address.ok) return kept({ flash: { tone: "refused", text: address.error }, emailDraft: typed });
+      const addresses = shares.filter((share) => share.mode === "email");
+      const renewing = addresses.some((share) => share.mode === "email" && share.address === address.value);
+      if (!renewing && addresses.length >= MAX_EMAIL_SHARES) {
+        return kept({
+          flash: {
+            tone: "refused",
+            text: `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes, so ${address.value} was not shared.`,
+          },
+          emailDraft: typed,
+        });
+      }
+      await deleteDeadEmailShare(db, userId, name, address.value, now);
+      const made = await createEmailShare(db, {
+        shareId: newShareId(),
+        userId,
+        name,
+        subject: address.value,
+        at: now,
+        expiresAt,
+      });
+      return kept({
+        shares: relisted(shares, shareViewOf(made.share)),
+        flash: made.renewed
+          ? { tone: "done", text: `${address.value} already held a share, so its expiry moved instead.` }
+          : null,
+        minted: {
+          mode: "email",
+          address: shareAddress(host, "email", made.share.shareId),
+          recipient: address.value,
+          expiresAt: made.share.expiresAt,
+        },
+      });
+    }
+    if (todo === "link") return mintedLink(false);
+    if (todo === "relink") return mintedLink(true);
+    if (todo === "extend") {
+      const extended = await extendLinkShare(db, userId, name, now, expiresAt);
+      if (extended === null) return kept({ flash: GONE_FLASH });
+      return kept({
+        shares: relisted(shares, shareViewOf(extended)),
+        flash: { tone: "done", text: `The link share now stops working on ${dayOf(extended.expiresAt)}.` },
+      });
+    }
+    if (todo === "revoke") {
+      const shareId = form.get("share") ?? "";
+      const going = shares.find((share) => share.shareId === shareId);
+      if (going === undefined) return kept({ flash: GONE_FLASH });
+      const revoked = await revokeShares(db, userId, name, { kind: "one", shareId });
+      if (revoked === 0) return kept({ flash: GONE_FLASH });
+      return kept({
+        shares: shares.filter((share) => share.shareId !== shareId),
+        flash: {
+          tone: "done",
+          text: going.mode === "link" ? "The link share is revoked." : `The share with ${going.address} is revoked.`,
+        },
+      });
+    }
+    if (todo === "revoke-all") {
+      const revoked = await revokeShares(db, userId, name, { kind: "all" });
+      return kept({
+        shares: [],
+        flash: revoked === 0 ? GONE_FLASH : { tone: "done", text: `Every share on ${name} is revoked.` },
+      });
+    }
+    return kept({});
+  };
+
+  const sharesPost = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    rawName: string,
+    now: number,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const host = deps.artifacts;
+    if (host === null || !host.sharing) return sharesPage(email, live, url, { kind: "off" });
+    const posted = await formPost(request, url);
+    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
+    if (target instanceof Response) return target;
+    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
+    const csrf = pageToken(request);
+    // Nothing is created, extended or revoked for a post that did not come from this page, and the
+    // refusal says nothing the page does not already draw.
+    if (!posted.trusted) {
+      const state: ShareState = { shares, flash: UNTRUSTED_FLASH, minted: null, ask: null, emailDraft: "" };
+      return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) }, 403);
+    }
+    const state = await shareMutation(db, host, target, shares, posted.form, now);
+    return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) });
+  };
+
+  // The addresses the form offers, which are the pairs the board stores rather than strings a
+  // second resolver would have to read: the fleet, every host signed in, and every live session.
+  const boardOptions = async (env: TenantEnv, userId: string, now: number): Promise<BoardOption[]> => {
+    const [hosts, live, labels] = await Promise.all([
+      listDevices(env.ACCOUNT, userId),
+      listSessions(env.DB, userId, now),
+      readLabels(env.DB, userId),
+    ]);
+    return [
+      { value: FLEET_OPTION, label: "The fleet — the first session anywhere that reads it" },
+      ...hosts.map((host) => ({
+        value: `host:${host.deviceId}`,
+        label: `${labels.hosts.get(host.host) ?? host.host} — the first session on that host`,
+      })),
+      ...live.map((session) => ({ value: `session:${session.sessionId}`, label: `${session.name} — that session` })),
+    ];
+  };
+
+  const askedAddress = (to: string, userId: string): BoardAddress | null => {
+    if (to === FLEET_OPTION) return { scope: "fleet", target: userId };
+    const colon = to.indexOf(":");
+    if (colon < 1) return null;
+    const scope = to.slice(0, colon);
+    const target = to.slice(colon + 1);
+    if (target === "") return null;
+    if (scope === "host") return { scope: "host", target };
+    return scope === "session" ? { scope: "session", target } : null;
+  };
+
+  const boardTab = async (
+    request: Request,
+    url: URL,
+    env: TenantEnv,
+    userId: string,
+    email: string,
+    live: Live,
+    now: number,
+  ): Promise<Response> => {
+    const csrf = pageToken(request);
+    const options = await boardOptions(env, userId, now);
+    const render = async (post: BoardPoster, status: number): Promise<Response> => {
+      const cursor = pageCursor(url.searchParams.get(CURSOR_PARAM) ?? "", "desc");
+      const listed = await listBoard(env.DB, userId, BOARD_PAGE, cursor, now);
+      return boardPage(email, live, url, { ...listed, post }, now, status);
+    };
+    if (request.method === "GET") {
+      const posted = readCookie(request.headers.get("cookie"), SENT_COOKIE) === BOARD_TAB.path;
+      return render({ csrf, to: FLEET_OPTION, draft: "", flash: posted ? { tone: "posted" } : null, options }, 200);
+    }
+    return postFromDashboard(request, url, env, userId, email, now, csrf, options, render);
+  };
+
+  // The dashboard's own post, which is the Labels tab's post shape pointed at the board. A browser
+  // carries no device token, so it cannot reach `POST /v1/board`; what it shares with it is the
+  // table. Every refusal re-renders with the typing still in the box and says what went wrong.
+  const postFromDashboard = async (
+    request: Request,
+    url: URL,
+    env: TenantEnv,
+    userId: string,
+    email: string,
+    now: number,
+    csrf: string,
+    options: BoardOption[],
+    render: (post: BoardPoster, status: number) => Promise<Response>,
+  ): Promise<Response> => {
+    const posted = await formPost(request, url);
+    const body = posted.form.get("body") ?? "";
+    const to = posted.form.get("to") ?? FLEET_OPTION;
+    const refuse = (text: string, status: number): Promise<Response> =>
+      render({ csrf, to, draft: body, flash: { tone: "refused", text }, options }, status);
+    if (!posted.trusted) {
+      return refuse("The form did not come from this page, so nothing was posted. Post it again from here.", 403);
+    }
+    if (body.trim() === "") return refuse("The message was empty, so nothing was posted.", 400);
+    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
+      return refuse(
+        `A message holds at most ${MAX_BODY_BYTES} bytes, and this one is longer. Nothing was posted.`,
+        400,
+      );
+    }
+    const asked = askedAddress(to, userId);
+    if (asked === null) return refuse("That is not an address this page offers, so nothing was posted.", 400);
+    const address = await addressFor(env, userId, asked);
+    if (address instanceof Response) {
+      return refuse("That host or session is no longer on this account, so nothing was posted.", 400);
+    }
+    await postBoardMessage(env.DB, {
+      userId,
+      messageId: crypto.randomUUID(),
+      address,
+      fromDeviceId: DASHBOARD_DEVICE,
+      fromHost: DASHBOARD_DEVICE,
+      fromName: email,
+      body,
+      createdAt: now,
+    });
+    return new Response(null, {
+      status: 303,
+      headers: {
+        location: BOARD_TAB.path,
+        "set-cookie": `${SENT_COOKIE}=${BOARD_TAB.path}; Path=/; Max-Age=30; Secure; HttpOnly; SameSite=Strict`,
+      },
+    });
+  };
+
+  const labelsTab = async (
+    request: Request,
+    db: SqlDb,
+    userId: string,
+    email: string,
+    live: Live,
+  ): Promise<Response> => {
+    const [targets, labels] = await Promise.all([labelTargets(db, userId), readLabels(db, userId)]);
+    return labelsPage(email, live, targets, labels, pageToken(request));
+  };
+
+  const saveLabels = async (
+    request: Request,
+    url: URL,
+    db: SqlDb,
+    userId: string,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const posted = await formPost(request, url);
+    if (!posted.trusted) {
+      return lost(403, "Request refused", "The form did not come from this page. Reload it and try again.");
+    }
+    const labels = parseLabels(posted.form);
+    if (!labels.ok) return lost(400, "Labels refused", `${labels.error}.`);
+    await writeLabels(db, userId, labels.value);
+    return new Response(null, { status: 303, headers: { location: LABELS_TAB.path } });
+  };
+
+  // What the page tells the browser about a session's transcript: which files it holds, and where
+  // every stretch of the chosen one sits. It is one listing and no reads — the browser fetches the
+  // bytes it wants itself, off the stretches named here.
+  const transcriptPlan = async (
+    env: TenantEnv,
+    userId: string,
+    sessionId: string,
+    url: URL,
+  ): Promise<TranscriptPlan | Response> => {
+    const wanted = url.searchParams.get("file");
+    const chosen = wanted === null ? { ok: true as const, value: MAIN_FILE } : parseTranscriptFile(wanted);
+    if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
+    const file = chosen.value;
+    const held = await archivedTranscript(env.TRANSCRIPTS, userId, sessionId);
+    if (held.length === 0) return { kind: "none" };
+    const files = held.map((archived) => archived.file);
+    const archive = held.find((archived) => archived.file === file);
+    if (archive === undefined || archive.bytes === 0) return { kind: "missing", file, files };
+    return { kind: "read", file, files, bytes: archive.bytes, runs: archive.runs };
+  };
+
+  // Whether anyone is still running the session, and the stretches of its file around and past
+  // where the reader has read. A box following a live session beats against this, so it answers
+  // off the cheapest readings there are: the extent the storage event caches says whether the
+  // file has grown past where the reader has read, and a beat that finds it has not opens no
+  // object and lists nothing at all.
+  //
+  // That extent is a cache and lags the objects for as long as the event behind it is in flight,
+  // so it is trusted to say a file has grown and never to say it has not. A session no event has
+  // ever landed for keeps no row at all, and that one never corrects itself; with no row the
+  // objects are listed regardless, so a reader is never left watching a box that beats on in
+  // silence about a session writing away.
+  //
+  // The cursor is where the reader has read to and the stretch it read to the end of, and the two
+  // come off the manifest the archive itself wrote: a read is taken whole, so `from` is always the
+  // end of the stretch `after` names. That pair is what bounds the listing a beat pays for — the
+  // page opens past `after` and its first object sits at `from` — so a beat over a session of ten
+  // thousand stretches costs what one over a session of ten costs. The reader reads forward from
+  // `from` across whatever comes back.
+  //
+  // Only the session's own file is followed. Every other file is a delegated turn, which derives
+  // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
+  const transcriptTail = async (url: URL, env: TenantEnv, userId: string, rawSessionId: string): Promise<Response> => {
+    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!session.ok) return error(400, session.error);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    if (file.value !== MAIN_FILE) return error(400, `only ${MAIN_FILE} is followed as it is written`);
+    const from = parseStretchOffset(url.searchParams.get("from"));
+    if (!from.ok) return error(400, from.error);
+    const after = parseStretchCursor(url.searchParams.get("after"));
+    if (!after.ok) return error(400, after.error);
+    const [mark, device] = await Promise.all([
+      indexMark(env.DB, userId, session.value),
+      liveSessionDevice(env.DB, userId, session.value, deps.now()),
+    ]);
+    const grown = mark === null || mark.archived > from.value;
+    const runs = grown
+      ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value)
+      : [];
+    const reach: Reach = { running: device !== null, runs };
+    return json(reach, 200, { "cache-control": "no-store" });
+  };
+
+  // One session the dashboard can read and talk to. The page is reached by clicking a row of the
+  // ledger or the history, and both carry sessions this account has on record, live or long over.
+  const sessionDetail = async (
+    request: Request,
+    url: URL,
+    env: TenantEnv,
+    userId: string,
+    email: string,
+    live: Live,
+    rawSessionId: string,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const parsed = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!parsed.ok) return lost(404, "No such session", "The dashboard has no page at this address.");
+    const now = deps.now();
+    const found = await findSession(env.DB, userId, parsed.value, now);
+    if (!found) return lost(404, "No such session", `This recall holds no session ${parsed.value}.`);
+    const { session } = found;
+    const [deviceId, spend, labels] = await Promise.all([
+      liveSessionDevice(env.DB, userId, session.sessionId, now),
+      sessionSpend(env.DB, userId, session.sessionId),
+      readLabels(env.DB, userId),
+    ]);
+    const csrf = pageToken(request);
+    const render = async (flash: Flash | null, draft: string, status: number): Promise<Response> => {
+      const transcript = await transcriptPlan(env, userId, session.sessionId, url);
+      if (transcript instanceof Response) return transcript;
+      const view: SessionView = { session, deviceId, spend, transcript, send: { csrf, draft, flash } };
+      return sessionPage(email, live, view, labels, now, status);
+    };
+    if (request.method === "GET") {
+      const sent = readCookie(request.headers.get("cookie"), SENT_COOKIE) === session.sessionId;
+      return render(sent ? { tone: "sent" } : null, "", 200);
+    }
+    return sendToSession(request, url, env, userId, email, session.sessionId, deviceId, render);
+  };
+
+  // The dashboard's own send, which is the Labels tab's post shape pointed at the message bus: an
+  // origin and CSRF check, then the same publish `POST /v1/messages` makes. A browser carries no
+  // device token, so it cannot reach that endpoint; what it shares with it is the mailbox.
+  //
+  // Every refusal, the refused origin and token among them, re-renders the page with the typing
+  // still in the box and says what went wrong, since a send box that clears itself and shows
+  // nothing is indistinguishable from one that worked.
+  const sendToSession = async (
+    request: Request,
+    url: URL,
+    env: TenantEnv,
+    userId: string,
+    email: string,
+    sessionId: string,
+    deviceId: string | null,
+    render: (flash: Flash | null, draft: string, status: number) => Promise<Response>,
+  ): Promise<Response> => {
+    const posted = await formPost(request, url);
+    const body = posted.form.get("body") ?? "";
+    const refuse = (text: string, status: number): Promise<Response> => render({ tone: "refused", text }, body, status);
+    if (!posted.trusted) {
+      return refuse("The form did not come from this page, so nothing was sent. Send it again from here.", 403);
+    }
+    if (body.trim() === "") return refuse("The message was empty, so nothing was sent.", 400);
+    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
+      return refuse(`A message holds at most ${MAX_BODY_BYTES} bytes, and this one is longer. Nothing was sent.`, 400);
+    }
+    if (deviceId === null) {
+      return refuse("No host is running this session any more, so the bus has nowhere to deliver it.", 400);
+    }
+    if (!(await hasDevice(env.ACCOUNT, userId, deviceId))) {
+      return refuse("The host that ran this session is signed out, so the bus has nowhere to deliver it.", 400);
+    }
+    const sender: Sender = { deviceId: DASHBOARD_DEVICE, host: DASHBOARD_DEVICE, name: email };
+    const input: SendInput = { kind: "news", toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
+    await mailboxFor(env, userId).publish(input, sender, deps.now());
+    return new Response(null, {
+      status: 303,
+      headers: {
+        location: sessionPath(sessionId),
+        "set-cookie": `${SENT_COOKIE}=${sessionId}; Path=/; Max-Age=30; Secure; HttpOnly; SameSite=Strict`,
+      },
+    });
+  };
+
+  const statsTab = async (db: SqlDb, userId: string, email: string, live: Live, now: number): Promise<Response> => {
+    const windows: StatsWindows = {
+      month: dayWindow(now, USAGE_MONTH_DAYS),
+      fortnight: dayWindow(now, USAGE_CHART_DAYS),
+      week: dayWindow(now, USAGE_WEEK_DAYS),
+      prior: dayWindow(now - USAGE_WEEK_DAYS * DAY_MS, USAGE_WEEK_DAYS),
+    };
+    const [stats, labels] = await Promise.all([readStats(db, userId, windows), readLabels(db, userId)]);
+    return statsPage(email, live, stats, labels, now);
+  };
+
+  const insightsTab = async (
+    db: SqlDb,
+    account: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    now: number,
+  ): Promise<Response> =>
+    insightsPage(email, live, await readInsights(db, account, userId, dayWindow(now, USAGE_CHART_DAYS), now), now);
+
+  // A page link cut from an order a reader has since left behind, or one a hand edited, reads as
+  // page one rather than as an error: the address still names the list it names.
+  const pageCursor = (cursor: string, direction: "desc" | "asc"): Cursor =>
+    decodeCursor(cursor, direction) ?? decodeCursor("", direction) ?? [Number.MAX_SAFE_INTEGER, ""];
+
+  const historyTab = async (
+    url: URL,
+    db: SqlDb,
+    userId: string,
+    email: string,
+    live: Live,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const chosen = sortInForce(url, HISTORY_SORTS);
+    const input = parseHistory(url.searchParams, chosen.sort);
+    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
+    const filter = input.value;
+    const now = deps.now();
+    const match = filter.query === "" ? null : ftsQuery(filter.query);
+    const page =
+      filter.query === ""
+        ? {
+            ...(await listSessionHistory(
+              db,
+              userId,
+              filter,
+              pageCursor(filter.cursor, historyCursorDirection(filter.sort)),
+              now,
+            )),
+            cut: false,
+          }
+        : {
+            nextCursor: "",
+            ...(match === null
+              ? { sessions: [], cut: false }
+              : await searchSessionHistory(db, userId, filter, match, MAX_SEARCH_MATCHES, now)),
+          };
+    const [known, labels] = await Promise.all([sessionHistoryFilters(db, userId), readLabels(db, userId)]);
+    return historyPage(email, live, url, filter, known, page.sessions, page.nextCursor, page.cut, labels);
+  };
+
+  const memoryBody = async (
+    rawName: string,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const name = parseName(decodeSegment(rawName) ?? "");
+    const memory = name.ok ? await getMemory(db, userId, name.value) : null;
+    if (!memory) return lost(404, "No such memory", "This recall holds no memory at this address.");
+    return memoryBodyPage(email, live, memory, deps.now());
+  };
+
+  // One page of the shelf's rows and the counts the chips and the heading print. No bytes are read
+  // and the bucket is not listed.
+  const artifactRows = async (
+    db: D1Database,
+    userId: string,
+    input: ArtifactListInput,
+    cursor: Cursor,
+  ): Promise<{ artifacts: ArtifactRecord[]; counts: ArtifactCounts; nextCursor: string; cut: boolean }> => {
+    const match = input.query === "" ? null : ftsQuery(input.query);
+    const [counts, page] = await Promise.all([
+      artifactCounts(db, userId),
+      input.query === ""
+        ? listArtifactPage(db, userId, input, cursor).then((read) => ({ ...read, cut: false }))
+        : match === null
+          ? Promise.resolve({ artifacts: [], nextCursor: "", cut: false })
+          : searchArtifacts(db, userId, input.type, match, MAX_SEARCH_MATCHES).then((found) => ({
+              ...found,
+              nextCursor: "",
+            })),
+    ]);
+    return { artifacts: page.artifacts, counts, nextCursor: page.nextCursor, cut: page.cut };
+  };
+
+  // The shelf, with the third read: the live share counts for the artifacts on this page, grouped
+  // by name rather than read per row, so the read is bounded by the page and not by the account.
+  // Where sharing is off it does not run at all and every count is zero.
+  const shelfFor = async (
+    db: D1Database,
+    host: ArtifactSurface,
+    userId: string,
+    input: ArtifactListInput,
+    cursor: Cursor,
+    now: number,
+  ): Promise<ArtifactShelf> => {
+    const page = await artifactRows(db, userId, input, cursor);
+    const counted = !host.sharing
+      ? new Map<string, number>()
+      : await shareCountsFor(
+          db,
+          userId,
+          page.artifacts.map((record) => record.name),
+          now,
+        );
+    return {
+      artifacts: page.artifacts.map((record) => viewOf(host, record, counted.get(record.name) ?? 0)),
+      counts: page.counts,
+      nextCursor: page.nextCursor,
+      cut: page.cut,
+    };
+  };
+
+  // The artifacts this account has published, off the same listing `GET /v1/artifacts` reads and
+  // scoped by the user the Access assertion resolved to. The tab browses and nothing else:
+  // publishing and unpublishing stay with `recall publish` and `recall unpublish`.
+  const artifactsTab = async (
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const host = deps.artifacts;
+    if (host === null) return artifactsPage(email, live, url, { kind: "off" });
+    const chosen = sortInForce(url, ARTIFACT_SORTS);
+    const input = parseArtifactList(url.searchParams, chosen.sort);
+    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
+    const cursor = pageCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
+    const shelf = await shelfFor(db, host, userId, input.value, cursor, deps.now());
+    return artifactsPage(email, live, url, { kind: "shelf", shelf });
+  };
+
+  const memoryTab = async (
+    url: URL,
+    db: D1Database,
+    userId: string,
+    email: string,
+    live: Live,
+    lost: Refusal,
+  ): Promise<Response> => {
+    const chosen = sortInForce(url, MEMORY_SORTS);
+    const input = parseList(url.searchParams, chosen.sort);
+    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
+    const filter = input.value;
+    const now = deps.now();
+    const counts = await memoryCounts(db, userId, now - FRESH_WINDOW_MS);
+    const query = url.searchParams.get("q") ?? "";
+    if (query === "") {
+      const cursor = pageCursor(filter.cursor, memoryCursorDirection(filter.sort));
+      const page = await listMemories(db, userId, filter, cursor);
+      return memoriesPage(email, live, url, filter, counts, page.memories, page.nextCursor, now);
+    }
+    const searched = parseSearch({
+      query,
+      tags: filter.tags,
+      any: filter.tags.length === 0,
+      limit: filter.limit,
+      minScore: DEFAULT_MIN_SCORE,
+      mode: "hybrid",
+    });
+    if (!searched.ok) return lost(400, "Search refused", `${searched.error}.`);
+    const rankings = await rank(db, userId, searched.value, filter.types);
+    const found = await hits(db, userId, rankings.inScope, searched.value.limit);
+    return memorySearchPage(email, live, url, filter, counts, found, now);
+  };
+
+  const save = async (request: Request, db: D1Database, userId: string, name: string): Promise<Response> => {
+    const input = parseSave(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
+    if (!vector) throw new Error("the embedder answered the memory with no vector");
+    const saved = await saveMemory(db, userId, name, input.value, quantize(vector), deps.now());
+    return json(saved, saved.created ? 201 : 200);
+  };
+
+  // What a publish is refused with when the name is taken: the artifact, its type, its size, when
+  // it was last written and the email that wrote it, in a string the CLI prints verbatim and in
+  // fields a tool reads.
+  const conflict = (record: ArtifactRecord): Response =>
+    json(
+      {
+        error: `${record.name} already holds a ${record.type} artifact of ${sizeText(record.bytes)}, last written ${momentOf(
+          record.updatedAt,
+        )} by ${record.lastWriter === "" ? "a device of this account" : record.lastWriter}; pass --replace to replace it`,
+        artifact: {
+          name: record.name,
+          type: record.type,
+          bytes: record.bytes,
+          updatedAt: record.updatedAt,
+          lastWriter: record.lastWriter,
+        },
+      },
+      409,
+    );
+
+  // What a write would replace. The caller's own row comes first and is the only one a write that
+  // is not replacing anything may find: one account publishing a name for the account to read must
+  // not take that name away from everyone else, who would otherwise be refused their own first
+  // publish under it. A caller who does mean to replace reaches the account-readable one, and the
+  // write permission decides whether they may.
+  const writeTarget = async (
+    db: D1Database,
+    userId: string,
+    name: string,
+    replacing: boolean,
+  ): Promise<ArtifactRecord | Response | null> => {
+    const own = await getArtifact(db, userId, name);
+    if (own !== null) return own;
+    if (!replacing) return null;
+    const shared = await resolveArtifact(db, userId, name);
+    if (shared === null || shared.write === "account") return shared;
+    return error(403, "this artifact's write permission is owner, and only its owner replaces or deletes it");
+  };
+
+  // The revision a failed publish wrote, and the one a publish that worked replaced. Neither is
+  // reachable from any address once the commit has run, so a delete that fails costs a dead
+  // revision an unpublish collects later rather than the answer the caller is owed.
+  const collect = (bucket: R2Bucket, userId: string, name: string, rev: number): Promise<void> =>
+    deleteRevision(bucket, userId, name, rev).catch((failure: unknown) => {
+      console.error(
+        JSON.stringify({
+          error: failure instanceof Error ? failure.message : String(failure),
+          collecting: `${userId}/${name}/${rev}`,
+          stack: failure instanceof Error ? failure.stack : "",
+        }),
+      );
+    });
+
+  // The publish. The manifest, the stored row and the gates come first and write nothing; then the
+  // revision is claimed in D1, so the prefix every file streams into is one no other writer can
+  // reach; then one compare-and-swap moves the row forward, which is the publish. Anything that
+  // fails before that statement leaves the artifact and every one of its files exactly as they
+  // were.
+  const publish = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    host: ArtifactSurface,
+    caller: Caller,
+    name: string,
+  ): Promise<Response> => {
+    const tooLarge = (): Response =>
+      error(413, `a file holds at most ${MAX_FILE_BYTES} bytes and an artifact at most ${MAX_ARTIFACT_BYTES}`);
+    const boundary = boundaryOf(request.headers.get("content-type") ?? "");
+    if (boundary === null || request.body === null) {
+      return error(400, "a publish sends multipart/form-data: a manifest part, then one part per file");
+    }
+    const declared = Number(request.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_ARTIFACT_BYTES) return tooLarge();
+    const parts = readMultipart(request.body, boundary);
+    const head = await parts.nextPart();
+    if (head === null || head.name !== "manifest") return error(400, "the first part must be named manifest");
+    const text = await parts.text(MANIFEST_BYTES);
+    if (text === null) return error(400, `the manifest part holds at most ${MANIFEST_BYTES} bytes`);
+    const manifest = parseManifest(jsonOrNull(text));
+    if (!manifest.ok) return error(400, manifest.error);
+    const declaredFiles = manifest.value.files;
+    const total = declaredFiles.reduce((running, file) => running + file.bytes, 0);
+    if (total > MAX_ARTIFACT_BYTES || declaredFiles.some((file) => file.bytes > MAX_FILE_BYTES)) return tooLarge();
+    const replacing = url.searchParams.get("replace") === "true";
+    const target = await writeTarget(db, caller.userId, name, replacing);
+    if (target instanceof Response) return target;
+    if (target !== null && !replacing) return conflict(target);
+    const owner = target?.ownerUserId ?? caller.userId;
+    if (manifest.value.read === "account" && (await accountReadableElsewhere(db, owner, name))) {
+      return error(409, `another account publishes ${name} for this recall to read; publish it under another name`);
+    }
+    const rev = await claimRevision(db, owner, name);
+    const refuse = async (status: number, message: string): Promise<Response> => {
+      await collect(host.bucket, owner, name, rev);
+      return error(status, message);
+    };
+    const files: ArtifactFile[] = [];
+    for (const file of declaredFiles) {
+      const part = await parts.nextPart();
+      if (part === null) {
+        return refuse(400, `the manifest names ${declaredFiles.length} files and the body holds ${files.length}`);
+      }
+      // R2 takes a stream whose length is known, so the length the manifest declared is the length
+      // the object is written at and the part is held to it exactly.
+      const sized = new FixedLengthStream(file.bytes);
+      const stored = host.bucket.put(fileKey(owner, name, rev, file.path), sized.readable);
+      const written = await parts.pipe(sized.writable, file.bytes);
+      if (!written.ok) {
+        await stored.catch(() => undefined);
+        return refuse(400, `${file.path} holds ${written.bytes} bytes and the manifest names ${file.bytes}`);
+      }
+      await stored;
+      files.push({ path: file.path, bytes: file.bytes, contentType: contentTypeFor(file.path) });
+    }
+    const commit = {
+      userId: owner,
+      name,
+      rev,
+      type: manifest.value.type,
+      title: manifest.value.title,
+      description: manifest.value.description,
+      read: manifest.value.read,
+      write: manifest.value.write,
+      files,
+      at: deps.now(),
+      writerUserId: caller.userId,
+    };
+    const committed =
+      target === null ? await createArtifact(db, commit) : await replaceArtifact(db, commit, target.rev);
+    if (!committed) {
+      await collect(host.bucket, owner, name, rev);
+      const held = await getArtifact(db, owner, name);
+      return held === null
+        ? error(409, `${name} was written by another request while this one was publishing`)
+        : conflict(held);
+    }
+    const saved = await getArtifact(db, owner, name);
+    if (saved === null) throw new Error(`artifact ${name} vanished right after it was published`);
+    if (target !== null) await collect(host.bucket, owner, name, target.rev);
+    const shares = await sharesHeld(db, host, saved, caller.userId, deps.now());
+    return json({ artifact: viewOf(host, saved, shares), ownedByAnother: owner !== caller.userId });
+  };
+
+  const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
+    const target = await writeTarget(db, caller.userId, name, true);
+    if (target instanceof Response) return target;
+    if (target === null) {
+      // An artifact published before a row carried its type has bytes and no row, and unpublishing
+      // it is still deleting what the address serves.
+      const legacy = await bucket.head(fileKey(caller.userId, name, 0, ""));
+      if (legacy === null) return error(404, `no artifact named ${name}`);
+      await bucket.delete(legacy.key);
+      return new Response(null, { status: 204 });
+    }
+    await deleteArtifactWithShares(db, target.ownerUserId, name);
+    await deleteArtifactFiles(bucket, target.ownerUserId, name);
+    return new Response(null, { status: 204 });
+  };
+
+  const artifactsListing = async (
+    url: URL,
+    db: D1Database,
+    host: ArtifactSurface,
+    userId: string,
+    now: number,
+  ): Promise<Response> => {
+    const chosen = sortInForce(url, ARTIFACT_SORTS);
+    const input = parseArtifactList(url.searchParams, chosen.sort);
+    if (!input.ok) return error(400, input.error);
+    const cursor = decodeCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
+    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
+    // One optional param turns the page's third read from the counts into the rows themselves,
+    // which is what `recall shares` with no name walks instead of a collection of its own.
+    const wanted = url.searchParams.get("shares") === "true" && host.sharing;
+    const page = await artifactRows(db, userId, input.value, cursor);
+    const names = page.artifacts.map((record) => record.name);
+    const held = wanted ? await sharesFor(db, userId, names, now) : new Map<string, ShareRecord[]>();
+    const counted = wanted || !host.sharing ? new Map<string, number>() : await shareCountsFor(db, userId, names, now);
+    const artifacts = page.artifacts.map((record) => {
+      const shares = held.get(record.name) ?? [];
+      const view = viewOf(host, record, wanted ? shares.length : (counted.get(record.name) ?? 0));
+      return wanted ? { ...view, shares: shares.map(shareViewOf) } : view;
+    });
+    return json({ artifacts, nextCursor: page.nextCursor, total: page.counts.total, cut: page.cut });
+  };
+
+  // How many live shares one artifact holds, read for its owner alone: an account reading somebody
+  // else's account-readable artifact learns nothing about who else holds a share on it.
+  const sharesHeld = async (
+    db: D1Database,
+    host: ArtifactSurface,
+    record: ArtifactRecord,
+    userId: string,
+    now: number,
+  ): Promise<number> => {
+    if (!host.sharing || record.ownerUserId !== userId) return 0;
+    return shareCount(db, userId, record.name, now);
+  };
+
+  // What a `DELETE` on the collection names, which is exactly one of three. Naming none or more
+  // than one is refused by naming the three rather than picking one.
+  const revokeSelector = (url: URL): Parsed<RevokeScope> => {
+    const asked: RevokeScope[] = [];
+    if (url.searchParams.has("link")) asked.push({ kind: "link" });
+    if (url.searchParams.has("email")) {
+      const address = parseShareAddress(url.searchParams.get("email"));
+      if (!address.ok) return address;
+      asked.push({ kind: "email", address: address.value });
+    }
+    if (url.searchParams.get("all") === "true") asked.push({ kind: "all" });
+    const [scope] = asked;
+    if (asked.length !== 1 || scope === undefined) {
+      return fail("a revoke names exactly one of link, email=<address> and all=true");
+    }
+    return { ok: true, value: scope };
+  };
+
+  // The shares of one artifact, nested under the artifact that owns them: a share is meaningless
+  // without it, and the ownership check that answers the 403 falls out of the lookup the path
+  // already requires.
+  const artifactShareRoutes = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    host: ArtifactSurface,
+    userId: string,
+    name: string,
+    rawShareId: string | undefined,
+    now: number,
+  ): Promise<Response> => {
+    if (!host.sharing) {
+      return error(404, "this recall shares no artifacts; its deployment binds no share audience");
+    }
+    const record = await resolveArtifact(db, userId, name);
+    if (record === null) return error(404, `no artifact named ${name}`);
+    if (record.ownerUserId !== userId) return error(403, "only an artifact's owner shares it");
+    const remaining = async (): Promise<ShareView[]> => (await artifactShares(db, userId, name, now)).map(shareViewOf);
+    if (rawShareId !== undefined) {
+      if (request.method !== "DELETE") return error(405, "method not allowed");
+      const revoked = await revokeShares(db, userId, name, { kind: "one", shareId: rawShareId });
+      if (revoked === 0) return error(404, `no share ${rawShareId} on ${name}`);
+      return json({ revoked, shares: await remaining() });
+    }
+    if (request.method === "GET") return json({ shares: await remaining() });
+    if (request.method === "DELETE") {
+      const scope = revokeSelector(url);
+      if (!scope.ok) return error(400, scope.error);
+      const revoked = await revokeShares(db, userId, name, scope.value);
+      return json({ revoked, shares: await remaining() });
+    }
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const body = await readJson(request);
+    if (!isRecord(body)) return error(400, "a share names a mode of link or email");
+    const expiresAt = now + SHARE_WINDOW_MS;
+    if (body.mode === "link") {
+      const shares = await artifactShares(db, userId, name, now);
+      const token = newShareToken();
+      const share = await replaceLinkShare(db, {
+        shareId: newShareId(),
+        userId,
+        name,
+        subject: await hashShareToken(token),
+        at: now,
+        expiresAt,
+      });
+      return json({
+        share: shareViewOf(share),
+        address: shareAddress(host, "link", token),
+        replaced: shares.some((one) => one.mode === "link"),
+      });
+    }
+    if (body.mode !== "email") return error(400, "a share names a mode of link or email");
+    const address = parseShareAddress(body.address);
+    if (!address.ok) return error(400, address.error);
+    const shares = await artifactShares(db, userId, name, now);
+    const addresses = shares.filter((one) => one.mode === "email");
+    if (!addresses.some((one) => one.subject === address.value) && addresses.length >= MAX_EMAIL_SHARES) {
+      return error(409, `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes`);
+    }
+    await deleteDeadEmailShare(db, userId, name, address.value, now);
+    const made = await createEmailShare(db, {
+      shareId: newShareId(),
+      userId,
+      name,
+      subject: address.value,
+      at: now,
+      expiresAt,
+    });
+    return json({
+      share: shareViewOf(made.share),
+      address: shareAddress(host, "email", made.share.shareId),
+      renewed: made.renewed,
+    });
+  };
+
+  const artifacts = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    caller: Caller,
+    rawName: string | undefined,
+    rest: readonly string[],
+  ): Promise<Response> => {
+    const host = deps.artifacts;
+    if (host === null) {
+      return error(404, "this recall publishes no artifacts; its deployment names no artifact hostname");
+    }
+    const { bucket } = host;
+    const { userId } = caller;
+    const now = deps.now();
+    if (rawName === undefined) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      return artifactsListing(url, db, host, userId, now);
+    }
+    // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
+    // shadowed by an artifact named adopt.
+    if (rawName === "adopt" && rest.length === 0 && request.method === "POST") {
+      return json({ adopted: await adoptArtifacts(db, bucket, userId) });
+    }
+    const name = parseName(decodeSegment(rawName) ?? "");
+    if (!name.ok) return error(400, name.error);
+    // Under a name the next segment is a route word and nothing else, which is what frees `shares`
+    // beside `files` and is the same rule the artifact hostname holds: no position where a name or
+    // a file path meets a route.
+    const [word, ...tail] = rest;
+    if (word === SHARES_SEGMENT) {
+      if (tail.length > 1) return error(404, "not found");
+      return artifactShareRoutes(request, url, db, host, userId, name.value, tail[0], now);
+    }
+    if (word === "files") {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      const subpath = tail.join("/");
+      const lost = (): Response => error(404, `no file ${subpath} in artifact ${name.value}`);
+      if (subpath === "") return lost();
+      const record = await resolveArtifact(db, userId, name.value);
+      if (record === null) return lost();
+      return artifactFile(request, bucket, record, subpath, lost);
+    }
+    if (word !== undefined) return error(404, "not found");
+    if (request.method === "PUT") return publish(request, url, db, host, caller, name.value);
+    if (request.method === "DELETE") return unpublish(db, bucket, caller, name.value);
+    if (request.method !== "GET") return error(405, "method not allowed");
+    // The same artifact a read of one of its files names, so a shared artifact never answers its
+    // files over the API while refusing to say anything about itself.
+    const record = await resolveArtifact(db, userId, name.value);
+    if (record === null) return error(404, `no artifact named ${name.value}`);
+    return json({ artifact: viewOf(host, record, await sharesHeld(db, host, record, userId, now)) });
+  };
+
+  const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
+    const input = parseList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
+    if (!input.ok) return error(400, input.error);
+    const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
+    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
+    return json(await listMemories(db, userId, input.value, cursor));
+  };
+
+  const vectorRankings = async (
+    db: D1Database,
+    userId: string,
+    input: SearchInput,
+    types: MemoryType[],
+  ): Promise<Rankings> => {
+    const [vector] = await deps.embedder.embed([input.query]);
+    if (!vector) throw new Error("the embedder answered the query with no vector");
+    const inScope: Ranking = [];
+    const elsewhere: Ranking = [];
+    for (const candidate of await vectorCandidates(db, userId, input.tags, types)) {
+      const score = dot(vector, candidate.embedding);
+      if (score >= input.minScore) (candidate.inScope ? inScope : elsewhere).push([candidate.memoryId, score]);
+    }
+    const byScore = (a: [string, number], b: [string, number]): number => b[1] - a[1];
+    return { inScope: inScope.sort(byScore), elsewhere: elsewhere.sort(byScore) };
+  };
+
+  const textRankings = async (
+    db: D1Database,
+    userId: string,
+    input: SearchInput,
+    types: MemoryType[],
+  ): Promise<{ inScope: string[]; elsewhere: string[] }> => {
+    const match = ftsQuery(input.query);
+    const candidates = match ? await textCandidates(db, userId, input.tags, types, match) : [];
+    return {
+      inScope: candidates.filter((candidate) => candidate.inScope).map((candidate) => candidate.memoryId),
+      elsewhere: candidates.filter((candidate) => !candidate.inScope).map((candidate) => candidate.memoryId),
+    };
+  };
+
+  const rank = async (db: D1Database, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
+    if (input.mode === "vector") return vectorRankings(db, userId, input, types);
+    if (input.mode === "text") {
+      const text = await textRankings(db, userId, input, types);
+      return { inScope: reciprocalRankFusion([text.inScope]), elsewhere: reciprocalRankFusion([text.elsewhere]) };
+    }
+    const [vector, text] = await Promise.all([
+      vectorRankings(db, userId, input, types),
+      textRankings(db, userId, input, types),
+    ]);
+    const ids = (ranking: Ranking): string[] => ranking.map(([id]) => id);
+    return {
+      inScope: reciprocalRankFusion([ids(vector.inScope), text.inScope]),
+      elsewhere: reciprocalRankFusion([ids(vector.elsewhere), text.elsewhere]),
+    };
+  };
+
+  const hits = async (db: D1Database, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
+    const top = ranking.slice(0, limit);
+    if (top.length === 0) return [];
+    const described = await describeMemories(
+      db,
+      userId,
+      top.map(([id]) => id),
+    );
+    const byId = new Map(described.map((memory) => [memory.memoryId, memory]));
+    return top.flatMap(([id, score]) => {
+      const memory = byId.get(id);
+      return memory ? [{ memory, score }] : [];
+    });
+  };
+
+  // What a query finds: the memories in scope of its tags, and the ones it would have found had the
+  // tags not been named. Both surfaces rank the same way and differ only in how they write a hit.
+  const ranked = async (
+    db: D1Database,
+    userId: string,
+    input: SearchInput,
+  ): Promise<{ shown: MemoryHit[]; nearby: MemoryHit[] }> => {
+    const rankings = await rank(db, userId, input, []);
+    const [shown, nearby] = await Promise.all([
+      hits(db, userId, rankings.inScope, input.limit),
+      hits(db, userId, rankings.elsewhere, ELSEWHERE_LIMIT),
+    ]);
+    return { shown, nearby };
+  };
+
+  const searched = async (db: D1Database, userId: string, input: SearchInput): Promise<unknown> => {
+    const { shown, nearby } = await ranked(db, userId, input);
+    const elsewhere = nearby.map(({ memory, score }) => ({
+      score,
+      name: memory.name,
+      type: memory.type,
+      tags: memory.tags,
+      description: memory.description,
+    }));
+    return { hits: shown, elsewhere };
+  };
+
+  const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
+    const parsed = parseSearch(await readJson(request));
+    if (!parsed.ok) return error(400, parsed.error);
+    return json(await searched(db, userId, parsed.value));
+  };
+
+  const v2MemoriesList = async (url: URL, db: D1Database, caller: Caller): Promise<Response> => {
+    const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
+    if (!input.ok) return error(400, input.error);
+    const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
+    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
+    const page = await listMemories(db, caller.userId, input.value, cursor);
+    return json({ memories: page.memories.map(memoryView), nextCursor: page.nextCursor });
+  };
+
+  const v2MemorySearch = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
+    const input = parseSearchMemories(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    const { shown, nearby } = await ranked(db, caller.userId, input.value);
+    return json({ hits: shown.map(memoryHitView), elsewhere: nearby.map(nearbyMemoryView) });
+  };
+
+  const v2MemorySave = async (request: Request, db: D1Database, caller: Caller, name: string): Promise<Response> => {
+    const input = parseSaveMemory(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
+    if (!vector) throw new Error("the embedder answered the memory with no vector");
+    const saved = await saveMemory(db, caller.userId, name, input.value, quantize(vector), deps.now());
+    return json({ memory: memoryView(saved.memory) }, saved.created ? 201 : 200);
+  };
+
+  // Recalling a memory is a write, so it is a POST and the GET beside it is a read and nothing
+  // more. `/v1` folded the two into one GET behind a query parameter, which left every reader of a
+  // memory deciding whether it meant to count as one.
+  const v2MemoryRecall = async (db: D1Database, caller: Caller, name: string): Promise<Response> => {
+    const memory = await getMemory(db, caller.userId, name);
+    if (!memory) return error(404, `no memory named ${name}`);
+    const [recalled] = await recall(db, caller.userId, [memory.memoryId], deps.now());
+    if (!recalled) return error(404, `no memory named ${name}`);
+    return json({ memory: memoryView(recalled) });
+  };
+
+  // A memory answers a GET, a PUT and a DELETE at its own name and never a POST, which is what
+  // frees `search` beside it and `recall` below it: no position where a slug meets a route word.
+  const v2Memories = async (
+    request: Request,
+    url: URL,
+    db: D1Database,
+    caller: Caller,
+    rawName: string | undefined,
+    word: string | undefined,
+  ): Promise<Response> => {
+    if (rawName === undefined) {
+      return request.method === "GET" ? v2MemoriesList(url, db, caller) : error(405, "method not allowed");
+    }
+    if (rawName === "search" && word === undefined && request.method === "POST") {
+      return v2MemorySearch(request, db, caller);
+    }
+    const name = parseMemoryName(decodeSegment(rawName) ?? "");
+    if (!name.ok) return error(400, name.error);
+    if (word === "recall") {
+      if (request.method !== "POST") return error(405, "method not allowed");
+      return v2MemoryRecall(db, caller, name.value);
+    }
+    if (word !== undefined) return error(404, "not found");
+    if (request.method === "PUT") return v2MemorySave(request, db, caller, name.value);
+    if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
+    const memory = await getMemory(db, caller.userId, name.value);
+    if (!memory) return error(404, `no memory named ${name.value}`);
+    if (request.method === "GET") return json({ memory: memoryView(memory) });
+    await deleteMemory(db, caller.userId, memory.memoryId);
+    return new Response(null, { status: 204 });
+  };
+
+  const runTool = (env: TenantEnv, caller: Caller): RunTool => {
+    // Every tool but the send one reads or writes a memory, which is an account row.
+    const db = env.ACCOUNT;
+    const { userId } = caller;
+    const refused = (reason: string): ToolResult => ({ ok: false, error: `recall: ${reason}` });
+    const document = (value: unknown): ToolResult => ({ ok: true, text: JSON.stringify(value) });
+    const saved = async (name: string, input: SaveInput): Promise<ToolResult> => {
+      const [vector] = await deps.embedder.embed([embeddingText(name, input.description, input.body)]);
+      if (!vector) throw new Error("the embedder answered the memory with no vector");
+      const written = await saveMemory(db, userId, name, input, quantize(vector), deps.now());
+      return document({ name: written.memory.name, created: written.created, tags: written.memory.tags });
+    };
+    return async (call: ToolCall): Promise<ToolResult> => {
+      const definition = TOOLS.find((tool) => tool.name === call.name);
+      if (definition === undefined) return refused(`no tool named ${call.name}`);
+      const args = toolArguments(definition, call.arguments);
+      if (!args.ok) return refused(args.error);
+      if (call.name === "recall_search") {
+        const input = parseSearchArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const { query, tags, mode } = input.value;
+        return document(
+          await searched(db, userId, { query, tags, mode, limit: SEARCH_LIMIT, minScore: DEFAULT_MIN_SCORE }),
+        );
+      }
+      if (call.name === "recall_get") {
+        const input = parseNameArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const memory = await getMemory(db, userId, input.value.name);
+        if (memory === null) return refused(`no memory named ${input.value.name}`);
+        const [recalled] = await recall(db, userId, [memory.memoryId], deps.now());
+        return { ok: true, text: renderMemory(recalled ?? memory) };
+      }
+      if (call.name === "recall_list") {
+        const input = parseListArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const sort = "newest";
+        const page = await listMemories(
+          db,
+          userId,
+          { ...input.value, types: [], cursor: "", sort },
+          startCursor(memoryCursorDirection(sort)),
+        );
+        return document(page.memories);
+      }
+      if (call.name === "recall_save") {
+        const input = parseSaveArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const name = parseName(input.value.name);
+        if (!name.ok) return refused(name.error);
+        return saved(name.value, input.value);
+      }
+      if (call.name === "recall_edit") {
+        const input = parseEditArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const memory = await getMemory(db, userId, input.value.name);
+        if (memory === null) return refused(`no memory named ${input.value.name}`);
+        return saved(memory.name, editedMemory(memory, input.value));
+      }
+      if (call.name === "recall_delete") {
+        const input = parseNameArgs(args.value);
+        if (!input.ok) return refused(input.error);
+        const memory = await getMemory(db, userId, input.value.name);
+        if (memory === null) return refused(`no memory named ${input.value.name}`);
+        await deleteMemory(db, userId, memory.memoryId);
+        return document({ deleted: memory.name });
+      }
+      const input = parseSendArgs(args.value);
+      if (!input.ok) return refused(input.error);
+      const now = deps.now();
+      const [devices, sessions, labels] = await Promise.all([
+        listDevices(env.ACCOUNT, userId),
+        listSessions(env.DB, userId, now),
+        readLabels(env.DB, userId),
+      ]);
+      const target = resolveTarget(devices, labels, sessions, input.value.to);
+      if (!target.ok) return refused(target.error);
+      if (new TextEncoder().encode(input.value.message).byteLength > MAX_BODY_BYTES) {
+        return refused(`message must hold at most ${MAX_BODY_BYTES} bytes`);
+      }
+      const sender: Sender = { deviceId: caller.deviceId, host: caller.host, name: caller.name };
+      const message: SendInput = {
+        kind: "news",
+        toDeviceId: target.value.toDeviceId,
+        toSessionId: target.value.toSessionId,
+        fromSessionId: "",
+        body: input.value.message,
+      };
+      const sent = await mailboxFor(env, userId).publish(message, sender, now);
+      return document({
+        messageId: sent.message.messageId,
+        toDeviceId: sent.message.toDeviceId,
+        toSessionId: sent.message.toSessionId,
+      });
+    };
+  };
+
+  // The second version of the API, which is the first one with its sentinels and its epoch
+  // integers taken out. `/v1` is untouched and stays the live surface until every host has
+  // crossed; this answers beside it, authenticates with the same device tokens, and shares every
+  // handler whose shape was never the problem.
+  //
+  // A caller is proved once, here, and handed to every handler below with the database it reads.
+  // No handler under this branch reaches back into the environment for a binding once the caller
+  // is known, which is what lets the whole branch move behind a Durable Object unchanged.
+  const v2Devices = async (
+    request: Request,
+    env: TenantEnv,
+    caller: Caller,
+    deviceId: string | undefined,
+  ): Promise<Response> => {
+    if (deviceId === undefined) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      const [listed, labels] = await Promise.all([
+        listDevices(env.ACCOUNT, caller.userId),
+        readLabels(env.DB, caller.userId),
+      ]);
+      return json({ devices: listed.map((device) => deviceView(device, labels.hosts, caller.deviceId)) });
+    }
+    // No `current`: a client revokes its own login by reading its row off the listing, where
+    // `current` already says which one it is. A path segment that means a different device
+    // depending on who sent the request is one `curl` cannot be used to reason about.
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    if (!(await revokeDevice(env.ACCOUNT, caller.userId, deviceId))) return error(404, `no device ${deviceId}`);
+    await mailboxFor(env, caller.userId).revoke(deviceId);
+    return new Response(null, { status: 204 });
+  };
+
+  const v2SessionsList = async (db: SqlDb, caller: Caller): Promise<Response> => {
+    const [listed, labels] = await Promise.all([
+      listSessions(db, caller.userId, deps.now()),
+      readLabels(db, caller.userId),
+    ]);
+    return json({ sessions: listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)) });
+  };
+
+  // Every file of a session the archive holds, whichever path wrote it. The record path is the one
+  // `/v2` writes with and the byte path is what `/v1` left behind, so a file the records hold is
+  // answered off them and the byte path answers for the rest.
+  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<HeldFile[]> => {
+    const [recorded, archived] = await Promise.all([
+      recordFiles(bucket, userId, sessionId),
+      archivedFiles(bucket, userId, sessionId),
+    ]);
+    const held = new Set(recorded.map((file) => file.file));
+    const byBytes = archived
+      .filter((file) => !held.has(file.file))
+      .map(({ file, bytes, through, named }): HeldFile => ({ held: "bytes", file, bytes, through, named }));
+    return [...recorded, ...byBytes].sort((left, right) => left.file.localeCompare(right.file));
+  };
+
+  const v2Session = async (bucket: R2Bucket, db: SqlDb, caller: Caller, target: string): Promise<Response> => {
+    const found = await findSession(db, caller.userId, target, deps.now());
+    if (!found) return error(404, `no session named ${target}`);
+    const [files, labels] = await Promise.all([
+      v2FilesOf(bucket, caller.userId, found.session.sessionId),
+      readLabels(db, caller.userId),
+    ]);
+    return json({ session: pastSessionView(found.session, labels.hosts), matches: found.matches, files });
+  };
+
+  // The transcript files a session has on record, which `/v1` served from the transcript path when
+  // no file was named. One path, one shape.
+  const v2Files = async (
+    request: Request,
+    bucket: R2Bucket,
+    db: SqlDb,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const [files, counted] = await Promise.all([
+      v2FilesOf(bucket, caller.userId, sessionId),
+      countedFiles(db, caller.userId, sessionId),
+    ]);
+    return json({ files, counted });
+  };
+
+  // One file of a session's transcript, read back. The PUT `/v1` answered here is gone: a host
+  // sends records now, and the records endpoint is the one way prose enters the archive on `/v2`.
+  const v2Transcript = async (
+    request: Request,
+    url: URL,
+    bucket: R2Bucket,
+    db: SqlDb,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    const ndjson = (body: ReadableStream<Uint8Array>, gzip: boolean): Response =>
+      new Response(body, {
+        headers: {
+          "content-type": "application/x-ndjson",
+          "cache-control": "no-store",
+          ...(gzip ? { "content-encoding": "gzip" } : {}),
+        },
+      });
+    // The records first: they are what `/v2` writes, and a session that only ever posted them has
+    // nothing under the byte path's prefix at all.
+    const recorded = await readRecords(bucket, caller.userId, sessionId, file.value);
+    if (recorded !== null) return ndjson(recorded, false);
+    const archived = await readTranscript(bucket, caller.userId, sessionId, file.value, takesGzip(request));
+    if (archived === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
+    return ndjson(archived.body, archived.gzip);
+  };
+
+  const v2Usage = async (request: Request, db: SqlDb, caller: Caller, sessionId: string): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const now = deps.now();
+    const input = parseUsageDelta(await readJson(request), now, USAGE_EPOCH, DAY_MS);
+    if (!input.ok) return error(400, input.error);
+    await recordUsage(db, caller.userId, sessionId, input.value, now);
+    return new Response(null, { status: 204 });
+  };
+
+  // A stretch of a session's transcript as the records it holds, and the whole of what that costs:
+  // the records are stored, read for turns, chunked, embedded and written to the index before the
+  // response goes back. Embedding is a subrequest and so is wall clock rather than billed CPU,
+  // which is what makes indexing in the request affordable where reading a megabyte of archive
+  // back was not.
+  //
+  // Ordering is total and carries no clock. The record at index `i` has ordinal `from + i`, so an
+  // ordinal is a position and never a field; `from` has to equal the next ordinal the file is
+  // waiting for, which makes a replayed call a 409 carrying the real `next` and never a second
+  // write of prose already indexed.
+  const v2Records = async (
+    request: Request,
+    bucket: R2Bucket,
+    db: SqlDb,
+    caller: Caller,
+    sessionId: string,
+  ): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const tooLarge = error(413, `an append must hold at most ${MAX_RECORDS_BYTES} bytes`);
+    if (Number(request.headers.get("content-length") ?? 0) > MAX_RECORDS_BYTES) return tooLarge;
+    const body = await request.arrayBuffer();
+    if (body.byteLength > MAX_RECORDS_BYTES) return tooLarge;
+    const sent = jsonOrNull(new TextDecoder().decode(body));
+    // Counted before the contract's own schema reads it: the schema bounds the array too, but a
+    // body past the ceiling is refused for being too large rather than for being malformed, and a
+    // host told 400 would retry it forever.
+    if (isRecord(sent) && Array.isArray(sent.records) && sent.records.length > MAX_RECORDS_PER_APPEND) {
+      return error(413, `an append must carry at most ${MAX_RECORDS_PER_APPEND} records`);
+    }
+    const input = parseAppendRecords(sent);
+    if (!input.ok) return error(400, input.error);
+    const file = parseTranscriptFile(input.value.file);
+    if (!file.ok) return error(400, file.error);
+    // The account is what a session belongs to, and the key prefix below is built from the
+    // caller's own user id, so neither a read nor an append can reach another account's session.
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    const { userId } = caller;
+    const { from, records, closed } = input.value;
+    const fault = recordsFault(records);
+    if (fault !== "") return error(400, fault);
+    // Every 409 this endpoint answers carries the ordinal to send from, because the only thing a
+    // host can do with one is send again from there.
+    const conflict = (next: number, error: string): Response => {
+      const refused: V2RecordsConflict = { error, next };
+      return json(refused, 409);
+    };
+    const refuse = (next: number): Response =>
+      conflict(next, `${file.value} holds ${next} records; send the records starting at ${next}`);
+    const accepted = (next: number): Response => {
+      const taken: V2RecordsAccepted = { file: file.value, next };
+      return json(taken);
+    };
+    // One session, one path into the index. A session the byte path already wrote is taken over
+    // whole or not at all: the record mark is written, the byte mark cleared and the chunks the
+    // byte path wrote dropped, all in the batch that carries this append — so the two never index
+    // the same prose and the chunk counter they share is held by one of them.
+    //
+    // Nothing here weighs where the append opens. A session on the byte path holds no record mark,
+    // so the fold below reads the file from ordinal 0 whatever `from` says, which is the whole of
+    // what a takeover needs; an append landing in the middle of a file the records do not reach is
+    // refused by the ordinal check for the ordinary reason and told to send from 0.
+    const mark = await indexMark(db, userId, sessionId);
+    const crossing = file.value === MAIN_FILE && mark !== null && mark.archived > 0;
+    const takeover = crossing && !(await onRecordMark(db, userId, sessionId));
+    // The mark says where the file is waiting, and the objects are the arbiter: the two part
+    // company only where a writer stored records and did not live to write the mark. The objects
+    // also carry the one thing the mark cannot, which is whether a break closed the record in
+    // front of this append, so they are read on every call rather than on the conflicting one.
+    const marked = await recordReach(db, userId, sessionId, file.value);
+    const end = await recordsEnd(bucket, userId, sessionId, file.value);
+    if (from !== marked && from !== end.reach) return refuse(end.reach);
+    // A record the session stopped writing part way through is the last record its file takes. An
+    // append behind it would store its bytes under an ordinal of their own, and the file would
+    // read back with the two run together under the first of them — one line where the archive
+    // counts two, which is a restore calling a whole file a part for ever.
+    if (from === end.reach && !end.closes) {
+      return conflict(end.reach, `${file.value} ends on a record no break closed; it takes no more records`);
+    }
+    // A put that does not land means the archive already holds an append at this ordinal. The
+    // conditional put weighs presence and never content, so what is stored there is read back
+    // before the writer is sent anywhere: two appends starting in the same place and agreeing as
+    // far as they overlap are one host sending a different number of records, and it is told the
+    // real reach and sends from there. Records that disagree at an ordinal are a transcript being
+    // rewritten, and neither side's prose may be dropped for the other's without the host hearing
+    // of it.
+    if (!(await putRecords(bucket, userId, sessionId, file.value, from, records, closed))) {
+      const stored = await readRecordAppend(bucket, userId, sessionId, file.value, from);
+      if (stored !== null && !recordsAgree(stored, records)) {
+        const reach = await recordsReach(bucket, userId, sessionId, file.value);
+        return conflict(reach, `${file.value} holds other records at ordinal ${from}; a record is written once`);
+      }
+      return refuse(await recordsReach(bucket, userId, sessionId, file.value));
+    }
+    const next = from + records.length;
+    // Only the session's own file reaches the index, exactly as the byte path's consumer reads
+    // only `main`. A delegated turn is the model talking to itself and derives nothing.
+    if (file.value !== MAIN_FILE) {
+      const commit = {
+        userId,
+        sessionId,
+        file: file.value,
+        held: marked,
+        next,
+        chunkFrom: 0,
+        chunks: [],
+        open: [],
+        takeover: false,
+      };
+      if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
+      return accepted(next);
+    }
+    // Every record the index has not read yet, which is this append and the span between the mark
+    // and it. That span is what an append landing ahead of the mark leaves behind: another writer
+    // stored records and lost the file before it could index them, or this one did and is sending
+    // again. The prose is in the archive either way, and the append carrying the mark past it is
+    // the one that has to index it, or nothing ever will.
+    const behind = await readRecordsBetween(bucket, userId, sessionId, file.value, marked, from);
+    const text = [...behind, ...records].join("\n");
+    const carried = await openChunks(db, userId, sessionId, file.value);
+    const { closed: shut, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
+    // A takeover indexes the session from nothing, so its chunks open at ordinal 0 and the byte
+    // path's are dropped under them in the same batch.
+    const chunkFrom = takeover ? 0 : await chunkReach(db, userId, sessionId);
+    const indexed = await embedChunks(shut);
+    // The mark the work above was read against, still standing. A host knows its next `from`
+    // without asking and pipelines two appends, and the second read the chunks and the open chunk
+    // of a file the first had not finished writing; it is told the real `next` and sends again.
+    const commit = {
+      userId,
+      sessionId,
+      file: file.value,
+      held: marked,
+      next,
+      chunkFrom,
+      chunks: indexed,
+      open,
+      takeover,
+    };
+    if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
+    // The span this append indexed opens the session wherever the mark stood at nothing, which is
+    // not the same as the call carrying ordinal 0: a first append that lost its commit leaves the
+    // name to whichever later one carries the mark off zero. A losing append names nothing.
+    if (marked === 0) {
+      const named = agentName(text.slice(0, HEAD_BYTES));
+      if (named !== "") await nameSession(db, userId, sessionId, named);
+    }
+    return accepted(next);
+  };
+
+  // What a session leaves behind when it ends. A chunk closes where the conversation turns or
+  // where the character ceiling runs out, so the one a file is still holding closes nowhere at all
+  // unless the end of the session closes it — and a short session, which turns nowhere, would be
+  // unfindable entirely. `/v1` closed everything at the end of every indexing bite.
+  //
+  // It is also the last chance the span past the mark has. An append that stored its records and
+  // lost its commit leaves the archive ahead of the mark, and the gap fold that would have carried
+  // the index over it only runs on another append; where the session ended there, the end of it is
+  // the append that never came.
+  const closeSession = async (bucket: R2Bucket, db: SqlDb, userId: string, sessionId: string): Promise<void> => {
+    const [open, held, chunkFrom, reach] = await Promise.all([
+      openChunks(db, userId, sessionId, MAIN_FILE),
+      recordReach(db, userId, sessionId, MAIN_FILE),
+      chunkReach(db, userId, sessionId),
+      recordsReach(bucket, userId, sessionId, MAIN_FILE),
+    ]);
+    const next = Math.max(held, reach);
+    if (open.length === 0 && next === held) return;
+    const behind = await readRecordsBetween(bucket, userId, sessionId, MAIN_FILE, held, next);
+    const tail = chunkTurnsCarrying(readTurns(behind.join("\n"), MAIN_FILE), open);
+    const indexed = await embedChunks([...tail.closed, ...closeChunks(tail.open)]);
+    await commitRecords(db, {
+      userId,
+      sessionId,
+      file: MAIN_FILE,
+      held,
+      next,
+      chunkFrom,
+      chunks: indexed,
+      open: [],
+      takeover: false,
+    });
+  };
+
+  const v2Sessions = async (
+    request: Request,
+    url: URL,
+    bucket: R2Bucket,
+    db: SqlDb,
+    caller: Caller,
+    rawSessionId: string | undefined,
+    subresource: string | undefined,
+  ): Promise<Response> => {
+    if (rawSessionId === undefined) {
+      return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
+    }
+    const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!sessionId.ok) return error(400, sessionId.error);
+    if (subresource === "usage") return v2Usage(request, db, caller, sessionId.value);
+    if (subresource === "records") return v2Records(request, bucket, db, caller, sessionId.value);
+    if (subresource === "files") return v2Files(request, bucket, db, caller, sessionId.value);
+    if (subresource === "transcript") {
+      return v2Transcript(request, url, bucket, db, caller, sessionId.value);
+    }
+    if (subresource !== undefined) return error(404, "not found");
+    if (request.method === "GET") return v2Session(bucket, db, caller, sessionId.value);
+    if (request.method === "PUT") {
+      const input = parseSessionSync(await readJson(request));
+      if (!input.ok) return error(400, input.error);
+      await putSession(db, caller, sessionId.value, input.value, deps.now());
+      return new Response(null, { status: 204 });
+    }
+    if (request.method !== "DELETE") return error(405, "method not allowed");
+    await closeSession(bucket, db, caller.userId, sessionId.value);
+    if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
+    return new Response(null, { status: 204 });
+  };
+
+  // Every session the account has on record, and the ones a query finds by meaning. It is its own
+  // collection rather than a scope of the sessions listing because `history` is a legal session id
+  // and `/v2/sessions/history` would have answered two things depending on which one was meant.
+  const v2History = async (request: Request, url: URL, db: SqlDb, caller: Caller): Promise<Response> => {
+    if (request.method !== "GET") return error(405, "method not allowed");
+    const { userId } = caller;
+    if (url.searchParams.get("q") === null) {
+      return json(await listSessionHistoryIds(db, userId, url.searchParams.get("cursor") ?? ""));
+    }
+    const hits = await sessionSearchHits(url, db, userId);
+    if (!hits.ok) return error(400, hits.error);
+    const labels = await readLabels(db, userId);
+    return json({ hits: hits.value.map((hit) => sessionHitView(hit, labels.hosts)) });
+  };
+
+  const v2SendMessage = async (request: Request, env: TenantEnv, caller: Caller): Promise<Response> => {
+    const input = parseV2Send(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
+      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
+    }
+    const { scope, target } = input.value.address;
+    const now = deps.now();
+    // A session is addressed by itself and the device it runs on is read off it, where `/v1` had
+    // the caller name both and an empty session id meant every session on the device.
+    const toDeviceId =
+      scope === "host"
+        ? (await hasDevice(env.ACCOUNT, caller.userId, target))
+          ? target
+          : null
+        : await liveSessionDevice(env.DB, caller.userId, target, now);
+    if (toDeviceId === null) {
+      return error(404, scope === "host" ? `no device ${target}` : `no session ${target} running on this account`);
+    }
+    const sender = await senderOf(env.DB, caller, input.value.fromSessionId, now);
+    const sent = await mailboxFor(env, caller.userId).publish(sendInputOf(input.value, toDeviceId), sender, now);
+    return json(sent, 201);
+  };
+
+  // The dashboard from the sign-in on. Who is reading was settled in the Worker, which is where
+  // the Access assertion and the invitation live; everything below reads this account's own rows.
+  const dashboard = async (request: Request, env: TenantEnv, userId: string, email: string): Promise<Response> => {
+    const url = new URL(request.url);
+    const db = env.DB;
+    const lost = (status: number, title: string, text: string): Response =>
+      dashboardNotice(status, title, text, "Back to the dashboard");
+    const { tab, segments, rawSessionId, bytes, shareName, saving } = dashboardAsk(request, url);
+    if (saving) return saveLabels(request, url, db, userId, lost);
+    // A read of the tail renders no page, so it does not pay for the tally a page carries in its
+    // header. It reads this tenant's rows for how far the file now reaches, which is what keeps it
+    // here while the bytes of a named stretch are answered in the Worker off the archive alone.
+    if (bytes) return transcriptTail(url, env, userId, rawSessionId);
+    const now = deps.now();
+    const live = await liveTally(db, userId, now);
+    if (shareName !== null) {
+      return request.method === "POST"
+        ? sharesPost(request, url, env.ACCOUNT, userId, email, live, shareName, now, lost)
+        : sharesTab(request, url, env.ACCOUNT, userId, email, live, shareName, now, lost);
+    }
+    if (tab === null) {
+      if (segments.length === 1) {
+        return sessionDetail(request, url, env, userId, email, live, rawSessionId, lost);
+      }
+      const prefix = `${MEMORY_TAB.path}/`;
+      if (segments.length > 0 || !url.pathname.startsWith(prefix)) {
+        return lost(404, "No such page", "The dashboard has no page at this address.");
+      }
+      return memoryBody(url.pathname.slice(prefix.length), env.ACCOUNT, userId, email, live, lost);
+    }
+    if (tab.path === BOARD_TAB.path) return boardTab(request, url, env, userId, email, live, now);
+    if (tab.path === MEMORY_TAB.path) return memoryTab(url, env.ACCOUNT, userId, email, live, lost);
+    if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(url, env.ACCOUNT, userId, email, live, lost);
+    if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
+    if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
+    if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, env.ACCOUNT, userId, email, live, now);
+    if (tab.path === LABELS_TAB.path) return labelsTab(request, db, userId, email, live);
+    const [listed, labels] = await Promise.all([listSessions(db, userId, now), readLabels(db, userId)]);
+    return sessionsPage(email, live, url, listed, labels, now);
+  };
+
+  // The tenant half of `/v1`, which is every collection below the device token. The Worker weighed
+  // the shape of the address and proved the caller; nothing here reaches back for a binding.
+  const routeV1 = async (
+    request: Request,
+    url: URL,
+    env: TenantEnv,
+    caller: Caller,
+    collection: string | undefined,
+    rawName: string | undefined,
+    rest: readonly string[],
+  ): Promise<Response> => {
+    if (collection === "devices") return devices(request, env, caller, rawName);
+    if (collection === "board") return board(request, url, env, caller, rawName, parsePost);
+    if (collection === "sessions") return sessions(request, url, env, caller, rawName, rest[0]);
+    if (collection === "messages") {
+      if (rawName !== undefined) return error(404, "not found");
+      return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
+    }
+    const { userId } = caller;
+    const account = env.ACCOUNT;
+    if (collection === "search" && rawName === undefined) {
+      return request.method === "POST" ? search(request, account, userId) : error(405, "method not allowed");
+    }
+    if (collection !== "memories") return error(404, "not found");
+    if (rawName === undefined) {
+      return request.method === "GET" ? list(url, account, userId) : error(405, "method not allowed");
+    }
+    const name = parseName(decodeSegment(rawName) ?? "");
+    if (!name.ok) return error(400, name.error);
+    if (request.method === "PUT") return save(request, account, userId, name.value);
+    if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
+    const memory = await getMemory(account, userId, name.value);
+    if (!memory) return error(404, `no memory named ${name.value}`);
+    if (request.method === "GET" && url.searchParams.get("recall") !== "true") return json({ memory });
+    if (request.method === "GET") {
+      const [recalled] = await recall(account, userId, [memory.memoryId], deps.now());
+      return recalled ? json({ memory: recalled }) : error(404, `no memory named ${name.value}`);
+    }
+    await deleteMemory(account, userId, memory.memoryId);
+    return new Response(null, { status: 204 });
+  };
+
+  // The tenant half of `/v2`. A caller is proved once, in the Worker, and handed to every handler
+  // below with the stores it reads.
+  const routeV2 = async (
+    request: Request,
+    url: URL,
+    env: TenantEnv,
+    caller: Caller,
+    collection: string | undefined,
+    rawName: string | undefined,
+    rest: readonly string[],
+  ): Promise<Response> => {
+    const db = env.DB;
+    if (collection === "devices") return v2Devices(request, env, caller, rawName);
+    if (collection === "board") return board(request, url, env, caller, rawName, parseV2Post);
+    if (collection === "sessions") return v2Sessions(request, url, env.TRANSCRIPTS, db, caller, rawName, rest[0]);
+    if (collection === "history") {
+      if (rawName !== undefined) return error(404, "not found");
+      return v2History(request, url, db, caller);
+    }
+    if (collection === "memories") return v2Memories(request, url, env.ACCOUNT, caller, rawName, rest[0]);
+    if (collection !== "messages") return error(404, "not found");
+    if (rawName !== undefined) return error(404, "not found");
+    return request.method === "POST" ? v2SendMessage(request, env, caller) : error(405, "method not allowed");
+  };
+
+  return {
+    api(request: Request, env: TenantEnv, caller: Caller): Promise<Response> {
+      const url = new URL(request.url);
+      const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
+      return version === "v2"
+        ? routeV2(request, url, env, caller, collection, rawName, rest)
+        : routeV1(request, url, env, caller, collection, rawName, rest);
+    },
+    dashboard,
+    artifacts,
+    tool(made: ToolCall, env: TenantEnv, caller: Caller): Promise<ToolResult> {
+      return runTool(env, caller)(made);
+    },
+    // One bite of one session's archive, written into this tenant's index. A session on the record
+    // mark indexes itself inside the append that writes it, so the byte path leaves it alone: the
+    // two read the same prose, and a session on both marks would hold every chunk of it twice.
+    async index(env: TenantEnv, userId: string, sessionId: string): Promise<boolean> {
+      if (await onRecordMark(env.DB, userId, sessionId)) return true;
+      return indexSession(env, userId, sessionId);
+    },
+  };
+};
+
+export const createApp = (deps: Deps): App => {
+  const authenticate = async (request: Request, db: D1Database): Promise<Caller | Response> => {
+    const authorization = request.headers.get("authorization") ?? "";
+    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+    if (!TOKEN_PATTERN.test(token)) {
+      return error(401, "missing or malformed Authorization: Bearer <device token>; run recall login");
+    }
+    const caller = await deviceForToken(db, token, deps.now());
+    return caller ?? error(401, "this device token is unknown or revoked; run recall login");
+  };
+
+  const grantError = (code: string, description: string): Response =>
+    json({ error: code, error_description: description }, 400);
+
+  const readParams = async (request: Request): Promise<Record<string, unknown>> => {
+    if ((request.headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded")) {
+      return Object.fromEntries(new URLSearchParams(await request.text()));
+    }
+    const body = await readJson(request);
+    return typeof body === "object" && body !== null && !Array.isArray(body) ? { ...body } : {};
+  };
+
+  const startDevice = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
+    const { device_name: deviceName } = await readParams(request);
+    if (typeof deviceName !== "string" || !/^[\p{L}\p{N} ._'()-]{1,100}$/u.test(deviceName)) {
+      return grantError("invalid_request", "device_name must hold 1 to 100 letters, digits, spaces or . _ ' ( ) -");
+    }
+    const clientIp = request.headers.get("cf-connecting-ip") ?? "unknown";
+    const started = await startDeviceCode(db, deviceName, clientIp, deps.deviceCodeLimits, deps.now());
+    if (!started) {
+      return json(
+        {
+          error: "slow_down",
+          error_description: "too many sign-ins are waiting for approval; try again in ten minutes",
+        },
+        429,
+      );
+    }
+    const userCode = formatUserCode(started.userCode);
+    return json({
+      device_code: started.deviceCode,
+      user_code: userCode,
+      verification_uri: `${url.origin}/device`,
+      verification_uri_complete: `${url.origin}/device?code=${userCode}`,
+      expires_in: DEVICE_CODE_TTL_MS / 1000,
+      interval: POLL_INTERVAL_S,
+    });
+  };
+
+  const pollDevice = async (request: Request, db: D1Database): Promise<Response> => {
+    const { grant_type: grantType, device_code: deviceCode } = await readParams(request);
+    if (grantType !== DEVICE_GRANT) return grantError("unsupported_grant_type", `grant_type must be ${DEVICE_GRANT}`);
+    if (typeof deviceCode !== "string" || !TOKEN_PATTERN.test(deviceCode)) {
+      return grantError("invalid_request", "device_code is missing or malformed");
+    }
+    const outcome = await pollDeviceCode(db, deviceCode, deps.now());
+    if (outcome.ok) return json({ access_token: outcome.accessToken, token_type: "Bearer" });
+    return grantError(outcome.error, GRANT_ERRORS[outcome.error]);
   };
 
   const listen = (request: Request, env: AppEnv, caller: Caller): Promise<Response> => {
@@ -1082,47 +3177,6 @@ export const createApp = (deps: Deps): App => {
   const invited = async (db: D1Database, email: string, refuse: Refusal): Promise<string | Response> => {
     const userId = await userForEmail(db, email);
     return userId ?? refuse(403, "Not invited", `${email} is not invited to this recall. Ask its owner to add it.`);
-  };
-
-  // One file of one artifact, streamed. The request's own headers are handed to R2, so the slice is
-  // R2's to compute and a seek in a long track never waits for the bytes before it. The manifest
-  // names the content type, and a path the manifest does not name is a 404 whoever asks.
-  // A file carries the policy a site's page does, because a document may hold HTML or SVG of its
-  // publisher's and an address under a name is navigated to as readily as the name itself.
-  // `sandbox` binds the document a navigation makes, and a subresource the player or a rendered
-  // document asks for is fetched under the asking page's policy, so a track still plays and a
-  // range still answers.
-  const artifactFile = async (
-    request: Request,
-    bucket: R2Bucket,
-    record: ArtifactRecord,
-    path: string,
-    lost: () => Response,
-  ): Promise<Response> => {
-    const asked = parseFilePath(path);
-    if (!asked.ok) return lost();
-    const entry = record.files.find((file) => file.path === asked.value);
-    if (entry === undefined) return lost();
-    const object = await bucket.get(fileKey(record.ownerUserId, record.name, record.rev, entry.path), {
-      range: request.headers,
-      onlyIf: request.headers,
-    });
-    if (object === null) return lost();
-    const headers: Record<string, string> = {
-      "content-type": entry.contentType,
-      "cache-control": "private, no-cache",
-      "content-security-policy": ARTIFACT_CSP,
-      "x-content-type-options": "nosniff",
-      "x-frame-options": "DENY",
-      "referrer-policy": "no-referrer",
-      "accept-ranges": "bytes",
-    };
-    if (!("body" in object)) return new Response(null, { status: 304, headers });
-    if (!request.headers.has("range")) return new Response(object.body, { headers });
-    return new Response(object.body, {
-      status: 206,
-      headers: { ...headers, "content-range": contentRangeOf(object.range, object.size) },
-    });
   };
 
   const entryBody = async (bucket: R2Bucket, record: ArtifactRecord): Promise<R2ObjectBody> => {
@@ -1368,889 +3422,6 @@ export const createApp = (deps: Deps): App => {
     return artifactView(request, url, host, record, chrome, route, gone);
   };
 
-  const dashboard = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
-    const db = env.DB;
-    const lost = (status: number, title: string, text: string): Response =>
-      dashboardNotice(status, title, text, "Back to the dashboard");
-    const signIn = (status: number, title: string, text: string): Response =>
-      dashboardNotice(status, title, text, "Sign in again");
-    const tab = tabForPath(url.pathname);
-    const sessionPrefix = `${SESSIONS_PATH}/`;
-    const segments = url.pathname.startsWith(sessionPrefix) ? url.pathname.slice(sessionPrefix.length).split("/") : [];
-    const rawSessionId = segments[0] ?? "";
-    const bytes = segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT;
-    const shareName = sharedArtifactName(url.pathname);
-    const saving = request.method === "POST" && tab?.path === LABELS_TAB.path;
-    const posting = request.method === "POST" && tab?.path === BOARD_TAB.path;
-    const sending = request.method === "POST" && segments.length === 1;
-    const sharing = request.method === "POST" && shareName !== null;
-    if (request.method !== "GET" && !saving && !posting && !sending && !sharing) {
-      return lost(
-        405,
-        "Not allowed",
-        "The dashboard only answers a GET, the Labels and Board tabs their own POST, an artifact's share page its own POST, and a session page the message it sends.",
-      );
-    }
-    const email = await approver(request, deps.verify, signIn);
-    if (email instanceof Response) return email;
-    const userId = await invited(db, email, signIn);
-    if (userId instanceof Response) return userId;
-    if (saving) return saveLabels(request, url, db, userId, lost);
-    // A ranged read renders no page, so it does not pay for the tally a page carries in its
-    // header: a scroll back through a long transcript is thousands of them, and a D1 write batch
-    // apiece would be the whole cost of reading one. A box following a live session beats against
-    // the same route, and `from` is what tells the two apart: it asks how far the file now reaches
-    // rather than for the bytes of one stretch named in the manifest.
-    if (bytes) {
-      return url.searchParams.has("from")
-        ? transcriptTail(url, env, userId, rawSessionId)
-        : transcriptBytes(request, url, env, userId, rawSessionId);
-    }
-    const now = deps.now();
-    const live = await liveTally(db, userId, now);
-    if (shareName !== null) {
-      return request.method === "POST"
-        ? sharesPost(request, url, db, userId, email, live, shareName, now, lost)
-        : sharesTab(request, url, db, userId, email, live, shareName, now, lost);
-    }
-    if (tab === null) {
-      if (segments.length === 1) {
-        return sessionDetail(request, url, env, userId, email, live, rawSessionId, lost);
-      }
-      const prefix = `${MEMORY_TAB.path}/`;
-      if (segments.length > 0 || !url.pathname.startsWith(prefix)) {
-        return lost(404, "No such page", "The dashboard has no page at this address.");
-      }
-      return memoryBody(url.pathname.slice(prefix.length), db, userId, email, live, lost);
-    }
-    if (tab.path === BOARD_TAB.path) return boardTab(request, url, db, userId, email, live, now);
-    if (tab.path === MEMORY_TAB.path) return memoryTab(url, db, userId, email, live, lost);
-    if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(url, db, userId, email, live, lost);
-    if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
-    if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
-    if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, userId, email, live, now);
-    if (tab.path === LABELS_TAB.path) return labelsTab(request, db, userId, email, live);
-    const [sessions, labels] = await Promise.all([listSessions(db, userId, now), readLabels(db, userId)]);
-    return sessionsPage(email, live, url, sessions, labels, now);
-  };
-
-  // The token every dashboard form posts back. A browser holds one cookie for the whole site, so
-  // a page that minted a fresh one on each view would invalidate the form of every page already
-  // open; the cookie it arrived with is the token it keeps.
-  const pageToken = (request: Request): string =>
-    readCookie(request.headers.get("cookie"), CSRF_COOKIE) ?? randomToken();
-
-  // What a dashboard form post is worth: the fields it carries, and whether it came from a page
-  // of this site holding the cookie's token. The caller decides how to answer an untrusted one.
-  const formPost = async (request: Request, url: URL): Promise<{ form: URLSearchParams; trusted: boolean }> => {
-    const form = new URLSearchParams(await request.text());
-    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
-    const trusted =
-      request.headers.get("origin") === url.origin && cookie !== null && sameSecret(cookie, form.get("csrf") ?? "");
-    return { form, trusted };
-  };
-
-  // The artifact a share page is about, as the address holds it, and null where the address is no
-  // share page at all. The segment is not decoded here: a state drawn for no artifact echoes the
-  // address unrewritten, which is the page's to do.
-  const sharedArtifactName = (pathname: string): string | null => {
-    const segments = pathname.replace(/\/$/, "").split("/");
-    if (segments.length !== 5 || segments[4] !== SHARES_SEGMENT) return null;
-    return `/${segments[1]}/${segments[2]}` === ARTIFACTS_TAB.path ? (segments[3] ?? null) : null;
-  };
-
-  // The whole address a share answers on, built in one place. For a link it exists on the one
-  // response that mints it and nowhere else, because storage holds only the token's hash.
-  const shareAddress = (host: ArtifactHost, mode: ShareMode, credential: string): string =>
-    `https://${host.hostname}${mode === "link" ? SHARE_LINK_PREFIX : SHARE_EMAIL_PREFIX}/${credential}`;
-
-  const dayOf = (at: number): string => new Date(at).toISOString().slice(0, 10);
-
-  const GONE_FLASH: ShareFlash = { tone: "refused", text: "That share is already gone." };
-
-  const UNTRUSTED_FLASH: ShareFlash = {
-    tone: "refused",
-    text: "This form did not come from this page, so nothing was created, extended or revoked; reload the page and try again.",
-  };
-
-  // Where a row the mutation just wrote belongs in the list the page already read: the link first,
-  // then the addresses oldest first, which is the order the index supplies. The list is rebuilt
-  // rather than read again, so a POST costs the page's two reads and its one write and no more.
-  const sameSubject = (left: ShareView, right: ShareView): boolean => {
-    if (left.shareId === right.shareId) return true;
-    if (left.mode === "link" && right.mode === "link") return true;
-    return left.mode === "email" && right.mode === "email" && left.address === right.address;
-  };
-
-  const relisted = (shares: readonly ShareView[], written: ShareView): ShareView[] => {
-    const others = shares.filter((one) => !sameSubject(one, written));
-    const link = written.mode === "link" ? written : others.find((one) => one.mode === "link");
-    const addresses = [...(written.mode === "email" ? [written] : []), ...others.filter((one) => one.mode === "email")];
-    addresses.sort((left, right) => left.createdAt - right.createdAt);
-    return [...(link === undefined ? [] : [link]), ...addresses];
-  };
-
-  // The artifact a share page draws, or the state it draws instead of one, off one read. A name
-  // this account does not own answers the 403 the API answers, and a name it holds no artifact
-  // under is the dashboard's own notice; a private artifact of another account resolves to
-  // neither, so the reader learns nothing about it.
-  const shareTarget = async (
-    db: D1Database,
-    url: URL,
-    userId: string,
-    email: string,
-    live: Live,
-    rawName: string,
-    lost: Refusal,
-  ): Promise<ArtifactRecord | Response> => {
-    const name = parseName(decodeSegment(rawName) ?? "");
-    const record = name.ok ? await resolveArtifact(db, userId, name.value) : null;
-    if (record === null) {
-      return lost(404, "No such artifact", "This recall publishes no artifact under this name.");
-    }
-    if (record.ownerUserId !== userId) return sharesPage(email, live, url, { kind: "foreign" });
-    return record;
-  };
-
-  // The question the query asks, against the shares the page holds. An id naming no live share is
-  // not a question at all: the page says so and lists what remains.
-  const askFor = (url: URL, shares: readonly ShareView[]): { ask: ShareAsk | null; flash: ShareFlash | null } => {
-    if (url.searchParams.get("relink") === "1") {
-      return shares.some((share) => share.mode === "link")
-        ? { ask: { kind: "relink" }, flash: null }
-        : { ask: null, flash: GONE_FLASH };
-    }
-    const revoke = url.searchParams.get("revoke");
-    if (revoke === null) return { ask: null, flash: null };
-    if (revoke === "all") {
-      return shares.length === 0
-        ? { ask: null, flash: GONE_FLASH }
-        : { ask: { kind: "revoke-all", count: shares.length }, flash: null };
-    }
-    const share = shares.find((one) => one.shareId === revoke);
-    return share === undefined ? { ask: null, flash: GONE_FLASH } : { ask: { kind: "revoke", share }, flash: null };
-  };
-
-  interface ShareState {
-    shares: ShareView[];
-    flash: ShareFlash | null;
-    minted: Minted | null;
-    ask: ShareAsk | null;
-    emailDraft: string;
-  }
-
-  const sharePageOf = (
-    host: ArtifactHost,
-    record: ArtifactRecord,
-    state: ShareState,
-    csrf: string,
-    now: number,
-  ): SharePage => ({
-    artifact: viewOf(host, record, state.shares.length),
-    shares: state.shares,
-    csrf,
-    flash: state.flash,
-    minted: state.minted,
-    ask: state.ask,
-    emailDraft: state.emailDraft,
-    emailFull: state.shares.filter((share) => share.mode === "email").length >= MAX_EMAIL_SHARES,
-    now,
-  });
-
-  const sharesTab = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    rawName: string,
-    now: number,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const host = deps.artifactHost;
-    if (host === null || host.sharing === null) return sharesPage(email, live, url, { kind: "off" });
-    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
-    if (target instanceof Response) return target;
-    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
-    const { ask, flash } = askFor(url, shares);
-    const state: ShareState = { shares, flash, minted: null, ask, emailDraft: "" };
-    const page = sharePageOf(host, target, state, pageToken(request), now);
-    return sharesPage(email, live, url, { kind: "page", page });
-  };
-
-  // Every mutation the page posts, each one write against the artifact's own shares. Nothing is a
-  // redirect: the response carries the page, because a minted address exists on that one response
-  // and nowhere else.
-  const shareMutation = async (
-    db: D1Database,
-    host: ArtifactHost,
-    record: ArtifactRecord,
-    shares: ShareView[],
-    form: URLSearchParams,
-    now: number,
-  ): Promise<ShareState> => {
-    const { ownerUserId: userId, name } = record;
-    const expiresAt = now + SHARE_WINDOW_MS;
-    const kept = (extra: Partial<ShareState>): ShareState => ({
-      shares,
-      flash: null,
-      minted: null,
-      ask: null,
-      emailDraft: "",
-      ...extra,
-    });
-    const mintedLink = async (replacing: boolean): Promise<ShareState> => {
-      const token = newShareToken();
-      const input = { shareId: newShareId(), userId, name, subject: await hashShareToken(token), at: now, expiresAt };
-      const made = replacing ? await replaceLinkShare(db, input) : await createLinkShare(db, input);
-      // A live link refused the write, which is the one reload worth catching: the page asks
-      // whether to retire the address already in use rather than minting a second one.
-      if (made === null) return kept({ ask: { kind: "relink" } });
-      return kept({
-        shares: relisted(shares, shareViewOf(made)),
-        minted: { mode: "link", address: shareAddress(host, "link", token), expiresAt: made.expiresAt },
-      });
-    };
-    const todo = form.get("do") ?? "";
-    if (todo === "email") {
-      const typed = form.get("address") ?? "";
-      const address = parseShareAddress(typed);
-      if (!address.ok) return kept({ flash: { tone: "refused", text: address.error }, emailDraft: typed });
-      const addresses = shares.filter((share) => share.mode === "email");
-      const renewing = addresses.some((share) => share.mode === "email" && share.address === address.value);
-      if (!renewing && addresses.length >= MAX_EMAIL_SHARES) {
-        return kept({
-          flash: {
-            tone: "refused",
-            text: `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes, so ${address.value} was not shared.`,
-          },
-          emailDraft: typed,
-        });
-      }
-      await deleteDeadEmailShare(db, userId, name, address.value, now);
-      const made = await createEmailShare(db, {
-        shareId: newShareId(),
-        userId,
-        name,
-        subject: address.value,
-        at: now,
-        expiresAt,
-      });
-      return kept({
-        shares: relisted(shares, shareViewOf(made.share)),
-        flash: made.renewed
-          ? { tone: "done", text: `${address.value} already held a share, so its expiry moved instead.` }
-          : null,
-        minted: {
-          mode: "email",
-          address: shareAddress(host, "email", made.share.shareId),
-          recipient: address.value,
-          expiresAt: made.share.expiresAt,
-        },
-      });
-    }
-    if (todo === "link") return mintedLink(false);
-    if (todo === "relink") return mintedLink(true);
-    if (todo === "extend") {
-      const extended = await extendLinkShare(db, userId, name, now, expiresAt);
-      if (extended === null) return kept({ flash: GONE_FLASH });
-      return kept({
-        shares: relisted(shares, shareViewOf(extended)),
-        flash: { tone: "done", text: `The link share now stops working on ${dayOf(extended.expiresAt)}.` },
-      });
-    }
-    if (todo === "revoke") {
-      const shareId = form.get("share") ?? "";
-      const going = shares.find((share) => share.shareId === shareId);
-      if (going === undefined) return kept({ flash: GONE_FLASH });
-      const revoked = await revokeShares(db, userId, name, { kind: "one", shareId });
-      if (revoked === 0) return kept({ flash: GONE_FLASH });
-      return kept({
-        shares: shares.filter((share) => share.shareId !== shareId),
-        flash: {
-          tone: "done",
-          text: going.mode === "link" ? "The link share is revoked." : `The share with ${going.address} is revoked.`,
-        },
-      });
-    }
-    if (todo === "revoke-all") {
-      const revoked = await revokeShares(db, userId, name, { kind: "all" });
-      return kept({
-        shares: [],
-        flash: revoked === 0 ? GONE_FLASH : { tone: "done", text: `Every share on ${name} is revoked.` },
-      });
-    }
-    return kept({});
-  };
-
-  const sharesPost = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    rawName: string,
-    now: number,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const host = deps.artifactHost;
-    if (host === null || host.sharing === null) return sharesPage(email, live, url, { kind: "off" });
-    const posted = await formPost(request, url);
-    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
-    if (target instanceof Response) return target;
-    const shares = (await artifactShares(db, userId, target.name, now)).map(shareViewOf);
-    const csrf = pageToken(request);
-    // Nothing is created, extended or revoked for a post that did not come from this page, and the
-    // refusal says nothing the page does not already draw.
-    if (!posted.trusted) {
-      const state: ShareState = { shares, flash: UNTRUSTED_FLASH, minted: null, ask: null, emailDraft: "" };
-      return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) }, 403);
-    }
-    const state = await shareMutation(db, host, target, shares, posted.form, now);
-    return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) });
-  };
-
-  // The addresses the form offers, which are the pairs the board stores rather than strings a
-  // second resolver would have to read: the fleet, every host signed in, and every live session.
-  const boardOptions = async (db: D1Database, userId: string, now: number): Promise<BoardOption[]> => {
-    const [hosts, live, labels] = await Promise.all([
-      listDevices(db, userId),
-      listSessions(db, userId, now),
-      readLabels(db, userId),
-    ]);
-    return [
-      { value: FLEET_OPTION, label: "The fleet — the first session anywhere that reads it" },
-      ...hosts.map((host) => ({
-        value: `host:${host.deviceId}`,
-        label: `${labels.hosts.get(host.host) ?? host.host} — the first session on that host`,
-      })),
-      ...live.map((session) => ({ value: `session:${session.sessionId}`, label: `${session.name} — that session` })),
-    ];
-  };
-
-  const askedAddress = (to: string, userId: string): BoardAddress | null => {
-    if (to === FLEET_OPTION) return { scope: "fleet", target: userId };
-    const colon = to.indexOf(":");
-    if (colon < 1) return null;
-    const scope = to.slice(0, colon);
-    const target = to.slice(colon + 1);
-    if (target === "") return null;
-    if (scope === "host") return { scope: "host", target };
-    return scope === "session" ? { scope: "session", target } : null;
-  };
-
-  const boardTab = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    now: number,
-  ): Promise<Response> => {
-    const csrf = pageToken(request);
-    const options = await boardOptions(db, userId, now);
-    const render = async (post: BoardPoster, status: number): Promise<Response> => {
-      const cursor = pageCursor(url.searchParams.get(CURSOR_PARAM) ?? "", "desc");
-      const listed = await listBoard(db, userId, BOARD_PAGE, cursor, now);
-      return boardPage(email, live, url, { ...listed, post }, now, status);
-    };
-    if (request.method === "GET") {
-      const posted = readCookie(request.headers.get("cookie"), SENT_COOKIE) === BOARD_TAB.path;
-      return render({ csrf, to: FLEET_OPTION, draft: "", flash: posted ? { tone: "posted" } : null, options }, 200);
-    }
-    return postFromDashboard(request, url, db, userId, email, now, csrf, options, render);
-  };
-
-  // The dashboard's own post, which is the Labels tab's post shape pointed at the board. A browser
-  // carries no device token, so it cannot reach `POST /v1/board`; what it shares with it is the
-  // table. Every refusal re-renders with the typing still in the box and says what went wrong.
-  const postFromDashboard = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    userId: string,
-    email: string,
-    now: number,
-    csrf: string,
-    options: BoardOption[],
-    render: (post: BoardPoster, status: number) => Promise<Response>,
-  ): Promise<Response> => {
-    const posted = await formPost(request, url);
-    const body = posted.form.get("body") ?? "";
-    const to = posted.form.get("to") ?? FLEET_OPTION;
-    const refuse = (text: string, status: number): Promise<Response> =>
-      render({ csrf, to, draft: body, flash: { tone: "refused", text }, options }, status);
-    if (!posted.trusted) {
-      return refuse("The form did not come from this page, so nothing was posted. Post it again from here.", 403);
-    }
-    if (body.trim() === "") return refuse("The message was empty, so nothing was posted.", 400);
-    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
-      return refuse(
-        `A message holds at most ${MAX_BODY_BYTES} bytes, and this one is longer. Nothing was posted.`,
-        400,
-      );
-    }
-    const asked = askedAddress(to, userId);
-    if (asked === null) return refuse("That is not an address this page offers, so nothing was posted.", 400);
-    const address = await addressFor(db, userId, asked);
-    if (address instanceof Response) {
-      return refuse("That host or session is no longer on this account, so nothing was posted.", 400);
-    }
-    await postBoardMessage(db, {
-      userId,
-      messageId: crypto.randomUUID(),
-      address,
-      fromDeviceId: DASHBOARD_DEVICE,
-      fromHost: DASHBOARD_DEVICE,
-      fromName: email,
-      body,
-      createdAt: now,
-    });
-    return new Response(null, {
-      status: 303,
-      headers: {
-        location: BOARD_TAB.path,
-        "set-cookie": `${SENT_COOKIE}=${BOARD_TAB.path}; Path=/; Max-Age=30; Secure; HttpOnly; SameSite=Strict`,
-      },
-    });
-  };
-
-  const labelsTab = async (
-    request: Request,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-  ): Promise<Response> => {
-    const [targets, labels] = await Promise.all([labelTargets(db, userId), readLabels(db, userId)]);
-    return labelsPage(email, live, targets, labels, pageToken(request));
-  };
-
-  const saveLabels = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    userId: string,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const posted = await formPost(request, url);
-    if (!posted.trusted) {
-      return lost(403, "Request refused", "The form did not come from this page. Reload it and try again.");
-    }
-    const labels = parseLabels(posted.form);
-    if (!labels.ok) return lost(400, "Labels refused", `${labels.error}.`);
-    await writeLabels(db, userId, labels.value);
-    return new Response(null, { status: 303, headers: { location: LABELS_TAB.path } });
-  };
-
-  // What the page tells the browser about a session's transcript: which files it holds, and where
-  // every stretch of the chosen one sits. It is one listing and no reads — the browser fetches the
-  // bytes it wants itself, off the stretches named here.
-  const transcriptPlan = async (
-    env: AppEnv,
-    userId: string,
-    sessionId: string,
-    url: URL,
-  ): Promise<TranscriptPlan | Response> => {
-    const wanted = url.searchParams.get("file");
-    const chosen = wanted === null ? { ok: true as const, value: MAIN_FILE } : parseTranscriptFile(wanted);
-    if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
-    const file = chosen.value;
-    const held = await archivedTranscript(env.TRANSCRIPTS, userId, sessionId);
-    if (held.length === 0) return { kind: "none" };
-    const files = held.map((archived) => archived.file);
-    const archive = held.find((archived) => archived.file === file);
-    if (archive === undefined || archive.bytes === 0) return { kind: "missing", file, files };
-    return { kind: "read", file, files, bytes: archive.bytes, runs: archive.runs };
-  };
-
-  // One stretch stored gzipped, handed over as it stands. A gzip member has no inner range, so the
-  // manifest never splits a read of one and the whole object is the answer: the browser inflates
-  // it, which leaves this reading no byte of the archive to touch and puts under a third of them on
-  // the wire. This route sits behind the Access assertion, so every reader of it is a browser and
-  // every browser takes gzip — `fetch` cannot drop the header — and the member goes over as it is.
-  const compressedStretch = async (
-    request: Request,
-    env: AppEnv,
-    userId: string,
-    sessionId: string,
-    file: string,
-    name: string,
-    inflates: number,
-  ): Promise<Response> => {
-    if (request.headers.get("range") !== null) {
-      return error(416, `the stretch at ${name} is one gzip member, so it is read whole, as ${inflates} bytes`);
-    }
-    const object = await openStretch(env.TRANSCRIPTS, userId, sessionId, file, name);
-    if (object === null) {
-      return error(404, `the archive holds no stretch of ${file} at ${name} of session ${sessionId}`);
-    }
-    return new Response(object.body, {
-      headers: {
-        "content-type": "application/x-ndjson",
-        "cache-control": "no-store",
-        "content-encoding": "gzip",
-      },
-    });
-  };
-
-  // The bytes of one stretch, streamed as they come off the archive. The key is built from the
-  // user the Access assertion resolved to, so a caller reaches nothing outside its own prefix, and
-  // the range is the browser's to choose: this reads no listing, joins no stretches and parses
-  // nothing, which is the whole of why the window the reader sees is the browser's own business.
-  const transcriptBytes = async (
-    request: Request,
-    url: URL,
-    env: AppEnv,
-    userId: string,
-    rawSessionId: string,
-  ): Promise<Response> => {
-    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!session.ok) return error(400, session.error);
-    const file = parseTranscriptFile(url.searchParams.get("file"));
-    if (!file.ok) return error(400, file.error);
-    const at = parseStretchName(url.searchParams.get("at"));
-    if (!at.ok) return error(400, at.error);
-    const packed = packedStretch(at.value);
-    if (packed !== null) {
-      return compressedStretch(request, env, userId, session.value, file.value, at.value, packed.inflates);
-    }
-    const asked = parseByteRange(request.headers.get("range"));
-    if (!asked.ok) return error(416, asked.error);
-    const { offset, length } = asked.value;
-    const object = await openStretch(env.TRANSCRIPTS, userId, session.value, file.value, at.value, { offset, length });
-    if (object === null) {
-      return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
-    }
-    if (offset + length > object.size) {
-      return error(416, `the stretch at ${at.value} holds ${object.size} bytes`);
-    }
-    return new Response(object.body, {
-      status: 206,
-      headers: {
-        "content-type": "application/x-ndjson",
-        "cache-control": "no-store",
-        "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
-      },
-    });
-  };
-
-  // Whether anyone is still running the session, and the stretches of its file around and past
-  // where the reader has read. A box following a live session beats against this, so it answers
-  // off the cheapest readings there are: the extent the storage event caches says whether the
-  // file has grown past where the reader has read, and a beat that finds it has not opens no
-  // object and lists nothing at all.
-  //
-  // That extent is a cache and lags the objects for as long as the event behind it is in flight,
-  // so it is trusted to say a file has grown and never to say it has not. A session no event has
-  // ever landed for keeps no row at all, and that one never corrects itself; with no row the
-  // objects are listed regardless, so a reader is never left watching a box that beats on in
-  // silence about a session writing away.
-  //
-  // The cursor is where the reader has read to and the stretch it read to the end of, and the two
-  // come off the manifest the archive itself wrote: a read is taken whole, so `from` is always the
-  // end of the stretch `after` names. That pair is what bounds the listing a beat pays for — the
-  // page opens past `after` and its first object sits at `from` — so a beat over a session of ten
-  // thousand stretches costs what one over a session of ten costs. The reader reads forward from
-  // `from` across whatever comes back.
-  //
-  // Only the session's own file is followed. Every other file is a delegated turn, which derives
-  // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
-  const transcriptTail = async (url: URL, env: AppEnv, userId: string, rawSessionId: string): Promise<Response> => {
-    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!session.ok) return error(400, session.error);
-    const file = parseTranscriptFile(url.searchParams.get("file"));
-    if (!file.ok) return error(400, file.error);
-    if (file.value !== MAIN_FILE) return error(400, `only ${MAIN_FILE} is followed as it is written`);
-    const from = parseStretchOffset(url.searchParams.get("from"));
-    if (!from.ok) return error(400, from.error);
-    const after = parseStretchCursor(url.searchParams.get("after"));
-    if (!after.ok) return error(400, after.error);
-    const [mark, device] = await Promise.all([
-      indexMark(env.DB, userId, session.value),
-      liveSessionDevice(env.DB, userId, session.value, deps.now()),
-    ]);
-    const grown = mark === null || mark.archived > from.value;
-    const runs = grown
-      ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value)
-      : [];
-    const reach: Reach = { running: device !== null, runs };
-    return json(reach, 200, { "cache-control": "no-store" });
-  };
-
-  // One session the dashboard can read and talk to. The page is reached by clicking a row of the
-  // ledger or the history, and both carry sessions this account has on record, live or long over.
-  const sessionDetail = async (
-    request: Request,
-    url: URL,
-    env: AppEnv,
-    userId: string,
-    email: string,
-    live: Live,
-    rawSessionId: string,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const parsed = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!parsed.ok) return lost(404, "No such session", "The dashboard has no page at this address.");
-    const now = deps.now();
-    const found = await findSession(env.DB, userId, parsed.value, now);
-    if (!found) return lost(404, "No such session", `This recall holds no session ${parsed.value}.`);
-    const { session } = found;
-    const [deviceId, spend, labels] = await Promise.all([
-      liveSessionDevice(env.DB, userId, session.sessionId, now),
-      sessionSpend(env.DB, userId, session.sessionId),
-      readLabels(env.DB, userId),
-    ]);
-    const csrf = pageToken(request);
-    const render = async (flash: Flash | null, draft: string, status: number): Promise<Response> => {
-      const transcript = await transcriptPlan(env, userId, session.sessionId, url);
-      if (transcript instanceof Response) return transcript;
-      const view: SessionView = { session, deviceId, spend, transcript, send: { csrf, draft, flash } };
-      return sessionPage(email, live, view, labels, now, status);
-    };
-    if (request.method === "GET") {
-      const sent = readCookie(request.headers.get("cookie"), SENT_COOKIE) === session.sessionId;
-      return render(sent ? { tone: "sent" } : null, "", 200);
-    }
-    return sendToSession(request, url, env, userId, email, session.sessionId, deviceId, render);
-  };
-
-  // The dashboard's own send, which is the Labels tab's post shape pointed at the message bus: an
-  // origin and CSRF check, then the same publish `POST /v1/messages` makes. A browser carries no
-  // device token, so it cannot reach that endpoint; what it shares with it is the mailbox.
-  //
-  // Every refusal, the refused origin and token among them, re-renders the page with the typing
-  // still in the box and says what went wrong, since a send box that clears itself and shows
-  // nothing is indistinguishable from one that worked.
-  const sendToSession = async (
-    request: Request,
-    url: URL,
-    env: AppEnv,
-    userId: string,
-    email: string,
-    sessionId: string,
-    deviceId: string | null,
-    render: (flash: Flash | null, draft: string, status: number) => Promise<Response>,
-  ): Promise<Response> => {
-    const posted = await formPost(request, url);
-    const body = posted.form.get("body") ?? "";
-    const refuse = (text: string, status: number): Promise<Response> => render({ tone: "refused", text }, body, status);
-    if (!posted.trusted) {
-      return refuse("The form did not come from this page, so nothing was sent. Send it again from here.", 403);
-    }
-    if (body.trim() === "") return refuse("The message was empty, so nothing was sent.", 400);
-    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
-      return refuse(`A message holds at most ${MAX_BODY_BYTES} bytes, and this one is longer. Nothing was sent.`, 400);
-    }
-    if (deviceId === null) {
-      return refuse("No host is running this session any more, so the bus has nowhere to deliver it.", 400);
-    }
-    if (!(await hasDevice(env.DB, userId, deviceId))) {
-      return refuse("The host that ran this session is signed out, so the bus has nowhere to deliver it.", 400);
-    }
-    const sender: Sender = { deviceId: DASHBOARD_DEVICE, host: DASHBOARD_DEVICE, name: email };
-    const input: SendInput = { kind: "news", toDeviceId: deviceId, toSessionId: sessionId, fromSessionId: "", body };
-    await mailboxFor(env, userId).publish(input, sender, deps.now());
-    return new Response(null, {
-      status: 303,
-      headers: {
-        location: sessionPath(sessionId),
-        "set-cookie": `${SENT_COOKIE}=${sessionId}; Path=/; Max-Age=30; Secure; HttpOnly; SameSite=Strict`,
-      },
-    });
-  };
-
-  const statsTab = async (
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    now: number,
-  ): Promise<Response> => {
-    const windows: StatsWindows = {
-      month: dayWindow(now, USAGE_MONTH_DAYS),
-      fortnight: dayWindow(now, USAGE_CHART_DAYS),
-      week: dayWindow(now, USAGE_WEEK_DAYS),
-      prior: dayWindow(now - USAGE_WEEK_DAYS * DAY_MS, USAGE_WEEK_DAYS),
-    };
-    const [stats, labels] = await Promise.all([readStats(db, userId, windows), readLabels(db, userId)]);
-    return statsPage(email, live, stats, labels, now);
-  };
-
-  const insightsTab = async (
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    now: number,
-  ): Promise<Response> =>
-    insightsPage(email, live, await readInsights(db, userId, dayWindow(now, USAGE_CHART_DAYS), now), now);
-
-  // A page link cut from an order a reader has since left behind, or one a hand edited, reads as
-  // page one rather than as an error: the address still names the list it names.
-  const pageCursor = (cursor: string, direction: "desc" | "asc"): Cursor =>
-    decodeCursor(cursor, direction) ?? decodeCursor("", direction) ?? [Number.MAX_SAFE_INTEGER, ""];
-
-  const historyTab = async (
-    url: URL,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const chosen = sortInForce(url, HISTORY_SORTS);
-    const input = parseHistory(url.searchParams, chosen.sort);
-    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
-    const filter = input.value;
-    const now = deps.now();
-    const match = filter.query === "" ? null : ftsQuery(filter.query);
-    const page =
-      filter.query === ""
-        ? {
-            ...(await listSessionHistory(
-              db,
-              userId,
-              filter,
-              pageCursor(filter.cursor, historyCursorDirection(filter.sort)),
-              now,
-            )),
-            cut: false,
-          }
-        : {
-            nextCursor: "",
-            ...(match === null
-              ? { sessions: [], cut: false }
-              : await searchSessionHistory(db, userId, filter, match, MAX_SEARCH_MATCHES, now)),
-          };
-    const [known, labels] = await Promise.all([sessionHistoryFilters(db, userId), readLabels(db, userId)]);
-    return historyPage(email, live, url, filter, known, page.sessions, page.nextCursor, page.cut, labels);
-  };
-
-  const memoryBody = async (
-    rawName: string,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const name = parseName(decodeSegment(rawName) ?? "");
-    const memory = name.ok ? await getMemory(db, userId, name.value) : null;
-    if (!memory) return lost(404, "No such memory", "This recall holds no memory at this address.");
-    return memoryBodyPage(email, live, memory, deps.now());
-  };
-
-  // One page of the shelf's rows and the counts the chips and the heading print. No bytes are read
-  // and the bucket is not listed.
-  const artifactRows = async (
-    db: D1Database,
-    userId: string,
-    input: ArtifactListInput,
-    cursor: Cursor,
-  ): Promise<{ artifacts: ArtifactRecord[]; counts: ArtifactCounts; nextCursor: string; cut: boolean }> => {
-    const match = input.query === "" ? null : ftsQuery(input.query);
-    const [counts, page] = await Promise.all([
-      artifactCounts(db, userId),
-      input.query === ""
-        ? listArtifactPage(db, userId, input, cursor).then((read) => ({ ...read, cut: false }))
-        : match === null
-          ? Promise.resolve({ artifacts: [], nextCursor: "", cut: false })
-          : searchArtifacts(db, userId, input.type, match, MAX_SEARCH_MATCHES).then((found) => ({
-              ...found,
-              nextCursor: "",
-            })),
-    ]);
-    return { artifacts: page.artifacts, counts, nextCursor: page.nextCursor, cut: page.cut };
-  };
-
-  // The shelf, with the third read: the live share counts for the artifacts on this page, grouped
-  // by name rather than read per row, so the read is bounded by the page and not by the account.
-  // Where sharing is off it does not run at all and every count is zero.
-  const shelfFor = async (
-    db: D1Database,
-    host: ArtifactHost,
-    userId: string,
-    input: ArtifactListInput,
-    cursor: Cursor,
-    now: number,
-  ): Promise<ArtifactShelf> => {
-    const page = await artifactRows(db, userId, input, cursor);
-    const counted =
-      host.sharing === null
-        ? new Map<string, number>()
-        : await shareCountsFor(
-            db,
-            userId,
-            page.artifacts.map((record) => record.name),
-            now,
-          );
-    return {
-      artifacts: page.artifacts.map((record) => viewOf(host, record, counted.get(record.name) ?? 0)),
-      counts: page.counts,
-      nextCursor: page.nextCursor,
-      cut: page.cut,
-    };
-  };
-
-  // The artifacts this account has published, off the same listing `GET /v1/artifacts` reads and
-  // scoped by the user the Access assertion resolved to. The tab browses and nothing else:
-  // publishing and unpublishing stay with `recall publish` and `recall unpublish`.
-  const artifactsTab = async (
-    url: URL,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const host = deps.artifactHost;
-    if (host === null) return artifactsPage(email, live, url, { kind: "off" });
-    const chosen = sortInForce(url, ARTIFACT_SORTS);
-    const input = parseArtifactList(url.searchParams, chosen.sort);
-    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
-    const cursor = pageCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
-    const shelf = await shelfFor(db, host, userId, input.value, cursor, deps.now());
-    return artifactsPage(email, live, url, { kind: "shelf", shelf });
-  };
-
-  const memoryTab = async (
-    url: URL,
-    db: D1Database,
-    userId: string,
-    email: string,
-    live: Live,
-    lost: Refusal,
-  ): Promise<Response> => {
-    const chosen = sortInForce(url, MEMORY_SORTS);
-    const input = parseList(url.searchParams, chosen.sort);
-    if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
-    const filter = input.value;
-    const now = deps.now();
-    const counts = await memoryCounts(db, userId, now - FRESH_WINDOW_MS);
-    const query = url.searchParams.get("q") ?? "";
-    if (query === "") {
-      const cursor = pageCursor(filter.cursor, memoryCursorDirection(filter.sort));
-      const page = await listMemories(db, userId, filter, cursor);
-      return memoriesPage(email, live, url, filter, counts, page.memories, page.nextCursor, now);
-    }
-    const searched = parseSearch({
-      query,
-      tags: filter.tags,
-      any: filter.tags.length === 0,
-      limit: filter.limit,
-      minScore: DEFAULT_MIN_SCORE,
-      mode: "hybrid",
-    });
-    if (!searched.ok) return lost(400, "Search refused", `${searched.error}.`);
-    const rankings = await rank(db, userId, searched.value, filter.types);
-    const found = await hits(db, userId, rankings.inScope, searched.value.limit);
-    return memorySearchPage(email, live, url, filter, counts, found, now);
-  };
-
   const devicePage = async (request: Request, url: URL, db: D1Database): Promise<Response> => {
     if (request.method !== "GET" && request.method !== "POST") return error(405, "method not allowed");
     const email = await approver(request, deps.verify);
@@ -2285,539 +3456,6 @@ export const createApp = (deps: Deps): App => {
     return decision === "approved"
       ? messagePage(200, "Device approved", "Return to your terminal. You can close this page.")
       : messagePage(200, "Device denied", "The device gets no access. You can close this page.");
-  };
-
-  const save = async (request: Request, db: D1Database, userId: string, name: string): Promise<Response> => {
-    const input = parseSave(await readJson(request));
-    if (!input.ok) return error(400, input.error);
-    const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
-    if (!vector) throw new Error("the embedder answered the memory with no vector");
-    const saved = await saveMemory(db, userId, name, input.value, quantize(vector), deps.now());
-    return json(saved, saved.created ? 201 : 200);
-  };
-
-  // What a publish is refused with when the name is taken: the artifact, its type, its size, when
-  // it was last written and the email that wrote it, in a string the CLI prints verbatim and in
-  // fields a tool reads.
-  const conflict = (record: ArtifactRecord): Response =>
-    json(
-      {
-        error: `${record.name} already holds a ${record.type} artifact of ${sizeText(record.bytes)}, last written ${momentOf(
-          record.updatedAt,
-        )} by ${record.lastWriter === "" ? "a device of this account" : record.lastWriter}; pass --replace to replace it`,
-        artifact: {
-          name: record.name,
-          type: record.type,
-          bytes: record.bytes,
-          updatedAt: record.updatedAt,
-          lastWriter: record.lastWriter,
-        },
-      },
-      409,
-    );
-
-  // What a write would replace. The caller's own row comes first and is the only one a write that
-  // is not replacing anything may find: one account publishing a name for the account to read must
-  // not take that name away from everyone else, who would otherwise be refused their own first
-  // publish under it. A caller who does mean to replace reaches the account-readable one, and the
-  // write permission decides whether they may.
-  const writeTarget = async (
-    db: D1Database,
-    userId: string,
-    name: string,
-    replacing: boolean,
-  ): Promise<ArtifactRecord | Response | null> => {
-    const own = await getArtifact(db, userId, name);
-    if (own !== null) return own;
-    if (!replacing) return null;
-    const shared = await resolveArtifact(db, userId, name);
-    if (shared === null || shared.write === "account") return shared;
-    return error(403, "this artifact's write permission is owner, and only its owner replaces or deletes it");
-  };
-
-  // The revision a failed publish wrote, and the one a publish that worked replaced. Neither is
-  // reachable from any address once the commit has run, so a delete that fails costs a dead
-  // revision an unpublish collects later rather than the answer the caller is owed.
-  const collect = (bucket: R2Bucket, userId: string, name: string, rev: number): Promise<void> =>
-    deleteRevision(bucket, userId, name, rev).catch((failure: unknown) => {
-      console.error(
-        JSON.stringify({
-          error: failure instanceof Error ? failure.message : String(failure),
-          collecting: `${userId}/${name}/${rev}`,
-          stack: failure instanceof Error ? failure.stack : "",
-        }),
-      );
-    });
-
-  // The publish. The manifest, the stored row and the gates come first and write nothing; then the
-  // revision is claimed in D1, so the prefix every file streams into is one no other writer can
-  // reach; then one compare-and-swap moves the row forward, which is the publish. Anything that
-  // fails before that statement leaves the artifact and every one of its files exactly as they
-  // were.
-  const publish = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    host: ArtifactHost,
-    caller: Caller,
-    name: string,
-  ): Promise<Response> => {
-    const tooLarge = (): Response =>
-      error(413, `a file holds at most ${MAX_FILE_BYTES} bytes and an artifact at most ${MAX_ARTIFACT_BYTES}`);
-    const boundary = boundaryOf(request.headers.get("content-type") ?? "");
-    if (boundary === null || request.body === null) {
-      return error(400, "a publish sends multipart/form-data: a manifest part, then one part per file");
-    }
-    const declared = Number(request.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > MAX_ARTIFACT_BYTES) return tooLarge();
-    const parts = readMultipart(request.body, boundary);
-    const head = await parts.nextPart();
-    if (head === null || head.name !== "manifest") return error(400, "the first part must be named manifest");
-    const text = await parts.text(MANIFEST_BYTES);
-    if (text === null) return error(400, `the manifest part holds at most ${MANIFEST_BYTES} bytes`);
-    const manifest = parseManifest(jsonOrNull(text));
-    if (!manifest.ok) return error(400, manifest.error);
-    const declaredFiles = manifest.value.files;
-    const total = declaredFiles.reduce((running, file) => running + file.bytes, 0);
-    if (total > MAX_ARTIFACT_BYTES || declaredFiles.some((file) => file.bytes > MAX_FILE_BYTES)) return tooLarge();
-    const replacing = url.searchParams.get("replace") === "true";
-    const target = await writeTarget(db, caller.userId, name, replacing);
-    if (target instanceof Response) return target;
-    if (target !== null && !replacing) return conflict(target);
-    const owner = target?.ownerUserId ?? caller.userId;
-    if (manifest.value.read === "account" && (await accountReadableElsewhere(db, owner, name))) {
-      return error(409, `another account publishes ${name} for this recall to read; publish it under another name`);
-    }
-    const rev = await claimRevision(db, owner, name);
-    const refuse = async (status: number, message: string): Promise<Response> => {
-      await collect(host.bucket, owner, name, rev);
-      return error(status, message);
-    };
-    const files: ArtifactFile[] = [];
-    for (const file of declaredFiles) {
-      const part = await parts.nextPart();
-      if (part === null) {
-        return refuse(400, `the manifest names ${declaredFiles.length} files and the body holds ${files.length}`);
-      }
-      // R2 takes a stream whose length is known, so the length the manifest declared is the length
-      // the object is written at and the part is held to it exactly.
-      const sized = new FixedLengthStream(file.bytes);
-      const stored = host.bucket.put(fileKey(owner, name, rev, file.path), sized.readable);
-      const written = await parts.pipe(sized.writable, file.bytes);
-      if (!written.ok) {
-        await stored.catch(() => undefined);
-        return refuse(400, `${file.path} holds ${written.bytes} bytes and the manifest names ${file.bytes}`);
-      }
-      await stored;
-      files.push({ path: file.path, bytes: file.bytes, contentType: contentTypeFor(file.path) });
-    }
-    const commit = {
-      userId: owner,
-      name,
-      rev,
-      type: manifest.value.type,
-      title: manifest.value.title,
-      description: manifest.value.description,
-      read: manifest.value.read,
-      write: manifest.value.write,
-      files,
-      at: deps.now(),
-      writerUserId: caller.userId,
-    };
-    const committed =
-      target === null ? await createArtifact(db, commit) : await replaceArtifact(db, commit, target.rev);
-    if (!committed) {
-      await collect(host.bucket, owner, name, rev);
-      const held = await getArtifact(db, owner, name);
-      return held === null
-        ? error(409, `${name} was written by another request while this one was publishing`)
-        : conflict(held);
-    }
-    const saved = await getArtifact(db, owner, name);
-    if (saved === null) throw new Error(`artifact ${name} vanished right after it was published`);
-    if (target !== null) await collect(host.bucket, owner, name, target.rev);
-    const shares = await sharesHeld(db, host, saved, caller.userId, deps.now());
-    return json({ artifact: viewOf(host, saved, shares), ownedByAnother: owner !== caller.userId });
-  };
-
-  const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
-    const target = await writeTarget(db, caller.userId, name, true);
-    if (target instanceof Response) return target;
-    if (target === null) {
-      // An artifact published before a row carried its type has bytes and no row, and unpublishing
-      // it is still deleting what the address serves.
-      const legacy = await bucket.head(fileKey(caller.userId, name, 0, ""));
-      if (legacy === null) return error(404, `no artifact named ${name}`);
-      await bucket.delete(legacy.key);
-      return new Response(null, { status: 204 });
-    }
-    await deleteArtifactWithShares(db, target.ownerUserId, name);
-    await deleteArtifactFiles(bucket, target.ownerUserId, name);
-    return new Response(null, { status: 204 });
-  };
-
-  const artifactsListing = async (
-    url: URL,
-    db: D1Database,
-    host: ArtifactHost,
-    userId: string,
-    now: number,
-  ): Promise<Response> => {
-    const chosen = sortInForce(url, ARTIFACT_SORTS);
-    const input = parseArtifactList(url.searchParams, chosen.sort);
-    if (!input.ok) return error(400, input.error);
-    const cursor = decodeCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
-    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
-    // One optional param turns the page's third read from the counts into the rows themselves,
-    // which is what `recall shares` with no name walks instead of a collection of its own.
-    const wanted = url.searchParams.get("shares") === "true" && host.sharing !== null;
-    const page = await artifactRows(db, userId, input.value, cursor);
-    const names = page.artifacts.map((record) => record.name);
-    const held = wanted ? await sharesFor(db, userId, names, now) : new Map<string, ShareRecord[]>();
-    const counted =
-      wanted || host.sharing === null ? new Map<string, number>() : await shareCountsFor(db, userId, names, now);
-    const artifacts = page.artifacts.map((record) => {
-      const shares = held.get(record.name) ?? [];
-      const view = viewOf(host, record, wanted ? shares.length : (counted.get(record.name) ?? 0));
-      return wanted ? { ...view, shares: shares.map(shareViewOf) } : view;
-    });
-    return json({ artifacts, nextCursor: page.nextCursor, total: page.counts.total, cut: page.cut });
-  };
-
-  // How many live shares one artifact holds, read for its owner alone: an account reading somebody
-  // else's account-readable artifact learns nothing about who else holds a share on it.
-  const sharesHeld = async (
-    db: D1Database,
-    host: ArtifactHost,
-    record: ArtifactRecord,
-    userId: string,
-    now: number,
-  ): Promise<number> => {
-    if (host.sharing === null || record.ownerUserId !== userId) return 0;
-    return shareCount(db, userId, record.name, now);
-  };
-
-  // What a `DELETE` on the collection names, which is exactly one of three. Naming none or more
-  // than one is refused by naming the three rather than picking one.
-  const revokeSelector = (url: URL): Parsed<RevokeScope> => {
-    const asked: RevokeScope[] = [];
-    if (url.searchParams.has("link")) asked.push({ kind: "link" });
-    if (url.searchParams.has("email")) {
-      const address = parseShareAddress(url.searchParams.get("email"));
-      if (!address.ok) return address;
-      asked.push({ kind: "email", address: address.value });
-    }
-    if (url.searchParams.get("all") === "true") asked.push({ kind: "all" });
-    const [scope] = asked;
-    if (asked.length !== 1 || scope === undefined) {
-      return fail("a revoke names exactly one of link, email=<address> and all=true");
-    }
-    return { ok: true, value: scope };
-  };
-
-  // The shares of one artifact, nested under the artifact that owns them: a share is meaningless
-  // without it, and the ownership check that answers the 403 falls out of the lookup the path
-  // already requires.
-  const artifactShareRoutes = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    host: ArtifactHost,
-    userId: string,
-    name: string,
-    rawShareId: string | undefined,
-    now: number,
-  ): Promise<Response> => {
-    if (host.sharing === null) {
-      return error(404, "this recall shares no artifacts; its deployment binds no share audience");
-    }
-    const record = await resolveArtifact(db, userId, name);
-    if (record === null) return error(404, `no artifact named ${name}`);
-    if (record.ownerUserId !== userId) return error(403, "only an artifact's owner shares it");
-    const remaining = async (): Promise<ShareView[]> => (await artifactShares(db, userId, name, now)).map(shareViewOf);
-    if (rawShareId !== undefined) {
-      if (request.method !== "DELETE") return error(405, "method not allowed");
-      const revoked = await revokeShares(db, userId, name, { kind: "one", shareId: rawShareId });
-      if (revoked === 0) return error(404, `no share ${rawShareId} on ${name}`);
-      return json({ revoked, shares: await remaining() });
-    }
-    if (request.method === "GET") return json({ shares: await remaining() });
-    if (request.method === "DELETE") {
-      const scope = revokeSelector(url);
-      if (!scope.ok) return error(400, scope.error);
-      const revoked = await revokeShares(db, userId, name, scope.value);
-      return json({ revoked, shares: await remaining() });
-    }
-    if (request.method !== "POST") return error(405, "method not allowed");
-    const body = await readJson(request);
-    if (!isRecord(body)) return error(400, "a share names a mode of link or email");
-    const expiresAt = now + SHARE_WINDOW_MS;
-    if (body.mode === "link") {
-      const shares = await artifactShares(db, userId, name, now);
-      const token = newShareToken();
-      const share = await replaceLinkShare(db, {
-        shareId: newShareId(),
-        userId,
-        name,
-        subject: await hashShareToken(token),
-        at: now,
-        expiresAt,
-      });
-      return json({
-        share: shareViewOf(share),
-        address: shareAddress(host, "link", token),
-        replaced: shares.some((one) => one.mode === "link"),
-      });
-    }
-    if (body.mode !== "email") return error(400, "a share names a mode of link or email");
-    const address = parseShareAddress(body.address);
-    if (!address.ok) return error(400, address.error);
-    const shares = await artifactShares(db, userId, name, now);
-    const addresses = shares.filter((one) => one.mode === "email");
-    if (!addresses.some((one) => one.subject === address.value) && addresses.length >= MAX_EMAIL_SHARES) {
-      return error(409, `${name} holds ${MAX_EMAIL_SHARES} email shares, the most one artifact takes`);
-    }
-    await deleteDeadEmailShare(db, userId, name, address.value, now);
-    const made = await createEmailShare(db, {
-      shareId: newShareId(),
-      userId,
-      name,
-      subject: address.value,
-      at: now,
-      expiresAt,
-    });
-    return json({
-      share: shareViewOf(made.share),
-      address: shareAddress(host, "email", made.share.shareId),
-      renewed: made.renewed,
-    });
-  };
-
-  const artifacts = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    caller: Caller,
-    rawName: string | undefined,
-    rest: readonly string[],
-  ): Promise<Response> => {
-    const host = deps.artifactHost;
-    if (host === null) {
-      return error(404, "this recall publishes no artifacts; its deployment names no artifact hostname");
-    }
-    const { bucket } = host;
-    const { userId } = caller;
-    const now = deps.now();
-    if (rawName === undefined) {
-      if (request.method !== "GET") return error(405, "method not allowed");
-      return artifactsListing(url, db, host, userId, now);
-    }
-    // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
-    // shadowed by an artifact named adopt.
-    if (rawName === "adopt" && rest.length === 0 && request.method === "POST") {
-      return json({ adopted: await adoptArtifacts(db, bucket, userId) });
-    }
-    const name = parseName(decodeSegment(rawName) ?? "");
-    if (!name.ok) return error(400, name.error);
-    // Under a name the next segment is a route word and nothing else, which is what frees `shares`
-    // beside `files` and is the same rule the artifact hostname holds: no position where a name or
-    // a file path meets a route.
-    const [word, ...tail] = rest;
-    if (word === SHARES_SEGMENT) {
-      if (tail.length > 1) return error(404, "not found");
-      return artifactShareRoutes(request, url, db, host, userId, name.value, tail[0], now);
-    }
-    if (word === "files") {
-      if (request.method !== "GET") return error(405, "method not allowed");
-      const subpath = tail.join("/");
-      const lost = (): Response => error(404, `no file ${subpath} in artifact ${name.value}`);
-      if (subpath === "") return lost();
-      const record = await resolveArtifact(db, userId, name.value);
-      if (record === null) return lost();
-      return artifactFile(request, bucket, record, subpath, lost);
-    }
-    if (word !== undefined) return error(404, "not found");
-    if (request.method === "PUT") return publish(request, url, db, host, caller, name.value);
-    if (request.method === "DELETE") return unpublish(db, bucket, caller, name.value);
-    if (request.method !== "GET") return error(405, "method not allowed");
-    // The same artifact a read of one of its files names, so a shared artifact never answers its
-    // files over the API while refusing to say anything about itself.
-    const record = await resolveArtifact(db, userId, name.value);
-    if (record === null) return error(404, `no artifact named ${name.value}`);
-    return json({ artifact: viewOf(host, record, await sharesHeld(db, host, record, userId, now)) });
-  };
-
-  const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
-    const input = parseList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
-    if (!input.ok) return error(400, input.error);
-    const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
-    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
-    return json(await listMemories(db, userId, input.value, cursor));
-  };
-
-  const vectorRankings = async (
-    db: D1Database,
-    userId: string,
-    input: SearchInput,
-    types: MemoryType[],
-  ): Promise<Rankings> => {
-    const [vector] = await deps.embedder.embed([input.query]);
-    if (!vector) throw new Error("the embedder answered the query with no vector");
-    const inScope: Ranking = [];
-    const elsewhere: Ranking = [];
-    for (const candidate of await vectorCandidates(db, userId, input.tags, types)) {
-      const score = dot(vector, candidate.embedding);
-      if (score >= input.minScore) (candidate.inScope ? inScope : elsewhere).push([candidate.memoryId, score]);
-    }
-    const byScore = (a: [string, number], b: [string, number]): number => b[1] - a[1];
-    return { inScope: inScope.sort(byScore), elsewhere: elsewhere.sort(byScore) };
-  };
-
-  const textRankings = async (
-    db: D1Database,
-    userId: string,
-    input: SearchInput,
-    types: MemoryType[],
-  ): Promise<{ inScope: string[]; elsewhere: string[] }> => {
-    const match = ftsQuery(input.query);
-    const candidates = match ? await textCandidates(db, userId, input.tags, types, match) : [];
-    return {
-      inScope: candidates.filter((candidate) => candidate.inScope).map((candidate) => candidate.memoryId),
-      elsewhere: candidates.filter((candidate) => !candidate.inScope).map((candidate) => candidate.memoryId),
-    };
-  };
-
-  const rank = async (db: D1Database, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
-    if (input.mode === "vector") return vectorRankings(db, userId, input, types);
-    if (input.mode === "text") {
-      const text = await textRankings(db, userId, input, types);
-      return { inScope: reciprocalRankFusion([text.inScope]), elsewhere: reciprocalRankFusion([text.elsewhere]) };
-    }
-    const [vector, text] = await Promise.all([
-      vectorRankings(db, userId, input, types),
-      textRankings(db, userId, input, types),
-    ]);
-    const ids = (ranking: Ranking): string[] => ranking.map(([id]) => id);
-    return {
-      inScope: reciprocalRankFusion([ids(vector.inScope), text.inScope]),
-      elsewhere: reciprocalRankFusion([ids(vector.elsewhere), text.elsewhere]),
-    };
-  };
-
-  const hits = async (db: D1Database, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
-    const top = ranking.slice(0, limit);
-    if (top.length === 0) return [];
-    const described = await describeMemories(
-      db,
-      userId,
-      top.map(([id]) => id),
-    );
-    const byId = new Map(described.map((memory) => [memory.memoryId, memory]));
-    return top.flatMap(([id, score]) => {
-      const memory = byId.get(id);
-      return memory ? [{ memory, score }] : [];
-    });
-  };
-
-  // What a query finds: the memories in scope of its tags, and the ones it would have found had the
-  // tags not been named. Both surfaces rank the same way and differ only in how they write a hit.
-  const ranked = async (
-    db: D1Database,
-    userId: string,
-    input: SearchInput,
-  ): Promise<{ shown: MemoryHit[]; nearby: MemoryHit[] }> => {
-    const rankings = await rank(db, userId, input, []);
-    const [shown, nearby] = await Promise.all([
-      hits(db, userId, rankings.inScope, input.limit),
-      hits(db, userId, rankings.elsewhere, ELSEWHERE_LIMIT),
-    ]);
-    return { shown, nearby };
-  };
-
-  const searched = async (db: D1Database, userId: string, input: SearchInput): Promise<unknown> => {
-    const { shown, nearby } = await ranked(db, userId, input);
-    const elsewhere = nearby.map(({ memory, score }) => ({
-      score,
-      name: memory.name,
-      type: memory.type,
-      tags: memory.tags,
-      description: memory.description,
-    }));
-    return { hits: shown, elsewhere };
-  };
-
-  const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
-    const parsed = parseSearch(await readJson(request));
-    if (!parsed.ok) return error(400, parsed.error);
-    return json(await searched(db, userId, parsed.value));
-  };
-
-  const v2MemoriesList = async (url: URL, db: D1Database, caller: Caller): Promise<Response> => {
-    const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
-    if (!input.ok) return error(400, input.error);
-    const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
-    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
-    const page = await listMemories(db, caller.userId, input.value, cursor);
-    return json({ memories: page.memories.map(memoryView), nextCursor: page.nextCursor });
-  };
-
-  const v2MemorySearch = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
-    const input = parseSearchMemories(await readJson(request));
-    if (!input.ok) return error(400, input.error);
-    const { shown, nearby } = await ranked(db, caller.userId, input.value);
-    return json({ hits: shown.map(memoryHitView), elsewhere: nearby.map(nearbyMemoryView) });
-  };
-
-  const v2MemorySave = async (request: Request, db: D1Database, caller: Caller, name: string): Promise<Response> => {
-    const input = parseSaveMemory(await readJson(request));
-    if (!input.ok) return error(400, input.error);
-    const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
-    if (!vector) throw new Error("the embedder answered the memory with no vector");
-    const saved = await saveMemory(db, caller.userId, name, input.value, quantize(vector), deps.now());
-    return json({ memory: memoryView(saved.memory) }, saved.created ? 201 : 200);
-  };
-
-  // Recalling a memory is a write, so it is a POST and the GET beside it is a read and nothing
-  // more. `/v1` folded the two into one GET behind a query parameter, which left every reader of a
-  // memory deciding whether it meant to count as one.
-  const v2MemoryRecall = async (db: D1Database, caller: Caller, name: string): Promise<Response> => {
-    const memory = await getMemory(db, caller.userId, name);
-    if (!memory) return error(404, `no memory named ${name}`);
-    const [recalled] = await recall(db, caller.userId, [memory.memoryId], deps.now());
-    if (!recalled) return error(404, `no memory named ${name}`);
-    return json({ memory: memoryView(recalled) });
-  };
-
-  // A memory answers a GET, a PUT and a DELETE at its own name and never a POST, which is what
-  // frees `search` beside it and `recall` below it: no position where a slug meets a route word.
-  const v2Memories = async (
-    request: Request,
-    url: URL,
-    db: D1Database,
-    caller: Caller,
-    rawName: string | undefined,
-    word: string | undefined,
-  ): Promise<Response> => {
-    if (rawName === undefined) {
-      return request.method === "GET" ? v2MemoriesList(url, db, caller) : error(405, "method not allowed");
-    }
-    if (rawName === "search" && word === undefined && request.method === "POST") {
-      return v2MemorySearch(request, db, caller);
-    }
-    const name = parseMemoryName(decodeSegment(rawName) ?? "");
-    if (!name.ok) return error(400, name.error);
-    if (word === "recall") {
-      if (request.method !== "POST") return error(405, "method not allowed");
-      return v2MemoryRecall(db, caller, name.value);
-    }
-    if (word !== undefined) return error(404, "not found");
-    if (request.method === "PUT") return v2MemorySave(request, db, caller, name.value);
-    if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
-    const memory = await getMemory(db, caller.userId, name.value);
-    if (!memory) return error(404, `no memory named ${name.value}`);
-    if (request.method === "GET") return json({ memory: memoryView(memory) });
-    await deleteMemory(db, caller.userId, memory.memoryId);
-    return new Response(null, { status: 204 });
   };
 
   const mcpCaller = async (request: Request, env: AppEnv, host: McpHost): Promise<Caller | Response> => {
@@ -2866,102 +3504,6 @@ export const createApp = (deps: Deps): App => {
     return connectorDevice(env.DB, userId, deps.now());
   };
 
-  const runTool = (env: AppEnv, caller: Caller): RunTool => {
-    const db = env.DB;
-    const { userId } = caller;
-    const refused = (reason: string): ToolResult => ({ ok: false, error: `recall: ${reason}` });
-    const document = (value: unknown): ToolResult => ({ ok: true, text: JSON.stringify(value) });
-    const saved = async (name: string, input: SaveInput): Promise<ToolResult> => {
-      const [vector] = await deps.embedder.embed([embeddingText(name, input.description, input.body)]);
-      if (!vector) throw new Error("the embedder answered the memory with no vector");
-      const written = await saveMemory(db, userId, name, input, quantize(vector), deps.now());
-      return document({ name: written.memory.name, created: written.created, tags: written.memory.tags });
-    };
-    return async (call: ToolCall): Promise<ToolResult> => {
-      const definition = TOOLS.find((tool) => tool.name === call.name);
-      if (definition === undefined) return refused(`no tool named ${call.name}`);
-      const args = toolArguments(definition, call.arguments);
-      if (!args.ok) return refused(args.error);
-      if (call.name === "recall_search") {
-        const input = parseSearchArgs(args.value);
-        if (!input.ok) return refused(input.error);
-        const { query, tags, mode } = input.value;
-        return document(
-          await searched(db, userId, { query, tags, mode, limit: SEARCH_LIMIT, minScore: DEFAULT_MIN_SCORE }),
-        );
-      }
-      if (call.name === "recall_get") {
-        const input = parseNameArgs(args.value);
-        if (!input.ok) return refused(input.error);
-        const memory = await getMemory(db, userId, input.value.name);
-        if (memory === null) return refused(`no memory named ${input.value.name}`);
-        const [recalled] = await recall(db, userId, [memory.memoryId], deps.now());
-        return { ok: true, text: renderMemory(recalled ?? memory) };
-      }
-      if (call.name === "recall_list") {
-        const input = parseListArgs(args.value);
-        if (!input.ok) return refused(input.error);
-        const sort = "newest";
-        const page = await listMemories(
-          db,
-          userId,
-          { ...input.value, types: [], cursor: "", sort },
-          startCursor(memoryCursorDirection(sort)),
-        );
-        return document(page.memories);
-      }
-      if (call.name === "recall_save") {
-        const input = parseSaveArgs(args.value);
-        if (!input.ok) return refused(input.error);
-        const name = parseName(input.value.name);
-        if (!name.ok) return refused(name.error);
-        return saved(name.value, input.value);
-      }
-      if (call.name === "recall_edit") {
-        const input = parseEditArgs(args.value);
-        if (!input.ok) return refused(input.error);
-        const memory = await getMemory(db, userId, input.value.name);
-        if (memory === null) return refused(`no memory named ${input.value.name}`);
-        return saved(memory.name, editedMemory(memory, input.value));
-      }
-      if (call.name === "recall_delete") {
-        const input = parseNameArgs(args.value);
-        if (!input.ok) return refused(input.error);
-        const memory = await getMemory(db, userId, input.value.name);
-        if (memory === null) return refused(`no memory named ${input.value.name}`);
-        await deleteMemory(db, userId, memory.memoryId);
-        return document({ deleted: memory.name });
-      }
-      const input = parseSendArgs(args.value);
-      if (!input.ok) return refused(input.error);
-      const now = deps.now();
-      const [devices, sessions, labels] = await Promise.all([
-        listDevices(db, userId),
-        listSessions(db, userId, now),
-        readLabels(db, userId),
-      ]);
-      const target = resolveTarget(devices, labels, sessions, input.value.to);
-      if (!target.ok) return refused(target.error);
-      if (new TextEncoder().encode(input.value.message).byteLength > MAX_BODY_BYTES) {
-        return refused(`message must hold at most ${MAX_BODY_BYTES} bytes`);
-      }
-      const sender: Sender = { deviceId: caller.deviceId, host: caller.host, name: caller.name };
-      const message: SendInput = {
-        kind: "news",
-        toDeviceId: target.value.toDeviceId,
-        toSessionId: target.value.toSessionId,
-        fromSessionId: "",
-        body: input.value.message,
-      };
-      const sent = await mailboxFor(env, userId).publish(message, sender, now);
-      return document({
-        messageId: sent.message.messageId,
-        toDeviceId: sent.message.toDeviceId,
-        toSessionId: sent.message.toSessionId,
-      });
-    };
-  };
-
   const mcp = (request: Request, env: AppEnv): Promise<Response> =>
     mcpEndpoint(request, async () => {
       const host = deps.mcpHost;
@@ -2969,383 +3511,67 @@ export const createApp = (deps: Deps): App => {
         return mcpRefusal(404, "this recall serves no MCP connector; its deployment has not switched one on");
       }
       const caller = await mcpCaller(request, env, host);
-      return caller instanceof Response ? caller : runTool(env, caller);
+      if (caller instanceof Response) return caller;
+      const tenant = tenantOf(env, caller.userId);
+      return (made: ToolCall): Promise<ToolResult> => tenant.tool(made, caller, handed());
     });
 
-  // The second version of the API, which is the first one with its sentinels and its epoch
-  // integers taken out. `/v1` is untouched and stays the live surface until every host has
-  // crossed; this answers beside it, authenticates with the same device tokens, and shares every
-  // handler whose shape was never the problem.
-  //
-  // A caller is proved once, here, and handed to every handler below with the database it reads.
-  // No handler under this branch reaches back into the environment for a binding once the caller
-  // is known, which is what lets the whole branch move behind a Durable Object unchanged.
-  const v2Devices = async (
-    request: Request,
-    env: AppEnv,
-    db: D1Database,
-    caller: Caller,
-    deviceId: string | undefined,
-  ): Promise<Response> => {
-    if (deviceId === undefined) {
-      if (request.method !== "GET") return error(405, "method not allowed");
-      const [listed, labels] = await Promise.all([listDevices(db, caller.userId), readLabels(db, caller.userId)]);
-      return json({ devices: listed.map((device) => deviceView(device, labels.hosts, caller.deviceId)) });
-    }
-    // No `current`: a client revokes its own login by reading its row off the listing, where
-    // `current` already says which one it is. A path segment that means a different device
-    // depending on who sent the request is one `curl` cannot be used to reason about.
-    if (request.method !== "DELETE") return error(405, "method not allowed");
-    if (!(await revokeDevice(db, caller.userId, deviceId))) return error(404, `no device ${deviceId}`);
-    await mailboxFor(env, caller.userId).revoke(deviceId);
-    return new Response(null, { status: 204 });
-  };
+  // The half the Worker answers out of itself, for the paths that read no tenant row. Its clock is
+  // a function rather than a moment, so one of these serves every request the Worker takes.
+  const account = createTenant({
+    embedder: deps.embedder,
+    artifacts:
+      deps.artifactHost === null
+        ? null
+        : {
+            hostname: deps.artifactHost.hostname,
+            bucket: deps.artifactHost.bucket,
+            dashboard: deps.artifactHost.dashboard,
+            sharing: deps.artifactHost.sharing !== null,
+          },
+    now: deps.now,
+  });
 
-  const v2SessionsList = async (db: D1Database, caller: Caller): Promise<Response> => {
-    const [listed, labels] = await Promise.all([
-      listSessions(db, caller.userId, deps.now()),
-      readLabels(db, caller.userId),
-    ]);
-    return json({ sessions: listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)) });
-  };
+  // What a tenant object is handed on every call: the clock the Worker read, the embedder it was
+  // built with, and the artifact surface of this deployment. They are built once, here, so the
+  // object has nothing of its own to construct and nothing to disagree with the Worker about.
+  const handed = (): TenantCall => ({
+    now: deps.now(),
+    embed: (texts: string[]): Promise<Float32Array[]> => deps.embedder.embed(texts),
+    artifacts:
+      deps.artifactHost === null
+        ? null
+        : {
+            hostname: deps.artifactHost.hostname,
+            dashboard: deps.artifactHost.dashboard,
+            sharing: deps.artifactHost.sharing !== null,
+          },
+  });
 
-  // Every file of a session the archive holds, whichever path wrote it. The record path is the one
-  // `/v2` writes with and the byte path is what `/v1` left behind, so a file the records hold is
-  // answered off them and the byte path answers for the rest.
-  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<HeldFile[]> => {
-    const [recorded, archived] = await Promise.all([
-      recordFiles(bucket, userId, sessionId),
-      archivedFiles(bucket, userId, sessionId),
-    ]);
-    const held = new Set(recorded.map((file) => file.file));
-    const byBytes = archived
-      .filter((file) => !held.has(file.file))
-      .map(({ file, bytes, through, named }): HeldFile => ({ held: "bytes", file, bytes, through, named }));
-    return [...recorded, ...byBytes].sort((left, right) => left.file.localeCompare(right.file));
-  };
-
-  const v2Session = async (bucket: R2Bucket, db: D1Database, caller: Caller, target: string): Promise<Response> => {
-    const found = await findSession(db, caller.userId, target, deps.now());
-    if (!found) return error(404, `no session named ${target}`);
-    const [files, labels] = await Promise.all([
-      v2FilesOf(bucket, caller.userId, found.session.sessionId),
-      readLabels(db, caller.userId),
-    ]);
-    return json({ session: pastSessionView(found.session, labels.hosts), matches: found.matches, files });
-  };
-
-  // The transcript files a session has on record, which `/v1` served from the transcript path when
-  // no file was named. One path, one shape.
-  const v2Files = async (
-    request: Request,
-    bucket: R2Bucket,
-    db: D1Database,
-    caller: Caller,
-    sessionId: string,
-  ): Promise<Response> => {
-    if (request.method !== "GET") return error(405, "method not allowed");
-    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
-    const [files, counted] = await Promise.all([
-      v2FilesOf(bucket, caller.userId, sessionId),
-      countedFiles(db, caller.userId, sessionId),
-    ]);
-    return json({ files, counted });
-  };
-
-  // One file of a session's transcript, read back. The PUT `/v1` answered here is gone: a host
-  // sends records now, and the records endpoint is the one way prose enters the archive on `/v2`.
-  const v2Transcript = async (
-    request: Request,
-    url: URL,
-    bucket: R2Bucket,
-    db: D1Database,
-    caller: Caller,
-    sessionId: string,
-  ): Promise<Response> => {
-    if (request.method !== "GET") return error(405, "method not allowed");
-    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
-    const file = parseTranscriptFile(url.searchParams.get("file"));
-    if (!file.ok) return error(400, file.error);
-    const ndjson = (body: ReadableStream<Uint8Array>, gzip: boolean): Response =>
-      new Response(body, {
-        headers: {
-          "content-type": "application/x-ndjson",
-          "cache-control": "no-store",
-          ...(gzip ? { "content-encoding": "gzip" } : {}),
-        },
-      });
-    // The records first: they are what `/v2` writes, and a session that only ever posted them has
-    // nothing under the byte path's prefix at all.
-    const recorded = await readRecords(bucket, caller.userId, sessionId, file.value);
-    if (recorded !== null) return ndjson(recorded, false);
-    const archived = await readTranscript(bucket, caller.userId, sessionId, file.value, takesGzip(request));
-    if (archived === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
-    return ndjson(archived.body, archived.gzip);
-  };
-
-  const v2Usage = async (request: Request, db: D1Database, caller: Caller, sessionId: string): Promise<Response> => {
-    if (request.method !== "POST") return error(405, "method not allowed");
-    const now = deps.now();
-    const input = parseUsageDelta(await readJson(request), now, USAGE_EPOCH, DAY_MS);
-    if (!input.ok) return error(400, input.error);
-    await recordUsage(db, caller.userId, sessionId, input.value, now);
-    return new Response(null, { status: 204 });
-  };
-
-  // A stretch of a session's transcript as the records it holds, and the whole of what that costs:
-  // the records are stored, read for turns, chunked, embedded and written to the index before the
-  // response goes back. Embedding is a subrequest and so is wall clock rather than billed CPU,
-  // which is what makes indexing in the request affordable where reading a megabyte of archive
-  // back was not.
-  //
-  // Ordering is total and carries no clock. The record at index `i` has ordinal `from + i`, so an
-  // ordinal is a position and never a field; `from` has to equal the next ordinal the file is
-  // waiting for, which makes a replayed call a 409 carrying the real `next` and never a second
-  // write of prose already indexed.
-  const v2Records = async (
-    request: Request,
-    bucket: R2Bucket,
-    db: D1Database,
-    caller: Caller,
-    sessionId: string,
-  ): Promise<Response> => {
-    if (request.method !== "POST") return error(405, "method not allowed");
-    const tooLarge = error(413, `an append must hold at most ${MAX_RECORDS_BYTES} bytes`);
-    if (Number(request.headers.get("content-length") ?? 0) > MAX_RECORDS_BYTES) return tooLarge;
-    const body = await request.arrayBuffer();
-    if (body.byteLength > MAX_RECORDS_BYTES) return tooLarge;
-    const sent = jsonOrNull(new TextDecoder().decode(body));
-    // Counted before the contract's own schema reads it: the schema bounds the array too, but a
-    // body past the ceiling is refused for being too large rather than for being malformed, and a
-    // host told 400 would retry it forever.
-    if (isRecord(sent) && Array.isArray(sent.records) && sent.records.length > MAX_RECORDS_PER_APPEND) {
-      return error(413, `an append must carry at most ${MAX_RECORDS_PER_APPEND} records`);
+  const dashboard = async (request: Request, url: URL, env: AppEnv): Promise<Response> => {
+    const lost = (status: number, title: string, text: string): Response =>
+      dashboardNotice(status, title, text, "Back to the dashboard");
+    const signIn = (status: number, title: string, text: string): Response =>
+      dashboardNotice(status, title, text, "Sign in again");
+    const { saving, posting, sending, sharing, bytes, rawSessionId } = dashboardAsk(request, url);
+    if (request.method !== "GET" && !saving && !posting && !sending && !sharing) {
+      return lost(
+        405,
+        "Not allowed",
+        "The dashboard only answers a GET, the Labels and Board tabs their own POST, an artifact's share page its own POST, and a session page the message it sends.",
+      );
     }
-    const input = parseAppendRecords(sent);
-    if (!input.ok) return error(400, input.error);
-    const file = parseTranscriptFile(input.value.file);
-    if (!file.ok) return error(400, file.error);
-    // The account is what a session belongs to, and the key prefix below is built from the
-    // caller's own user id, so neither a read nor an append can reach another account's session.
-    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
-    const { userId } = caller;
-    const { from, records, closed } = input.value;
-    const fault = recordsFault(records);
-    if (fault !== "") return error(400, fault);
-    // Every 409 this endpoint answers carries the ordinal to send from, because the only thing a
-    // host can do with one is send again from there.
-    const conflict = (next: number, error: string): Response => {
-      const refused: V2RecordsConflict = { error, next };
-      return json(refused, 409);
-    };
-    const refuse = (next: number): Response =>
-      conflict(next, `${file.value} holds ${next} records; send the records starting at ${next}`);
-    const accepted = (next: number): Response => {
-      const taken: V2RecordsAccepted = { file: file.value, next };
-      return json(taken);
-    };
-    // One session, one path into the index. A session the byte path already wrote is taken over
-    // whole or not at all: the record mark is written, the byte mark cleared and the chunks the
-    // byte path wrote dropped, all in the batch that carries this append — so the two never index
-    // the same prose and the chunk counter they share is held by one of them.
-    //
-    // Nothing here weighs where the append opens. A session on the byte path holds no record mark,
-    // so the fold below reads the file from ordinal 0 whatever `from` says, which is the whole of
-    // what a takeover needs; an append landing in the middle of a file the records do not reach is
-    // refused by the ordinal check for the ordinary reason and told to send from 0.
-    const mark = await indexMark(db, userId, sessionId);
-    const crossing = file.value === MAIN_FILE && mark !== null && mark.archived > 0;
-    const takeover = crossing && !(await onRecordMark(db, userId, sessionId));
-    // The mark says where the file is waiting, and the objects are the arbiter: the two part
-    // company only where a writer stored records and did not live to write the mark. The objects
-    // also carry the one thing the mark cannot, which is whether a break closed the record in
-    // front of this append, so they are read on every call rather than on the conflicting one.
-    const marked = await recordReach(db, userId, sessionId, file.value);
-    const end = await recordsEnd(bucket, userId, sessionId, file.value);
-    if (from !== marked && from !== end.reach) return refuse(end.reach);
-    // A record the session stopped writing part way through is the last record its file takes. An
-    // append behind it would store its bytes under an ordinal of their own, and the file would
-    // read back with the two run together under the first of them — one line where the archive
-    // counts two, which is a restore calling a whole file a part for ever.
-    if (from === end.reach && !end.closes) {
-      return conflict(end.reach, `${file.value} ends on a record no break closed; it takes no more records`);
+    const email = await approver(request, deps.verify, signIn);
+    if (email instanceof Response) return email;
+    const userId = await invited(env.DB, email, signIn);
+    if (userId instanceof Response) return userId;
+    // The bytes of one named stretch come off the archive and read no row at all, so they are
+    // answered here rather than one round trip into the object apiece. `from` asks how far the
+    // file now reaches, which is a row this tenant holds, so that one goes on to the object.
+    if (bytes && !url.searchParams.has("from")) {
+      return transcriptBytes(request, url, env.TRANSCRIPTS, userId, rawSessionId);
     }
-    // A put that does not land means the archive already holds an append at this ordinal. The
-    // conditional put weighs presence and never content, so what is stored there is read back
-    // before the writer is sent anywhere: two appends starting in the same place and agreeing as
-    // far as they overlap are one host sending a different number of records, and it is told the
-    // real reach and sends from there. Records that disagree at an ordinal are a transcript being
-    // rewritten, and neither side's prose may be dropped for the other's without the host hearing
-    // of it.
-    if (!(await putRecords(bucket, userId, sessionId, file.value, from, records, closed))) {
-      const stored = await readRecordAppend(bucket, userId, sessionId, file.value, from);
-      if (stored !== null && !recordsAgree(stored, records)) {
-        const reach = await recordsReach(bucket, userId, sessionId, file.value);
-        return conflict(reach, `${file.value} holds other records at ordinal ${from}; a record is written once`);
-      }
-      return refuse(await recordsReach(bucket, userId, sessionId, file.value));
-    }
-    const next = from + records.length;
-    // Only the session's own file reaches the index, exactly as the byte path's consumer reads
-    // only `main`. A delegated turn is the model talking to itself and derives nothing.
-    if (file.value !== MAIN_FILE) {
-      const commit = {
-        userId,
-        sessionId,
-        file: file.value,
-        held: marked,
-        next,
-        chunkFrom: 0,
-        chunks: [],
-        open: [],
-        takeover: false,
-      };
-      if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
-      return accepted(next);
-    }
-    // Every record the index has not read yet, which is this append and the span between the mark
-    // and it. That span is what an append landing ahead of the mark leaves behind: another writer
-    // stored records and lost the file before it could index them, or this one did and is sending
-    // again. The prose is in the archive either way, and the append carrying the mark past it is
-    // the one that has to index it, or nothing ever will.
-    const behind = await readRecordsBetween(bucket, userId, sessionId, file.value, marked, from);
-    const text = [...behind, ...records].join("\n");
-    const carried = await openChunks(db, userId, sessionId, file.value);
-    const { closed: shut, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
-    // A takeover indexes the session from nothing, so its chunks open at ordinal 0 and the byte
-    // path's are dropped under them in the same batch.
-    const chunkFrom = takeover ? 0 : await chunkReach(db, userId, sessionId);
-    const indexed = await embedChunks(shut);
-    // The mark the work above was read against, still standing. A host knows its next `from`
-    // without asking and pipelines two appends, and the second read the chunks and the open chunk
-    // of a file the first had not finished writing; it is told the real `next` and sends again.
-    const commit = {
-      userId,
-      sessionId,
-      file: file.value,
-      held: marked,
-      next,
-      chunkFrom,
-      chunks: indexed,
-      open,
-      takeover,
-    };
-    if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
-    // The span this append indexed opens the session wherever the mark stood at nothing, which is
-    // not the same as the call carrying ordinal 0: a first append that lost its commit leaves the
-    // name to whichever later one carries the mark off zero. A losing append names nothing.
-    if (marked === 0) {
-      const named = agentName(text.slice(0, HEAD_BYTES));
-      if (named !== "") await nameSession(db, userId, sessionId, named);
-    }
-    return accepted(next);
-  };
-
-  // What a session leaves behind when it ends. A chunk closes where the conversation turns or
-  // where the character ceiling runs out, so the one a file is still holding closes nowhere at all
-  // unless the end of the session closes it — and a short session, which turns nowhere, would be
-  // unfindable entirely. `/v1` closed everything at the end of every indexing bite.
-  //
-  // It is also the last chance the span past the mark has. An append that stored its records and
-  // lost its commit leaves the archive ahead of the mark, and the gap fold that would have carried
-  // the index over it only runs on another append; where the session ended there, the end of it is
-  // the append that never came.
-  const closeSession = async (bucket: R2Bucket, db: D1Database, userId: string, sessionId: string): Promise<void> => {
-    const [open, held, chunkFrom, reach] = await Promise.all([
-      openChunks(db, userId, sessionId, MAIN_FILE),
-      recordReach(db, userId, sessionId, MAIN_FILE),
-      chunkReach(db, userId, sessionId),
-      recordsReach(bucket, userId, sessionId, MAIN_FILE),
-    ]);
-    const next = Math.max(held, reach);
-    if (open.length === 0 && next === held) return;
-    const behind = await readRecordsBetween(bucket, userId, sessionId, MAIN_FILE, held, next);
-    const tail = chunkTurnsCarrying(readTurns(behind.join("\n"), MAIN_FILE), open);
-    const indexed = await embedChunks([...tail.closed, ...closeChunks(tail.open)]);
-    await commitRecords(db, {
-      userId,
-      sessionId,
-      file: MAIN_FILE,
-      held,
-      next,
-      chunkFrom,
-      chunks: indexed,
-      open: [],
-      takeover: false,
-    });
-  };
-
-  const v2Sessions = async (
-    request: Request,
-    url: URL,
-    bucket: R2Bucket,
-    db: D1Database,
-    caller: Caller,
-    rawSessionId: string | undefined,
-    subresource: string | undefined,
-  ): Promise<Response> => {
-    if (rawSessionId === undefined) {
-      return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
-    }
-    const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!sessionId.ok) return error(400, sessionId.error);
-    if (subresource === "usage") return v2Usage(request, db, caller, sessionId.value);
-    if (subresource === "records") return v2Records(request, bucket, db, caller, sessionId.value);
-    if (subresource === "files") return v2Files(request, bucket, db, caller, sessionId.value);
-    if (subresource === "transcript") {
-      return v2Transcript(request, url, bucket, db, caller, sessionId.value);
-    }
-    if (subresource !== undefined) return error(404, "not found");
-    if (request.method === "GET") return v2Session(bucket, db, caller, sessionId.value);
-    if (request.method === "PUT") {
-      const input = parseSessionSync(await readJson(request));
-      if (!input.ok) return error(400, input.error);
-      await putSession(db, caller, sessionId.value, input.value, deps.now());
-      return new Response(null, { status: 204 });
-    }
-    if (request.method !== "DELETE") return error(405, "method not allowed");
-    await closeSession(bucket, db, caller.userId, sessionId.value);
-    if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
-    return new Response(null, { status: 204 });
-  };
-
-  // Every session the account has on record, and the ones a query finds by meaning. It is its own
-  // collection rather than a scope of the sessions listing because `history` is a legal session id
-  // and `/v2/sessions/history` would have answered two things depending on which one was meant.
-  const v2History = async (request: Request, url: URL, db: D1Database, caller: Caller): Promise<Response> => {
-    if (request.method !== "GET") return error(405, "method not allowed");
-    const { userId } = caller;
-    if (url.searchParams.get("q") === null) {
-      return json(await listSessionHistoryIds(db, userId, url.searchParams.get("cursor") ?? ""));
-    }
-    const hits = await sessionSearchHits(url, db, userId);
-    if (!hits.ok) return error(400, hits.error);
-    const labels = await readLabels(db, userId);
-    return json({ hits: hits.value.map((hit) => sessionHitView(hit, labels.hosts)) });
-  };
-
-  const v2SendMessage = async (request: Request, env: AppEnv, db: D1Database, caller: Caller): Promise<Response> => {
-    const input = parseV2Send(await readJson(request));
-    if (!input.ok) return error(400, input.error);
-    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
-      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
-    }
-    const { scope, target } = input.value.address;
-    const now = deps.now();
-    // A session is addressed by itself and the device it runs on is read off it, where `/v1` had
-    // the caller name both and an empty session id meant every session on the device.
-    const toDeviceId =
-      scope === "host"
-        ? (await hasDevice(db, caller.userId, target))
-          ? target
-          : null
-        : await liveSessionDevice(db, caller.userId, target, now);
-    if (toDeviceId === null) {
-      return error(404, scope === "host" ? `no device ${target}` : `no session ${target} running on this account`);
-    }
-    const sender = await senderOf(db, caller, input.value.fromSessionId, now);
-    const sent = await mailboxFor(env, caller.userId).publish(sendInputOf(input.value, toDeviceId), sender, now);
-    return json(sent, 201);
+    return tenantOf(env, userId).dashboard(request, userId, email, handed());
   };
 
   const routeV2 = async (
@@ -3371,26 +3597,17 @@ export const createApp = (deps: Deps): App => {
     }
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
-    const db = env.DB;
-    if (collection === "devices") return v2Devices(request, env, db, caller, rawName);
-    if (collection === "board") return board(request, url, db, caller, rawName, parseV2Post);
-    if (collection === "sessions") return v2Sessions(request, url, env.TRANSCRIPTS, db, caller, rawName, rest[0]);
-    if (collection === "history") {
-      if (rawName !== undefined) return error(404, "not found");
-      return v2History(request, url, db, caller);
-    }
-    if (collection === "artifacts") return artifacts(request, url, db, caller, rawName, rest);
-    if (collection === "memories") return v2Memories(request, url, db, caller, rawName, rest[0]);
-    if (collection !== "messages") return error(404, "not found");
-    if (rawName === "listen") {
+    // The bus is the Worker's: a listener holds a socket open against its own object for as long
+    // as the host runs, and nothing it does reads a row of this account.
+    if (collection === "messages" && rawName === "listen") {
       if (request.method !== "GET") return error(405, "method not allowed");
       if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
         return error(426, "/v2/messages/listen only answers a WebSocket upgrade; send Upgrade: websocket");
       }
       return listen(request, env, caller);
     }
-    if (rawName !== undefined) return error(404, "not found");
-    return request.method === "POST" ? v2SendMessage(request, env, db, caller) : error(405, "method not allowed");
+    if (collection === "artifacts") return account.artifacts(request, url, env.DB, caller, rawName, rest);
+    return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 
   const route = async (request: Request, env: AppEnv): Promise<Response> => {
@@ -3419,7 +3636,6 @@ export const createApp = (deps: Deps): App => {
     const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
     if (version === "v2") return routeV2(request, url, env, collection, rawName, rest);
     if (version !== "v1") return error(404, "not found");
-    const subresource = rest[0];
     // An artifact's files are addressed by a path of up to three segments, so the tail below the
     // name belongs to the collection rather than to the router.
     if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts") return error(404, "not found");
@@ -3432,42 +3648,15 @@ export const createApp = (deps: Deps): App => {
     }
     const caller = await authenticate(request, env.DB);
     if (caller instanceof Response) return caller;
-    if (collection === "devices") return devices(request, env, caller, rawName);
-    if (collection === "board") return board(request, url, env.DB, caller, rawName, parsePost);
-    if (collection === "sessions") return sessions(request, url, env, caller, rawName, subresource);
-    if (collection === "messages") {
-      if (rawName === "listen") {
-        if (request.method !== "GET") return error(405, "method not allowed");
-        if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
-          return error(426, "/v1/messages/listen only answers a WebSocket upgrade; send Upgrade: websocket");
-        }
-        return listen(request, env, caller);
+    if (collection === "messages" && rawName === "listen") {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
+        return error(426, "/v1/messages/listen only answers a WebSocket upgrade; send Upgrade: websocket");
       }
-      if (rawName !== undefined) return error(404, "not found");
-      return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
+      return listen(request, env, caller);
     }
-    const { userId } = caller;
-    if (collection === "artifacts") return artifacts(request, url, env.DB, caller, rawName, rest);
-    if (collection === "search" && rawName === undefined) {
-      return request.method === "POST" ? search(request, env.DB, userId) : error(405, "method not allowed");
-    }
-    if (collection !== "memories") return error(404, "not found");
-    if (rawName === undefined) {
-      return request.method === "GET" ? list(url, env.DB, userId) : error(405, "method not allowed");
-    }
-    const name = parseName(decodeSegment(rawName) ?? "");
-    if (!name.ok) return error(400, name.error);
-    if (request.method === "PUT") return save(request, env.DB, userId, name.value);
-    if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
-    const memory = await getMemory(env.DB, userId, name.value);
-    if (!memory) return error(404, `no memory named ${name.value}`);
-    if (request.method === "GET" && url.searchParams.get("recall") !== "true") return json({ memory });
-    if (request.method === "GET") {
-      const [recalled] = await recall(env.DB, userId, [memory.memoryId], deps.now());
-      return recalled ? json({ memory: recalled }) : error(404, `no memory named ${name.value}`);
-    }
-    await deleteMemory(env.DB, userId, memory.memoryId);
-    return new Response(null, { status: 204 });
+    if (collection === "artifacts") return account.artifacts(request, url, env.DB, caller, rawName, rest);
+    return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 
   return {
@@ -3505,11 +3694,8 @@ export const createApp = (deps: Deps): App => {
         else session.messages.push(message);
       }
       for (const { stretch, messages } of sessions.values()) {
-        // A session on the record mark indexes itself inside the append that writes it, so the
-        // byte path leaves it alone. The two read the same prose, and a session on both marks
-        // would hold every chunk of it twice.
-        if (await onRecordMark(env.DB, stretch.userId, stretch.sessionId)) continue;
-        const caughtUp = await indexSession(env, stretch.userId, stretch.sessionId).catch((failure: unknown) => {
+        const tenant = tenantOf(env, stretch.userId);
+        const caughtUp = await tenant.index(stretch.userId, stretch.sessionId, handed()).catch((failure: unknown) => {
           console.error(
             JSON.stringify({
               error: failure instanceof Error ? failure.message : String(failure),

@@ -57,6 +57,7 @@ import {
   usageDayStart,
 } from "./model";
 import type { ShareMode, ShareRecord } from "./shares";
+import type { SqlDb, SqlResult, SqlStatement } from "./tenant-sql";
 import { MAIN_FILE } from "./transcripts";
 import type { Speaker } from "./turns";
 
@@ -372,11 +373,11 @@ const toSession = (row: SessionRow): Session => ({
   pid: row.pid,
 });
 
-const expireSessions = (db: D1Database, userId: string, now: number): D1PreparedStatement =>
+const expireSessions = (db: SqlDb, userId: string, now: number): SqlStatement =>
   db.prepare("DELETE FROM sessions WHERE user_id = ? AND last_activity_at <= ?").bind(userId, now - SESSION_TTL_MS);
 
 export const putSession = async (
-  db: D1Database,
+  db: SqlDb,
   caller: Caller,
   sessionId: string,
   input: SessionInput,
@@ -430,7 +431,7 @@ export const putSession = async (
   ]);
 };
 
-export const endSession = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+export const endSession = async (db: SqlDb, userId: string, sessionId: string): Promise<boolean> => {
   const result = await db
     .prepare("DELETE FROM sessions WHERE user_id = ? AND session_id = ?")
     .bind(userId, sessionId)
@@ -438,7 +439,7 @@ export const endSession = async (db: D1Database, userId: string, sessionId: stri
   return result.meta.changes === 1;
 };
 
-export const listSessions = async (db: D1Database, userId: string, now: number): Promise<Session[]> => {
+export const listSessions = async (db: SqlDb, userId: string, now: number): Promise<Session[]> => {
   const [, listed] = await db.batch<SessionRow>([
     expireSessions(db, userId, now),
     db
@@ -514,7 +515,7 @@ const HISTORY_ORDERS: Record<string, Order<PastSession>> = {
 export const historyCursorDirection = (sort: string): "desc" | "asc" => orderFor(HISTORY_ORDERS, sort).direction;
 
 export const listSessionHistory = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   input: HistoryInput,
   [cursorAt, cursorSessionId]: Cursor,
@@ -541,7 +542,7 @@ export const listSessionHistory = async (
 // subject and the agent name, so one match is one read of the history row beside it. A relevance
 // order has no keyset, so a search is one bounded page and never carries a cursor.
 export const searchSessionHistory = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   input: HistoryInput,
   match: string,
@@ -571,7 +572,7 @@ const SESSION_IDS_PAGE = 100;
 // syncing while a caller pages rewrites its own last activity, and a row whose time moves under an
 // ordering keyed on it hops across the cursor and is never read. An id never moves.
 export const listSessionHistoryIds = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   cursor: string,
 ): Promise<{ sessionIds: string[]; nextCursor: string }> => {
@@ -612,7 +613,7 @@ const HANDLE_SCAN = 500;
 // One session, by any of the three things that name it: its Claude Code session id, the name the
 // harness gave it, or the handle `recall send` addresses it by.
 export const findSession = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   target: string,
   now: number,
@@ -645,7 +646,7 @@ export const findSession = async (
 };
 
 export const describeSessions = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   sessionIds: string[],
   now: number,
@@ -660,12 +661,7 @@ export const describeSessions = async (
 // The name the harness gave a session, learned from the head of its own transcript. It is written
 // to both tables because the two carry a session at different points in its life: a live session
 // has a row in each, and one already over has only the history row left.
-export const nameSession = async (
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-  agentName: string,
-): Promise<void> => {
+export const nameSession = async (db: SqlDb, userId: string, sessionId: string, agentName: string): Promise<void> => {
   await db.batch(
     ["sessions", "session_history"].map((table) =>
       db
@@ -675,7 +671,7 @@ export const nameSession = async (
   );
 };
 
-export const sessionHistoryFilters = async (db: D1Database, userId: string): Promise<HistoryFilters> => {
+export const sessionHistoryFilters = async (db: SqlDb, userId: string): Promise<HistoryFilters> => {
   const { results } = await db
     .prepare(
       `SELECT DISTINCT 'host' AS field, host AS value FROM session_history WHERE user_id = ?1 AND host <> ''
@@ -691,7 +687,7 @@ export const sessionHistoryFilters = async (db: D1Database, userId: string): Pro
 
 type LabelRow = { kind: LabelKind; value: string; label: string };
 
-export const readLabels = async (db: D1Database, userId: string): Promise<Labels> => {
+export const readLabels = async (db: SqlDb, userId: string): Promise<Labels> => {
   const { results } = await db
     .prepare("SELECT kind, value, label FROM labels WHERE user_id = ? ORDER BY kind, value")
     .bind(userId)
@@ -703,7 +699,7 @@ export const readLabels = async (db: D1Database, userId: string): Promise<Labels
 
 // Every host and account the user has on record, live or past, plus the ones already labelled, so a
 // label survives on the page that set it even once its value stops appearing in the data.
-export const labelTargets = async (db: D1Database, userId: string): Promise<LabelTargets> => {
+export const labelTargets = async (db: SqlDb, userId: string): Promise<LabelTargets> => {
   const { results } = await db
     .prepare(
       `SELECT DISTINCT 'host' AS kind, host AS value FROM sessions WHERE user_id = ?1 AND host <> ''
@@ -723,7 +719,7 @@ export const labelTargets = async (db: D1Database, userId: string): Promise<Labe
   return { hosts: values("host"), accounts: values("account") };
 };
 
-export const writeLabels = async (db: D1Database, userId: string, labels: Label[]): Promise<void> => {
+export const writeLabels = async (db: SqlDb, userId: string, labels: Label[]): Promise<void> => {
   if (labels.length === 0) return;
   await db.batch(
     labels.map((entry) =>
@@ -770,7 +766,7 @@ type MemoryTotalRow = { memories: number };
 // the shape of a single result set — the same unchecked assertion .all<Row>() makes for a lone
 // statement — so one page costs one round trip instead of one per read.
 const resultRows = <Row extends Record<string, unknown>>(
-  result: D1Result<Record<string, unknown>> | undefined,
+  result: SqlResult<Record<string, unknown>> | undefined,
 ): Row[] => (result?.results ?? []) as Row[];
 
 const COUNT_SUMS = `COALESCE(SUM(prompts), 0) AS prompts,
@@ -796,7 +792,7 @@ const toModelTotals = (row: ModelRow): ModelTotals => ({
 // Every window the pages draw reads the daily rollup and nothing else: the counters land in
 // usage_daily on the same write that records the raw event, so the current day is already live
 // there and no window ever touches usage_events.
-const usageDaysStatement = (db: D1Database, userId: string, fromDay: string): D1PreparedStatement =>
+const usageDaysStatement = (db: SqlDb, userId: string, fromDay: string): SqlStatement =>
   db
     .prepare(
       `SELECT day AS bucket, provider, model, ${COUNT_SUMS} FROM usage_daily
@@ -807,7 +803,7 @@ const usageDaysStatement = (db: D1Database, userId: string, fromDay: string): D1
 
 // The month a delta falls in is the month of the UTC day the rollup already keyed it under, so the
 // long horizon reads the same column the windows do and the two can never disagree.
-const usageMonthsStatement = (db: D1Database, userId: string): D1PreparedStatement =>
+const usageMonthsStatement = (db: SqlDb, userId: string): SqlStatement =>
   db
     .prepare(
       `SELECT substr(day, 1, 7) AS bucket, provider, model, ${COUNT_SUMS} FROM usage_daily
@@ -816,7 +812,7 @@ const usageMonthsStatement = (db: D1Database, userId: string): D1PreparedStateme
     )
     .bind(userId);
 
-const usageSplitsStatement = (db: D1Database, userId: string, fromDay: string): D1PreparedStatement =>
+const usageSplitsStatement = (db: SqlDb, userId: string, fromDay: string): SqlStatement =>
   db
     .prepare(
       `SELECT 'host' AS field, host AS value, provider, model, ${COUNT_SUMS} FROM usage_daily
@@ -830,7 +826,7 @@ const usageSplitsStatement = (db: D1Database, userId: string, fromDay: string): 
     )
     .bind(userId, fromDay);
 
-const sessionsPerDayStatement = (db: D1Database, userId: string, since: number): D1PreparedStatement =>
+const sessionsPerDayStatement = (db: SqlDb, userId: string, since: number): SqlStatement =>
   db
     .prepare(
       `SELECT date(started_at / 1000, 'unixepoch') AS day, COUNT(*) AS sessions
@@ -844,13 +840,7 @@ const sessionsPerDayStatement = (db: D1Database, userId: string, since: number):
 // fortnight. Overlapping sessions still each count their own stretch: this is session time, not
 // wall-clock time, and the page says so. The all-time ranking passes since 0, which leaves the clip
 // at now and nothing else.
-const repoHoursStatement = (
-  db: D1Database,
-  userId: string,
-  since: number,
-  until: number,
-  limit: number,
-): D1PreparedStatement =>
+const repoHoursStatement = (db: SqlDb, userId: string, since: number, until: number, limit: number): SqlStatement =>
   db
     .prepare(
       `SELECT repo, SUM(MAX(MIN(last_activity_at, ?3) - MAX(started_at, ?2), 0)) AS ms, COUNT(*) AS sessions
@@ -860,7 +850,7 @@ const repoHoursStatement = (
     )
     .bind(userId, since, until, limit);
 
-const rhythmStatement = (db: D1Database, userId: string, since: number): D1PreparedStatement =>
+const rhythmStatement = (db: SqlDb, userId: string, since: number): SqlStatement =>
   db
     .prepare(
       `SELECT CAST(strftime('%w', started_at / 1000, 'unixepoch') AS INTEGER) AS weekday,
@@ -903,7 +893,7 @@ const REPO_BAR_COUNT = 5;
 
 // The sidebar's live summary, on every dashboard page: one round trip for the expiry sweep, the
 // live and busy counts, today's sessions and today's tokens, which the page prices on render.
-export const liveTally = async (db: D1Database, userId: string, now: number): Promise<Live> => {
+export const liveTally = async (db: SqlDb, userId: string, now: number): Promise<Live> => {
   const [, counts, today] = await db.batch<Record<string, unknown>>([
     expireSessions(db, userId, now),
     db
@@ -931,7 +921,7 @@ export const liveTally = async (db: D1Database, userId: string, now: number): Pr
   };
 };
 
-export const readStats = async (db: D1Database, userId: string, windows: StatsWindows): Promise<Stats> => {
+export const readStats = async (db: SqlDb, userId: string, windows: StatsWindows): Promise<Stats> => {
   const [usage, splits, sessions] = await db.batch<Record<string, unknown>>([
     usageDaysStatement(db, userId, windows.month.from),
     usageSplitsStatement(db, userId, windows.month.from),
@@ -949,27 +939,35 @@ export const readStats = async (db: D1Database, userId: string, windows: StatsWi
   };
 };
 
+// The Insights page, off two round trips. The sessions, the usage and the repositories are the
+// tenant's own rows; the memory counters are the account's, and no reading on the page joins the
+// two, so each store answers one batch of its own.
 export const readInsights = async (
-  db: D1Database,
+  db: SqlDb,
+  account: D1Database,
   userId: string,
   fortnight: DayWindow,
   now: number,
 ): Promise<Insights> => {
-  const [usage, monthly, recalled, stale, memories, repos, allTime, rhythm] = await db.batch<Record<string, unknown>>([
-    usageDaysStatement(db, userId, fortnight.from),
-    usageMonthsStatement(db, userId),
-    workingSetStatement(db, userId, usageDayStart(now) - (USAGE_MONTH_DAYS - 1) * DAY_MS, WORKING_SET_SIZE),
-    staleStatement(
-      db,
-      userId,
-      now - STALE_AFTER_DAYS * DAY_MS,
-      now - NEVER_RECALLED_AFTER_DAYS * DAY_MS,
-      STALE_LIST_SIZE,
-    ),
-    db.prepare("SELECT COUNT(*) AS memories FROM memories WHERE user_id = ?").bind(userId),
-    repoHoursStatement(db, userId, fortnight.since, fortnight.until, REPO_BAR_COUNT),
-    repoHoursStatement(db, userId, 0, now, REPO_BAR_COUNT),
-    rhythmStatement(db, userId, fortnight.since),
+  const [[usage, monthly, repos, allTime, rhythm], [recalled, stale, memories]] = await Promise.all([
+    db.batch<Record<string, unknown>>([
+      usageDaysStatement(db, userId, fortnight.from),
+      usageMonthsStatement(db, userId),
+      repoHoursStatement(db, userId, fortnight.since, fortnight.until, REPO_BAR_COUNT),
+      repoHoursStatement(db, userId, 0, now, REPO_BAR_COUNT),
+      rhythmStatement(db, userId, fortnight.since),
+    ]),
+    account.batch<Record<string, unknown>>([
+      workingSetStatement(account, userId, usageDayStart(now) - (USAGE_MONTH_DAYS - 1) * DAY_MS, WORKING_SET_SIZE),
+      staleStatement(
+        account,
+        userId,
+        now - STALE_AFTER_DAYS * DAY_MS,
+        now - NEVER_RECALLED_AFTER_DAYS * DAY_MS,
+        STALE_LIST_SIZE,
+      ),
+      account.prepare("SELECT COUNT(*) AS memories FROM memories WHERE user_id = ?").bind(userId),
+    ]),
   ]);
   const recalls = resultRows<RecallRow>(recalled);
   const staleRows = resultRows<StaleRow>(stale);
@@ -1005,7 +1003,7 @@ export const readInsights = async (
 // session the account no longer has running has none, and saying so is what stops the dashboard
 // queueing a message no host will ever read.
 export const liveSessionDevice = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   sessionId: string,
   now: number,
@@ -1018,7 +1016,7 @@ export const liveSessionDevice = async (
 };
 
 export const sessionOnDevice = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   sessionId: string,
   deviceId: string,
@@ -1029,7 +1027,7 @@ export const sessionOnDevice = async (
 // day, host, repo and account and never by session, so the raw events are the only reading that
 // holds a session together. They are swept at two weeks unless the reading was taken from the
 // transcript, and the page says that rather than printing an old session's spend as nothing.
-export const sessionSpend = async (db: D1Database, userId: string, sessionId: string): Promise<SessionSpend[]> => {
+export const sessionSpend = async (db: SqlDb, userId: string, sessionId: string): Promise<SessionSpend[]> => {
   const { results } = await db
     .prepare(
       `SELECT account, provider, model, ${COUNT_SUMS} FROM usage_events
@@ -1044,7 +1042,7 @@ export const sessionSpend = async (db: D1Database, userId: string, sessionId: st
 // Whether this account has the session at all, running or long over. A transcript outlives the
 // device that wrote it — a host signs in again and carries a new device id — so what a stretch is
 // checked against is the account, and the object key it lands under is the caller's own.
-export const sessionOnRecord = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+export const sessionOnRecord = async (db: SqlDb, userId: string, sessionId: string): Promise<boolean> => {
   const row = await db
     .prepare(
       `SELECT session_id FROM sessions WHERE user_id = ?1 AND session_id = ?2
@@ -1064,7 +1062,7 @@ const USAGE_SUMS =
   "cache_read_tokens = usage_daily.cache_read_tokens + excluded.cache_read_tokens";
 
 export const recordUsage = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   sessionId: string,
   input: UsageInput,
@@ -1140,7 +1138,7 @@ export interface IndexMark {
   chunks: number;
 }
 
-export const indexMark = async (db: D1Database, userId: string, sessionId: string): Promise<IndexMark | null> =>
+export const indexMark = async (db: SqlDb, userId: string, sessionId: string): Promise<IndexMark | null> =>
   db
     .prepare("SELECT archived, bytes AS indexed, chunks FROM session_index WHERE user_id = ?1 AND session_id = ?2")
     .bind(userId, sessionId)
@@ -1162,7 +1160,7 @@ export interface IndexedChunk {
 // writes nothing at all: there is no ordering of the two that leaves one session holding chunks
 // from both paths.
 export const writeChunks = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   sessionId: string,
   from: number,
@@ -1204,7 +1202,7 @@ export interface ChunkCandidate {
 // the floor is one scalar read. The prose is read back only for the chunks that win, since
 // carrying it here would be ten times the bytes.
 export const chunkVectors = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   chunkSeqs: readonly number[],
   recent: number,
@@ -1232,12 +1230,7 @@ export interface ChunkMatch {
   speaker: string;
 }
 
-export const chunkMatches = async (
-  db: D1Database,
-  userId: string,
-  match: string,
-  limit: number,
-): Promise<ChunkMatch[]> => {
+export const chunkMatches = async (db: SqlDb, userId: string, match: string, limit: number): Promise<ChunkMatch[]> => {
   const { results } = await db
     .prepare(
       `SELECT c.chunk_seq, c.session_id, c.speaker FROM session_chunks_fts f
@@ -1256,11 +1249,7 @@ export interface Excerpt {
   at: number;
 }
 
-export const chunkExcerpts = async (
-  db: D1Database,
-  userId: string,
-  chunkSeqs: number[],
-): Promise<Map<number, Excerpt>> => {
+export const chunkExcerpts = async (db: SqlDb, userId: string, chunkSeqs: number[]): Promise<Map<number, Excerpt>> => {
   const { results } = await db
     .prepare(
       `SELECT chunk_seq, speaker, text, at FROM session_chunks
@@ -1271,7 +1260,7 @@ export const chunkExcerpts = async (
   return new Map(results.map((row) => [row.chunk_seq, { speaker: row.speaker, text: row.text, at: row.at }]));
 };
 
-export const countedFiles = async (db: D1Database, userId: string, sessionId: string): Promise<string[]> => {
+export const countedFiles = async (db: SqlDb, userId: string, sessionId: string): Promise<string[]> => {
   const { results } = await db
     .prepare("SELECT file FROM counted_files WHERE user_id = ? AND session_id = ? ORDER BY file")
     .bind(userId, sessionId)
@@ -1949,7 +1938,7 @@ const toBoardEntry = (row: BoardEntryRow): BoardEntry => {
 // read already filters on the window and would be spending writes on rows it is ignoring anyway.
 // The pickups go first, because a row there outliving its message would read as a message nobody
 // can see having been taken.
-const sweepBoard = (db: D1Database, userId: string, now: number): D1PreparedStatement[] => [
+const sweepBoard = (db: SqlDb, userId: string, now: number): SqlStatement[] => [
   db
     .prepare(
       `DELETE FROM board_pickups WHERE user_id = ?1 AND message_id IN
@@ -1959,7 +1948,7 @@ const sweepBoard = (db: D1Database, userId: string, now: number): D1PreparedStat
   db.prepare("DELETE FROM board_messages WHERE user_id = ?1 AND expires_at <= ?2").bind(userId, now),
 ];
 
-export const postBoardMessage = async (db: D1Database, input: BoardInput): Promise<BoardMessage> => {
+export const postBoardMessage = async (db: SqlDb, input: BoardInput): Promise<BoardMessage> => {
   const expiresAt = input.createdAt + BOARD_WINDOW_MS;
   await db.batch([
     ...sweepBoard(db, input.userId, input.createdAt),
@@ -2017,7 +2006,7 @@ const BOARD_THROUGH = `SUM(LENGTH(CAST(m.body AS BLOB)))
 // walk rather than ahead of it because `sessions --sync` is detached and races the pickup: a
 // session not on record yet leaves its message waiting instead of having it refused.
 export const claimBoardMessages = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   taker: BoardTaker,
   now: number,
@@ -2058,7 +2047,7 @@ export const claimBoardMessages = async (
 };
 
 export const listBoard = async (
-  db: D1Database,
+  db: SqlDb,
   userId: string,
   limit: number,
   [cursorAt, cursorId]: Cursor,
@@ -2086,7 +2075,7 @@ export const listBoard = async (
 // Where the record path has reached in one file of one session, which is the ordinal the next
 // record carries. It is the mark the endpoint weighs an append against; the objects are the
 // arbiter and are read only where the two disagree.
-export const recordReach = async (db: D1Database, userId: string, sessionId: string, file: string): Promise<number> => {
+export const recordReach = async (db: SqlDb, userId: string, sessionId: string, file: string): Promise<number> => {
   const row = await db
     .prepare("SELECT next_ordinal FROM session_records WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
     .bind(userId, sessionId, file)
@@ -2099,7 +2088,7 @@ export const recordReach = async (db: D1Database, userId: string, sessionId: str
 // leaves it alone rather than indexing the same prose a second time. The mark is read for `main`
 // alone: a delegated file derives nothing either way, and a row for one of those would otherwise
 // stop the byte path from ever indexing the session's own prose.
-export const onRecordMark = async (db: D1Database, userId: string, sessionId: string): Promise<boolean> => {
+export const onRecordMark = async (db: SqlDb, userId: string, sessionId: string): Promise<boolean> => {
   const row = await db
     .prepare("SELECT file FROM session_records WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
     .bind(userId, sessionId, MAIN_FILE)
@@ -2107,12 +2096,7 @@ export const onRecordMark = async (db: D1Database, userId: string, sessionId: st
   return row !== null;
 };
 
-export const openChunks = async (
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-  file: string,
-): Promise<OpenChunk[]> => {
+export const openChunks = async (db: SqlDb, userId: string, sessionId: string, file: string): Promise<OpenChunk[]> => {
   const { results } = await db
     .prepare("SELECT speaker, pieces, at FROM session_open_chunks WHERE user_id = ?1 AND session_id = ?2 AND file = ?3")
     .bind(userId, sessionId, file)
@@ -2129,7 +2113,7 @@ export const openChunks = async (
 // How many chunks a session already holds, which is the ordinal the next one takes. The record
 // path shares the counter with the byte path, so a session that was indexed either way appends to
 // what is there rather than writing over it.
-export const chunkReach = async (db: D1Database, userId: string, sessionId: string): Promise<number> => {
+export const chunkReach = async (db: SqlDb, userId: string, sessionId: string): Promise<number> => {
   const row = await db
     .prepare("SELECT chunks FROM session_index WHERE user_id = ?1 AND session_id = ?2")
     .bind(userId, sessionId)
@@ -2171,7 +2155,7 @@ const markStands = (at: number): string =>
 // It answers whether the mark was still where the request read it. A caller told `false` lost the
 // file to another append and nothing it carried was written; ordinals are implicit in position, so
 // a host knows its next `from` without asking and pipelines two appends as a matter of course.
-export const commitRecords = async (db: D1Database, commit: RecordCommit): Promise<boolean> => {
+export const commitRecords = async (db: SqlDb, commit: RecordCommit): Promise<boolean> => {
   const { userId, sessionId, file, held, chunkFrom, chunks, open, next, takeover } = commit;
   const results = await db.batch([
     // A takeover first, so everything below it is written over a session the byte path no longer

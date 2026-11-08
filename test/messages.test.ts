@@ -1,7 +1,6 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { MAX_BODY_BYTES, type Message, type Sent } from "../src/mailbox";
-import { type Client, harness } from "./harness";
+import { type Client, harness, tenantRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -45,9 +44,13 @@ describe("messages", () => {
     const laptop = h.clientWithToken(await h.login(email, "ip-10-0-7-31"));
     await h.login(email, "desktop");
     const desktopId = await deviceId(laptop, "desktop");
-    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
-      .bind(userId, "ip-10-0-7-31", "core")
-      .run();
+    await tenantRows(
+      userId,
+      "INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)",
+      userId,
+      "ip-10-0-7-31",
+      "core",
+    );
     expect((await laptop.sync("9f8a1b2c")).status).toBe(204);
 
     const named = await sentMessage(await send(laptop, desktopId, "ship it", "", "9f8a1b2c"));
