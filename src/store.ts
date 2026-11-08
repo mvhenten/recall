@@ -59,7 +59,7 @@ import {
   usageDay,
   usageDayStart,
 } from "./model";
-import { artifactNames, artifactShares, mcpClients, memories, memoryTags } from "./schema/account";
+import { artifactNames, artifactShares, mcpClients } from "./schema/account";
 import { blobOf, toBytes } from "./schema/columns";
 import { artifactsFts, memoriesFts, sessionChunksFts, sessionHistoryFts } from "./schema/fts";
 import {
@@ -69,6 +69,8 @@ import {
   boardPickups,
   countedFiles as countedFilesTable,
   labels as labelsTable,
+  memories,
+  memoryTags,
   sessionChunks,
   sessionHistory,
   sessionIndex,
@@ -147,8 +149,8 @@ const toMemory = (row: MemoryRow): Memory => ({
   lastRecalledAt: row.lastRecalledAt,
 });
 
-export const getMemory = async (db: AccountDb, userId: string, name: string): Promise<Memory | null> => {
-  const row = await db
+export const getMemory = async (db: TenantDb, userId: string, name: string): Promise<Memory | null> => {
+  const row = db
     .select(MEMORY_FIELDS)
     .from(memories)
     .where(and(eq(memories.userId, userId), eq(memories.name, name)))
@@ -157,7 +159,7 @@ export const getMemory = async (db: AccountDb, userId: string, name: string): Pr
 };
 
 export const saveMemory = async (
-  db: AccountDb,
+  db: TenantDb,
   userId: string,
   name: string,
   input: SaveInput,
@@ -167,8 +169,8 @@ export const saveMemory = async (
   const candidateId = crypto.randomUUID();
   const ownedId = sql`(SELECT ${memories.memoryId} FROM ${memories}
     WHERE ${memories.userId} = ${userId} AND ${memories.name} = ${name})`;
-  const [upsert] = await db.batch([
-    db
+  const created = db.transaction((tx) => {
+    const [upsert] = tx
       .insert(memories)
       .values({
         memoryId: candidateId,
@@ -193,18 +195,21 @@ export const saveMemory = async (
           updatedAt: sql`excluded.updated_at`,
         },
       })
-      .returning({ memoryId: memories.memoryId }),
-    db.delete(memoryTags).where(eq(memoryTags.memoryId, ownedId)),
-    db.insert(memoryTags).select(sql`SELECT ${ownedId}, value FROM json_each(${JSON.stringify(input.tags)})`),
-  ]);
+      .returning({ memoryId: memories.memoryId })
+      .all();
+    tx.delete(memoryTags).where(eq(memoryTags.memoryId, ownedId)).run();
+    tx.insert(memoryTags)
+      .select(sql`SELECT ${ownedId}, value FROM json_each(${JSON.stringify(input.tags)})`)
+      .run();
+    return upsert?.memoryId === candidateId;
+  });
   const memory = await getMemory(db, userId, name);
   if (!memory) throw new Error(`memory ${name} vanished right after it was saved`);
-  return { memory, created: upsert[0]?.memoryId === candidateId };
+  return { memory, created };
 };
 
-export const deleteMemory = async (db: AccountDb, userId: string, memoryId: string): Promise<void> => {
-  await db
-    .delete(memories)
+export const deleteMemory = async (db: TenantDb, userId: string, memoryId: string): Promise<void> => {
+  db.delete(memories)
     .where(and(eq(memories.userId, userId), eq(memories.memoryId, memoryId)))
     .run();
 };
@@ -283,13 +288,13 @@ const MEMORY_ORDERS: Record<string, Order<Memory>> = {
 export const memoryCursorDirection = (sort: string): "desc" | "asc" => orderFor(MEMORY_ORDERS, sort).direction;
 
 export const listMemories = async (
-  db: AccountDb,
+  db: TenantDb,
   userId: string,
   input: ListInput,
   [cursorAt, cursorId]: Cursor,
 ): Promise<{ memories: Memory[]; nextCursor: string }> => {
   const order = orderFor(MEMORY_ORDERS, input.sort);
-  const results = await db
+  const results = db
     .select(MEMORY_FIELDS)
     .from(memories)
     .where(
@@ -310,8 +315,8 @@ export const listMemories = async (
   return { memories: found, nextCursor };
 };
 
-export const memoryCounts = async (db: AccountDb, userId: string, since: number): Promise<MemoryCounts> => {
-  const results = await db
+export const memoryCounts = async (db: TenantDb, userId: string, since: number): Promise<MemoryCounts> => {
+  const results = db
     .select({
       type: memories.type,
       total: count(),
@@ -347,12 +352,12 @@ export interface TextCandidate {
 // Read as positional rows rather than objects: this is every vector the account holds, and naming a
 // column per row costs more than the scoring does.
 export const vectorCandidates = async (
-  db: AccountDb,
+  db: TenantDb,
   userId: string,
   tags: string[],
   types: MemoryType[],
 ): Promise<VectorCandidate[]> => {
-  const rows = await db.values<[string, unknown, number]>(sql`
+  const rows = db.values<[string, unknown, number]>(sql`
     SELECT ${memories.memoryId}, ${memories.embedding}, ${tagFilter(tags)} FROM ${memories}
     WHERE ${memories.userId} = ${userId} AND ${typeFilter(types)}`);
   return rows.map(([memoryId, embedding, inScope]) => ({
@@ -363,13 +368,13 @@ export const vectorCandidates = async (
 };
 
 export const textCandidates = async (
-  db: AccountDb,
+  db: TenantDb,
   userId: string,
   tags: string[],
   types: MemoryType[],
   query: string,
 ): Promise<TextCandidate[]> => {
-  const results = await db
+  const results = db
     .select({ memoryId: memories.memoryId, inScope: tagFilter(tags).mapWith(Number).as("in_scope") })
     .from(memoriesFts)
     .innerJoin(memories, eq(memories.memorySeq, memoriesFts.rowid))
@@ -380,8 +385,8 @@ export const textCandidates = async (
   return results.map((row) => ({ memoryId: row.memoryId, inScope: row.inScope === 1 }));
 };
 
-export const describeMemories = async (db: AccountDb, userId: string, memoryIds: string[]): Promise<Memory[]> => {
-  const results = await db
+export const describeMemories = async (db: TenantDb, userId: string, memoryIds: string[]): Promise<Memory[]> => {
+  const results = db
     .select(MEMORY_FIELDS)
     .from(memories)
     .where(and(eq(memories.userId, userId), sql`${memories.memoryId} IN ${jsonEach(memoryIds)}`))
@@ -992,7 +997,7 @@ const rhythm = (db: TenantTx, userId: string, since: number) => {
     .orderBy(desc(count()), weekday, hour);
 };
 
-const workingSet = (db: AccountDb, userId: string, since: number, limit: number) =>
+const workingSet = (db: TenantTx, userId: string, since: number, limit: number) =>
   db
     .select({
       name: memories.name,
@@ -1004,7 +1009,7 @@ const workingSet = (db: AccountDb, userId: string, since: number, limit: number)
     .orderBy(desc(memories.recallCount), asc(memories.name))
     .limit(limit);
 
-const staleMemories = (db: AccountDb, userId: string, staleBefore: number, savedBefore: number, limit: number) =>
+const staleMemories = (db: TenantTx, userId: string, staleBefore: number, savedBefore: number, limit: number) =>
   db
     .select({
       name: memories.name,
@@ -1076,57 +1081,52 @@ export const readStats = async (db: TenantDb, userId: string, windows: StatsWind
     };
   });
 
-// The Insights page, off two round trips. The sessions, the usage and the repositories are the
-// tenant's own rows; the memory counters are the account's, and no reading on the page joins the
-// two, so each store answers a batch of its own. The account's batch is sent before the tenant's
-// own SQLite is read, so the two are in flight together.
+// The Insights page, off one round trip. The sessions, the usage, the repositories and the memory
+// counters are all this account's own rows, so the whole page is one transaction against its own
+// object and nothing on it joins across the split.
 export const readInsights = async (
   db: TenantDb,
-  account: AccountDb,
   userId: string,
   fortnight: DayWindow,
   now: number,
 ): Promise<Insights> => {
-  const accountSide = account.batch([
-    workingSet(account, userId, usageDayStart(now) - (USAGE_MONTH_DAYS - 1) * DAY_MS, WORKING_SET_SIZE),
-    staleMemories(
-      account,
-      userId,
-      now - STALE_AFTER_DAYS * DAY_MS,
-      now - NEVER_RECALLED_AFTER_DAYS * DAY_MS,
-      STALE_LIST_SIZE,
-    ),
-    account.select({ memories: count() }).from(memories).where(eq(memories.userId, userId)),
-  ]);
-  const tenantSide = db.transaction((tx) => ({
+  const read = db.transaction((tx) => ({
     usage: usageDays(tx, userId, fortnight.from).all(),
     monthly: usageMonths(tx, userId).all(),
     repos: repoHours(tx, userId, fortnight.since, fortnight.until, REPO_BAR_COUNT).all(),
     allTime: repoHours(tx, userId, 0, now, REPO_BAR_COUNT).all(),
     rhythm: rhythm(tx, userId, fortnight.since).all(),
+    recalls: workingSet(tx, userId, usageDayStart(now) - (USAGE_MONTH_DAYS - 1) * DAY_MS, WORKING_SET_SIZE).all(),
+    stale: staleMemories(
+      tx,
+      userId,
+      now - STALE_AFTER_DAYS * DAY_MS,
+      now - NEVER_RECALLED_AFTER_DAYS * DAY_MS,
+      STALE_LIST_SIZE,
+    ).all(),
+    total: tx.select({ memories: count() }).from(memories).where(eq(memories.userId, userId)).all(),
   }));
-  const [recalls, staleRows, total] = await accountSide;
   return {
     fortnight,
-    usage: tenantSide.usage.map((row) => ({ bucket: row.bucket, ...toModelTotals(row) })),
-    monthly: tenantSide.monthly.map((row) => ({ bucket: row.bucket, ...toModelTotals(row) })),
+    usage: read.usage.map((row) => ({ bucket: row.bucket, ...toModelTotals(row) })),
+    monthly: read.monthly.map((row) => ({ bucket: row.bucket, ...toModelTotals(row) })),
     working: {
-      entries: recalls.map((row) => ({ name: row.name, recalls: row.recallCount })),
-      recalls: recalls[0]?.totalRecalls ?? 0,
+      entries: read.recalls.map((row) => ({ name: row.name, recalls: row.recallCount })),
+      recalls: read.recalls[0]?.totalRecalls ?? 0,
     },
     stale: {
-      entries: staleRows.map((row) => ({
+      entries: read.stale.map((row) => ({
         name: row.name,
         recalled: row.recallCount > 0,
         lastRecalledAt: row.lastRecalledAt,
         createdAt: row.createdAt,
       })),
-      atRisk: staleRows[0]?.atRisk ?? 0,
-      total: total[0]?.memories ?? 0,
+      atRisk: read.stale[0]?.atRisk ?? 0,
+      total: read.total[0]?.memories ?? 0,
     },
-    repos: tenantSide.repos.map((row) => ({ repo: row.repo, ms: row.ms, sessions: row.sessions })),
-    allTime: tenantSide.allTime.map((row) => ({ repo: row.repo, ms: row.ms, sessions: row.sessions })),
-    rhythm: tenantSide.rhythm.map((row) => ({ weekday: row.weekday, hour: row.hour, sessions: row.sessions })),
+    repos: read.repos.map((row) => ({ repo: row.repo, ms: row.ms, sessions: row.sessions })),
+    allTime: read.allTime.map((row) => ({ repo: row.repo, ms: row.ms, sessions: row.sessions })),
+    rhythm: read.rhythm.map((row) => ({ weekday: row.weekday, hour: row.hour, sessions: row.sessions })),
   };
 };
 
@@ -2195,19 +2195,21 @@ export const adoptArtifacts = async (db: TenantDb, bucket: R2Bucket, userId: str
   return taking.length;
 };
 
-export const recall = async (db: AccountDb, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {
+export const recall = async (db: TenantDb, userId: string, memoryIds: string[], now: number): Promise<Memory[]> => {
   const named = sql`${memories.memoryId} IN ${jsonEach(memoryIds)}`;
-  const [, selected] = await db.batch([
-    db
-      .update(memories)
-      .set({ recallCount: sql`${memories.recallCount} + 1`, lastRecalledAt: now })
-      .where(and(eq(memories.userId, userId), named)),
-    db
-      .select(MEMORY_FIELDS)
-      .from(memories)
-      .where(and(eq(memories.userId, userId), named)),
-  ]);
-  return selected.map(toMemory);
+  return db
+    .transaction((tx) => {
+      tx.update(memories)
+        .set({ recallCount: sql`${memories.recallCount} + 1`, lastRecalledAt: now })
+        .where(and(eq(memories.userId, userId), named))
+        .run();
+      return tx
+        .select(MEMORY_FIELDS)
+        .from(memories)
+        .where(and(eq(memories.userId, userId), named))
+        .all();
+    })
+    .map(toMemory);
 };
 
 interface BoardRow {

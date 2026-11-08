@@ -9,9 +9,13 @@ import {
   chunkMatches,
   createArtifact,
   endSession,
+  getMemory,
   putSession,
+  saveMemory,
   searchArtifacts,
   searchSessionHistory,
+  textCandidates,
+  vectorCandidates,
 } from "../src/store";
 import { TENANT_MIGRATIONS } from "../src/tenant-migrations";
 import { tenantRows } from "./harness";
@@ -110,6 +114,40 @@ const ARTIFACT_QUERIES = ["rank", "scan", "archive", "board OR migration", "vect
 const ARTIFACT_INSERT = `INSERT INTO artifacts (user_id, name, rev, type, title, description, read_perm,
    write_perm, entry_path, files, file_count, bytes, created_at, updated_at, last_writer_user_id)
  VALUES (?1, ?2, 1, 'document', ?3, ?4, 'private', 'owner', 'index.md', '[]', 1, 12, 1, 1, ?1)`;
+
+// What a memory carries that the index reads, for one fixed corpus. `in_scope` orders ahead of the
+// ranking, so every row is written with a tag and the scoped read asks for one of them.
+const MEMORIES: ReadonlyArray<readonly [string, string, string, string]> = [
+  ["rank-the-chunks", "bound the vector scan", "a search ranks the chunks it reads", "search"],
+  ["bound-the-scan", "rank the history rows", "the vector scan is bounded before it runs", "search"],
+  ["move-the-board", "rank the board", "the board moves into the object it belongs to", "board"],
+  ["write-the-migration", "write it once", "the migration is written once and applied once", "store"],
+  ["scan-the-archive", "scan it twice", "the archive is scanned twice and ranked once", "search"],
+];
+
+// name heaviest, then description, then body — the column order `memories_fts` was created in.
+const MEMORY_RANKING = `SELECT m.memory_id FROM memories_fts f
+   JOIN memories m ON m.memory_seq = f.rowid
+   WHERE memories_fts MATCH ?2 AND m.user_id = ?1
+   ORDER BY (SELECT count(*) FROM memory_tags t WHERE t.memory_id = m.memory_id AND t.tag = ?3) DESC,
+     bm25(memories_fts, 5.0, 2.0, 1.0) LIMIT 50`;
+
+const MEMORY_QUERIES = ["rank", "scan", "archive", "board OR migration", "vector AND scan"];
+
+const SAVED_AT = 1_700_000_000_000;
+
+const embeddingFor = (name: string): Uint8Array =>
+  Uint8Array.from({ length: 16 }, (_, index) => (name.charCodeAt(index % name.length) + index) % 256);
+
+const withMemories = async (): Promise<string> => {
+  const userId = `user-${crypto.randomUUID()}`;
+  for (const [name, description, body, tag] of MEMORIES) {
+    await inStore(userId, (db) =>
+      saveMemory(db, userId, name, { description, type: "project", body, tags: [tag] }, embeddingFor(name), SAVED_AT),
+    );
+  }
+  return userId;
+};
 
 describe("the tenant store", () => {
   it("takes a whole batch back when one statement of it fails", async () => {
@@ -218,6 +256,35 @@ describe("the tenant store", () => {
       expect(ranked).not.toEqual([]);
       const found = await inStore(userId, (db) => searchArtifacts(db, userId, "", query, 50));
       expect(found.artifacts.map((artifact) => artifact.name)).toEqual(ranked);
+    }
+  });
+
+  it("ranks a memory search by tag scope first and then the way bm25 weights it", async () => {
+    const userId = await withMemories();
+    for (const query of MEMORY_QUERIES) {
+      const ranked = (await tenantRows<{ memory_id: string }>(userId, MEMORY_RANKING, userId, query, "search")).map(
+        (row) => row.memory_id,
+      );
+      expect(ranked, query).not.toEqual([]);
+      const found = await inStore(userId, (db) => textCandidates(db, userId, ["search"], [], query));
+      expect(found.map((candidate) => candidate.memoryId)).toEqual(ranked);
+      const scope = found.map((candidate) => candidate.inScope);
+      expect(scope).toEqual([...scope].sort((left, right) => Number(right) - Number(left)));
+    }
+  });
+
+  // The object's SQLite hands a blob back as an ArrayBuffer and a miniflare build of D1 as a
+  // number array, so this is the one read that proves a vector survives the round trip byte for
+  // byte whichever of the two the driver gives.
+  it("hands an embedding back as the bytes it was saved with", async () => {
+    const userId = await withMemories();
+    const candidates = await inStore(userId, (db) => vectorCandidates(db, userId, [], []));
+    expect(candidates).toHaveLength(MEMORIES.length);
+    const byId = new Map(candidates.map((candidate) => [candidate.memoryId, [...candidate.embedding]]));
+    for (const [name] of MEMORIES) {
+      const saved = await inStore(userId, (db) => getMemory(db, userId, name));
+      expect(saved).not.toBeNull();
+      expect(byId.get(saved?.memoryId ?? "")).toEqual([...embeddingFor(name)]);
     }
   });
 

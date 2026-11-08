@@ -24,7 +24,8 @@
     "setup": "node npm-scripts/setup.mjs",
     "release": "node npm-scripts/release.mjs",
     "recompress-archive": "node npm-scripts/recompress-archive.mjs",
-    "copy-artifacts": "node npm-scripts/copy-artifacts.mjs"
+    "copy-artifacts": "node npm-scripts/copy-artifacts.mjs",
+    "copy-memories": "node npm-scripts/copy-memories.mjs"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.4",

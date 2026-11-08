@@ -1,0 +1,16 @@
+-- The memories, their tags and their search index are no longer the account store's. They moved
+-- to each account's own Durable Object in `migrations/tenant/0003_memories.sql`, and
+-- `src/schema/legacy.ts` is what still names them here: `src/memory-copy.ts` is their one reader,
+-- and it copies what they hold into the object the account is served by.
+--
+-- drizzle-kit wrote this file as `DROP TABLE memories; DROP TABLE memory_tags;` and it is
+-- deliberately empty of both. The corpus is the one store recall cannot rebuild — a transcript is
+-- still on the host that wrote it and a published artifact's bytes are still in R2, while a memory
+-- is its row and nothing else — so the rows stay exactly where they are until a window of
+-- production has run on the tenant store. Rolling the release back reads them again. Step E of
+-- #115 is what takes the tables away.
+--
+-- What this migration carries is the snapshot beside it, so the next generate diffs from a schema
+-- that no longer claims the two tables. D1 refuses a migration holding no statement at all, so
+-- the one below is deliberately a read that changes nothing.
+SELECT 1;
