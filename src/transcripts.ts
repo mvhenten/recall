@@ -40,6 +40,9 @@
 // is the length of the session; the price is a second write on the append path, and a row left
 // standing ahead of the objects where one of them is lost outright. Nothing derived is ever asked
 // a question the objects can answer, so every reading that must not lag lists them.
+
+// The largest stretch one call may carry. A transcript of any size lands as a run of these.
+import type { SqlDb, SqlStatement } from "./tenant-sql";
 import {
   compressedStretchName,
   isStretchName,
@@ -50,7 +53,6 @@ import {
   stretchName,
 } from "./transcript-plan";
 
-// The largest stretch one call may carry. A transcript of any size lands as a run of these.
 export const MAX_STRETCH_BYTES = 1_048_576;
 
 // The name a session's own transcript is held under. Every other name is a delegated turn, which
@@ -679,12 +681,7 @@ export const appendStretch = async (
 // A delegated turn derives nothing — the index never reads one — so its stretch writes no row at
 // all. The archive answers for those files by listing them, which is the only reading that can
 // answer without lagging.
-export const cacheArchived = (
-  db: D1Database,
-  userId: string,
-  sessionId: string,
-  archived: number,
-): D1PreparedStatement =>
+export const cacheArchived = (db: SqlDb, userId: string, sessionId: string, archived: number): SqlStatement =>
   db
     .prepare(
       `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)

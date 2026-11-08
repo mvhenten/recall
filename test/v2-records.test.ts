@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { Embedder } from "../src/model";
 import { BINARY_RECORD, MAX_RECORDS_BYTES, MAX_RECORDS_PER_APPEND, RECORDS_PREFIX } from "../src/records";
-import { harness, wordEmbedder } from "./harness";
+import { harness, tenantRows, wordEmbedder } from "./harness";
 
 const line = (entry: Record<string, unknown>): string => JSON.stringify(entry);
 
@@ -38,14 +38,46 @@ interface ChunkRow {
   at: number;
 }
 
-const chunksOf = async (userId: string, sessionId: string): Promise<ChunkRow[]> => {
-  const { results } = await env.DB.prepare(
+const chunksOf = (userId: string, sessionId: string): Promise<ChunkRow[]> =>
+  tenantRows<ChunkRow>(
+    userId,
     "SELECT speaker, text, at FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
-  )
-    .bind(userId, sessionId)
-    .all<ChunkRow>();
-  return results;
+    userId,
+    sessionId,
+  );
+
+const recordMark = async (userId: string, sessionId: string): Promise<{ next_ordinal: number } | null> => {
+  const [row] = await tenantRows<{ next_ordinal: number }>(
+    userId,
+    "SELECT next_ordinal FROM session_records WHERE user_id = ? AND session_id = ? AND file = 'main'",
+    userId,
+    sessionId,
+  );
+  return row ?? null;
 };
+
+const indexMarkOf = async (
+  userId: string,
+  sessionId: string,
+): Promise<{ archived: number; bytes: number; chunks: number } | null> => {
+  const [row] = await tenantRows<{ archived: number; bytes: number; chunks: number }>(
+    userId,
+    "SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?",
+    userId,
+    sessionId,
+  );
+  return row ?? null;
+};
+
+const ordinalsOf = async (userId: string, sessionId: string): Promise<number[]> =>
+  (
+    await tenantRows<{ ordinal: number }>(
+      userId,
+      "SELECT ordinal FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
+      userId,
+      sessionId,
+    )
+  ).map((row) => row.ordinal);
 
 // What a chunk is, said apart from where in the index it landed. Two batchings reach the same
 // ordinals only if they also closed in the same order; what carrying the open chunk promises is
@@ -237,30 +269,17 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
       second.join("\n"),
       { customMetadata: { records: String(second.length), closes: "1" } },
     );
-    const marked = await env.DB.prepare(
-      "SELECT next_ordinal FROM session_records WHERE user_id = ? AND session_id = ? AND file = 'main'",
-    )
-      .bind(client.userId, session)
-      .first<{ next_ordinal: number }>();
+    const marked = await recordMark(client.userId, session);
     expect(marked).toBeNull();
 
     const resumed = await client.v2.records(session, "main", second.length, about(3, "tenancy"));
     expect(resumed.status).toBe(200);
 
     // The byte path is gone and the records are indexed from ordinal 0, stranded span and all.
-    const counted = await env.DB.prepare(
-      "SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?",
-    )
-      .bind(client.userId, session)
-      .first<{ archived: number; bytes: number; chunks: number }>();
+    const counted = await indexMarkOf(client.userId, session);
     const taken = await chunksOf(client.userId, session);
     expect(counted).toEqual({ archived: 0, bytes: 0, chunks: taken.length });
-    const ordinals = await env.DB.prepare(
-      "SELECT ordinal FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
-    )
-      .bind(client.userId, session)
-      .all<{ ordinal: number }>();
-    expect(ordinals.results.map((row) => row.ordinal)).toEqual(taken.map((_, at) => at));
+    expect(await ordinalsOf(client.userId, session)).toEqual(taken.map((_, at) => at));
     expect(taken.map((chunk) => chunk.text).join("\n")).not.toContain("pagination");
   });
 
@@ -336,10 +355,13 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     expect((await client.archive(session, "main", 0, `${first.join("\n")}\n`)).status).toBe(200);
     await deliver();
-    const byBytes = await env.DB.prepare("SELECT chunk_seq FROM session_chunks WHERE user_id = ? AND session_id = ?")
-      .bind(client.userId, session)
-      .all<{ chunk_seq: number }>();
-    expect(byBytes.results.length).toBeGreaterThan(0);
+    const byBytes = await tenantRows<{ chunk_seq: number }>(
+      client.userId,
+      "SELECT chunk_seq FROM session_chunks WHERE user_id = ? AND session_id = ?",
+      client.userId,
+      session,
+    );
+    expect(byBytes.length).toBeGreaterThan(0);
 
     expect((await client.v2.records(session, "main", 0, second)).status).toBe(200);
     expect((await client.v2.end(session)).status).toBe(204);
@@ -357,27 +379,19 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     // The ordinals run from nothing with no hole in them and the shared counter says the same
     // number, so no chunk of the byte path is left under one of them and none is orphaned.
-    const ordinals = await env.DB.prepare(
-      "SELECT ordinal FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
-    )
-      .bind(client.userId, session)
-      .all<{ ordinal: number }>();
-    expect(ordinals.results.map((row) => row.ordinal)).toEqual(taken.map((_, at) => at));
-    const counted = await env.DB.prepare(
-      "SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?",
-    )
-      .bind(client.userId, session)
-      .first<{ archived: number; bytes: number; chunks: number }>();
+    expect(await ordinalsOf(client.userId, session)).toEqual(taken.map((_, at) => at));
+    const counted = await indexMarkOf(client.userId, session);
     expect(counted).toEqual({ archived: 0, bytes: 0, chunks: taken.length });
 
     // The full-text index lost the chunks with them. `chunk_seq` is the table's own rowid and
     // SQLite hands the highest ones out again, so a row left behind would be matched under an id
     // the next chunk takes and answer a search with prose that chunk never held.
-    const dropped = new Set(byBytes.results.map((row) => row.chunk_seq));
-    const matched = await env.DB.prepare(
+    const dropped = new Set(byBytes.map((row) => row.chunk_seq));
+    const matched = await tenantRows<{ seq: number }>(
+      client.userId,
       "SELECT rowid AS seq FROM session_chunks_fts WHERE session_chunks_fts MATCH 'pagination'",
-    ).all<{ seq: number }>();
-    expect(matched.results.map((row) => row.seq).filter((seq) => dropped.has(seq))).toEqual([]);
+    );
+    expect(matched.map((row) => row.seq).filter((seq) => dropped.has(seq))).toEqual([]);
   });
 
   // A byte-path stretch that lands after the takeover indexes nothing: the mark it reads is gone
@@ -473,16 +487,10 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     // The mark, the chunk counter and the chunk ordinals all say the same thing: one append's
     // chunks are in the index whole, and the other wrote none of its own over them.
-    const marked = await env.DB.prepare(
-      "SELECT next_ordinal FROM session_records WHERE user_id = ? AND session_id = ? AND file = 'main'",
-    )
-      .bind(client.userId, session)
-      .first<{ next_ordinal: number }>();
+    const marked = await recordMark(client.userId, session);
     expect(next).toBe(marked?.next_ordinal);
 
-    const counted = await env.DB.prepare("SELECT chunks FROM session_index WHERE user_id = ? AND session_id = ?")
-      .bind(client.userId, session)
-      .first<{ chunks: number }>();
+    const counted = await indexMarkOf(client.userId, session);
     const indexed = await chunksOf(client.userId, session);
     expect(indexed.length).toBeGreaterThan(0);
     expect(counted?.chunks).toBe(indexed.length);
@@ -553,11 +561,7 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     const said = (await chunksOf(client.userId, session)).map((chunk) => chunk.text).join("\n");
     for (const subject of SUBJECTS) expect(said).toContain(`${subject}:`);
 
-    const marked = await env.DB.prepare(
-      "SELECT next_ordinal FROM session_records WHERE user_id = ? AND session_id = ? AND file = 'main'",
-    )
-      .bind(client.userId, session)
-      .first<{ next_ordinal: number }>();
+    const marked = await recordMark(client.userId, session);
     expect(marked?.next_ordinal).toBe(records.length);
   });
 

@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { DAY_MS, USAGE_RETENTION_MS } from "../src/model";
 import { compressedStretchName, followedBatch, legacyStretchName, stretchName } from "../src/transcript-plan";
 import { archivedSince, archivedTranscript, MAX_STRETCH_BYTES, readStretch } from "../src/transcripts";
-import { gzipped, harness } from "./harness";
+import { gzipped, harness, tenantRows } from "./harness";
 
 // How far into each of a session's files the archive reaches, which is what a host sends on from.
 const held = async (response: Response): Promise<Record<string, number>> => {
@@ -60,14 +60,12 @@ const parses = (line: string): boolean => {
   }
 };
 
-const rollup = async (userId: string): Promise<Array<Record<string, unknown>>> => {
-  const { results } = await env.DB.prepare(
+const rollup = (userId: string): Promise<Array<Record<string, unknown>>> =>
+  tenantRows(
+    userId,
     "SELECT day, model, prompts, input_tokens FROM usage_daily WHERE user_id = ? ORDER BY day, model",
-  )
-    .bind(userId)
-    .all();
-  return results;
-};
+    userId,
+  );
 
 describe("transcript archive", () => {
   it("takes a session's files a stretch at a time and says where each one reaches", async () => {

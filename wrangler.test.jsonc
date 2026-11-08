@@ -10,7 +10,8 @@
     { "binding": "TRANSCRIPTS", "bucket_name": "recall-transcripts" }
   ],
   "durable_objects": {
-    "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }]
+    "bindings": [{ "name": "MAILBOX", "class_name": "Mailbox" }, { "name": "TENANT", "class_name": "Tenant" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox"] }, { "tag": "v2", "new_sqlite_classes": ["Tenant"] }],
+  "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }]
 }

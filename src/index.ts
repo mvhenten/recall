@@ -5,13 +5,16 @@ import { DEVICE_CODE_LIMITS } from "./device";
 import type { Mailbox } from "./mailbox";
 import type { Embedder } from "./model";
 import { DIMENSIONS, normalize } from "./rank";
+import type { Tenant } from "./tenant";
 
 export { Mailbox } from "./mailbox";
+export { Tenant } from "./tenant";
 
 export interface Env {
   DB: D1Database;
   AI: Ai;
   MAILBOX: DurableObjectNamespace<Mailbox>;
+  TENANT: DurableObjectNamespace<Tenant>;
   TRANSCRIPTS: R2Bucket;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;

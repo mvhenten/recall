@@ -1,7 +1,6 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session } from "../src/model";
-import { type Client, harness } from "./harness";
+import { type Client, harness, tenantRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -24,10 +23,11 @@ const ids = async (client: Client, query: string): Promise<{ sessionIds: string[
 };
 
 const account = async (h: Harness): Promise<{ laptop: Client; tower: Client }> => {
-  const email = await h.invite(`sessions-${crypto.randomUUID()}@example.com`);
+  const userId = `user-${crypto.randomUUID()}`;
+  const email = await h.invite(`sessions-${crypto.randomUUID()}@example.com`, userId);
   return {
-    laptop: h.clientWithToken(await h.login(email, "laptop")),
-    tower: h.clientWithToken(await h.login(email, "tower")),
+    laptop: h.clientWithToken(await h.login(email, "laptop"), userId),
+    tower: h.clientWithToken(await h.login(email, "tower"), userId),
   };
 };
 
@@ -38,9 +38,13 @@ describe("sessions", () => {
     const email = await h.invite(`sessions-${crypto.randomUUID()}@example.com`, userId);
     const laptop = h.clientWithToken(await h.login(email, "ip-10-0-7-31"));
     const tower = h.clientWithToken(await h.login(email, "tower"));
-    await env.DB.prepare("INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)")
-      .bind(userId, "ip-10-0-7-31", "core")
-      .run();
+    await tenantRows(
+      userId,
+      "INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)",
+      userId,
+      "ip-10-0-7-31",
+      "core",
+    );
 
     expect((await laptop.sync("s-core", { host: "ip-10-0-7-31", lastActivityAt: h.now() })).status).toBe(204);
     expect((await tower.sync("s-tower", { host: "tower", lastActivityAt: h.now() - 60_000 })).status).toBe(204);
@@ -165,12 +169,13 @@ describe("session history", () => {
     h.tick(SESSION_TTL_MS + 1000);
     expect(await listed(laptop)).toEqual([]);
 
-    const { results } = await env.DB.prepare(
+    const results = await tenantRows(
+      laptop.userId,
       `SELECT session_id, device_name, host, cwd, repo, branch, commit_subject, started_at, last_activity_at,
          prompts, focus_first, focus_latest, mode
        FROM session_history WHERE session_id IN ('ended-session', 'crashed-session')
        ORDER BY last_activity_at DESC`,
-    ).all();
+    );
     expect(results).toEqual([
       {
         session_id: "crashed-session",
@@ -205,9 +210,14 @@ describe("session history", () => {
     });
     await stranger.sync("resynced-session", { branch: "feat/stranger-session", lastActivityAt: h.now() });
 
-    const { results } = await env.DB.prepare(
-      "SELECT branch, prompts, focus_latest FROM session_history WHERE session_id = 'resynced-session' ORDER BY branch",
-    ).all();
+    const history = (client: Client): Promise<Array<Record<string, unknown>>> =>
+      tenantRows(
+        client.userId,
+        "SELECT branch, prompts, focus_latest FROM session_history WHERE session_id = 'resynced-session'",
+      );
+    const results = [...(await history(laptop)), ...(await history(stranger))].sort((left, right) =>
+      String(left.branch).localeCompare(String(right.branch)),
+    );
     expect(results).toEqual([
       { branch: "feat/session-history", prompts: 9, focus_latest: "ship it" },
       expect.objectContaining({ branch: "feat/stranger-session" }),

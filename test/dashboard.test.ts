@@ -1,7 +1,6 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { dayWindow, USAGE_CHART_DAYS } from "../src/model";
-import { type Client, DASHBOARD_AUDIENCE, harness } from "./harness";
+import { type Client, DASHBOARD_AUDIENCE, harness, tenantRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
@@ -632,9 +631,11 @@ const barShare = (html: string, label: string): number => {
 };
 
 const eventCount = async (userId: string): Promise<number> => {
-  const row = await env.DB.prepare("SELECT COUNT(*) AS events FROM usage_events WHERE user_id = ?")
-    .bind(userId)
-    .first<{ events: number }>();
+  const [row] = await tenantRows<{ events: number }>(
+    userId,
+    "SELECT COUNT(*) AS events FROM usage_events WHERE user_id = ?",
+    userId,
+  );
   return row?.events ?? 0;
 };
 
