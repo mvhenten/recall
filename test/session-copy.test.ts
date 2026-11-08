@@ -103,8 +103,8 @@ const tenantChunks = (userId: string): Promise<D1Chunk[]> =>
     userId,
   );
 
-const copy = async (client: Client): Promise<SessionCopyReport> => {
-  const response = await client.request("POST", "/v1/sessions/copy");
+const copyFrom = async (client: Client, after: number): Promise<SessionCopyReport> => {
+  const response = await client.request("POST", `/v1/sessions/copy?after=${after}`);
   expect(response.status).toBe(200);
   const report: SessionCopyReport = await response.json();
   // Every corpus a test writes is well inside one call's budget, so a run that did not reach the
@@ -112,6 +112,8 @@ const copy = async (client: Client): Promise<SessionCopyReport> => {
   expect(report.chunks.done).toBe(true);
   return report;
 };
+
+const copy = (client: Client): Promise<SessionCopyReport> => copyFrom(client, 0);
 
 const tallyOf = (report: SessionCopyReport, table: string): { copied: number; held: number } => {
   const row = report.tables.find((one) => one.table === table);
@@ -217,6 +219,39 @@ describe("copying the sessions an account held before they moved", () => {
     expect(again.checks.chunkIndex).toEqual({ corrupt: false, error: "" });
     expect(again.checks.ok).toBe(true);
     expect(await tenantChunks(client.userId)).toEqual(after);
+
+    // A call carrying on from a frontier leaves the metadata alone rather than reading every table
+    // of D1 and attempting an insert per row again: `usage_events` is one row per event of every
+    // session the account ever ran, and doing that on each of a long run's calls would spend the
+    // budget re-conflicting what the opening call already wrote. `held: 0` is the read that did
+    // not happen; the counts beside it are still taken.
+    const carried = await copyFrom(client, after[0]?.chunk_seq ?? 1);
+    for (const row of carried.tables) {
+      if (row.table === "chunks") continue;
+      expect([row.table, row.copied, row.held]).toEqual([row.table, 0, 0]);
+      expect([row.table, row.tenant >= row.account]).toEqual([row.table, true]);
+    }
+    expect(carried.checks.short).toEqual([]);
+    expect(await tenantChunks(client.userId)).toEqual(after);
+  });
+
+  // What one call cannot account for, and why the script adds a run up rather than reading the
+  // last report. A call opened past the end of D1's prose walks none of it, and no row count the
+  // object can be asked will say so: it holds the chunks it indexed itself, so `tenant >= account`
+  // is satisfied by an account nothing was ever copied into. What the call reports instead is how
+  // much it walked against how much D1 holds.
+  it("walks no prose when opened past the end of it, and reports what it walked", async () => {
+    const h = await harness();
+    const client = await owner(h);
+    const sessionId = crypto.randomUUID();
+    await seedSession(client.userId, sessionId, "rebuild the archive reader", true);
+
+    const report = await copyFrom(client, 99_999_999);
+    expect(report.chunks.copied + report.chunks.held).toBe(0);
+    expect(report.chunks.account).toBe(PROSE.length);
+    expect(report.checks.missingChunks).toBe(0);
+    expect(report.checks.short).toEqual([]);
+    expect(await tenantChunks(client.userId)).toEqual([]);
   });
 
   // The three sessions that straddle the cutover. The object wrote its own prose for one of them
@@ -298,13 +333,16 @@ describe("copying the sessions an account held before they moved", () => {
     expect(matched.map((row) => row.chunk_seq)).toEqual([mover?.chunk_seq]);
   });
 
-  // The copy that would be passed over if the prose alone said a chunk had already arrived. A
-  // session replayed after the cutover is re-indexed from ordinal zero, so the object writes the
-  // pre-cutover prose again under the low keys D1 handed this account — the same session and the
-  // same text at a `chunk_seq` D1 uses, and a copy that read that as its own earlier work would
-  // drop a chunk of history and report itself sound. The instant the chunk was spoken is what
-  // tells the two apart.
-  it("copies a chunk whose prose the object already holds under the key D1 wrote it under", async () => {
+  // The third thing a chunk is recognised by. A session and a text are not enough to say two rows
+  // are one chunk: a session says the same thing twice over a long enough day, and the object
+  // writing that again under a `chunk_seq` D1 handed this account would have the copy read its own
+  // earlier work where there was none and drop a chunk of history. The instant the chunk opened on
+  // is what separates them.
+  //
+  // A row matching all three is the same chunk whoever wrote it — a session replayed after the
+  // cutover re-chunks the same bytes at the same instants, and the copy leaving those where they
+  // stand loses nothing. This stands the other case: same session, same prose, another instant.
+  it("copies a chunk whose prose the object already holds at another instant", async () => {
     const h = await harness();
     const client = await owner(h);
     const sessionId = crypto.randomUUID();

@@ -1339,8 +1339,12 @@ export const writeChunks = async (
         .onConflictDoNothing({ target: [sessionChunks.userId, sessionChunks.sessionId, sessionChunks.ordinal] })
         .run();
     });
+    // The reach climbs and never drops back to what this pass read. Another writer may have moved
+    // it between the read and here — a record append, or the one-shot copy out of D1 shifting a
+    // session's copied chunks above the ordinals this object already holds — and a reach set back
+    // under theirs would have the next pass write over prose that is already indexed.
     tx.update(sessionIndex)
-      .set({ bytes: reached, chunks: from + chunks.length })
+      .set({ bytes: reached, chunks: sql`MAX(chunks, ${from + chunks.length})` })
       .where(and(eq(sessionIndex.userId, userId), eq(sessionIndex.sessionId, sessionId), offRecord(userId, sessionId)))
       .run();
   });

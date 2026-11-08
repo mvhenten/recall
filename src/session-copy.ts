@@ -65,6 +65,9 @@ const CHUNK_BUDGET = 5_000;
 // A table of either store keyed by the account it belongs to, which every one of these is.
 type Owned = SQLiteTable & { userId: SQLiteColumn };
 
+// A column of that table and of no other, so an order cannot name one the query never reads.
+type ColumnOf<T extends SQLiteTable> = T["_"]["columns"][keyof T["_"]["columns"]];
+
 // What one table did, and what each store holds of it afterwards. The counts are the half the
 // tallies cannot say: every insert of a table conflicting reads as `copied: 0, held: N`, which is
 // exactly what a table that arrived twice over reads as too.
@@ -77,19 +80,26 @@ export interface TableReport {
 }
 
 export interface SessionCopyChecks {
-  // The tables the object holds fewer rows of than D1, which is the whole of what says a table did
-  // not arrive. It may hold more of any of them: a session started after the cutover is its own.
+  // The tables the object holds fewer rows of than D1, which is what says a table did not arrive.
+  // It may hold more of any of them: a session started after the cutover is its own.
+  //
+  // `session_chunks` is deliberately not among them. The object counts the prose it indexed itself
+  // alongside the prose it was given, so an account whose own chunks outnumber D1's satisfies
+  // `tenant >= account` having copied nothing at all. What accounts for the prose is how much of
+  // D1's the run walked, which is `chunks.copied + chunks.held` summed over every call of it and
+  // so is the caller's to add up — one call cannot see a run.
   short: string[];
   // Session ids D1 holds that the object does not.
   missing: string[];
   // Session ids the object holds that D1 does not, which a session started after the cutover
   // accounts for.
   extra: string[];
-  // D1 chunks with no row in the object under the `chunk_seq` they were written with.
+  // D1 chunks this call walked with no row in the object under the `chunk_seq` they were written
+  // with. Like `embeddings`, it is this call's own and the caller sums it over the run.
   missingChunks: number;
-  // The chunks this run wrote whose embedding does not come back out of the object as the bytes
+  // The chunks this call wrote whose embedding does not come back out of the object as the bytes
   // D1 holds. A vector is quantized int8, so one re-encoded byte moves every score computed from
-  // it. A chunk an earlier run brought over is left out: its vector was held against D1's then.
+  // it. A chunk an earlier call brought over is left out: its vector was held against D1's then.
   embeddings: number[];
   // What SQLite makes of `session_chunks_fts` against `session_chunks`. The index is
   // external-content and the copy moves rowids by hand, so this is the one thing no count can
@@ -98,6 +108,8 @@ export interface SessionCopyChecks {
   chunkIndex: IndexCheck;
   // The same read of `session_history_fts`, which stores its own copy of the text.
   historyIndex: IndexCheck;
+  // What this call can account for, which is everything but how much of the prose the run has
+  // walked. The caller holds that, and `npm run copy-sessions` is what adds it up.
   ok: boolean;
 }
 
@@ -114,8 +126,13 @@ export interface SessionCopyReport {
   // One per table the cutover moved, `session_chunks` last.
   tables: TableReport[];
   chunks: {
+    // What this call walked of D1's prose. The two together are how much of it this call accounts
+    // for, and summed over the run they are what says the whole corpus crossed — the object's own
+    // row count cannot say it, since the object holds the prose it indexed itself as well.
     copied: number;
     held: number;
+    // How many chunks D1 holds for this account, so the caller has what to sum against.
+    account: number;
     // The copied chunks that could not keep the ordinal D1 gave them, because the object already
     // indexes that ordinal of that session.
     shifted: number;
@@ -140,7 +157,7 @@ const allOf = async <T extends Owned>(
   db: AccountDb,
   table: T,
   userId: string,
-  order: readonly SQLiteColumn[],
+  order: ReadonlyArray<ColumnOf<T>>,
 ): Promise<Array<T["$inferSelect"]>> => {
   const rows: Array<T["$inferSelect"]> = [];
   for (let offset = 0; ; offset += READ_PAGE) {
@@ -288,12 +305,17 @@ const nextOrdinal = (tx: TenantTx, userId: string, sessionId: string, state: Chu
 // entry, the way it does for every chunk the object indexes itself.
 //
 // Three things can stand in the way of it, and the row already at that key says which. A row of
-// the same session carrying the same prose at the same instant is this chunk, copied by an earlier
-// run, and is left alone — all three, because a session replayed after the cutover is re-indexed
-// from ordinal zero and writes the pre-cutover prose again under the low keys D1 handed this
-// account, so the session and the text alone would pass over a chunk of history and the copy would
-// report itself sound. `at` is copied verbatim, so a second run still recognises its own work, and
-// `ordinal` cannot join it because a shifted chunk does not keep the one it came in with.
+// the same session carrying the same prose at the same instant is this chunk and is left alone.
+// All three, rather than the session and the prose: `at` is the timestamp of the transcript entry
+// the chunk opened on, so it separates two stretches of one session that happened to say the same
+// thing from one chunk written twice. It is copied verbatim, so a second run still recognises its
+// own work; `ordinal` cannot join it, because a shifted chunk does not keep the one it came in
+// with.
+//
+// A row matching all three is the same chunk whoever wrote it, which is why passing it over loses
+// nothing. A session replayed after the cutover is re-indexed from ordinal zero and writes the
+// pre-cutover prose again under the low keys D1 handed this account, at the instants it already
+// carried: those rows match, and the copy leaving them where they stand is right.
 //
 // A row that is not this chunk is the object's own and moves up. What is left is an ordinal of
 // this session the object already indexes, which the chunk climbs past.
@@ -433,9 +455,7 @@ const copyChunks = async (
       for (const [sessionId, chunks] of reach) raiseChunkReach(tx, userId, sessionId, chunks);
     });
     verifyChunkPage(tenant, userId, page, placed, state);
-    const last = page.at(-1);
-    if (last === undefined) return { ...state, frontier, done: true };
-    frontier = last.chunkSeq;
+    frontier = page[page.length - 1]?.chunkSeq ?? frontier;
     seen += page.length;
     if (page.length < CHUNK_PAGE) return { ...state, frontier, done: true };
     if (seen >= CHUNK_BUDGET) return { ...state, frontier, done: false };
@@ -524,21 +544,33 @@ export const copySessions = async (
 
   // One table of D1 into the table of the object it became. `from`'s row type has to be one the
   // insert takes, which is what holds the two schemas to each other here rather than at the run.
+  //
+  // The metadata is the opening call's work and a continuation only counts it. These tables are
+  // read whole and written a row at a time, and `usage_events` is one row per event of every
+  // session the account ever ran — doing that again on every call would have a long run spending
+  // its budget re-conflicting rows the first call wrote, which is the stall the frontier exists to
+  // remove. A continuation that finds a table short copies it after all, so an opening call that
+  // died part way through the metadata is finished rather than failing the run.
   const moved = async <A extends Owned, T extends Owned>(
     table: string,
     from: A & { $inferSelect: T["$inferInsert"] },
     into: T,
-    order: readonly SQLiteColumn[],
+    order: ReadonlyArray<ColumnOf<A>>,
   ): Promise<TableReport> => {
-    const rows = await allOf(account, from, userId, order);
-    const copied = copyTable(tenant, into, rows);
-    return {
+    const counted = async (copied: number, held: number): Promise<TableReport> => ({
       table,
       copied,
-      held: rows.length - copied,
+      held,
       account: await accountCount(account, from, userId),
       tenant: tenantCount(tenant, into, userId),
-    };
+    });
+    if (after > 0) {
+      const standing = await counted(0, 0);
+      if (standing.tenant >= standing.account) return standing;
+    }
+    const rows = await allOf(account, from, userId, order);
+    const copied = copyTable(tenant, into, rows);
+    return counted(copied, rows.length - copied);
   };
 
   const tables: TableReport[] = [
@@ -574,11 +606,12 @@ export const copySessions = async (
 
   const highest = await highestChunkSeq(account, userId);
   const chunks = await copyChunks(tenant, account, userId, highest, after);
+  const inD1 = await accountCount(account, legacySessionChunks, userId);
   tables.push({
     table: "chunks",
     copied: chunks.copied,
     held: chunks.held,
-    account: await accountCount(account, legacySessionChunks, userId),
+    account: inD1,
     tenant: tenantCount(tenant, sessionChunks, userId),
   });
 
@@ -588,10 +621,11 @@ export const copySessions = async (
   const chunkIndex = indexIntegrity(tenant, sessionChunksFts, 1);
   const historyIndex = indexIntegrity(tenant, sessionHistoryFts, 0);
   // A table the object holds fewer rows of than D1 did not arrive, whatever its tally said. The
-  // prose is left out of this until the walk reaches the end of it, because a call that stopped on
-  // its budget is short of the rest by design.
+  // prose is not one of them: the object's chunk count holds what it indexed itself as well, so
+  // `tenant >= account` is satisfied by an account that was never copied into at all. How much of
+  // D1's prose the run walked is what accounts for it, and only the caller can add that up.
   const short = tables
-    .filter((row) => row.tenant < row.account && (chunks.done || row.table !== "chunks"))
+    .filter((row) => row.table !== "chunks" && row.tenant < row.account)
     .map((row) => row.table)
     .sort();
 
@@ -601,6 +635,7 @@ export const copySessions = async (
     chunks: {
       copied: chunks.copied,
       held: chunks.held,
+      account: inD1,
       shifted: chunks.shifted,
       moved: chunks.moved,
       frontier: chunks.frontier,
