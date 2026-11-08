@@ -5,10 +5,12 @@ use crate::seen::Seen;
 use crate::sessions;
 use crate::settings::Settings;
 use crate::transcripts;
+use crate::watch;
 use crate::ws::{self, Ended, Reply};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -21,6 +23,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 pub const BASE_DELAY: Duration = Duration::from_secs(1);
 pub const MAX_DELAY: Duration = Duration::from_secs(60);
@@ -375,26 +378,89 @@ fn archive(
     }
 }
 
-/// The transcripts of the sessions still running, on a beat of its own. A session works for
-/// minutes between prompts and writes the whole time, while the hook that would carry its lines up
-/// only fires on a prompt, so without this a long turn reaches the archive only once it is over.
+/// How long a write waits for the writes behind it. A turn lands as a run of lines and a persisted
+/// tool output as a run of blocks, so a pass per event would send one file a dozen times over
+/// where a single pass carries all of it.
+pub const DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// What a pass over the live transcripts runs on.
+enum Woken {
+    Beat,
+    Written,
+    Deaf,
+}
+
+/// Runs a pass whenever a session writes, and on the beat besides. The watch is what the daemon
+/// normally wakes on; the beat is the backstop, for the filesystems inotify does not reach, the
+/// watch that could not be established, and the write no event arrived for. A burst of writes is
+/// one pass: the first event opens a window, everything that lands in it is drained, and the pass
+/// runs once the window is out. The beat is reset behind a pass the watch asked for, so a session
+/// writing steadily costs the passes its writing earns and not those plus the beat's.
+///
+/// One pass runs at a time, and the first runs before anything is waited on: it is what
+/// establishes the watches, and a daemon that came up under a session already running owes it the
+/// lines written while there was nothing watching.
+async fn wake_loop(every: Duration, debounce: Duration, wake: &mut UnboundedReceiver<()>, mut pass: impl AsyncFnMut()) {
+    pass().await;
+    let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut watching = true;
+    loop {
+        let woken = tokio::select! {
+            _ = beat.tick() => Woken::Beat,
+            event = wake.recv(), if watching => match event {
+                Some(()) => Woken::Written,
+                None => Woken::Deaf,
+            },
+        };
+        match woken {
+            Woken::Beat => {}
+            Woken::Written => {
+                tokio::time::sleep(debounce).await;
+                while wake.try_recv().is_ok() {}
+                beat.reset();
+            }
+            Woken::Deaf => {
+                watching = false;
+                continue;
+            }
+        }
+        pass().await;
+    }
+}
+
+/// The directories the live sessions are writing in. A session whose record carries no transcript
+/// names none, and neither does one whose directories are not there to be watched.
+fn watched(live: &[(String, PathBuf)]) -> BTreeMap<PathBuf, watch::Depth> {
+    live.iter().flat_map(|(_, path)| transcripts::dirs(path)).collect()
+}
+
+/// The transcripts of the sessions still running. A session works for minutes between prompts and
+/// writes the whole time, while the hook that would carry its lines up only fires on a prompt, so
+/// without this a long turn reaches the archive only once it is over.
 ///
 /// The beat is `archive.interval.seconds` and not the registry sweep's: the sweep ends dead
 /// sessions and runs adoption, which a host wanting its newest lines sooner has no reason to
 /// hurry. The registry is read and never swept here, since a second sweeper would unlink the dead
-/// records before the tick that owes the service their notice had seen them. One pass runs at a
-/// time: the next beat waits on the one before it rather than piling up behind it.
+/// records before the tick that owes the service their notice had seen them.
 async fn archive_loop(
     client: Arc<Client>,
     held_at: Arc<Mutex<transcripts::Archive>>,
     sessions_dir: PathBuf,
     every: Duration,
+    mut watch: Option<watch::Watch>,
+    mut wake: UnboundedReceiver<()>,
 ) {
-    let mut beat = tokio::time::interval(every);
-    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        beat.tick().await;
+    wake_loop(every, DEBOUNCE, &mut wake, async || {
         let live = sessions::transcript_paths(&sessions_dir);
+        if let Some(watch) = watch.as_mut() {
+            for unwatched in watch.sync(&watched(&live)) {
+                log(
+                    &format!("sessions:unwatched:{}:{}", unwatched.dir.display(), unwatched.error),
+                    Duration::ZERO,
+                );
+            }
+        }
         let client = Arc::clone(&client);
         let held_at = Arc::clone(&held_at);
         let beaten = tokio::task::spawn_blocking(move || {
@@ -402,7 +468,7 @@ async fn archive_loop(
             pass.retain(&live.iter().map(|(session_id, _)| session_id.as_str()).collect());
             for (session_id, path) in &live {
                 // Every session here is still running, so a record half written at the end of one
-                // of its files waits for the beat that holds the whole of it.
+                // of its files waits for the pass that holds the whole of it.
                 archive(&mut pass, &client, session_id, path, transcripts::Pass::Open);
             }
         })
@@ -410,7 +476,8 @@ async fn archive_loop(
         if let Err(error) = beaten {
             log(&format!("sessions:archive-failed:{error}"), Duration::ZERO);
         }
-    }
+    })
+    .await;
 }
 
 /// One adoption pass at a time, whatever the tick does: a pass reads transcripts and then waits on
@@ -469,6 +536,14 @@ async fn serve(archive_every: Duration) -> Result<()> {
     }
     let adopting = Arc::new(AtomicBool::new(false));
     let held_at = Arc::new(Mutex::new(transcripts::Archive::default()));
+    let (wake, woken) = watch::wake();
+    let watching = match watch::Watch::new(wake) {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            log(&format!("sessions:watch-failed:{error:#}"), Duration::ZERO);
+            None
+        }
+    };
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -477,7 +552,7 @@ async fn serve(archive_every: Duration) -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
-        _ = archive_loop(Arc::clone(&client), Arc::clone(&held_at), sessions_dir.clone(), archive_every) => Ok(()),
+        _ = archive_loop(Arc::clone(&client), Arc::clone(&held_at), sessions_dir.clone(), archive_every, watching, woken) => Ok(()),
         _ = sessions::idle_exit(&sessions_dir, IDLE_CHECK, IDLE_TIMEOUT, |ended| {
             report_ended(&client, &held_at, ended);
             if let Ok(scope) = scope.as_ref() {
@@ -685,6 +760,7 @@ pub fn restart(settings: &Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn sandbox(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("recall-listen-{}-{name}", std::process::id()));
@@ -935,6 +1011,77 @@ mod tests {
 
         held.release().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The clock is paused, so every wait here is the runtime jumping to the next deadline and
+    /// nothing is actually slept through: what the burst proves is the count of passes, not how
+    /// long they took.
+    fn passes() -> (Arc<AtomicUsize>, impl AsyncFnMut()) {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&ran);
+        (ran, async move || {
+            counting.fetch_add(1, Ordering::Release);
+        })
+    }
+
+    /// The whole point of the debounce. A turn lands as a run of writes, and every one of them is
+    /// an event; left undebounced each would be its own pass over the same files.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_writes_is_one_pass_and_not_one_per_write() {
+        let every = Duration::from_secs(10);
+        let (ran, pass) = passes();
+        let (wake, mut woken) = watch::wake();
+        for _ in 0..12 {
+            wake.send(()).unwrap();
+        }
+
+        let _ = tokio::time::timeout(every / 2, wake_loop(every, DEBOUNCE, &mut woken, pass)).await;
+
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            2,
+            "the pass that establishes the watches, and one for the whole burst"
+        );
+    }
+
+    /// A watch that was never established, a filesystem inotify does not reach, and a write no
+    /// event arrived for all come out here: the beat runs the pass with nothing waking it.
+    #[tokio::test(start_paused = true)]
+    async fn the_beat_still_runs_a_pass_when_no_write_is_ever_announced() {
+        let every = Duration::from_secs(10);
+        let (ran, pass) = passes();
+        let (_wake, mut woken) = watch::wake();
+
+        let _ = tokio::time::timeout(every * 3 + every / 2, wake_loop(every, DEBOUNCE, &mut woken, pass)).await;
+
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            4,
+            "the first pass and one on each of three beats"
+        );
+    }
+
+    /// A beat behind a pass the watch asked for would send over files the pass just read. The
+    /// window is a fraction of the beat here, so a write early in a beat still leaves most of one
+    /// behind it, and nothing but the reset keeps the beat from firing into it.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_pushes_the_beat_out_rather_than_adding_a_pass_to_it() {
+        let every = Duration::from_secs(10);
+        let (ran, pass) = passes();
+        let (wake, mut woken) = watch::wake();
+        tokio::spawn(async move {
+            tokio::time::sleep(every - DEBOUNCE * 2).await;
+            wake.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let _ = tokio::time::timeout(every + every / 2, wake_loop(every, DEBOUNCE, &mut woken, pass)).await;
+
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            2,
+            "the first pass and the written one; the beat it displaced is still ahead"
+        );
     }
 
     #[test]

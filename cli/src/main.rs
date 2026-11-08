@@ -14,6 +14,7 @@ mod seen;
 mod sessions;
 mod settings;
 mod transcripts;
+mod watch;
 mod ws;
 
 use anyhow::{Context, Result, bail};

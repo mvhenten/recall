@@ -42,9 +42,10 @@
 //! moving either can neither skip nor replay the other.
 
 use crate::redact;
+use crate::watch::Depth;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -111,6 +112,26 @@ fn size_of(path: &Path) -> i64 {
 fn beside(transcript: &Path) -> Option<PathBuf> {
     let stem = transcript.file_stem()?;
     Some(transcript.parent()?.join(stem))
+}
+
+/// The directories one session writes in, for the watch that wakes the daemon when it does: the
+/// one its own transcript sits in, shared with every other session of the project, and the one its
+/// subagent turns and persisted tool outputs sit under, which is the session's alone. A directory
+/// that is not there yet is left out rather than watched and refused: the one above it is watched,
+/// so its appearing is itself an event, and the pass that follows is what asks for it.
+pub fn dirs(transcript: &Path) -> BTreeMap<PathBuf, Depth> {
+    if transcript.as_os_str().is_empty() {
+        return BTreeMap::new();
+    }
+    let mut dirs = BTreeMap::new();
+    if let Some(parent) = transcript.parent() {
+        dirs.insert(parent.to_path_buf(), Depth::Here);
+    }
+    if let Some(own) = beside(transcript) {
+        dirs.insert(own, Depth::Below);
+    }
+    dirs.retain(|dir, _| dir.is_dir());
+    dirs
 }
 
 /// How long a name the service takes, and which characters beyond letters and digits it holds.

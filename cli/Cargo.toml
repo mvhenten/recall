@@ -25,6 +25,10 @@ rustls = { version = "0.23.37", default-features = false, features = ["ring", "s
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink"] }
 libc = "0.2.180"
 schemars = "1"
+notify = "8.2.1"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 
 [package.metadata.dist]
