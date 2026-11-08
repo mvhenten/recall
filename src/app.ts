@@ -177,6 +177,7 @@ import {
   recordsFault,
   recordsReach,
 } from "./records";
+import { copySessions } from "./session-copy";
 import {
   ARTIFACT_PREFIX,
   FILE_SEGMENT,
@@ -834,6 +835,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
           current: session.deviceId === caller.deviceId,
         })),
       });
+    }
+    // The one-shot copy of this account's sessions out of D1 and into its own object, run against
+    // a running deployment by `npm run copy-sessions` and by nothing else. A session answers a
+    // GET, a PUT and a DELETE at its own id and never a POST, so a session id of `copy` shadows
+    // nothing. It is here rather than on a read path because a read path must never migrate
+    // anything.
+    if (rawSessionId === "copy" && subresource === undefined && request.method === "POST") {
+      return json(await copySessions(db, env.ACCOUNT, caller.userId));
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);
