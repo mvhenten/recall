@@ -379,12 +379,12 @@ describe("planning a window of records", () => {
   });
 
   it("reads forward from where the box has got to, and passes over the records it has", () => {
-    const written = spans([4, 4, 4], 10);
+    const written = spans([4, 4, 4, 4], 10);
 
-    expect(followedRecords(written, 4, 1_000)).toEqual({ from: 4, through: 12, bytes: 80 });
+    expect(followedRecords(written, 4, 1_000)).toEqual({ from: 4, through: 16, bytes: 120 });
     const held = followedRecords(written, 4, 50);
-    expect(held).toEqual({ from: 4, through: 8, bytes: 40 });
-    expect(followedRecords(written, held.through, 50)).toEqual({ from: 8, through: 12, bytes: 40 });
+    expect(held).toEqual({ from: 4, through: 12, bytes: 80 });
+    expect(followedRecords(written, held.through, 50)).toEqual({ from: 12, through: 16, bytes: 40 });
   });
 
   it("reads nothing forward where nothing has landed since the box last looked", () => {
