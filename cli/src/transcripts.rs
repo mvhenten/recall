@@ -283,12 +283,14 @@ impl Place {
 }
 
 /// What one pass over one file did: where the file is waiting now, how many records it put there,
-/// and how many lines it read that no record could carry.
+/// how many lines it read that no record could carry, and whether it stopped with records still
+/// to send.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sent {
     pub next: i64,
     pub records: i64,
     pub dropped: i64,
+    pub more: bool,
 }
 
 /// One line of a file as it was read: its bytes without the break, and whether a break closed it.
@@ -473,7 +475,7 @@ impl<R: BufRead> Reader<R> {
             taken += group;
         }
         let held_back = complete < first;
-        records.truncate(fitting(&records).min(limit));
+        records.truncate(fitting(file, self.at, &records).min(limit));
         if records.is_empty() {
             // Nothing of the batch can go up. Either the redactor held the first record back, and
             // only the bytes that finish the secret let it through — which a batch at its ceiling
@@ -555,12 +557,15 @@ fn written(record: &[u8]) -> String {
 }
 
 /// How many of a batch's records fit the body one append may hold. The ceiling is on the body the
-/// service is offered, so it is weighed against what the records are written out as and never
-/// against the bytes they were read from: a line of JSON goes up quoted, and every quote in it is
-/// a byte the escaping adds.
-fn fitting(records: &[String]) -> usize {
-    const ENVELOPE: usize = 256;
-    let mut room = MAX_APPEND_BYTES - ENVELOPE;
+/// service is offered, so it is weighed against the body `crate::api::append_body` writes and
+/// never against the bytes the records were read from: a line of JSON goes up quoted, and every
+/// quote in it is a byte the escaping adds. The envelope is weighed with the longer of the two
+/// words `closed` crosses as, which is the one a batch cut short of the file's end sends.
+fn fitting(file: &str, from: i64, records: &[String]) -> usize {
+    let envelope = crate::api::append_body(file, from, &[], false).len();
+    let Some(mut room) = MAX_APPEND_BYTES.checked_sub(envelope) else {
+        return 0;
+    };
     for (index, record) in records.iter().enumerate() {
         let written = serde_json::to_string(record)
             .map(|json| json.len() + 1)
@@ -573,24 +578,41 @@ fn fitting(records: &[String]) -> usize {
     records.len()
 }
 
+/// How many appends one pass over one file offers before it leaves the rest to the pass behind it.
+/// The daemon archives every live session on one beat, so a host returning from a gap with
+/// hundreds of megabytes of transcript would hold that beat — and every other session's lines —
+/// for as long as its backlog took. The place a pass reaches is proven and kept, so the pass after
+/// it opens where this one stopped and the backlog drains a beat at a time.
+pub const MAX_APPENDS_PER_PASS: usize = 32;
+
 /// Sends what is left of one file from the record the archive is waiting for. A place this run
 /// worked out for itself costs one append of a single record, which the service refuses with the
 /// place the file really waits at; from there every append carries all it may.
+///
+/// `appends` is how many it offers before it stops and says the file holds more.
 pub fn send_from(
     store: &impl Store,
     session_id: &str,
     file: &str,
     reader: &mut Reader<impl BufRead>,
     from: Place,
+    appends: usize,
 ) -> Result<Sent> {
     let mut place = from;
     let mut records = 0;
+    let mut offered = 0;
+    let mut more = false;
     reader.skip_to(place.next)?;
     loop {
+        if offered == appends {
+            more = true;
+            break;
+        }
         let limit = if place.proven { MAX_RECORDS } else { 1 };
         let Some(batch) = reader.batch(file, limit)? else {
             break;
         };
+        offered += 1;
         match store.append(session_id, file, place.next, &batch.records, batch.closed)? {
             Appended::Written(next) => {
                 records += batch.records.len() as i64;
@@ -613,6 +635,7 @@ pub fn send_from(
         next: place.next,
         records,
         dropped: reader.dropped(),
+        more,
     })
 }
 
@@ -642,15 +665,29 @@ pub fn records_held(path: &Path, holds: Holds) -> Result<i64> {
 /// the one before opens no file and sends no call. The place is this run's own: a session it has
 /// never seen opens at nothing and the first append it offers is the one record that asks the
 /// service where the file really waits.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Archive {
     seen: HashMap<String, HashMap<String, Seen>>,
+    appends: usize,
+}
+
+impl Default for Archive {
+    fn default() -> Archive {
+        Archive {
+            seen: HashMap::new(),
+            appends: MAX_APPENDS_PER_PASS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Seen {
     place: Place,
     size: i64,
+    /// Whether the pass that reached this place stopped with records still to send. A file that
+    /// holds more is read again on the next beat whatever its size says, since a pass cut short
+    /// leaves a backlog behind that no later write announces.
+    more: bool,
 }
 
 impl Archive {
@@ -670,10 +707,11 @@ impl Archive {
         let known = self.seen.get(session_id).cloned().unwrap_or_default();
         if !first
             && pass == Pass::Open
-            && sources
-                .found
-                .iter()
-                .all(|source| known.get(&source.file).is_some_and(|seen| seen.size == source.size))
+            && sources.found.iter().all(|source| {
+                known
+                    .get(&source.file)
+                    .is_some_and(|seen| seen.size == source.size && !seen.more)
+            })
         {
             return Ok(0);
         }
@@ -685,12 +723,13 @@ impl Archive {
                 .map(|seen| seen.place)
                 .unwrap_or(Place::nothing());
             let mut reader = open(source, pass)?;
-            let reached = send_from(store, session_id, &source.file, &mut reader, from)?;
+            let reached = send_from(store, session_id, &source.file, &mut reader, from, self.appends)?;
             ends.insert(
                 source.file.clone(),
                 Seen {
                     place: Place::reached(reached.next),
                     size: source.size,
+                    more: reached.more,
                 },
             );
             sent += reached.records;
@@ -720,7 +759,7 @@ impl Archive {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -812,6 +851,44 @@ mod tests {
         fn next(&self, file: &str) -> i64 {
             self.records(file).len() as i64
         }
+
+        /// How many records each append carried, in the order they were offered.
+        fn appends(&self, file: &str) -> Vec<usize> {
+            self.files
+                .borrow()
+                .get(file)
+                .map(|held| held.iter().map(|one| one.records.len()).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    /// A second host that reaches the same file between two of this one's appends, which is what
+    /// the service answers 409 for. It writes its own run at `when` and then hands the offer on,
+    /// so the append that follows is refused with the ordinal the file really waits at.
+    struct Raced<'a> {
+        archive: &'a Fake,
+        offered: Cell<usize>,
+        when: usize,
+        extra: Vec<String>,
+    }
+
+    impl Store for Raced<'_> {
+        fn append(
+            &self,
+            session_id: &str,
+            file: &str,
+            from: i64,
+            records: &[String],
+            closed: bool,
+        ) -> Result<Appended> {
+            let offered = self.offered.get();
+            self.offered.set(offered + 1);
+            if offered == self.when {
+                let reach = self.archive.next(file);
+                self.archive.append(session_id, file, reach, &self.extra, true)?;
+            }
+            self.archive.append(session_id, file, from, records, closed)
+        }
     }
 
     /// A record as the service stores it, which is the bytes the host read: a marked one carries
@@ -838,8 +915,9 @@ mod tests {
                 records.iter().all(|record| !record.is_empty()),
                 "a record holds at least one character"
             );
-            let body =
-                serde_json::json!({ "file": file, "from": from, "records": records, "closed": closed }).to_string();
+            // Weighed as the body the transport writes, so a sender that fits its records to one
+            // shape and sends them in another is caught here rather than by the service.
+            let body = crate::api::append_body(file, from, records, closed);
             assert!(
                 body.len() <= MAX_APPEND_BYTES,
                 "a body of {} bytes is more than the {MAX_APPEND_BYTES} an append may hold",
@@ -869,6 +947,19 @@ mod tests {
                     "{{\"type\":\"user\",\"timestamp\":\"2026-11-07T12:0{}:00Z\",\"message\":{{\"content\":\"{tag} {index}: the archive holds every line of this as it stands.\"}}}}\n",
                     index % 10
                 )
+            })
+            .collect()
+    }
+
+    /// A transcript whose records are large enough that the byte ceiling, and not the record
+    /// ceiling, is what cuts one append from the next.
+    fn heavy(count: usize, bytes: usize) -> String {
+        const FILLER: &str = "the archive holds every line of this as it stands and reads it back the same. ";
+        (0..count)
+            .map(|index| {
+                let mut prose = FILLER.repeat(bytes / FILLER.len() + 1);
+                prose.truncate(bytes);
+                format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{index}: {prose}\"}}}}\n")
             })
             .collect()
     }
@@ -1049,7 +1140,7 @@ mod tests {
         service.append("s-1", MAIN, 0, &ahead, true).unwrap();
 
         let mut reader = open(&source, Pass::Final).unwrap();
-        let sent = send_from(&service, "s-1", MAIN, &mut reader, Place::nothing()).unwrap();
+        let sent = send_from(&service, "s-1", MAIN, &mut reader, Place::nothing(), usize::MAX).unwrap();
 
         assert_eq!(sent.next, 40);
         assert_eq!(sent.records, 15, "the fifteen the other host had not reached");
@@ -1271,13 +1362,108 @@ mod tests {
         assert_eq!(service.body("main"), "one\n", "and the records in front of it went up");
     }
 
+    #[test]
+    fn a_backlog_several_times_the_byte_ceiling_goes_up_as_the_appends_it_takes() {
+        let sandbox = Sandbox::new("backlog");
+        let text = heavy(40, 90_000);
+        let transcript = sandbox.transcript("s-1", &text);
+        let service = Fake::default();
+
+        let sent = Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
+
+        assert!(text.len() > 3 * MAX_APPEND_BYTES, "a backlog several times the ceiling");
+        assert_eq!(sent, 40, "every record of it went up");
+        assert!(
+            *service.offered.borrow() > 3,
+            "as the appends it takes and not one the service would refuse"
+        );
+        assert_eq!(service.next("main"), 40, "the archive waits past the last record");
+        assert_eq!(service.body("main"), text, "and the appends lay back out as the file");
+    }
+
+    #[test]
+    fn a_backlog_that_crosses_the_record_ceiling_first_splits_on_the_count() {
+        let sandbox = Sandbox::new("thousands");
+        let text = turns(2_400, "line");
+        let transcript = sandbox.transcript("s-1", &text);
+        let service = Fake::default();
+
+        let sent = Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
+
+        assert!(
+            text.len() < MAX_APPEND_BYTES,
+            "no append of it is near the byte ceiling"
+        );
+        assert_eq!(sent, 2_400);
+        assert_eq!(
+            service.appends("main"),
+            vec![1, MAX_RECORDS, MAX_RECORDS, 399],
+            "the record this pass proved its place with, then every append filled to the ceiling"
+        );
+        assert_eq!(service.body("main"), text);
+    }
+
+    #[test]
+    fn a_refusal_part_way_through_a_backlog_resumes_where_the_archive_says_and_still_finishes() {
+        let sandbox = Sandbox::new("raced");
+        let text = turns(2_400, "line");
+        let transcript = sandbox.transcript("s-1", &text);
+        let service = Fake::default();
+        let raced = Raced {
+            archive: &service,
+            offered: Cell::new(0),
+            when: 1,
+            extra: text.lines().skip(1).take(600).map(str::to_string).collect(),
+        };
+        let source = sources(&transcript).unwrap().found.remove(0);
+
+        let mut reader = open(&source, Pass::Final).unwrap();
+        let sent = send_from(&raced, "s-1", MAIN, &mut reader, Place::nothing(), usize::MAX).unwrap();
+
+        assert_eq!(sent.next, 2_400, "the pass carried on from the record it was handed");
+        assert_eq!(sent.records, 1_800, "and sent every record the other host had not");
+        assert_eq!(
+            service.body("main"),
+            text,
+            "the file is whole, to the break that ends it"
+        );
+    }
+
+    #[test]
+    fn a_pass_sends_what_it_may_and_the_pass_behind_it_opens_where_that_one_stopped() {
+        let sandbox = Sandbox::new("bounded");
+        let text = turns(2_400, "line");
+        let transcript = sandbox.transcript("s-1", &text);
+        let service = Fake::default();
+        let mut archive = Archive {
+            appends: 2,
+            ..Archive::default()
+        };
+
+        let first = archive.send(&service, "s-1", &transcript, Pass::Open).unwrap();
+        let second = archive.send(&service, "s-1", &transcript, Pass::Open).unwrap();
+        let third = archive.send(&service, "s-1", &transcript, Pass::Open).unwrap();
+
+        assert_eq!(first, 1_001, "the record that proved the place, then one full append");
+        assert_eq!(
+            second, 1_399,
+            "and the pass behind it reads the file again though nothing was written since"
+        );
+        assert_eq!(third, 0, "a file the archive is level with sends nothing");
+        assert_eq!(service.body("main"), text, "and the backlog reached the archive whole");
+    }
+
     /// A file read back out of the archive and sent again, which is what `recall sessions
     /// --replay` does. It goes through the very reader the live sender uses, so the only thing
     /// that can be proved here is the thing that matters: where a replay stops is a function of
     /// the file and nothing else.
     fn replay(service: &Fake, file: &str, text: &str) -> Sent {
         let mut reader = Reader::new(text.as_bytes(), holds_of(file), Pass::Final);
-        send_from(service, "s-1", file, &mut reader, Place::nothing()).unwrap()
+        send_from(service, "s-1", file, &mut reader, Place::nothing(), usize::MAX).unwrap()
     }
 
     #[test]

@@ -476,7 +476,8 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
         for part in &session.parts {
             let mut reader = transcripts::open(&part.source, Pass::Final)?;
             let from = transcripts::Place::nothing();
-            done.records += transcripts::send_from(service, id, &part.source.file, &mut reader, from)?.records;
+            done.records +=
+                transcripts::send_from(service, id, &part.source.file, &mut reader, from, usize::MAX)?.records;
         }
         sent(id, done);
     }

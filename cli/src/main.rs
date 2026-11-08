@@ -882,11 +882,19 @@ fn replay_sessions(client: &Client) -> Result<ExitCode> {
 }
 
 /// One archived file, read back as it is served and sent again as records. The session wrote it
-/// long ago, so the end of the file is the end for good.
+/// long ago, so the end of the file is the end for good, and a replay asked for once runs the
+/// whole file rather than leaving a remainder for a beat that is never coming.
 fn replay_file(client: &Client, session_id: &str, file: &str) -> Result<transcripts::Sent> {
     let body = client.transcript_body(session_id, file)?;
     let mut reader = transcripts::Reader::new(std::io::BufReader::new(body), transcripts::holds_of(file), Pass::Final);
-    transcripts::send_from(client, session_id, file, &mut reader, transcripts::Place::nothing())
+    transcripts::send_from(
+        client,
+        session_id,
+        file,
+        &mut reader,
+        transcripts::Place::nothing(),
+        usize::MAX,
+    )
 }
 
 /// Says which session a name settled on when it named more than one. The service answers with the
