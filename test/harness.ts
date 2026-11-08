@@ -87,8 +87,9 @@ export interface V2Client {
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   /// One append of whole redacted JSONL lines, the record at index `i` carrying ordinal
-  /// `from + i`.
-  records(sessionId: string, file: string, from: number, records: string[]): Promise<Response>;
+  /// `from + i`. `closed` says whether a line break closes the last of them, which every file but
+  /// a tool output a session stopped writing part way through ends on.
+  records(sessionId: string, file: string, from: number, records: string[], closed?: boolean): Promise<Response>;
   session(target: string): Promise<Response>;
   files(sessionId: string): Promise<Response>;
   transcript(sessionId: string, file: string): Promise<Response>;
@@ -441,8 +442,8 @@ export const harness = async ({
       usage(sessionId, fields = {}) {
         return this.request("POST", `/v2/sessions/${sessionId}/usage`, { ...V2_USAGE_DELTA, ...fields });
       },
-      records(sessionId, file, from, records) {
-        return this.request("POST", `/v2/sessions/${sessionId}/records`, { file, from, records });
+      records(sessionId, file, from, records, closed = true) {
+        return this.request("POST", `/v2/sessions/${sessionId}/records`, { file, from, records, closed });
       },
       session(target) {
         return this.request("GET", `/v2/sessions/${encodeURIComponent(target)}`);

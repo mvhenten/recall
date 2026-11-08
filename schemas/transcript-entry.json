@@ -12,12 +12,14 @@
   "promptMarks": ["isMeta", "isVisibleInTranscriptOnly", "isCompactSummary"],
   "sidechainMark": "isSidechain",
   "mainFile": "main",
+  "binaryRecord": "\u0000base64:",
   "transcriptFile": {
     "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$",
     "maxBytes": 101,
     "extraChars": "._-"
   },
   "maxStretchBytes": 1048576,
+  "maxAppendBytes": 1048576,
   "headBytes": 8192,
   "idleAfterMs": 300000,
   "globalTag": "global",

@@ -73,6 +73,16 @@ export interface TranscriptFile extends Extent {
   bytes: number;
 }
 
+// One file of a session as `/v2` answers for it, said apart by the path that wrote it. The two
+// answer in places of different kinds — a stretch names a byte of the file on disk, and a record
+// names a line of it, which redaction cannot move — so which number a reader weighs its own copy
+// against follows from `held` and from nothing else. A file held as records reaches nowhere into
+// the file on disk: its `bytes` are a length of the archive, and the records are the one count
+// that is a place in both.
+export type HeldFile =
+  | ({ held: "bytes"; file: string; bytes: number } & Extent)
+  | { held: "records"; file: string; bytes: number; records: number };
+
 const filePrefix = (userId: string, sessionId: string, file: string): string => `${userId}/${sessionId}/${file}/`;
 
 const sessionPrefix = (userId: string, sessionId: string): string => `${userId}/${sessionId}/`;

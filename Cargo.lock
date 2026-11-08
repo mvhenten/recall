@@ -964,8 +964,8 @@ name = "recall"
 version = "0.18.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
- "flate2",
  "futures-util",
  "jiff",
  "libc",

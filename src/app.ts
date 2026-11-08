@@ -168,6 +168,9 @@ import {
   readRecords,
   readRecordsBetween,
   recordFiles,
+  recordsAgree,
+  recordsEnd,
+  recordsFault,
   recordsReach,
 } from "./records";
 import {
@@ -289,6 +292,7 @@ import {
   archivedSince,
   archivedTranscript,
   cacheArchived,
+  type HeldFile,
   MAIN_FILE,
   MAX_STRETCH_BYTES,
   openStretch,
@@ -299,7 +303,6 @@ import {
   type StretchBody,
   type Stretched,
   storedStretch,
-  type TranscriptFile,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
 import {
@@ -3009,15 +3012,16 @@ export const createApp = (deps: Deps): App => {
   // Every file of a session the archive holds, whichever path wrote it. The record path is the one
   // `/v2` writes with and the byte path is what `/v1` left behind, so a file the records hold is
   // answered off them and the byte path answers for the rest.
-  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
+  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<HeldFile[]> => {
     const [recorded, archived] = await Promise.all([
       recordFiles(bucket, userId, sessionId),
       archivedFiles(bucket, userId, sessionId),
     ]);
     const held = new Set(recorded.map((file) => file.file));
-    return [...recorded, ...archived.filter((file) => !held.has(file.file))].sort((left, right) =>
-      left.file.localeCompare(right.file),
-    );
+    const byBytes = archived
+      .filter((file) => !held.has(file.file))
+      .map(({ file, bytes, through, named }): HeldFile => ({ held: "bytes", file, bytes, through, named }));
+    return [...recorded, ...byBytes].sort((left, right) => left.file.localeCompare(right.file));
   };
 
   const v2Session = async (bucket: R2Bucket, db: D1Database, caller: Caller, target: string): Promise<Response> => {
@@ -3125,16 +3129,11 @@ export const createApp = (deps: Deps): App => {
     // caller's own user id, so neither a read nor an append can reach another account's session.
     if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
     const { userId } = caller;
-    const { from, records } = input.value;
-    // One session, one path into the index. A session the byte path already wrote cannot take
-    // records: the two would index the same prose, and the chunk counter they share belongs to
-    // whichever of them reached it first.
-    const mark = await indexMark(db, userId, sessionId);
-    if (mark !== null && mark.archived > 0) {
-      return error(409, `session ${sessionId} holds a transcript written as bytes; records and bytes are two paths`);
-    }
-    // Every 409 this endpoint answers carries the real reach, because the only thing a host can do
-    // with one is send again from there.
+    const { from, records, closed } = input.value;
+    const fault = recordsFault(records);
+    if (fault !== "") return error(400, fault);
+    // Every 409 this endpoint answers carries the ordinal to send from, because the only thing a
+    // host can do with one is send again from there.
     const conflict = (next: number, error: string): Response => {
       const refused: V2RecordsConflict = { error, next };
       return json(refused, 409);
@@ -3145,13 +3144,31 @@ export const createApp = (deps: Deps): App => {
       const taken: V2RecordsAccepted = { file: file.value, next };
       return json(taken);
     };
-    // The mark says where the file is waiting, and the objects are the arbiter. The two part
-    // company only where a writer stored records and did not live to write the mark, so the
-    // listing is paid for on the conflicting call alone and never on the ordinary one.
+    // One session, one path into the index. A session the byte path already wrote is taken over
+    // whole or not at all: the record mark is written, the byte mark cleared and the chunks the
+    // byte path wrote dropped, all in the batch that carries this append — so the two never index
+    // the same prose and the chunk counter they share is held by one of them.
+    //
+    // Nothing here weighs where the append opens. A session on the byte path holds no record mark,
+    // so the fold below reads the file from ordinal 0 whatever `from` says, which is the whole of
+    // what a takeover needs; an append landing in the middle of a file the records do not reach is
+    // refused by the ordinal check for the ordinary reason and told to send from 0.
+    const mark = await indexMark(db, userId, sessionId);
+    const crossing = file.value === MAIN_FILE && mark !== null && mark.archived > 0;
+    const takeover = crossing && !(await onRecordMark(db, userId, sessionId));
+    // The mark says where the file is waiting, and the objects are the arbiter: the two part
+    // company only where a writer stored records and did not live to write the mark. The objects
+    // also carry the one thing the mark cannot, which is whether a break closed the record in
+    // front of this append, so they are read on every call rather than on the conflicting one.
     const marked = await recordReach(db, userId, sessionId, file.value);
-    if (from !== marked) {
-      const held = await recordsReach(bucket, userId, sessionId, file.value);
-      if (from !== held) return refuse(held);
+    const end = await recordsEnd(bucket, userId, sessionId, file.value);
+    if (from !== marked && from !== end.reach) return refuse(end.reach);
+    // A record the session stopped writing part way through is the last record its file takes. An
+    // append behind it would store its bytes under an ordinal of their own, and the file would
+    // read back with the two run together under the first of them — one line where the archive
+    // counts two, which is a restore calling a whole file a part for ever.
+    if (from === end.reach && !end.closes) {
+      return conflict(end.reach, `${file.value} ends on a record no break closed; it takes no more records`);
     }
     // A put that does not land means the archive already holds an append at this ordinal. The
     // conditional put weighs presence and never content, so what is stored there is read back
@@ -3160,9 +3177,9 @@ export const createApp = (deps: Deps): App => {
     // real reach and sends from there. Records that disagree at an ordinal are a transcript being
     // rewritten, and neither side's prose may be dropped for the other's without the host hearing
     // of it.
-    if (!(await putRecords(bucket, userId, sessionId, file.value, from, records))) {
+    if (!(await putRecords(bucket, userId, sessionId, file.value, from, records, closed))) {
       const stored = await readRecordAppend(bucket, userId, sessionId, file.value, from);
-      if (stored?.some((record, at) => at < records.length && record !== records[at]) === true) {
+      if (stored !== null && !recordsAgree(stored, records)) {
         const reach = await recordsReach(bucket, userId, sessionId, file.value);
         return conflict(reach, `${file.value} holds other records at ordinal ${from}; a record is written once`);
       }
@@ -3172,7 +3189,17 @@ export const createApp = (deps: Deps): App => {
     // Only the session's own file reaches the index, exactly as the byte path's consumer reads
     // only `main`. A delegated turn is the model talking to itself and derives nothing.
     if (file.value !== MAIN_FILE) {
-      const commit = { userId, sessionId, file: file.value, held: marked, next, chunkFrom: 0, chunks: [], open: [] };
+      const commit = {
+        userId,
+        sessionId,
+        file: file.value,
+        held: marked,
+        next,
+        chunkFrom: 0,
+        chunks: [],
+        open: [],
+        takeover: false,
+      };
       if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
       return accepted(next);
     }
@@ -3184,13 +3211,25 @@ export const createApp = (deps: Deps): App => {
     const behind = await readRecordsBetween(bucket, userId, sessionId, file.value, marked, from);
     const text = [...behind, ...records].join("\n");
     const carried = await openChunks(db, userId, sessionId, file.value);
-    const { closed, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
-    const chunkFrom = await chunkReach(db, userId, sessionId);
-    const indexed = await embedChunks(closed);
+    const { closed: shut, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
+    // A takeover indexes the session from nothing, so its chunks open at ordinal 0 and the byte
+    // path's are dropped under them in the same batch.
+    const chunkFrom = takeover ? 0 : await chunkReach(db, userId, sessionId);
+    const indexed = await embedChunks(shut);
     // The mark the work above was read against, still standing. A host knows its next `from`
     // without asking and pipelines two appends, and the second read the chunks and the open chunk
     // of a file the first had not finished writing; it is told the real `next` and sends again.
-    const commit = { userId, sessionId, file: file.value, held: marked, next, chunkFrom, chunks: indexed, open };
+    const commit = {
+      userId,
+      sessionId,
+      file: file.value,
+      held: marked,
+      next,
+      chunkFrom,
+      chunks: indexed,
+      open,
+      takeover,
+    };
     if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
     // The span this append indexed opens the session wherever the mark stood at nothing, which is
     // not the same as the call carrying ordinal 0: a first append that lost its commit leaves the
@@ -3232,6 +3271,7 @@ export const createApp = (deps: Deps): App => {
       chunkFrom,
       chunks: indexed,
       open: [],
+      takeover: false,
     });
   };
 

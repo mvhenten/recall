@@ -23,6 +23,13 @@ const maxMemoryQuery = 2000;
 const maxMemoryHits = 50;
 const maxListRows = 100;
 
+@doc("""
+  One line of a transcript file, redacted, under the ordinal it holds in that file. A line that is
+  not valid UTF-8 would cross as a JSON string lossily, so it is carried as the marker
+  `\\u0000base64:` and the line's own bytes in base64; the archive decodes it back and holds the
+  bytes the host read. A line that is valid UTF-8 and opens with that marker is carried the same
+  way, which is what makes reading one unambiguous.
+  """)
 @minLength(1)
 scalar TranscriptLine extends string;
 
@@ -67,6 +74,14 @@ model AppendRecords {
   @minItems(1)
   @maxItems(maxRecordsPerAppend)
   records: TranscriptLine[];
+
+  @doc("""
+    Whether a line break closes the last record this append carries. Records join with one break
+    between them and a file is the records of it laid out that way, so the break that ends the
+    file is the one thing no ordinal says: a transcript always ends on one, and a tool output the
+    session stopped writing part way through a line does not.
+    """)
+  closed: boolean;
 }
 
 model RecordsAccepted {

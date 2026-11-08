@@ -1,28 +1,89 @@
 use crate::config::Config;
 use crate::transcripts::Appended;
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use jiff::Timestamp;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ureq::http::Response;
 use ureq::{Agent, RequestBuilder};
 
+/// A business date as `/v2` writes one: an instant carrying its offset. Everything this host keeps
+/// is epoch milliseconds, so the two readings live here and nowhere else. A number no instant can
+/// be read out of is corrupt local state: reading it as the epoch would archive 1970 as the date
+/// the session ran, which nothing downstream could tell from a session that really did.
+pub fn written(ms: i64) -> Result<String> {
+    Ok(Timestamp::from_millisecond(ms)
+        .with_context(|| format!("{ms} is no instant this host can write as a date"))?
+        .to_string())
+}
+
+mod iso {
+    use super::{Deserializer, Serializer, Timestamp, written};
+    use serde::Deserialize;
+
+    pub fn serialize<S: Serializer>(ms: &i64, out: S) -> Result<S::Ok, S::Error> {
+        out.serialize_str(&written(*ms).map_err(serde::ser::Error::custom)?)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(read: D) -> Result<i64, D::Error> {
+        let text = String::deserialize(read)?;
+        text.parse::<Timestamp>()
+            .map(|at| at.as_millisecond())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The words `/v2` writes an enum in, and the ones this host has always read them as. A clap flag,
+/// a markdown frontmatter and a memory file all say `project`, so the case the wire carries is
+/// turned here rather than at every place that prints one.
+fn capitalised(word: &str) -> String {
+    let lowered = word.to_lowercase();
+    let mut chars = lowered.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+fn lowered<'de, D: Deserializer<'de>>(read: D) -> Result<String, D::Error> {
+    Ok(String::deserialize(read)?.to_lowercase())
+}
+
+/// How a session's mode reads on the wire, where "the host could not tell" is a word of its own
+/// rather than an empty string.
+fn mode_out(mode: &str) -> &'static str {
+    match mode {
+        "interactive" => "Interactive",
+        "headless" => "Headless",
+        _ => "Unknown",
+    }
+}
+
+fn mode_in<'de, D: Deserializer<'de>>(read: D) -> Result<String, D::Error> {
+    let mode = String::deserialize(read)?;
+    Ok(match mode.as_str() {
+        "Interactive" => "interactive".to_string(),
+        "Headless" => "headless".to_string(),
+        _ => String::new(),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Memory {
     pub memory_id: String,
-    pub user_id: String,
+    #[serde(rename = "memoryName")]
     pub name: String,
     pub description: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "lowered")]
     pub kind: String,
     pub body: String,
     pub tags: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub recall_count: i64,
-    pub last_recalled_at: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,7 +229,7 @@ pub struct PublishInput {
     pub files: Vec<PathBuf>,
 }
 
-/// What a listing is asked for. Each field passes straight to `GET /v1/artifacts`.
+/// What a listing is asked for. Each field passes straight to `GET /v2/artifacts`.
 #[derive(Debug, Default)]
 pub struct ArtifactQuery {
     pub query: String,
@@ -203,19 +264,19 @@ pub struct SearchResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Elsewhere {
     pub score: f64,
+    #[serde(rename = "memoryName")]
     pub name: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "lowered")]
     pub kind: String,
     pub tags: Vec<String>,
     pub description: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+/// What a search asks for. An empty tag list means every memory, which is what `--any` resolves to
+/// before it gets here; `/v1` took a boolean beside the list that had to agree with it.
 pub struct SearchRequest<'a> {
     pub query: &'a str,
     pub tags: &'a [String],
-    pub any: bool,
     pub limit: u32,
     pub min_score: f64,
     pub mode: &'a str,
@@ -362,20 +423,13 @@ pub struct Device {
     pub device_id: String,
     pub name: String,
     /// The machine this login was made from.
-    #[serde(default)]
     pub host: String,
-    /// The name the user gave this host on the dashboard's labels tab, empty when it carries none.
-    #[serde(default)]
-    pub label: String,
+    /// The name to print for that machine: the label its owner gave it on the dashboard, and the
+    /// machine's own name where it carries none. It is never empty.
+    pub host_label: String,
     pub created_at: i64,
     pub last_used_at: i64,
     pub current: bool,
-}
-
-impl Device {
-    fn machine(&self) -> &str {
-        if self.host.is_empty() { &self.name } else { &self.host }
-    }
 }
 
 #[derive(Deserialize)]
@@ -548,17 +602,20 @@ pub struct Session {
     pub agent_name: String,
     pub device_id: String,
     pub host: String,
-    /// The name the user gave `host` on the dashboard's labels tab, empty when it carries none.
-    #[serde(default)]
+    /// The name to print for that host: its label where it carries one, and the host itself
+    /// otherwise. It is never empty.
     pub host_label: String,
     pub cwd: String,
     pub repo: String,
     pub branch: String,
     pub commit: String,
+    #[serde(with = "iso")]
     pub started_at: i64,
+    #[serde(with = "iso")]
     pub last_activity_at: i64,
     pub prompts: i64,
     pub focus: crate::sessions::Focus,
+    #[serde(deserialize_with = "mode_in")]
     pub mode: String,
     pub permission_mode: String,
     pub pid: i64,
@@ -576,12 +633,13 @@ pub struct PastSession {
     #[serde(default)]
     pub agent_name: String,
     pub host: String,
-    #[serde(default)]
     pub host_label: String,
     pub cwd: String,
     pub repo: String,
     pub branch: String,
+    #[serde(with = "iso")]
     pub started_at: i64,
+    #[serde(with = "iso")]
     pub last_activity_at: i64,
     pub prompts: i64,
     pub focus: crate::sessions::Focus,
@@ -603,6 +661,7 @@ pub struct SessionHit {
 pub struct Excerpt {
     pub speaker: String,
     pub text: String,
+    #[serde(with = "iso")]
     pub at: i64,
 }
 
@@ -629,8 +688,7 @@ struct SessionHits {
     hits: Vec<SessionHit>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy)]
 pub struct SessionBody<'a> {
     pub host: &'a str,
     pub cwd: &'a str,
@@ -646,19 +704,25 @@ pub struct SessionBody<'a> {
     pub pid: i64,
 }
 
-/// One usage delta: the event the hooks wrote, with the host and the repo it was spent in. Those
-/// two ride along rather than being read from the session row, so a session that already ended
-/// still has its closing tokens counted under the host that spent them.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageBody<'a> {
-    host: &'a str,
-    repo: &'a str,
-    /// The transcript files this delta read. It is what says their tokens are counted, which a
-    /// run reading the same files back long after has nothing else to ask.
-    files: &'a [String],
-    #[serde(flatten)]
-    event: &'a serde_json::Value,
+impl SessionBody<'_> {
+    /// The record as `/v2` takes one: the two dates carrying their offsets, and a mode that names
+    /// the reading the host could not make rather than leaving the field blank.
+    fn sent(&self, focus: &crate::sessions::Focus) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "host": self.host,
+            "cwd": self.cwd,
+            "repo": self.repo,
+            "branch": self.branch,
+            "commit": self.commit,
+            "startedAt": written(self.started_at)?,
+            "lastActivityAt": written(self.last_activity_at)?,
+            "prompts": self.prompts,
+            "focus": focus,
+            "mode": mode_out(self.mode),
+            "permissionMode": self.permission_mode,
+            "pid": self.pid,
+        }))
+    }
 }
 
 #[derive(Deserialize)]
@@ -673,21 +737,42 @@ struct HistoryIds {
     next_cursor: String,
 }
 
-/// One of a session's transcript files as the archive holds it: how many bytes of it are stored,
-/// how far into the file on disk those bytes reach, and whether every key behind that reach names
-/// both ends of the span of the file it holds. The first two differ because a stretch goes up
-/// redacted, and it is the second that an archive resumes from and a restore weighs a local file
-/// against, so nothing a host keeps locally can put the two out of step.
-///
-/// `named` reads as false where the service does not say, which leaves the reach unproven: the
-/// reading that stops rather than the one that writes a local transcript over.
+/// One of a session's transcript files as the archive holds it, said apart by the path that wrote
+/// it. The two answer in places of different kinds — a stretch names a byte of the file on disk
+/// and a record names a line of it, which redaction cannot move — so which of them holds a file is
+/// what says whether a reader weighs its own copy in bytes or in records.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HeldFile {
-    pub file: String,
-    pub bytes: i64,
-    pub through: i64,
-    #[serde(default)]
-    pub named: bool,
+#[serde(tag = "held", rename_all = "camelCase")]
+pub enum HeldFile {
+    /// `bytes` is what the archive stores and `through` is how far into the file on disk that
+    /// reaches; the two differ because a stretch goes up redacted. `named` is whether every key
+    /// behind the reach names both ends of the span it holds, and reads as false where the service
+    /// does not say — the reading that stops rather than the one that writes a local transcript
+    /// over.
+    Bytes {
+        file: String,
+        bytes: i64,
+        through: i64,
+        #[serde(default)]
+        named: bool,
+    },
+    /// `bytes` is a length of the archive and no place in the file on disk, so a reader weighs its
+    /// own copy against `records` and against nothing else.
+    Records { file: String, bytes: i64, records: i64 },
+}
+
+impl HeldFile {
+    pub fn file(&self) -> &str {
+        match self {
+            HeldFile::Bytes { file, .. } | HeldFile::Records { file, .. } => file,
+        }
+    }
+
+    pub fn bytes(&self) -> i64 {
+        match self {
+            HeldFile::Bytes { bytes, .. } | HeldFile::Records { bytes, .. } => *bytes,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -697,14 +782,20 @@ struct HeldFiles {
     counted: Vec<String>,
 }
 
-/// How far into one file the archive reaches, which is what an append answers with whether it
-/// landed or was beaten to the place it was offered at. A refusal says on which terms too: the
-/// writer that reached the place first may have been one whose key names a single offset.
+/// What the archive holds of one session: a row per file, and the files whose tokens have been
+/// counted. The two move apart — a running session's records are archived on a beat of their own,
+/// with no counting pass behind them — so neither ever stands in for the other.
+#[derive(Debug, Default)]
+pub struct Held {
+    pub files: Vec<HeldFile>,
+    pub counted: HashSet<String>,
+}
+
+/// The ordinal one file is waiting for, which is what an append answers with whether it landed or
+/// was beaten to the place it was offered at. It is the only coordinate the two sides share.
 #[derive(Deserialize)]
-struct Extent {
-    through: i64,
-    #[serde(default)]
-    named: bool,
+struct Waiting {
+    next: i64,
 }
 
 /// The device a message is queued against, and the one session on it the message is for; an empty
@@ -713,6 +804,18 @@ struct Extent {
 pub struct Target {
     pub device_id: String,
     pub session_id: String,
+}
+
+impl Target {
+    /// Where the message is addressed, in the one shape every `/v2` endpoint carries. A session is
+    /// addressed by itself and the device it runs on is read off it, where `/v1` had the caller
+    /// name both and an empty session id meant every session on the device.
+    fn addressed(&self) -> serde_json::Value {
+        if self.session_id.is_empty() {
+            return serde_json::json!({ "scope": "host", "target": self.device_id });
+        }
+        serde_json::json!({ "scope": "session", "target": self.session_id })
+    }
 }
 
 /// `to` is a device id, a host's name or the label it carries, any of which reach every session on
@@ -739,11 +842,9 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
     }
     let named: Vec<&Device> = devices
         .iter()
-        .filter(|device| {
-            device.name == to || device.machine() == to || (!device.label.is_empty() && device.label == to)
-        })
+        .filter(|device| device.name == to || device.host == to || device.host_label == to)
         .collect();
-    let mut machines: Vec<&str> = named.iter().map(|device| device.machine()).collect();
+    let mut machines: Vec<&str> = named.iter().map(|device| device.host.as_str()).collect();
     machines.sort_unstable();
     machines.dedup();
     match machines.as_slice() {
@@ -807,7 +908,7 @@ impl DeviceLogin {
     pub fn start(&self, device_name: &str) -> Result<DeviceStart> {
         let response = self
             .agent
-            .post(format!("{}/v1/device/code", self.endpoint))
+            .post(format!("{}/v2/device/code", self.endpoint))
             .send_json(serde_json::json!({ "device_name": device_name }))?;
         Ok(check(response, "starting the device login")?.body_mut().read_json()?)
     }
@@ -815,7 +916,7 @@ impl DeviceLogin {
     pub fn poll(&self, device_code: &str) -> Result<Poll> {
         let mut response = self
             .agent
-            .post(format!("{}/v1/device/token", self.endpoint))
+            .post(format!("{}/v2/device/token", self.endpoint))
             .send_json(serde_json::json!({
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 "device_code": device_code,
@@ -845,7 +946,7 @@ impl Client {
     }
 
     pub fn devices(&self) -> Result<Vec<Device>> {
-        let response = self.authed(self.agent.get(self.url("/v1/devices"))).call()?;
+        let response = self.authed(self.agent.get(self.url("/v2/devices"))).call()?;
         let devices: Devices = check(response, "listing devices")?.body_mut().read_json()?;
         Ok(devices.devices)
     }
@@ -854,7 +955,7 @@ impl Client {
         let response = self
             .authed(
                 self.agent
-                    .delete(self.url(&format!("/v1/devices/{}", encode(device_id)))),
+                    .delete(self.url(&format!("/v2/devices/{}", encode(device_id)))),
             )
             .call()?;
         if response.status().as_u16() == 404 {
@@ -864,31 +965,60 @@ impl Client {
         Ok(true)
     }
 
+    /// Revokes this host's own login, which it finds by reading its row off the listing. `/v1`
+    /// answered a path segment that meant a different device depending on who sent the request,
+    /// which is one nothing could be reasoned about from the outside.
+    pub fn revoke_this_device(&self) -> Result<bool> {
+        let Some(current) = self.devices()?.into_iter().find(|device| device.current) else {
+            return Ok(false);
+        };
+        self.revoke_device(&current.device_id)
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.config.endpoint)
     }
 
     fn memory_path(name: &str) -> String {
-        format!("/v1/memories/{}", encode(name))
+        format!("/v2/memories/{}", encode(name))
     }
 
+    /// Whether the save created the memory or replaced one is the status and no longer a field
+    /// beside it: `/v1` answered 201 and `created: true` together, which is one reading written
+    /// twice and two things to keep in step.
     pub fn save(&self, name: &str, body: &SaveBody) -> Result<Saved> {
         let response = self
             .authed(self.agent.put(self.url(&Self::memory_path(name))))
-            .send_json(body)?;
-        Ok(check(response, &format!("saving {name}"))?.body_mut().read_json()?)
+            .send_json(SaveBody {
+                kind: &capitalised(body.kind),
+                ..*body
+            })?;
+        let created = response.status().as_u16() == 201;
+        let single: Single = check(response, &format!("saving {name}"))?.body_mut().read_json()?;
+        Ok(Saved {
+            memory: single.memory,
+            created,
+        })
     }
 
     pub fn get(&self, name: &str) -> Result<Option<Memory>> {
-        self.read(name, &Self::memory_path(name))
+        let response = self.authed(self.agent.get(self.url(&Self::memory_path(name)))).call()?;
+        self.read(name, response)
     }
 
+    /// Recalling a memory is a write, so it is a POST of its own: `/v1` folded it into the GET
+    /// behind a query parameter, and every reader had to decide whether it meant to count as one.
     pub fn recall(&self, name: &str) -> Result<Option<Memory>> {
-        self.read(name, &format!("{}?recall=true", Self::memory_path(name)))
+        let response = self
+            .authed(
+                self.agent
+                    .post(self.url(&format!("{}/recall", Self::memory_path(name)))),
+            )
+            .send_empty()?;
+        self.read(name, response)
     }
 
-    fn read(&self, name: &str, path: &str) -> Result<Option<Memory>> {
-        let response = self.authed(self.agent.get(self.url(path))).call()?;
+    fn read(&self, name: &str, response: Response<ureq::Body>) -> Result<Option<Memory>> {
         if response.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -908,30 +1038,36 @@ impl Client {
     }
 
     pub fn list(&self, tags: &[String], since: i64, cursor: &str, limit: u32) -> Result<Page> {
-        let mut query = vec![format!("since={since}"), format!("limit={limit}")];
-        query.extend(tags.iter().map(|tag| format!("tag={}", encode(tag))));
+        let mut query = vec![format!("since={}", encode(&written(since)?)), format!("limit={limit}")];
+        query.extend(tags.iter().map(|tag| format!("tags={}", encode(tag))));
         if !cursor.is_empty() {
             query.push(format!("cursor={}", encode(cursor)));
         }
         let response = self
-            .authed(self.agent.get(self.url(&format!("/v1/memories?{}", query.join("&")))))
+            .authed(self.agent.get(self.url(&format!("/v2/memories?{}", query.join("&")))))
             .call()?;
         Ok(check(response, "listing memories")?.body_mut().read_json()?)
     }
 
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
         let response = self
-            .authed(self.agent.post(self.url("/v1/search")))
-            .send_json(request)?;
+            .authed(self.agent.post(self.url("/v2/memories/search")))
+            .send_json(serde_json::json!({
+                "query": request.query,
+                "tags": request.tags,
+                "limit": request.limit,
+                "minScore": request.min_score,
+                "mode": capitalised(request.mode),
+            }))?;
         Ok(check(response, "searching")?.body_mut().read_json()?)
     }
 
     fn session_path(session_id: &str) -> String {
-        format!("/v1/sessions/{}", encode(session_id))
+        format!("/v2/sessions/{}", encode(session_id))
     }
 
     pub fn sessions(&self) -> Result<Vec<Session>> {
-        let response = self.authed(self.agent.get(self.url("/v1/sessions"))).call()?;
+        let response = self.authed(self.agent.get(self.url("/v2/sessions"))).call()?;
         let listed: Sessions = check(response, "listing sessions")?.body_mut().read_json()?;
         Ok(listed.sessions)
     }
@@ -943,9 +1079,9 @@ impl Client {
         let mut held = HashSet::new();
         let mut cursor = String::new();
         loop {
-            let mut query = "/v1/sessions?scope=history".to_string();
+            let mut query = "/v2/history".to_string();
             if !cursor.is_empty() {
-                query.push_str(&format!("&cursor={}", encode(&cursor)));
+                query.push_str(&format!("?cursor={}", encode(&cursor)));
             }
             let response = self.authed(self.agent.get(self.url(&query))).call()?;
             let page: HistoryIds = check(response, "listing the sessions on record")?
@@ -978,15 +1114,15 @@ impl Client {
 
     /// The sessions whose transcripts answer a query, across every host signed in as this user.
     pub fn search_sessions(&self, query: &str, limit: u32) -> Result<Vec<SessionHit>> {
-        let path = format!("/v1/sessions?scope=search&q={}&limit={limit}", encode(query));
+        let path = format!("/v2/history?q={}&limit={limit}", encode(query));
         let response = self.authed(self.agent.get(self.url(&path))).call()?;
         let found: SessionHits = check(response, "searching sessions")?.body_mut().read_json()?;
         Ok(found.hits)
     }
 
-    /// One of a session's transcript files, written out as it arrives. A transcript runs to
-    /// megabytes, so it is streamed into the file rather than gathered in memory first.
-    pub fn read_transcript(&self, session_id: &str, file: &str, into: &mut impl std::io::Write) -> Result<u64> {
+    /// One of a session's transcript files, as it arrives. A transcript runs to megabytes, so it
+    /// is read a buffer at a time rather than gathered in memory first.
+    pub fn transcript_body(&self, session_id: &str, file: &str) -> Result<ureq::BodyReader<'static>> {
         let path = format!("{}/transcript?file={}", Self::session_path(session_id), encode(file));
         let request = self
             .agent
@@ -995,8 +1131,13 @@ impl Client {
             .timeout_global(Some(PUBLISH_TIMEOUT))
             .build();
         let response = self.authed(request).call()?;
-        let mut body = check(response, &format!("reading {file} of session {session_id}"))?.into_body();
-        Ok(std::io::copy(&mut body.as_reader(), into)?)
+        let body = check(response, &format!("reading {file} of session {session_id}"))?.into_body();
+        Ok(body.into_reader())
+    }
+
+    /// One of a session's transcript files, written out as it arrives.
+    pub fn read_transcript(&self, session_id: &str, file: &str, into: &mut impl std::io::Write) -> Result<u64> {
+        Ok(std::io::copy(&mut self.transcript_body(session_id, file)?, into)?)
     }
 
     /// The focus line is the session's first prompt and its latest, which the host reads straight
@@ -1011,7 +1152,7 @@ impl Client {
         };
         let response = self
             .authed(self.agent.put(self.url(&Self::session_path(session_id))))
-            .send_json(SessionBody { focus: &focus, ..*body })?;
+            .send_json(body.sent(&focus)?)?;
         check(response, &format!("syncing session {session_id}"))?;
         Ok(())
     }
@@ -1038,8 +1179,14 @@ impl Client {
         )
     }
 
-    /// Sends every event of one stretch. The events are the hooks' own: nothing here reads inside
-    /// one, so a counter the hooks learn to read needs no change in this binary.
+    /// Sends every event of one stretch, with the host and the repo it was spent in. Those two
+    /// ride along rather than being read from the session row, so a session that already ended
+    /// still has its closing tokens counted under the host that spent them.
+    ///
+    /// The events are the hooks' own and nothing here reads a counter out of one, so a counter
+    /// they learn to read needs no change in this binary. Two fields are this binary's: the
+    /// instant, which `/v2` takes with its offset named rather than as a count of milliseconds,
+    /// and whether the reading is durable, which a hook pass is not.
     pub fn post_usage(
         &self,
         session_id: &str,
@@ -1049,102 +1196,80 @@ impl Client {
         events: &[serde_json::Value],
     ) -> Result<usize> {
         for event in events {
+            let mut delta = event.clone();
+            let Some(fields) = delta.as_object_mut() else {
+                bail!("a usage delta of session {session_id} is no JSON object");
+            };
+            let at = fields.get("at").and_then(serde_json::Value::as_i64).unwrap_or_default();
+            fields.insert("at".to_string(), written(at)?.into());
+            fields.entry("durable").or_insert(false.into());
+            fields.insert("host".to_string(), host.into());
+            fields.insert("repo".to_string(), repo.into());
+            fields.insert("files".to_string(), files.into());
             let response = self
                 .authed(
                     self.agent
                         .post(self.url(&format!("{}/usage", Self::session_path(session_id)))),
                 )
-                .send_json(UsageBody {
-                    host,
-                    repo,
-                    files,
-                    event,
-                })?;
+                .send_json(&delta)?;
             check(response, &format!("sending usage for session {session_id}"))?;
         }
         Ok(events.len())
     }
 
-    /// What the service holds of one session: how far into each transcript file the archive
-    /// reaches, counted off the stored objects, and which files have had their tokens counted. It
-    /// answers only for a session the account already has on record. The count is a listing, so
-    /// it is asked once per session and read from there.
-    pub fn transcript_held(&self, session_id: &str) -> Result<crate::transcripts::Held> {
+    /// What the archive holds of one session: a row per transcript file, counted off the stored
+    /// objects, and which files have had their tokens counted. It answers only for a session the
+    /// account already has on record, and it is a listing, so it is asked once per session.
+    pub fn transcript_files(&self, session_id: &str) -> Result<Held> {
         let response = self
             .authed(
                 self.agent
-                    .get(self.url(&format!("{}/transcript", Self::session_path(session_id)))),
+                    .get(self.url(&format!("{}/files", Self::session_path(session_id)))),
             )
             .call()?;
         let held: HeldFiles = check(response, &format!("reading the archive of session {session_id}"))?
             .body_mut()
             .read_json()?;
-        Ok(crate::transcripts::Held {
-            reach: held
-                .files
-                .into_iter()
-                .map(|file| {
-                    (
-                        file.file,
-                        crate::transcripts::Reach {
-                            through: file.through,
-                            named: file.named,
-                        },
-                    )
-                })
-                .collect(),
+        Ok(Held {
+            files: held.files,
             counted: held.counted.into_iter().collect(),
         })
     }
 
-    /// Appends one stretch to one of a session's transcript files and answers how far into the file
-    /// the archive reaches once it is in. A stretch is stored under the span of the file it
-    /// accounts for and only where nothing is yet, so one already there — a retry, or another
-    /// writer that reached the same place first — is refused with how far the archive now reaches.
-    /// That is the same answer: it is where the next stretch begins.
-    ///
-    /// The body is one gzip member, and how many bytes of the file it holds is the service's to
-    /// take: it inflates the member once on a path that already pays for a listing, so nothing
-    /// stores a stretch under a name claiming part of what it holds.
-    ///
-    /// The cap is on the body offered and the source is cut before the compression runs, so the two
-    /// are different numbers and nothing relates them. A member past the cap goes up as the bytes it
-    /// was read from, which the archive stores as it stands: there is nothing to shrink, and a
-    /// stretch no later pass could get past is the one answer this must never leave behind.
-    pub fn append_transcript(
+    /// Appends a run of records to one of a session's transcript files and answers the ordinal the
+    /// file waits at once they are in. The record at index `i` holds ordinal `from + i`, so an
+    /// ordinal is a position and never a field, and `from` has to be the ordinal the file is
+    /// waiting for: a run offered anywhere else is refused with the one it really waits at, which
+    /// is where the next run begins.
+    pub fn append_records(
         &self,
         session_id: &str,
         file: &str,
         from: i64,
-        through: i64,
-        bytes: &[u8],
+        records: &[String],
+        closed: bool,
     ) -> Result<Appended> {
-        let member = crate::transcripts::packed(bytes)?;
-        let (body, content_type) = if member.len() > crate::transcripts::MAX_STRETCH {
-            (bytes, "application/x-ndjson")
-        } else {
-            (&member[..], "application/gzip")
-        };
-        let path = format!(
-            "{}/transcript?file={}&offset={from}&through={through}",
-            Self::session_path(session_id),
-            encode(file),
-        );
         let mut response = self
-            .authed(self.agent.put(self.url(&path)))
-            .header("content-type", content_type)
-            .send(body)?;
+            .authed(
+                self.agent
+                    .post(self.url(&format!("{}/records", Self::session_path(session_id)))),
+            )
+            .send_json(serde_json::json!({ "file": file, "from": from, "records": records, "closed": closed }))?;
         if response.status().as_u16() == 409 {
-            let extent: Extent = response.body_mut().read_json()?;
-            return Ok(Appended::Refused(crate::transcripts::Reach {
-                through: extent.through,
-                named: extent.named,
-            }));
+            // Every refusal of a run of records carries the ordinal to send from, because the only
+            // thing a host can do with one is send again from there. A session the byte path wrote
+            // is answered ordinal 0, which is the replay that takes it over.
+            let refused: serde_json::Value = response.body_mut().read_json()?;
+            if let Some(next) = refused.get("next").and_then(serde_json::Value::as_i64) {
+                return Ok(Appended::Refused(next));
+            }
+            let named = refused.get("error").and_then(serde_json::Value::as_str).unwrap_or("");
+            bail!("archiving {file} of session {session_id} was refused: {named}");
         }
-        let extent: Extent = check(response, &format!("archiving {file} of session {session_id}"))?
+        let waiting: Waiting = check(response, &format!("archiving {file} of session {session_id}"))?
             .body_mut()
             .read_json()?;
-        Ok(Appended::Written(extent.through))
+        Ok(Appended::Written(waiting.next))
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {
@@ -1163,11 +1288,10 @@ impl Client {
     /// sending process cannot say which session asked, and the header then names the host.
     pub fn send(&self, target: &Target, kind: Kind, from_session_id: &str, body: &str) -> Result<Sent> {
         let response = self
-            .authed(self.agent.post(self.url("/v1/messages")))
+            .authed(self.agent.post(self.url("/v2/messages")))
             .send_json(serde_json::json!({
                 "kind": kind.as_str(),
-                "toDeviceId": target.device_id,
-                "toSessionId": target.session_id,
+                "address": target.addressed(),
                 "fromSessionId": from_session_id,
                 "body": body,
             }))?;
@@ -1181,19 +1305,13 @@ impl Client {
     /// than for whoever is attached. `from_session_id` names the session posting it, as a send's
     /// does, and is empty where the posting process cannot say which session asked.
     pub fn post_board(&self, target: &Board, from_session_id: &str, body: &str) -> Result<BoardMessage> {
-        let mut posted = serde_json::json!({ "fromSessionId": from_session_id, "body": body });
-        match target {
-            Board::Fleet => posted["scope"] = "fleet".into(),
-            Board::Host(device_id) => {
-                posted["scope"] = "host".into();
-                posted["deviceId"] = device_id.clone().into();
-            }
-            Board::Session(session_id) => {
-                posted["scope"] = "session".into();
-                posted["sessionId"] = session_id.clone().into();
-            }
-        }
-        let response = self.authed(self.agent.post(self.url("/v1/board"))).send_json(&posted)?;
+        let address = match target {
+            Board::Fleet => serde_json::json!({ "scope": "fleet" }),
+            Board::Host(device_id) => serde_json::json!({ "scope": "host", "target": device_id }),
+            Board::Session(session_id) => serde_json::json!({ "scope": "session", "target": session_id }),
+        };
+        let posted = serde_json::json!({ "address": address, "fromSessionId": from_session_id, "body": body });
+        let response = self.authed(self.agent.post(self.url("/v2/board"))).send_json(&posted)?;
         Ok(check(response, "posting to the board")?.body_mut().read_json()?)
     }
 
@@ -1203,9 +1321,9 @@ impl Client {
         let mut cursor = String::new();
         for _ in 0..MAX_BOARD_PAGES {
             let query = if cursor.is_empty() {
-                "/v1/board".to_string()
+                "/v2/board".to_string()
             } else {
-                format!("/v1/board?cursor={}", encode(&cursor))
+                format!("/v2/board?cursor={}", encode(&cursor))
             };
             let response = self.authed(self.agent.get(self.url(&query))).call()?;
             let page: BoardPage = check(response, "reading the board")?.body_mut().read_json()?;
@@ -1222,7 +1340,7 @@ impl Client {
     /// this session's own claim won, and no other session will ever be handed it.
     pub fn pickup(&self, session_id: &str) -> Result<Vec<BoardMessage>> {
         let response = self
-            .authed(self.agent.post(self.url("/v1/board/pickup")))
+            .authed(self.agent.post(self.url("/v2/board/pickup")))
             .send_json(serde_json::json!({ "sessionId": session_id }))?;
         let picked: PickedUp = check(response, "picking up the board")?.body_mut().read_json()?;
         Ok(picked.messages)
@@ -1253,7 +1371,7 @@ impl Client {
         let replace = if input.replace { "?replace=true" } else { "" };
         let request = self
             .agent
-            .put(self.url(&format!("/v1/artifacts/{}{replace}", encode(&input.name))))
+            .put(self.url(&format!("/v2/artifacts/{}{replace}", encode(&input.name))))
             .header("content-type", &format!("multipart/form-data; boundary={boundary}"))
             .config()
             .timeout_global(Some(PUBLISH_TIMEOUT))
@@ -1292,7 +1410,7 @@ impl Client {
             format!("?{}", params.join("&"))
         };
         let response = self
-            .authed(self.agent.get(self.url(&format!("/v1/artifacts{suffix}"))))
+            .authed(self.agent.get(self.url(&format!("/v2/artifacts{suffix}"))))
             .call()?;
         Ok(check(response, "listing artifacts")?.body_mut().read_json()?)
     }
@@ -1301,7 +1419,7 @@ impl Client {
     /// is what the command reports rather than claiming it removed something.
     pub fn unpublish(&self, name: &str) -> Result<bool> {
         let response = self
-            .authed(self.agent.delete(self.url(&format!("/v1/artifacts/{}", encode(name)))))
+            .authed(self.agent.delete(self.url(&format!("/v2/artifacts/{}", encode(name)))))
             .call()?;
         if response.status().as_u16() == 404 {
             return Ok(false);
@@ -1314,7 +1432,7 @@ impl Client {
     /// once per deployment: a migration cannot read storage and nothing sweeps on a schedule.
     pub fn adopt_artifacts(&self) -> Result<i64> {
         let response = self
-            .authed(self.agent.post(self.url("/v1/artifacts/adopt")))
+            .authed(self.agent.post(self.url("/v2/artifacts/adopt")))
             .send_empty()?;
         let adopted: Adopted = check(response, "adopting artifacts")?.body_mut().read_json()?;
         Ok(adopted.adopted)
@@ -1330,7 +1448,7 @@ impl Client {
         let response = self
             .authed(
                 self.agent
-                    .post(self.url(&format!("/v1/artifacts/{}/shares", encode(name)))),
+                    .post(self.url(&format!("/v2/artifacts/{}/shares", encode(name)))),
             )
             .send_json(&body)?;
         Ok(check(response, &format!("sharing {name}"))?.body_mut().read_json()?)
@@ -1340,7 +1458,7 @@ impl Client {
         let response = self
             .authed(
                 self.agent
-                    .get(self.url(&format!("/v1/artifacts/{}/shares", encode(name)))),
+                    .get(self.url(&format!("/v2/artifacts/{}/shares", encode(name)))),
             )
             .call()?;
         let held: Shares = check(response, &format!("reading the shares on {name}"))?
@@ -1383,7 +1501,7 @@ impl Client {
         let response = self
             .authed(
                 self.agent
-                    .delete(self.url(&format!("/v1/artifacts/{}/shares?{selector}", encode(name)))),
+                    .delete(self.url(&format!("/v2/artifacts/{}/shares?{selector}", encode(name)))),
             )
             .call()?;
         Ok(check(response, &format!("revoking the shares on {name}"))?
@@ -1481,6 +1599,73 @@ fn multipart(boundary: &str, manifest: &str, files: &[PublishFile]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// `/v2` takes a business date as an instant carrying its offset and refuses anything else, so
+    /// a host whose dates read differently syncs no session at all.
+    #[test]
+    fn a_date_goes_up_as_an_instant_carrying_its_offset_and_reads_back_as_itself() {
+        let shaped = |at: i64| {
+            let written = written(at).unwrap();
+            let (date, time) = written.split_once('T').expect("a date and a time");
+            assert_eq!(date.len(), 10, "{written}");
+            assert!(time.ends_with('Z'), "{written}");
+            assert!(time.len() >= 9, "{written}");
+            written
+        };
+
+        assert_eq!(shaped(1_762_000_000_000), "2025-11-01T12:26:40Z");
+        assert_eq!(shaped(0), "1970-01-01T00:00:00Z");
+        assert_eq!(shaped(1_762_000_000_123), "2025-11-01T12:26:40.123Z");
+
+        let read: Session = serde_json::from_value(serde_json::json!({
+            "sessionId": "s-1",
+            "name": "laptop-9f8a",
+            "agentName": "",
+            "deviceId": "d-1",
+            "host": "laptop",
+            "hostLabel": "laptop",
+            "cwd": "/home/you/src/recall",
+            "repo": "",
+            "branch": "",
+            "commit": "",
+            "startedAt": "2025-11-01T13:26:40.123+01:00",
+            "lastActivityAt": written(1_762_000_000_000).unwrap(),
+            "prompts": 0,
+            "focus": { "first": "", "latest": "" },
+            "mode": "Headless",
+            "permissionMode": "default",
+            "pid": 1,
+            "current": false,
+        }))
+        .expect("a session as /v2 answers with one");
+        assert_eq!(read.started_at, 1_762_000_000_123, "an offset other than Z is read too");
+        assert_eq!(read.last_activity_at, 1_762_000_000_000);
+        assert_eq!(read.mode, "headless", "and the mode reads in this host's own words");
+    }
+
+    /// A message names where it is going in the one `address` every `/v2` endpoint carries: a
+    /// device for every session on a host, and a session for that one session.
+    #[test]
+    fn a_target_is_addressed_by_the_one_thing_it_names() {
+        let host = Target {
+            device_id: "d-1".to_string(),
+            session_id: String::new(),
+        };
+        let session = Target {
+            device_id: "d-1".to_string(),
+            session_id: "9f8a1b2c".to_string(),
+        };
+
+        assert_eq!(
+            host.addressed(),
+            serde_json::json!({ "scope": "host", "target": "d-1" })
+        );
+        assert_eq!(
+            session.addressed(),
+            serde_json::json!({ "scope": "session", "target": "9f8a1b2c" }),
+            "the device a session runs on is read off the session rather than named twice"
+        );
+    }
+
     #[test]
     fn reads_a_share_off_the_mode_the_service_discriminates_on() {
         let listed: Shares = serde_json::from_str(
@@ -1497,12 +1682,14 @@ mod tests {
         assert_eq!(listed.shares[1].uses, 3);
     }
 
+    /// A device as `/v2` answers with one, where the label is always filled in: a host carrying
+    /// none is named by itself.
     fn device(device_id: &str, name: &str) -> Device {
         Device {
             device_id: device_id.to_string(),
             name: name.to_string(),
             host: name.to_string(),
-            label: String::new(),
+            host_label: name.to_string(),
             created_at: 0,
             last_used_at: 0,
             current: false,
@@ -1512,7 +1699,7 @@ mod tests {
     fn relogin(device_id: &str, name: &str, host: &str, last_used_at: i64, label: &str) -> Device {
         Device {
             host: host.to_string(),
-            label: label.to_string(),
+            host_label: label.to_string(),
             last_used_at,
             ..device(device_id, name)
         }
@@ -1520,7 +1707,7 @@ mod tests {
 
     fn labelled_device(device_id: &str, name: &str, label: &str) -> Device {
         Device {
-            label: label.to_string(),
+            host_label: label.to_string(),
             ..device(device_id, name)
         }
     }

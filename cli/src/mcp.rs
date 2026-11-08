@@ -370,7 +370,6 @@ impl Recall {
             let result = client()?.search(&api::SearchRequest {
                 query: &params.query,
                 tags: &tags,
-                any,
                 limit: 5,
                 min_score: 0.55,
                 mode: mode.as_str(),
@@ -641,7 +640,6 @@ mod tests {
     fn memory() -> api::Memory {
         api::Memory {
             memory_id: "m1".into(),
-            user_id: "u1".into(),
             name: "indent".into(),
             description: "indent style".into(),
             kind: "feedback".into(),
@@ -650,7 +648,6 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             recall_count: 0,
-            last_recalled_at: 0,
         }
     }
 

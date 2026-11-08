@@ -406,13 +406,15 @@ pub trait Service: transcripts::Store {
     -> Result<usize>;
     fn sync(&self, session_id: &str, body: &SessionBody) -> Result<()>;
     fn end(&self, session_id: &str) -> Result<()>;
+    /// The files of one session whose tokens have been counted, whoever counted them.
+    fn counted(&self, session_id: &str) -> Result<HashSet<String>>;
 }
 
 /// What one run did for one session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sent {
     pub events: usize,
-    pub bytes: i64,
+    pub records: i64,
 }
 
 /// Which of one session's files this run still owes tokens for.
@@ -423,7 +425,7 @@ pub struct Sent {
 /// is never read again, whatever the service says — the hooks counted that one as the session
 /// ran, or a run before this did, and a transcript cannot say which. A persisted tool output is
 /// read for nothing: it holds no turn, so no token was ever spent on it.
-fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<(Vec<&'a Part>, transcripts::Held)> {
+fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<Vec<&'a Part>> {
     let turns = || {
         session
             .parts
@@ -431,13 +433,12 @@ fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<(Vec<&'a Part>,
             .filter(|part| part.source.holds == transcripts::Holds::Turns)
     };
     if !session.on_record {
-        return Ok((turns().collect(), transcripts::Held::default()));
+        return Ok(turns().collect());
     }
-    let held = service.held(&session.session_id)?;
-    let owed = turns()
-        .filter(|part| part.source.file != MAIN && !held.counted.contains(&part.source.file))
-        .collect();
-    Ok((owed, held))
+    let counted = service.counted(&session.session_id)?;
+    Ok(turns()
+        .filter(|part| part.source.file != MAIN && !counted.contains(&part.source.file))
+        .collect())
 }
 
 /// Sends each past session: the tokens it still owes, then for a session the service has never
@@ -456,9 +457,8 @@ fn owed<'a>(service: &impl Service, session: &'a Past) -> Result<(Vec<&'a Part>,
 pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl FnMut(&str, Sent)) -> Result<()> {
     for session in past {
         let id = &session.session_id;
-        let (owed, mut held) = owed(service, session)?;
         let mut done = Sent::default();
-        for part in owed {
+        for part in owed(service, session)? {
             let prompts = if part.source.file == MAIN { session.prompts } else { 0 };
             let events = part.events(account, prompts)?;
             let files = [part.source.file.clone()];
@@ -467,7 +467,6 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
         if !session.on_record {
             service.sync(id, &session.body())?;
             service.end(id)?;
-            held = service.held(id)?;
         }
         // The files this session was found to have, and not whatever is on disk by now: the set
         // the archive writes is then the set the tokens were decided over, and the two cannot
@@ -475,15 +474,9 @@ pub fn send(service: &impl Service, past: &[Past], account: &str, mut sent: impl
         // adoption, so one here wrote the last of its files long ago and the end of each of them
         // is the end for good.
         for part in &session.parts {
-            let from = held
-                .reach
-                .get(&part.source.file)
-                .copied()
-                .unwrap_or(transcripts::Reach {
-                    through: 0,
-                    named: true,
-                });
-            done.bytes += transcripts::send_from(service, id, &part.source, from, Pass::Final)?.bytes;
+            let mut reader = transcripts::open(&part.source, Pass::Final)?;
+            let from = transcripts::Place::nothing();
+            done.records += transcripts::send_from(service, id, &part.source.file, &mut reader, from)?.records;
         }
         sent(id, done);
     }
@@ -578,10 +571,9 @@ mod tests {
         events: RefCell<HashMap<(String, i64), Value>>,
         daily: RefCell<HashMap<(i64, String), i64>>,
         counted: RefCell<HashSet<(String, String)>>,
-        archive: RefCell<HashMap<(String, String), Vec<u8>>>,
-        /// How far into each file the archive reaches, which is what the key of its last stretch
-        /// names and what an append is weighed against.
-        reached: RefCell<HashMap<(String, String), i64>>,
+        /// The records of each file in the order they were written, which is what an append is
+        /// weighed against and what the file reads back as.
+        archive: RefCell<HashMap<(String, String), Vec<String>>>,
         history: RefCell<HashSet<String>>,
         ended: RefCell<Vec<String>>,
         fail_sync: String,
@@ -596,7 +588,6 @@ mod tests {
                 daily: dying.daily.clone(),
                 counted: dying.counted.clone(),
                 archive: dying.archive.clone(),
-                reached: dying.reached.clone(),
                 ..Fake::default()
             }
         }
@@ -610,69 +601,31 @@ mod tests {
         }
 
         fn archived(&self, session_id: &str, file: &str) -> String {
-            String::from_utf8(
-                self.archive
-                    .borrow()
-                    .get(&(session_id.to_string(), file.to_string()))
-                    .cloned()
-                    .unwrap_or_default(),
-            )
-            .unwrap()
+            self.archive
+                .borrow()
+                .get(&(session_id.to_string(), file.to_string()))
+                .cloned()
+                .unwrap_or_default()
+                .join("\n")
         }
     }
 
     impl transcripts::Store for Fake {
-        fn held(&self, session_id: &str) -> Result<transcripts::Held> {
-            Ok(transcripts::Held {
-                reach: self
-                    .reached
-                    .borrow()
-                    .iter()
-                    .filter(|((held, _), _)| held == session_id)
-                    .map(|((_, file), through)| {
-                        (
-                            file.clone(),
-                            transcripts::Reach {
-                                through: *through,
-                                named: true,
-                            },
-                        )
-                    })
-                    .collect(),
-                counted: self
-                    .counted
-                    .borrow()
-                    .iter()
-                    .filter(|(held, _)| held == session_id)
-                    .map(|(_, file)| file.clone())
-                    .collect(),
-            })
-        }
-
         fn append(
             &self,
             session_id: &str,
             file: &str,
             from: i64,
-            through: i64,
-            bytes: &[u8],
+            records: &[String],
+            _closed: bool,
         ) -> Result<transcripts::Appended> {
-            let held = (session_id.to_string(), file.to_string());
-            let mut reached = self.reached.borrow_mut();
-            let at = reached.entry(held.clone()).or_default();
-            if *at != from {
-                return Ok(transcripts::Appended::Refused(transcripts::Reach {
-                    through: *at,
-                    named: true,
-                }));
+            let mut archive = self.archive.borrow_mut();
+            let held = archive.entry((session_id.to_string(), file.to_string())).or_default();
+            if from != held.len() as i64 {
+                return Ok(transcripts::Appended::Refused(held.len() as i64));
             }
-            self.archive
-                .borrow_mut()
-                .entry(held)
-                .or_default()
-                .extend_from_slice(bytes);
-            *at = through;
-            Ok(transcripts::Appended::Written(through))
+            held.extend(records.iter().cloned());
+            Ok(transcripts::Appended::Written(held.len() as i64))
         }
     }
 
@@ -716,6 +669,16 @@ mod tests {
         fn end(&self, session_id: &str) -> Result<()> {
             self.ended.borrow_mut().push(session_id.to_string());
             Ok(())
+        }
+
+        fn counted(&self, session_id: &str) -> Result<HashSet<String>> {
+            Ok(self
+                .counted
+                .borrow()
+                .iter()
+                .filter(|(held, _)| held == session_id)
+                .map(|(_, file)| file.clone())
+                .collect())
         }
     }
 
@@ -1070,7 +1033,7 @@ mod tests {
         assert_eq!(
             *resumed.events.borrow(),
             posted,
-            "the service holds bytes of that file, so its tokens were counted and are not posted again"
+            "the service holds that file, so its tokens were counted and are not posted again"
         );
         assert_eq!(resumed.on_record(), on_record(&["s-old"]));
         assert_eq!(*resumed.ended.borrow(), vec!["s-old".to_string()]);
@@ -1199,7 +1162,7 @@ mod tests {
         assert_eq!(service.rollup(), once, "and a run that repeats adds none of it again");
         assert_eq!(
             service.archived("s-old", "agent-7f21"),
-            format!("{}\n", delegated().join("\n")),
+            delegated().join("\n"),
             "the delegated turn's transcript is held once and whole"
         );
     }
