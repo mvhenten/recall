@@ -641,11 +641,6 @@ fn report_order(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
 /// The record, then the delta it carries, then the transcript itself. The archive goes last so
 /// that a file the service holds bytes of is a file whose tokens were counted: the backfill reads
 /// it that way, and sending the bytes first would have it count a stretch twice.
-/// The transcript files one pending delta read, which is what says their tokens are counted.
-fn read(pending: &sessions::UsagePending) -> Vec<String> {
-    pending.files.keys().cloned().collect()
-}
-
 fn sync_session(session_id: &str) -> Result<()> {
     let dir = listen::sessions_dir();
     let Some(record) = sessions::record(&dir, session_id) else {
@@ -655,7 +650,13 @@ fn sync_session(session_id: &str) -> Result<()> {
     client.sync_record(session_id, &record)?;
     println!("synced {session_id}");
     if let Some(pending) = record.usage_pending.as_ref() {
-        let sent = client.post_usage(session_id, &record.host, &record.repo, &read(pending), &pending.events)?;
+        let sent = client.post_usage(
+            session_id,
+            &record.host,
+            &record.repo,
+            &pending.files_read(),
+            &pending.events,
+        )?;
         sessions::commit_usage(&dir, session_id, pending)?;
         println!("sent {sent} usage deltas for {session_id}");
     }
@@ -677,7 +678,13 @@ fn end_session(session_id: &str) -> Result<()> {
     let client = Client::new(config::load()?);
     if let Some(record) = record.as_ref() {
         if let Some(pending) = record.usage_pending.as_ref() {
-            let sent = client.post_usage(session_id, &record.host, &record.repo, &read(pending), &pending.events)?;
+            let sent = client.post_usage(
+                session_id,
+                &record.host,
+                &record.repo,
+                &pending.files_read(),
+                &pending.events,
+            )?;
             println!("sent {sent} usage deltas for {session_id}");
         }
         // The session is over, so the end of each of its files is the end for good and the last
