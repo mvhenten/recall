@@ -7,6 +7,7 @@ import {
   followedRecords,
   followedTexts,
   gapsIn,
+  gapsInSpans,
   groupedReads,
   joinedTexts,
   legacyStretchName,
@@ -367,15 +368,33 @@ describe("planning a window of records", () => {
     expect(plannedRecords(spans([3], 1_000), 3, 10)).toEqual({ from: 0, through: 3, bytes: 3_000 });
   });
 
-  // Records the archive does not hold are a window no read can answer, so the walk stops in front
-  // of the gap rather than asking for a span the objects do not tile.
-  it("stops at a gap rather than reading across it", () => {
+  // A window the objects do not tile is a read no archive can answer, so neither direction asks
+  // for one. Stopping at the hole instead would put every record on the far side of it out of
+  // reach, with the box saying it had read the file to the end; a beat that stopped would bring
+  // nothing back for as long as the session ran.
+  it("steps over a hole rather than stopping in front of it", () => {
     const held = [
       { from: 0, held: 2, bytes: 20 },
       { from: 5, held: 2, bytes: 20 },
     ];
+
     expect(plannedRecords(held, 7, 1_000)).toEqual({ from: 5, through: 7, bytes: 20 });
-    expect(plannedRecords(held, 5, 1_000)).toEqual({ from: 5, through: 5, bytes: 0 });
+    expect(plannedRecords(held, 5, 1_000)).toEqual({ from: 0, through: 2, bytes: 20 });
+    expect(plannedRecords(held, 0, 1_000)).toEqual({ from: 0, through: 0, bytes: 0 });
+
+    expect(followedRecords(held, 2, 1_000)).toEqual({ from: 5, through: 7, bytes: 20 });
+    expect(followedRecords(held, 7, 1_000)).toEqual({ from: 7, through: 7, bytes: 0 });
+  });
+
+  it("counts the records of a listing that sit in no object, and where they are missing from", () => {
+    const listed = listedSpans([
+      { from: 0, held: 2, bytes: 20 },
+      { from: 5, held: 2, bytes: 20 },
+      { from: 9, held: 1, bytes: 10 },
+    ]);
+
+    expect(gapsInSpans(listed)).toEqual({ records: 5, places: 2 });
+    expect(gapsInSpans(listedSpans(spans([4, 4], 10)))).toEqual({ records: 0, places: 0 });
   });
 
   it("reads forward from where the box has got to, and passes over the records it has", () => {

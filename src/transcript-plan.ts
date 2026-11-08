@@ -229,38 +229,56 @@ export const listedSpans = (spans: RecordSpan[]): SpanListing => {
 };
 
 // One window of a file held as records: the ordinal it opens at, the one past its last record,
-// and what the records in it weigh.
+// and what the records in it weigh. A window never spans a hole — the objects covering one have to
+// tile it exactly for the archive to answer it at all — so both ends sit in the same run of
+// records, and a walk that has a hole in front of it steps over it and opens the far side.
 export interface RecordWindow {
   from: number;
   through: number;
   bytes: number;
 }
 
-// The next window to fetch walking backwards, and the whole of what the walk needs to know once
-// it has landed: the window opens where it opens, so the caller's cursor becomes `from`. Whole
-// objects are taken until the budget is spent, and at least one always is, so a walk cannot stall
-// on an object weighing more than a step. A span that does not meet the one in front of it is a
-// hole in the archive, and the walk stops at it rather than reading across records that are not
-// there — a window spanning one is a read no archive can answer.
+const nothingAt = (place: number): RecordWindow => ({ from: place, through: place, bytes: 0 });
+
+// The next window to fetch walking backwards, and the whole of what the walk needs to know once it
+// has landed: the walk carries on from `from`. Whole objects are taken until the budget is spent,
+// and at least one always is, so a walk cannot stall on an object weighing more than a step.
+//
+// Where the span below the cursor does not reach it, the records between the two are in no object
+// and the window opens on the far side of them rather than asking for a span the archive cannot
+// tile. Stopping at the hole instead would leave every record in front of it unreachable, with the
+// box saying it had read the file to the end.
 export const plannedRecords = (spans: readonly RecordSpan[], edge: number, step: number): RecordWindow => {
-  let from = edge;
+  let at = spans.length - 1;
+  while (at >= 0 && (spans[at]?.from ?? edge) >= edge) at -= 1;
+  const span = spans[at];
+  if (span === undefined) return nothingAt(edge);
+  const through = span.from + span.held;
+  let from = through;
   let bytes = 0;
-  for (let at = spans.length - 1; at >= 0; at -= 1) {
-    const span = spans[at];
-    if (span === undefined || span.from >= from) continue;
-    if (span.from + span.held !== from) break;
+  for (; at >= 0; at -= 1) {
+    const one = spans[at];
+    if (one === undefined) continue;
+    if (one.from + one.held !== from) break;
     if (bytes >= step) break;
-    from = span.from;
-    bytes += span.bytes;
+    from = one.from;
+    bytes += one.bytes;
   }
-  return { from, through: edge, bytes };
+  return { from, through, bytes };
 };
 
 // The next window of a file a session is still writing, reading forward from where the reader has
 // got to. Every record already read is passed over, so nothing on screen is rendered twice, and
 // the window ends on an object boundary, so the next beat opens exactly where this one stopped.
+//
+// A hole in front of the cursor is stepped over the same way: the window opens at the first object
+// holding a record the reader has not read. A beat that stopped at the hole would read nothing for
+// as long as the session ran, and a box beating on in silence is one a reader reads as stopped.
 export const followedRecords = (spans: readonly RecordSpan[], at: number, step: number): RecordWindow => {
-  let through = at;
+  const opens = spans.find((span) => span.from + span.held > at);
+  if (opens === undefined) return nothingAt(at);
+  const from = Math.max(at, opens.from);
+  let through = from;
   let bytes = 0;
   for (const span of spans) {
     if (span.from + span.held <= through) continue;
@@ -269,7 +287,29 @@ export const followedRecords = (spans: readonly RecordSpan[], at: number, step: 
     through = span.from + span.held;
     bytes += span.bytes;
   }
-  return { from: at, through, bytes };
+  return { from, through, bytes };
+};
+
+export interface SpanGaps {
+  records: number;
+  places: number;
+}
+
+// The records of the listed span that sit in no object at all, and how many runs of them there
+// are. The span begins where the listing begins, so a listing held back at the ceiling does not
+// count what it deliberately left off.
+export const gapsInSpans = (listing: SpanListing): SpanGaps => {
+  let records = 0;
+  let places = 0;
+  let at = listing.from;
+  for (const span of listing.spans) {
+    if (span.from > at) {
+      records += span.from - at;
+      places += 1;
+    }
+    at = span.from + span.held;
+  }
+  return { records, places };
 };
 
 export interface Gaps {

@@ -7,6 +7,7 @@ import { DEVICE_CODE_LIMITS, type DeviceCodeLimits } from "../src/device";
 import { MCP_PATH } from "../src/mcp";
 import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
+import { putRecords, RECORDS_PREFIX } from "../src/records";
 import { SHARE_EMAIL_PREFIX, SHARE_LINK_PREFIX } from "../src/shares";
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
@@ -719,6 +720,20 @@ export const harness = async ({
     dropArtifactFile: async (userId: string, name: string, rev: number, path: string): Promise<void> => {
       await env.ARTIFACTS.delete(`${userId}/${name}/${rev}/${path}`);
     },
+    // One append stored where no endpoint would take it. The records endpoint accepts an append
+    // only at the ordinal the file is waiting for, so a file with a run of records the archive
+    // never got cannot be made through the API at all.
+    storeRecords: (
+      userId: string,
+      sessionId: string,
+      file: string,
+      from: number,
+      records: string[],
+    ): Promise<boolean> => putRecords(env.TRANSCRIPTS, userId, sessionId, file, from, records, true),
+    // A key under a session's record prefix this archive did not write, which is what a hand or a
+    // half-finished migration leaves behind.
+    strayRecord: (userId: string, sessionId: string, name: string): Promise<unknown> =>
+      env.TRANSCRIPTS.put(`${RECORDS_PREFIX}/${userId}/${sessionId}/${name}`, "no record object"),
     indexMark: (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
       inTenant(userId, (sql) =>
         sql

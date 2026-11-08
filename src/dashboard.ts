@@ -58,6 +58,7 @@ import { MAX_EMAIL_SHARES, SHARE_DAYS, type ShareView, shareTimeLeft } from "./s
 import {
   type Follow,
   gapsIn,
+  gapsInSpans,
   listedRuns,
   listedSpans,
   type Plan,
@@ -1599,6 +1600,16 @@ const spanTrimNote = (listing: SpanListing, records: number): string =>
     ? ""
     : `<p class="callout">This file holds ${records} records. The last ${listing.readable} of them are listed here; the records before that are not, so the box stops short of the start of the session.</p>`;
 
+// A hole in a file held as records is a run of ordinals no object holds, which is what an append
+// the archive never got leaves behind. The walk reads the records either side of it, and saying
+// how many are missing is what keeps a reader from taking the entries around the gap for one
+// unbroken conversation.
+const spanHoleNote = (listing: SpanListing): string => {
+  const { records, places } = gapsInSpans(listing);
+  if (records === 0) return "";
+  return `<p class="callout">The archive never got ${records} ${records === 1 ? "record" : "records"} of this file, in ${places} ${places === 1 ? "place" : "places"}. Whatever each gap holds is not shown.</p>`;
+};
+
 // What the box follows, and nothing when there is nothing to follow. `from` is the end of the
 // manifest, which is the first place the box has not been handed, so following starts where the
 // page stops and nothing is read twice. A session no host is holding writes nothing more, and
@@ -1640,7 +1651,11 @@ const transcriptCard = (view: SessionView): string => {
     return insightCard(
       "Transcript",
       `${held.file} · ${sizeText(listing.bytes)}`,
-      transcriptBox(held.file, plan, `${fileChips(id, held.files, held.file)}${spanTrimNote(listing, held.records)}`),
+      transcriptBox(
+        held.file,
+        plan,
+        `${fileChips(id, held.files, held.file)}${spanTrimNote(listing, held.records)}${spanHoleNote(listing)}`,
+      ),
     );
   }
   if (held.kind === "none") {

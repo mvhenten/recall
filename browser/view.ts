@@ -20,6 +20,7 @@
 import {
   type BytePlan,
   type Fetched,
+  type Follow,
   followedBatch,
   followedRecords,
   followedTexts,
@@ -33,6 +34,7 @@ import {
   type Reach,
   type RecordPlan,
   type RecordReach,
+  type RecordWindow,
   type Tail,
   tailNote,
   walkNote,
@@ -200,9 +202,220 @@ const notesOf = (note: HTMLElement, tail: HTMLElement, more: HTMLElement): Notes
     },
   };
 };
+// One batch the box puts on screen, whichever path the file is held on: the texts to render, in
+// the order they go into the box, and what they weigh, which is what the note counts.
+interface Batch {
+  texts: string[];
+  bytes: number;
+}
 
-const bootBytes = ({ box, list, note, tail, more }: Parts, plan: BytePlan): void => {
+interface Walked extends Batch {
+  /// Whether the walk has reached the start of the listing, so there is nothing earlier to load.
+  through: boolean;
+}
+
+interface Followed extends Batch {
+  /// Whether anyone is still running the session, which is the fact that ends the following.
+  running: boolean;
+  /// Whether the box is still behind what the beat named, so the next beat follows at once rather
+  /// than waiting out a pace meant for a box that is level.
+  behind: boolean;
+}
+
+type Step<T> = { ok: true; value: T } | { ok: false; why: string; signedOut: boolean };
+
+// What the box reads against. The two paths the archive takes a transcript on differ in how a
+// place in a file is named and in what a batch has to be joined out of, and in nothing else: the
+// cursors live in here, and the box below knows only that a step came back and what it weighed.
+interface Walker {
+  file: string;
+  /// What the listing weighs when the page is drawn. It grows as the box follows the file.
+  bytes: number;
+  follow: Follow | null;
+  back: () => Promise<Step<Walked>>;
+  forward: () => Promise<Step<Followed>>;
+}
+
+const boxOf = ({ box, list, note, tail, more }: Parts, walker: Walker): void => {
   const notes = notesOf(note, tail, more);
+  const { file, follow } = walker;
+  const pace = follow === null ? 0 : follow.every;
+
+  let loaded = 0;
+  let blanks = 0;
+  let blankBytes = 0;
+  let busy = false;
+  let through = false;
+  let reaches = walker.bytes;
+  let newer = 0;
+  let ended = false;
+  let misses = 0;
+  let beating = 0;
+  let every = pace;
+  let chasing = false;
+
+  const noteFor = (dry: number): string =>
+    walkNote({ file, bytes: reaches, loaded, shown: list.childElementCount, dry, through });
+
+  const atFoot = (): boolean => box.scrollHeight - box.scrollTop - box.clientHeight < FOOT_SLACK;
+
+  const stopFollowing = (): void => {
+    if (beating === 0) return;
+    clearTimeout(beating);
+    beating = 0;
+  };
+
+  const done = (): void => {
+    more.remove();
+    notes.say(noteFor(0));
+  };
+
+  const load = async (): Promise<void> => {
+    if (busy || notes.broken()) return;
+    if (through) return done();
+    busy = true;
+    more.setAttribute("disabled", "");
+    notes.say(`Reading ${file}…`);
+
+    const step = await walker.back();
+    if (!step.ok) {
+      busy = false;
+      notes.fail(step.why, step.signedOut, () => void load());
+      return;
+    }
+    const batch = step.value;
+    through = batch.through;
+    loaded += batch.bytes;
+
+    const held = box.scrollHeight - box.scrollTop;
+    const before = list.childElementCount;
+    for (const text of batch.texts) list.insertBefore(rendered(readTurns(text, file)), list.firstChild);
+    box.scrollTop = box.scrollHeight - held;
+
+    busy = false;
+    const blank = list.childElementCount === before;
+    blanks = blank ? blanks + 1 : 0;
+    blankBytes = blank ? blankBytes + batch.bytes : 0;
+    if (through) return done();
+    more.removeAttribute("disabled");
+    if (blanks >= BLANK_STEPS) {
+      const dry = blankBytes;
+      blanks = 0;
+      blankBytes = 0;
+      notes.say(noteFor(dry));
+      return;
+    }
+    notes.say(noteFor(0));
+    if (blank) return load();
+  };
+
+  const missed = (why: string, signedOut: boolean): void => {
+    misses += 1;
+    if (misses < FOLLOW_TRIES) return;
+    stopFollowing();
+    notes.lost(why, signedOut, () => {
+      misses = 0;
+      every = pace;
+      notes.sayTail({ newer, ended });
+      startFollowing();
+    });
+  };
+
+  // One beat. It reads forward only over what the box has not read, so nothing already on screen
+  // is fetched again and the cursor moves only by what came back.
+  const following = async (): Promise<void> => {
+    if (follow === null || chasing || notes.adrift()) return;
+    chasing = true;
+    const step = await walker.forward();
+    if (!step.ok) {
+      chasing = false;
+      missed(step.why, step.signedOut);
+      return;
+    }
+    const batch = step.value;
+    misses = 0;
+    reaches += batch.bytes;
+    loaded += batch.bytes;
+    every = batch.behind ? 0 : batch.bytes > 0 ? pace : Math.min(every * 2, FOLLOW_SLOWEST_MS);
+
+    const foot = atFoot();
+    const before = list.childElementCount;
+    for (const text of batch.texts) list.appendChild(rendered(readTurns(text, file)));
+    const added = list.childElementCount - before;
+    if (foot) {
+      box.scrollTop = box.scrollHeight;
+      newer = 0;
+    } else {
+      newer += added;
+    }
+    chasing = false;
+
+    if (!batch.running) {
+      ended = true;
+      stopFollowing();
+    }
+    if (batch.bytes > 0) notes.say(noteFor(0));
+    notes.sayTail({ newer, ended });
+  };
+
+  const beat = (): void => {
+    void following()
+      .catch((error: unknown) => {
+        chasing = false;
+        missed(`Following ${file} failed: ${error instanceof Error ? error.message : String(error)}.`, false);
+      })
+      .then(rest);
+  };
+
+  // When the next beat falls due. Nothing is waiting at a session that has ended, at a box that
+  // has given up following, or at a tab nobody is looking at.
+  const rest = (): void => {
+    if (follow === null || notes.adrift() || ended || document.hidden) return;
+    beating = setTimeout(() => {
+      beating = 0;
+      beat();
+    }, every);
+  };
+
+  // Following starts on the beat it fires here, and starting it twice beats once.
+  const startFollowing = (): void => {
+    if (follow === null || beating !== 0 || chasing || notes.adrift() || ended || document.hidden) return;
+    beat();
+  };
+
+  more.addEventListener("click", () => {
+    void load();
+  });
+  box.addEventListener("scroll", () => {
+    if (box.scrollTop < 240) void load();
+    if (newer > 0 && atFoot()) {
+      newer = 0;
+      notes.sayTail({ newer, ended });
+    }
+  });
+
+  if (follow !== null) {
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopFollowing();
+        return;
+      }
+      startFollowing();
+    });
+    window.addEventListener("pagehide", stopFollowing);
+  }
+
+  void load().then(() => {
+    box.scrollTop = box.scrollHeight;
+    startFollowing();
+  });
+};
+
+// A file the byte path wrote. A stretch is a span of the file on disk and a stretch boundary is
+// not a line boundary, so each batch holds a part line at the edge it was cut at, which is carried
+// to the batch beside it; the two directions hold one of those each, since they read away from
+// each other and never meet.
+const bytesWalker = (plan: BytePlan): Walker => {
   const reads: PlannedRead[] = [];
   plan.runs.forEach((run, index) => {
     for (const read of run.reads) {
@@ -213,30 +426,14 @@ const bootBytes = ({ box, list, note, tail, more }: Parts, plan: BytePlan): void
   let edge = reads.length;
   let pending = reads[edge - 1]?.bytes ?? 0;
   let remnant = "";
-  let loaded = 0;
-  let blanks = 0;
-  let blankBytes = 0;
-  let busy = false;
-
-  // The forward cursor and what hangs off it. `at` is how far the file has been read to: it
-  // starts at the end of the manifest the page was handed, which is the first byte the backward
-  // walk will never read, so following can only ever add turns the box has not shown. `after` is
-  // the stretch that cursor is the end of, and goes up with it: it is what lets a beat list one
-  // page of the end of the file rather than every object in front of it. `reaches` grows with the
-  // file, so the note counts against what the archive holds now rather than what it held when the
-  // page was drawn.
-  const following = plan.follow;
-  const pace = following === null ? 0 : following.every;
-  let at = following === null ? 0 : following.from;
+  // `at` is how far the file has been read to: it starts at the end of the manifest the page was
+  // handed, which is the first byte the backward walk will never read, so following can only ever
+  // add turns the box has not shown. `after` is the stretch that cursor is the end of, and goes up
+  // with it: it is what lets a beat list one page of the end of the file rather than every object
+  // in front of it.
+  let at = plan.follow === null ? 0 : plan.follow.from;
   let after = reads[reads.length - 1]?.at ?? "";
-  let reaches = plan.readable;
   let trailing = "";
-  let newer = 0;
-  let ended = false;
-  let misses = 0;
-  let beating = 0;
-  let every = pace;
-  let chasing = false;
 
   // One read, fetched off the route that opens one object. A stretch stored gzipped is one gzip
   // member: there is no part of it to ask for, the manifest never splits a read of one, and the
@@ -247,433 +444,128 @@ const bootBytes = ({ box, list, note, tail, more }: Parts, plan: BytePlan): void
     return asked(plan.file, url, { range: `bytes=${read.skip}-${read.skip + read.bytes - 1}` }, read.at);
   };
 
-  const noteFor = (dry: number): string =>
-    walkNote({ file: plan.file, bytes: reaches, loaded, shown: list.childElementCount, dry, through: edge === 0 });
-
-  const atFoot = (): boolean => box.scrollHeight - box.scrollTop - box.clientHeight < FOOT_SLACK;
-
-  const stopFollowing = (): void => {
-    if (beating === 0) return;
-    clearTimeout(beating);
-    beating = 0;
-  };
-
-  const done = (): void => {
-    more.remove();
-    notes.say(noteFor(0));
-  };
-
-  const load = async (): Promise<void> => {
-    if (busy || notes.broken()) return;
-    if (edge === 0) return done();
-    busy = true;
-    more.setAttribute("disabled", "");
-    notes.say(`Reading ${plan.file}…`);
-
-    const planned = plannedBatch(reads, edge, pending, plan.step);
-    const fetched: Fetched[] = [];
-    for (const read of planned.batch) {
+  const fetched = async (batch: PlannedRead[]): Promise<Step<Fetched[]>> => {
+    const held: Fetched[] = [];
+    for (const read of batch) {
       const got = await grab(read);
-      if (!got.ok) {
-        busy = false;
-        notes.fail(got.why, got.signedOut, () => void load());
-        return;
-      }
-      fetched.push({ ...read, text: got.text });
+      if (!got.ok) return got;
+      held.push({ ...read, text: got.text });
     }
-    edge = planned.edge;
-    pending = planned.pending;
-    let walked = 0;
-    for (const read of planned.batch) walked += read.bytes;
-    loaded += walked;
-
-    const joined = joinedTexts(groupedReads(fetched), plan.runs, remnant);
-    remnant = joined.remnant;
-
-    const held = box.scrollHeight - box.scrollTop;
-    const before = list.childElementCount;
-    for (const text of joined.texts) list.insertBefore(rendered(readTurns(text, plan.file)), list.firstChild);
-    box.scrollTop = box.scrollHeight - held;
-
-    busy = false;
-    const blank = list.childElementCount === before;
-    blanks = blank ? blanks + 1 : 0;
-    blankBytes = blank ? blankBytes + walked : 0;
-    if (edge === 0) return done();
-    more.removeAttribute("disabled");
-    if (blanks >= BLANK_STEPS) {
-      const dry = blankBytes;
-      blanks = 0;
-      blankBytes = 0;
-      notes.say(noteFor(dry));
-      return;
-    }
-    notes.say(noteFor(0));
-    if (blank) return load();
+    return { ok: true, value: held };
   };
 
-  const missed = (why: string, signedOut: boolean): void => {
-    misses += 1;
-    if (misses < FOLLOW_TRIES) return;
-    stopFollowing();
-    notes.lost(why, signedOut, () => {
-      misses = 0;
-      every = pace;
-      notes.sayTail({ newer, ended });
-      startFollowing();
-    });
+  const weighed = (batch: PlannedRead[]): number => batch.reduce((all, read) => all + read.bytes, 0);
+
+  return {
+    file: plan.file,
+    bytes: plan.readable,
+    follow: plan.follow,
+    back: async () => {
+      const planned = plannedBatch(reads, edge, pending, plan.step);
+      const got = await fetched(planned.batch);
+      if (!got.ok) return got;
+      edge = planned.edge;
+      pending = planned.pending;
+      const joined = joinedTexts(groupedReads(got.value), plan.runs, remnant);
+      remnant = joined.remnant;
+      return { ok: true, value: { texts: joined.texts, bytes: weighed(planned.batch), through: edge === 0 } };
+    },
+    forward: async () => {
+      const beat = await asked(
+        plan.file,
+        `${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}&after=${encodeURIComponent(after)}`,
+        {},
+        String(at),
+      );
+      if (!beat.ok) return beat;
+      const reach = JSON.parse(beat.text) as Reach;
+      // A batch is capped at the same step the backward walk takes, so a tab left hidden for an
+      // hour catches up over several beats rather than in one enormous read.
+      const planned = followedBatch(reach.runs, at, plan.step);
+      const got = await fetched(planned.batch);
+      if (!got.ok) return got;
+      // The part line held from the last beat belongs to the bytes just before this batch. A batch
+      // that does not start there sits across a hole, and nothing is carried over one.
+      const head = planned.batch[0];
+      if (head !== undefined && head.offset + head.skip !== at) trailing = "";
+      // The batch ends where the last read of it ends, which is the end of that stretch: the
+      // cursor and the stretch it names go up together, so the next beat's page opens there.
+      const last = planned.batch[planned.batch.length - 1];
+      if (last !== undefined) after = last.at;
+      at = planned.at;
+      const joined = followedTexts(groupedReads(got.value), trailing);
+      trailing = joined.remnant;
+      const listed = reach.runs[reach.runs.length - 1]?.to ?? at;
+      return {
+        ok: true,
+        value: { texts: joined.texts, bytes: weighed(planned.batch), running: reach.running, behind: at < listed },
+      };
+    },
   };
-
-  // One beat. It asks how the end of the file now lays out, and reads forward only over what it
-  // has not read: nothing already on screen is fetched again, and the cursor moves only by the
-  // bytes that came back. A batch is capped at the same step the backward walk takes, so a tab
-  // left hidden for an hour catches up over several beats rather than in one enormous read.
-  const follow = async (): Promise<void> => {
-    if (following === null || chasing || notes.adrift()) return;
-    chasing = true;
-    const got = await asked(
-      plan.file,
-      `${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}&after=${encodeURIComponent(after)}`,
-      {},
-      String(at),
-    );
-    if (!got.ok) {
-      chasing = false;
-      missed(got.why, got.signedOut);
-      return;
-    }
-    const reach = JSON.parse(got.text) as Reach;
-    const planned = followedBatch(reach.runs, at, plan.step);
-    const fetched: Fetched[] = [];
-    for (const read of planned.batch) {
-      const one = await grab(read);
-      if (!one.ok) {
-        chasing = false;
-        missed(one.why, one.signedOut);
-        return;
-      }
-      fetched.push({ ...read, text: one.text });
-    }
-    misses = 0;
-
-    // The part line held from the last beat belongs to the bytes just before this batch. A batch
-    // that does not start there sits across a hole, and nothing is carried over one.
-    const head = planned.batch[0];
-    if (head !== undefined && head.offset + head.skip !== at) trailing = "";
-    let walked = 0;
-    for (const read of planned.batch) walked += read.bytes;
-    // The batch ends where the last read of it ends, which is the end of that stretch: the cursor
-    // and the stretch it names go up together, so the next beat's page opens exactly there.
-    const last = planned.batch[planned.batch.length - 1];
-    if (last !== undefined) after = last.at;
-    at = planned.at;
-    reaches += walked;
-    loaded += walked;
-    // A batch cut off by its own budget leaves the box behind what the listing already named, so
-    // the next beat follows at once rather than waiting out a pace meant for a box that is level.
-    const listed = reach.runs[reach.runs.length - 1]?.to ?? at;
-    if (at < listed) every = 0;
-    else every = walked > 0 ? pace : Math.min(every * 2, FOLLOW_SLOWEST_MS);
-
-    const joined = followedTexts(groupedReads(fetched), trailing);
-    trailing = joined.remnant;
-    const foot = atFoot();
-    const before = list.childElementCount;
-    for (const text of joined.texts) list.appendChild(rendered(readTurns(text, plan.file)));
-    const added = list.childElementCount - before;
-    if (foot) {
-      box.scrollTop = box.scrollHeight;
-      newer = 0;
-    } else {
-      newer += added;
-    }
-    chasing = false;
-
-    if (!reach.running) {
-      ended = true;
-      stopFollowing();
-    }
-    if (walked > 0) notes.say(noteFor(0));
-    notes.sayTail({ newer, ended });
-  };
-
-  const beat = (): void => {
-    void follow()
-      .catch((error: unknown) => {
-        chasing = false;
-        missed(`Following ${plan.file} failed: ${error instanceof Error ? error.message : String(error)}.`, false);
-      })
-      .then(rest);
-  };
-
-  // When the next beat falls due. Nothing is waiting at a session that has ended, at a box that
-  // has given up following, or at a tab nobody is looking at.
-  const rest = (): void => {
-    if (following === null || notes.adrift() || ended || document.hidden) return;
-    beating = setTimeout(() => {
-      beating = 0;
-      beat();
-    }, every);
-  };
-
-  // Following starts on the beat it fires here, and starting it twice beats once.
-  const startFollowing = (): void => {
-    if (following === null || beating !== 0 || chasing || notes.adrift() || ended || document.hidden) return;
-    beat();
-  };
-
-  more.addEventListener("click", () => {
-    void load();
-  });
-  box.addEventListener("scroll", () => {
-    if (box.scrollTop < 240) void load();
-    if (newer > 0 && atFoot()) {
-      newer = 0;
-      notes.sayTail({ newer, ended });
-    }
-  });
-
-  if (following !== null) {
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) {
-        stopFollowing();
-        return;
-      }
-      startFollowing();
-    });
-    window.addEventListener("pagehide", stopFollowing);
-  }
-
-  void load().then(() => {
-    box.scrollTop = box.scrollHeight;
-    startFollowing();
-  });
 };
 
-// The same box over a file the record path holds. A record is one whole line verbatim, so a window
-// of them is two ordinals and comes back as prose that parses on its own: there is no range to ask
-// for, no part line to carry between windows, and no stretch boundary to join across. Where the
-// objects covering a window do not tile it the archive answers nothing at all, which is a failure
-// the box says out loud rather than a short read it renders as the file.
-const bootRecords = ({ box, list, note, tail, more }: Parts, plan: RecordPlan): void => {
-  const notes = notesOf(note, tail, more);
+// A file the record path wrote. A record is one whole line verbatim, so a window of them is two
+// ordinals and comes back as prose that parses on its own: there is no range to ask for, no part
+// line to carry between windows, and nothing to join. A hole is a run of ordinals no object holds;
+// the walk opens on the far side of one rather than stopping at it, and the page says how many
+// records each gap swallowed.
+const recordsWalker = (plan: RecordPlan): Walker => {
   const spans = plan.spans;
   const first = spans[0]?.from ?? 0;
   const end = spans[spans.length - 1];
 
   let edge = end === undefined ? 0 : end.from + end.held;
-  let loaded = 0;
-  let blanks = 0;
-  let blankBytes = 0;
-  let busy = false;
-
   // `at` is how many records of the file the box has read, which starts at the end of the manifest
   // the page was handed: an ordinal is a count of records and a place in the file at once, so the
   // backward walk and the forward one meet there and neither reads what the other has.
-  const following = plan.follow;
-  const pace = following === null ? 0 : following.every;
-  let at = following === null ? 0 : following.from;
-  let reaches = plan.bytes;
-  let newer = 0;
-  let ended = false;
-  let misses = 0;
-  let beating = 0;
-  let every = pace;
-  let chasing = false;
+  let at = plan.follow === null ? 0 : plan.follow.from;
 
-  const grab = (from: number, through: number): Promise<Got> =>
+  const grab = (window: RecordWindow): Promise<Got> =>
     asked(
       plan.file,
-      `${plan.path}?file=${encodeURIComponent(plan.file)}&records=${from}.${through}`,
+      `${plan.path}?file=${encodeURIComponent(plan.file)}&records=${window.from}.${window.through}`,
       {},
-      `${from}.${through}`,
+      `${window.from}.${window.through}`,
     );
 
-  const noteFor = (dry: number): string =>
-    walkNote({ file: plan.file, bytes: reaches, loaded, shown: list.childElementCount, dry, through: edge <= first });
-
-  const atFoot = (): boolean => box.scrollHeight - box.scrollTop - box.clientHeight < FOOT_SLACK;
-
-  const stopFollowing = (): void => {
-    if (beating === 0) return;
-    clearTimeout(beating);
-    beating = 0;
-  };
-
-  const done = (): void => {
-    more.remove();
-    notes.say(noteFor(0));
-  };
-
-  const load = async (): Promise<void> => {
-    if (busy || notes.broken()) return;
-    if (edge <= first) return done();
-    const window = plannedRecords(spans, edge, plan.step);
-    if (window.from === window.through) return done();
-    busy = true;
-    more.setAttribute("disabled", "");
-    notes.say(`Reading ${plan.file}…`);
-
-    const got = await grab(window.from, window.through);
-    if (!got.ok) {
-      busy = false;
-      notes.fail(got.why, got.signedOut, () => void load());
-      return;
-    }
-    edge = window.from;
-    loaded += window.bytes;
-
-    const held = box.scrollHeight - box.scrollTop;
-    const before = list.childElementCount;
-    list.insertBefore(rendered(readTurns(got.text, plan.file)), list.firstChild);
-    box.scrollTop = box.scrollHeight - held;
-
-    busy = false;
-    const blank = list.childElementCount === before;
-    blanks = blank ? blanks + 1 : 0;
-    blankBytes = blank ? blankBytes + window.bytes : 0;
-    if (edge <= first) return done();
-    more.removeAttribute("disabled");
-    if (blanks >= BLANK_STEPS) {
-      const dry = blankBytes;
-      blanks = 0;
-      blankBytes = 0;
-      notes.say(noteFor(dry));
-      return;
-    }
-    notes.say(noteFor(0));
-    if (blank) return load();
-  };
-
-  const missed = (why: string, signedOut: boolean): void => {
-    misses += 1;
-    if (misses < FOLLOW_TRIES) return;
-    stopFollowing();
-    notes.lost(why, signedOut, () => {
-      misses = 0;
-      every = pace;
-      notes.sayTail({ newer, ended });
-      startFollowing();
-    });
-  };
-
-  // One beat. It asks which objects hold records the box has not read, takes as many of them as
-  // one step allows, and reads that window forward. The cursor lands on an object boundary every
-  // time, so the next beat opens exactly where this one stopped and nothing on screen is fetched
-  // a second time.
-  const follow = async (): Promise<void> => {
-    if (following === null || chasing || notes.adrift()) return;
-    chasing = true;
-    const got = await asked(
-      plan.file,
-      `${plan.path}?file=${encodeURIComponent(plan.file)}&since=${at}`,
-      {},
-      String(at),
-    );
-    if (!got.ok) {
-      chasing = false;
-      missed(got.why, got.signedOut);
-      return;
-    }
-    const reach = JSON.parse(got.text) as RecordReach;
-    const window = followedRecords(reach.spans, at, plan.step);
-    let text = "";
-    if (window.through > window.from) {
-      const one = await grab(window.from, window.through);
-      if (!one.ok) {
-        chasing = false;
-        missed(one.why, one.signedOut);
-        return;
+  return {
+    file: plan.file,
+    bytes: plan.bytes,
+    follow: plan.follow,
+    back: async () => {
+      const window = plannedRecords(spans, edge, plan.step);
+      if (window.through === window.from) return { ok: true, value: { texts: [], bytes: 0, through: true } };
+      const got = await grab(window);
+      if (!got.ok) return got;
+      edge = window.from;
+      return { ok: true, value: { texts: [got.text], bytes: window.bytes, through: edge <= first } };
+    },
+    forward: async () => {
+      const beat = await asked(
+        plan.file,
+        `${plan.path}?file=${encodeURIComponent(plan.file)}&since=${at}`,
+        {},
+        String(at),
+      );
+      if (!beat.ok) return beat;
+      const reach = JSON.parse(beat.text) as RecordReach;
+      const window = followedRecords(reach.spans, at, plan.step);
+      const texts: string[] = [];
+      if (window.through > window.from) {
+        const got = await grab(window);
+        if (!got.ok) return got;
+        texts.push(got.text);
       }
-      text = one.text;
-    }
-    misses = 0;
-    at = window.through;
-    reaches += window.bytes;
-    loaded += window.bytes;
-    // A window cut off by its own budget leaves the box behind what the beat already named, so the
-    // next beat follows at once rather than waiting out a pace meant for a box that is level.
-    const listed = reach.spans[reach.spans.length - 1];
-    if (listed !== undefined && at < listed.from + listed.held) every = 0;
-    else every = window.bytes > 0 ? pace : Math.min(every * 2, FOLLOW_SLOWEST_MS);
-
-    const foot = atFoot();
-    const before = list.childElementCount;
-    if (text !== "") list.appendChild(rendered(readTurns(text, plan.file)));
-    const added = list.childElementCount - before;
-    if (foot) {
-      box.scrollTop = box.scrollHeight;
-      newer = 0;
-    } else {
-      newer += added;
-    }
-    chasing = false;
-
-    if (!reach.running) {
-      ended = true;
-      stopFollowing();
-    }
-    if (window.bytes > 0) notes.say(noteFor(0));
-    notes.sayTail({ newer, ended });
+      at = window.through;
+      const listed = reach.spans[reach.spans.length - 1];
+      const behind = listed !== undefined && at < listed.from + listed.held;
+      return { ok: true, value: { texts, bytes: window.bytes, running: reach.running, behind } };
+    },
   };
-
-  const beat = (): void => {
-    void follow()
-      .catch((error: unknown) => {
-        chasing = false;
-        missed(`Following ${plan.file} failed: ${error instanceof Error ? error.message : String(error)}.`, false);
-      })
-      .then(rest);
-  };
-
-  const rest = (): void => {
-    if (following === null || notes.adrift() || ended || document.hidden) return;
-    beating = setTimeout(() => {
-      beating = 0;
-      beat();
-    }, every);
-  };
-
-  const startFollowing = (): void => {
-    if (following === null || beating !== 0 || chasing || notes.adrift() || ended || document.hidden) return;
-    beat();
-  };
-
-  more.addEventListener("click", () => {
-    void load();
-  });
-  box.addEventListener("scroll", () => {
-    if (box.scrollTop < 240) void load();
-    if (newer > 0 && atFoot()) {
-      newer = 0;
-      notes.sayTail({ newer, ended });
-    }
-  });
-
-  if (following !== null) {
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) {
-        stopFollowing();
-        return;
-      }
-      startFollowing();
-    });
-    window.addEventListener("pagehide", stopFollowing);
-  }
-
-  void load().then(() => {
-    box.scrollTop = box.scrollHeight;
-    startFollowing();
-  });
 };
 
-const boot = (parts: Parts, plan: Plan): void => {
-  if (plan.held === "records") {
-    bootRecords(parts, plan);
-    return;
-  }
-  bootBytes(parts, plan);
-};
+const boot = (parts: Parts, plan: Plan): void =>
+  boxOf(parts, plan.held === "records" ? recordsWalker(plan) : bytesWalker(plan));
 
 const box = document.getElementById("tx");
 const list = document.getElementById("txlist");

@@ -7,6 +7,7 @@ import {
   followedBatch,
   followedRecords,
   type Plan,
+  plannedRecords,
   type Reach,
   type Read,
   type RecordPlan,
@@ -576,7 +577,8 @@ const windowOf = (h: Harness, plan: RecordPlan, from: number, through: number, a
   });
 
 // The whole of a file, read back out of the manifest alone. Whatever this reads is what a browser
-// reading against the same manifest sees.
+// reading against the same manifest sees. A window carries the break that closed its last record,
+// so the windows of a file lay end to end exactly as its objects do.
 const rejoined = async (h: Harness, plan: RecordPlan, assertion: string): Promise<string> => {
   const parts: string[] = [];
   for (const span of plan.spans) {
@@ -584,8 +586,11 @@ const rejoined = async (h: Harness, plan: RecordPlan, assertion: string): Promis
     expect(response.status).toBe(200);
     parts.push(await response.text());
   }
-  return parts.join("\n");
+  return parts.join("");
 };
+
+// What a file written as records reads back as: its lines, each closed by a break.
+const recordedText = (records: string[]): string => `${records.join("\n")}\n`;
 
 const recordBeatOf = (h: Harness, plan: RecordPlan, since: number, assertion: string): Promise<Response> =>
   h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&since=${since}`, {
@@ -603,7 +608,7 @@ describe("a session page over a transcript held as records", () => {
     expect(html).not.toContain("No transcript is archived for this session.");
     const plan = recordPlanOf(html);
     expect(plan.file).toBe("main");
-    expect(await rejoined(h, plan, you.assertion)).toBe(written.join("\n"));
+    expect(await rejoined(h, plan, you.assertion)).toBe(recordedText(written));
   });
 
   // A replay converts a session the byte path wrote, and nothing deletes the byte objects it
@@ -618,9 +623,74 @@ describe("a session page over a transcript held as records", () => {
     await recordedBody(h, you.laptop, "cafe0101", written);
 
     const plan = recordPlanOf(await read(h, "/dashboard/sessions/cafe0101", you.assertion));
-    const whole = await rejoined(h, plan, you.assertion);
-    expect(whole).toBe(written.join("\n"));
-    expect(whole).toContain("prompt 002");
+    expect(await rejoined(h, plan, you.assertion)).toBe(recordedText(written));
+  });
+
+  // The two paths are weighed file by file and never session by session, so a session that moved
+  // to records partway keeps reading the delegated turns the byte path still holds for it.
+  it("reads one file as records and another of the same session as bytes", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const written = [entry(0), entry(1)];
+    await recordedBody(h, you.laptop, "cafe0105", written);
+    const delegated = transcriptOf(2);
+    expect((await you.laptop.archive("cafe0105", "task-7", 0, delegated)).status).toBe(200);
+    await h.deliver();
+
+    const path = "/dashboard/sessions/cafe0105";
+    const html = await read(h, path, you.assertion);
+    expect(html).toContain(`<a href="${path}?file=task-7">task-7</a>`);
+    expect(await rejoined(h, recordPlanOf(html), you.assertion)).toBe(recordedText(written));
+
+    const byBytes = planOf(await read(h, `${path}?file=task-7`, you.assertion));
+    expect(byBytes.file).toBe("task-7");
+    expect(await reassembled(h, byBytes, you.assertion)).toBe(delegated);
+  });
+
+  // One key under a session's record prefix that this archive did not write must not take the page
+  // down with it: labels, the send box and every insight card hang off the same render, and the
+  // writer keeps its own loud reading of the objects.
+  it("draws a session whose record prefix holds a key the archive did not write", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const body = transcriptOf(2);
+    await archivedBody(h, you.laptop, "cafe0106", body);
+    await h.deliver();
+    await h.strayRecord(you.userId, "cafe0106", "main/not-an-ordinal");
+
+    const html = await read(h, "/dashboard/sessions/cafe0106", you.assertion);
+    expect(await reassembled(h, planOf(html), you.assertion)).toBe(body);
+  });
+
+  // A run of records the archive never got leaves the file in two pieces. The walk reads both and
+  // the page says how many records fell in the gap, rather than drawing the far side as the whole
+  // file and removing the control that would have reached the rest.
+  it("reads both sides of a hole in the records, and says how many fell in it", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const head = [entry(0), entry(1)];
+    const tail = [entry(5), entry(6)];
+    await recordedBody(h, you.laptop, "cafe0107", head);
+    expect(await h.storeRecords(you.userId, "cafe0107", "main", 5, tail)).toBe(true);
+
+    const html = await read(h, "/dashboard/sessions/cafe0107", you.assertion);
+    expect(html).toContain("The archive never got 3 records of this file, in 1 place.");
+    const plan = recordPlanOf(html);
+
+    // The walk reads the far side of the hole and then steps over it, so every record the archive
+    // holds is reachable and the box only says it is through once it is.
+    const newest = plannedRecords(plan.spans, 7, TRANSCRIPT_STEP_BYTES);
+    expect(newest).toEqual({ from: 5, through: 7, bytes: plan.spans[1]?.bytes });
+    const earlier = plannedRecords(plan.spans, newest.from, TRANSCRIPT_STEP_BYTES);
+    expect(earlier).toMatchObject({ from: 0, through: 2 });
+
+    expect(await (await windowOf(h, plan, newest.from, newest.through, you.assertion)).text()).toBe(recordedText(tail));
+    expect(await (await windowOf(h, plan, earlier.from, earlier.through, you.assertion)).text()).toBe(
+      recordedText(head),
+    );
+    // A window spanning the hole is a read the archive cannot answer, and it says so rather than
+    // handing back the records either side of it as though they joined up.
+    expect((await windowOf(h, plan, 0, 7, you.assertion)).status).toBe(404);
   });
 
   // A record is addressed by its ordinal, so the box follows the file by counting records and
@@ -642,9 +712,9 @@ describe("a session page over a transcript held as records", () => {
     expect(beat.running).toBe(true);
     const window = followedRecords(beat.spans, at, TRANSCRIPT_STEP_BYTES);
     expect(window).toMatchObject({ from: at, through: at + grew.length });
-    const read4 = await windowOf(h, plan, window.from, window.through, you.assertion);
-    expect(read4.status).toBe(200);
-    expect(await read4.text()).toBe(grew.join("\n"));
+    const landed = await windowOf(h, plan, window.from, window.through, you.assertion);
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toBe(recordedText(grew));
   });
 
   it("says a session nobody is running is no longer worth following", async () => {

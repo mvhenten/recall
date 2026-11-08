@@ -173,6 +173,8 @@ import {
   readRecordAppend,
   readRecords,
   readRecordsBetween,
+  readRecordWindow,
+  recordedTranscript,
   recordFiles,
   recordSpans,
   recordsAgree,
@@ -783,11 +785,11 @@ const transcriptBytes = async (
   });
 };
 
-// One window of a file the record path holds, handed back as the lines it is stored as. The
-// window is two ordinals and no byte range: a record is a line of the file verbatim, redaction
-// leaves it at another length than the host read, and where it sits in the file on disk is
-// something the archive never knew. The objects covering the window have to tile it exactly, and
-// `readRecordsBetween` fails where they do not rather than answering a reader short of the file.
+// One window of a file the record path holds, streamed as the bytes of the file it accounts for.
+// The window is two ordinals and no byte range: a record is a line of the file verbatim,
+// redaction leaves it at another length than the host read, and where it sits in the file on disk
+// is something the archive never knew. The objects covering the window have to tile it exactly;
+// where they do not, this says the archive holds no such run rather than answering short of it.
 //
 // Like the bytes of a stretch, it is answered in the Worker: it reads the archive and nothing
 // else, and the key is built from the user the Access assertion resolved to, so a caller reaches
@@ -805,8 +807,11 @@ const transcriptRecords = async (
   const window = parseRecordWindow(url.searchParams.get("records"));
   if (!window.ok) return error(400, window.error);
   const { from, through } = window.value;
-  const records = await readRecordsBetween(bucket, userId, session.value, file.value, from, through);
-  return new Response(records.join("\n"), {
+  const records = await readRecordWindow(bucket, userId, session.value, file.value, from, through);
+  if (records === null) {
+    return error(404, `the archive holds no unbroken run of ${file.value} from ${from} to ${through}`);
+  }
+  return new Response(records, {
     headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
   });
 };
@@ -1714,18 +1719,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
     const file = chosen.value;
     const [recorded, held] = await Promise.all([
-      recordFiles(env.TRANSCRIPTS, userId, sessionId),
+      recordedTranscript(env.TRANSCRIPTS, userId, sessionId, file),
       archivedTranscript(env.TRANSCRIPTS, userId, sessionId),
     ]);
-    const byRecords = new Set(recorded.map((recording) => recording.file));
+    const byRecords = new Set(recorded.files.map((recording) => recording.file));
     const files = [...new Set([...byRecords, ...held.map((archived) => archived.file)])].sort((left, right) =>
       left.localeCompare(right),
     );
     if (files.length === 0) return { kind: "none" };
-    const recording = recorded.find((one) => one.file === file);
+    const recording = recorded.files.find((one) => one.file === file);
     if (recording !== undefined) {
-      const spans = await recordSpans(env.TRANSCRIPTS, userId, sessionId, file);
-      return { kind: "records", file, files, records: recording.records, spans };
+      return { kind: "records", file, files, records: recording.records, spans: recorded.spans };
     }
     const archive = held.find((archived) => archived.file === file);
     if (archive === undefined || archive.bytes === 0) return { kind: "missing", file, files };
