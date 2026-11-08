@@ -4,15 +4,19 @@ import {
   compressedStretchName,
   type Fetched,
   followedBatch,
+  followedRecords,
   followedTexts,
   gapsIn,
   groupedReads,
   joinedTexts,
   legacyStretchName,
   listedRuns,
+  listedSpans,
   MAX_PLANNED_READS,
   type PlannedRead,
   plannedBatch,
+  plannedRecords,
+  type RecordSpan,
   tailNote,
   type Walk,
   walkNote,
@@ -330,5 +334,73 @@ describe("joining what came back", () => {
       { run: 0, at: 0, text: "abcd" },
       { run: 1, at: 50, text: "ef" },
     ]);
+  });
+});
+
+// A file the record path holds, written as so many objects of so many records each. A record is
+// one whole line, so an object weighs what its records weigh and the walk counts in both.
+const spans = (sizes: number[], bytes: number): RecordSpan[] => {
+  const written: RecordSpan[] = [];
+  let from = 0;
+  for (const held of sizes) {
+    written.push({ from, held, bytes: held * bytes });
+    from += held;
+  }
+  return written;
+};
+
+describe("planning a window of records", () => {
+  it("takes whole objects walking backwards, and opens where the one it stopped at opens", () => {
+    const written = spans([4, 4, 4], 10);
+
+    const first = plannedRecords(written, 12, 100);
+    expect(first).toEqual({ from: 0, through: 12, bytes: 120 });
+
+    const held = plannedRecords(written, 12, 50);
+    expect(held).toEqual({ from: 4, through: 12, bytes: 80 });
+    expect(plannedRecords(written, held.from, 50)).toEqual({ from: 0, through: 4, bytes: 40 });
+  });
+
+  // A walk that could not take an object weighing more than a step would never reach the start of
+  // a file one big append wrote, and the box would stop on a window it refetched for ever.
+  it("takes one object however little budget is left", () => {
+    expect(plannedRecords(spans([3], 1_000), 3, 10)).toEqual({ from: 0, through: 3, bytes: 3_000 });
+  });
+
+  // Records the archive does not hold are a window no read can answer, so the walk stops in front
+  // of the gap rather than asking for a span the objects do not tile.
+  it("stops at a gap rather than reading across it", () => {
+    const held = [
+      { from: 0, held: 2, bytes: 20 },
+      { from: 5, held: 2, bytes: 20 },
+    ];
+    expect(plannedRecords(held, 7, 1_000)).toEqual({ from: 5, through: 7, bytes: 20 });
+    expect(plannedRecords(held, 5, 1_000)).toEqual({ from: 5, through: 5, bytes: 0 });
+  });
+
+  it("reads forward from where the box has got to, and passes over the records it has", () => {
+    const written = spans([4, 4, 4], 10);
+
+    expect(followedRecords(written, 4, 1_000)).toEqual({ from: 4, through: 12, bytes: 80 });
+    const held = followedRecords(written, 4, 50);
+    expect(held).toEqual({ from: 4, through: 8, bytes: 40 });
+    expect(followedRecords(written, held.through, 50)).toEqual({ from: 8, through: 12, bytes: 40 });
+  });
+
+  it("reads nothing forward where nothing has landed since the box last looked", () => {
+    expect(followedRecords(spans([4], 10), 4, 1_000)).toEqual({ from: 4, through: 4, bytes: 0 });
+  });
+
+  it("names the newest spans of a file too long to name whole, and says where it opens", () => {
+    const written = spans(
+      Array.from({ length: MAX_PLANNED_READS + 3 }, () => 2),
+      10,
+    );
+    const listed = listedSpans(written);
+
+    expect(listed.spans).toHaveLength(MAX_PLANNED_READS);
+    expect(listed.from).toBe(6);
+    expect(listed.readable).toBe(MAX_PLANNED_READS * 2);
+    expect(listed.bytes).toBe(MAX_PLANNED_READS * 20);
   });
 });

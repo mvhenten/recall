@@ -128,6 +128,8 @@ import {
   parseLabels,
   parseList,
   parseName,
+  parseRecordCursor,
+  parseRecordWindow,
   parseSave,
   parseSearch,
   parseSession,
@@ -172,6 +174,7 @@ import {
   readRecords,
   readRecordsBetween,
   recordFiles,
+  recordSpans,
   recordsAgree,
   recordsEnd,
   recordsFault,
@@ -290,7 +293,7 @@ import {
   TOOLS,
   toolArguments,
 } from "./tools";
-import { legacyStretchName, packedStretch, type Reach } from "./transcript-plan";
+import { legacyStretchName, packedStretch, type Reach, type RecordReach } from "./transcript-plan";
 import {
   appendStretch,
   archivedFiles,
@@ -777,6 +780,34 @@ const transcriptBytes = async (
       "cache-control": "no-store",
       "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
     },
+  });
+};
+
+// One window of a file the record path holds, handed back as the lines it is stored as. The
+// window is two ordinals and no byte range: a record is a line of the file verbatim, redaction
+// leaves it at another length than the host read, and where it sits in the file on disk is
+// something the archive never knew. The objects covering the window have to tile it exactly, and
+// `readRecordsBetween` fails where they do not rather than answering a reader short of the file.
+//
+// Like the bytes of a stretch, it is answered in the Worker: it reads the archive and nothing
+// else, and the key is built from the user the Access assertion resolved to, so a caller reaches
+// nothing outside its own prefix.
+const transcriptRecords = async (
+  url: URL,
+  bucket: R2Bucket,
+  userId: string,
+  rawSessionId: string,
+): Promise<Response> => {
+  const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+  if (!session.ok) return error(400, session.error);
+  const file = parseTranscriptFile(url.searchParams.get("file"));
+  if (!file.ok) return error(400, file.error);
+  const window = parseRecordWindow(url.searchParams.get("records"));
+  if (!window.ok) return error(400, window.error);
+  const { from, through } = window.value;
+  const records = await readRecordsBetween(bucket, userId, session.value, file.value, from, through);
+  return new Response(records.join("\n"), {
+    headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
   });
 };
 
@@ -1663,8 +1694,15 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   // What the page tells the browser about a session's transcript: which files it holds, and where
-  // every stretch of the chosen one sits. It is one listing and no reads — the browser fetches the
-  // bytes it wants itself, off the stretches named here.
+  // every window of the chosen one sits. It is listings and no reads — the browser fetches the
+  // prose it wants itself, off the manifest named here.
+  //
+  // The two paths the archive takes a transcript on are weighed the way `/v2` weighs them. The
+  // record path is what `/v2` writes, so a file the records hold is answered off them, and the
+  // byte path answers for the rest, which is what `/v1` left behind. A session converted by a
+  // replay keeps the byte objects of the file it was converted from — nothing deletes them — so
+  // reading the bytes of a file the records also hold would show the transcript as it stood
+  // before the conversion and silently drop everything appended since.
   const transcriptPlan = async (
     env: TenantEnv,
     userId: string,
@@ -1675,9 +1713,20 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const chosen = wanted === null ? { ok: true as const, value: MAIN_FILE } : parseTranscriptFile(wanted);
     if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
     const file = chosen.value;
-    const held = await archivedTranscript(env.TRANSCRIPTS, userId, sessionId);
-    if (held.length === 0) return { kind: "none" };
-    const files = held.map((archived) => archived.file);
+    const [recorded, held] = await Promise.all([
+      recordFiles(env.TRANSCRIPTS, userId, sessionId),
+      archivedTranscript(env.TRANSCRIPTS, userId, sessionId),
+    ]);
+    const byRecords = new Set(recorded.map((recording) => recording.file));
+    const files = [...new Set([...byRecords, ...held.map((archived) => archived.file)])].sort((left, right) =>
+      left.localeCompare(right),
+    );
+    if (files.length === 0) return { kind: "none" };
+    const recording = recorded.find((one) => one.file === file);
+    if (recording !== undefined) {
+      const spans = await recordSpans(env.TRANSCRIPTS, userId, sessionId, file);
+      return { kind: "records", file, files, records: recording.records, spans };
+    }
     const archive = held.find((archived) => archived.file === file);
     if (archive === undefined || archive.bytes === 0) return { kind: "missing", file, files };
     return { kind: "read", file, files, bytes: archive.bytes, runs: archive.runs };
@@ -1704,7 +1753,45 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   //
   // Only the session's own file is followed. Every other file is a delegated turn, which derives
   // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
+  // The same question of a file the record path holds: how its records lay out past where the
+  // reader has read, and whether anyone is still running the session. The mark the index commits
+  // with every append says how far the records reach without opening the archive at all, so a
+  // beat that finds nothing new lists nothing. Like the byte path's extent it is trusted to say a
+  // file has grown and never to say it has not: a writer that stored records and lost the file
+  // before committing leaves the mark behind the objects, and the next append carries it past
+  // them.
+  //
+  // The objects are listed only where the mark says records landed, because a window the reader
+  // asks for opens and ends on an object boundary and nowhere else, and nothing but the listing
+  // says where those fall.
+  const transcriptRecordTail = async (
+    url: URL,
+    env: TenantEnv,
+    userId: string,
+    rawSessionId: string,
+  ): Promise<Response> => {
+    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+    if (!session.ok) return error(400, session.error);
+    const file = parseTranscriptFile(url.searchParams.get("file"));
+    if (!file.ok) return error(400, file.error);
+    const since = parseRecordCursor(url.searchParams.get("since"));
+    if (!since.ok) return error(400, since.error);
+    const [marked, device] = await Promise.all([
+      recordReach(env.DB, userId, session.value, file.value),
+      liveSessionDevice(env.DB, userId, session.value, deps.now()),
+    ]);
+    const spans =
+      marked > since.value
+        ? (await recordSpans(env.TRANSCRIPTS, userId, session.value, file.value)).filter(
+            (span) => span.from + span.held > since.value,
+          )
+        : [];
+    const reach: RecordReach = { running: device !== null, spans };
+    return json(reach, 200, { "cache-control": "no-store" });
+  };
+
   const transcriptTail = async (url: URL, env: TenantEnv, userId: string, rawSessionId: string): Promise<Response> => {
+    if (url.searchParams.has("since")) return transcriptRecordTail(url, env, userId, rawSessionId);
     const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!session.ok) return error(400, session.error);
     const file = parseTranscriptFile(url.searchParams.get("file"));
@@ -3046,7 +3133,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (saving) return saveLabels(request, url, db, userId, lost);
     // A read of the tail renders no page, so it does not pay for the tally a page carries in its
     // header. It reads this tenant's rows for how far the file now reaches, which is what keeps it
-    // here while the bytes of a named stretch are answered in the Worker off the archive alone.
+    // here while the prose of a named window is answered in the Worker off the archive alone.
     if (bytes) return transcriptTail(url, env, userId, rawSessionId);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
@@ -3653,10 +3740,15 @@ export const createApp = (deps: Deps): App => {
     if (email instanceof Response) return email;
     const userId = await invited(env.DB, email, signIn);
     if (userId instanceof Response) return userId;
-    // The bytes of one named stretch come off the archive and read no row at all, so they are
-    // answered here rather than one round trip into the object apiece. `from` asks how far the
-    // file now reaches, which is a row this tenant holds, so that one goes on to the object.
-    if (bytes && !url.searchParams.has("from")) {
+    // The prose of one named window comes off the archive and reads no row at all, so it is
+    // answered here rather than one round trip into the object apiece — the bytes of a stretch
+    // for a file the byte path holds, the records of an ordinal window for one the record path
+    // holds. `from` and `since` ask how far the file now reaches, which is a row this tenant
+    // holds, so those go on to the object.
+    if (bytes && !url.searchParams.has("from") && !url.searchParams.has("since")) {
+      if (url.searchParams.has("records")) {
+        return transcriptRecords(url, env.TRANSCRIPTS, userId, rawSessionId);
+      }
       return transcriptBytes(request, url, env.TRANSCRIPTS, userId, rawSessionId);
     }
     return tenantOf(env, userId).dashboard(request, userId, email, handed());

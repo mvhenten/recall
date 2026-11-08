@@ -87,6 +87,8 @@ export type HeldFile =
   | ({ held: "bytes"; file: string; bytes: number } & Extent)
   | { held: "records"; file: string; bytes: number; records: number };
 
+export type RecordedFile = Extract<HeldFile, { held: "records" }>;
+
 const filePrefix = (userId: string, sessionId: string, file: string): string => `${userId}/${sessionId}/${file}/`;
 
 const sessionPrefix = (userId: string, sessionId: string): string => `${userId}/${sessionId}/`;

@@ -2,7 +2,17 @@ import { describe, expect, it } from "vitest";
 import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
 import { MAX_BODY_BYTES, type Message, type NewsFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
 import { SESSION_TTL_MS } from "../src/model";
-import { followedBatch, type Plan, type Reach, type Read, stretchName } from "../src/transcript-plan";
+import {
+  type BytePlan,
+  followedBatch,
+  followedRecords,
+  type Plan,
+  type Reach,
+  type Read,
+  type RecordPlan,
+  type RecordReach,
+  stretchName,
+} from "../src/transcript-plan";
 import { type Client, harness, inflated } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -80,10 +90,22 @@ const entry = (index: number, pad = 1_200 + ((index * 137) % 1_600)): string =>
 const transcriptOf = (entries: number): string =>
   `${Array.from({ length: entries }, (_, index) => entry(index)).join("\n")}\n`;
 
-const planOf = (html: string): Plan => {
+const manifestOf = (html: string): Plan => {
   const found = /<script type="application\/json" id="txplan">([^<]*)<\/script>/.exec(html)?.[1];
   if (found === undefined) throw new Error("the session page carries no transcript manifest");
   return JSON.parse(found);
+};
+
+const planOf = (html: string): BytePlan => {
+  const plan = manifestOf(html);
+  if (plan.held !== "bytes") throw new Error(`the page reads ${plan.file} as ${plan.held}`);
+  return plan;
+};
+
+const recordPlanOf = (html: string): RecordPlan => {
+  const plan = manifestOf(html);
+  if (plan.held !== "records") throw new Error(`the page reads ${plan.file} as ${plan.held}`);
+  return plan;
 };
 
 const archivedBody = async (h: Harness, client: Client, sessionId: string, body: string, at = 0): Promise<number> => {
@@ -122,7 +144,7 @@ const wholeOf = (h: Harness, plan: Plan, read: Read, assertion: string): Promise
 
 // The whole of a file, reassembled out of the manifest alone, with a marker where the manifest
 // says a hole sits. Whatever this reads is what a browser reading against the same manifest sees.
-const reassembled = async (h: Harness, plan: Plan, assertion: string): Promise<string> => {
+const reassembled = async (h: Harness, plan: BytePlan, assertion: string): Promise<string> => {
   const parts: string[] = [];
   for (const run of plan.runs) {
     if (parts.length > 0) parts.push("|hole|");
@@ -403,14 +425,14 @@ describe("the transcript bytes", () => {
 
 // The stretch a reader standing at `from` read to the end of, which the browser carries beside its
 // byte cursor: a read is taken whole, so the cursor is always the end of one of them.
-const cursorOf = (plan: Plan, from: number): string => {
+const cursorOf = (plan: BytePlan, from: number): string => {
   const held = plan.runs.flatMap((run) => run.reads).filter((read) => read.offset + read.skip + read.bytes <= from);
   return held[held.length - 1]?.at ?? "";
 };
 
 // One beat of a box following a session still being written. It carries the box's cursor: how far
 // it has read the file to, and the stretch that place is the end of.
-const beatOf = (h: Harness, plan: Plan, from: number, assertion: string): Promise<Response> =>
+const beatOf = (h: Harness, plan: BytePlan, from: number, assertion: string): Promise<Response> =>
   h.send(
     `${plan.path}?file=${encodeURIComponent(plan.file)}&from=${from}&after=${encodeURIComponent(cursorOf(plan, from))}`,
     { headers: { "cf-access-jwt-assertion": assertion } },
@@ -529,6 +551,126 @@ describe("following a transcript as it is written", () => {
       ).status,
     ).toBe(400);
     expect((await beatOf(h, main, 0, await h.assertionFor("stranger@example.com"))).status).toBe(403);
+  });
+});
+
+// One append of records, the way a host on `/v2` writes its transcript.
+const recordedBody = async (
+  h: Harness,
+  client: Client,
+  sessionId: string,
+  records: string[],
+  from = 0,
+): Promise<number> => {
+  const now = h.now();
+  expect((await client.sync(sessionId, { startedAt: now - 600_000, lastActivityAt: now })).status).toBe(204);
+  expect((await client.v2.records(sessionId, "main", from, records)).status).toBe(200);
+  return from + records.length;
+};
+
+// One window of records, fetched the way the browser fetches it: two ordinals off the manifest and
+// no range at all.
+const windowOf = (h: Harness, plan: RecordPlan, from: number, through: number, assertion: string): Promise<Response> =>
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&records=${from}.${through}`, {
+    headers: { "cf-access-jwt-assertion": assertion },
+  });
+
+// The whole of a file, read back out of the manifest alone. Whatever this reads is what a browser
+// reading against the same manifest sees.
+const rejoined = async (h: Harness, plan: RecordPlan, assertion: string): Promise<string> => {
+  const parts: string[] = [];
+  for (const span of plan.spans) {
+    const response = await windowOf(h, plan, span.from, span.from + span.held, assertion);
+    expect(response.status).toBe(200);
+    parts.push(await response.text());
+  }
+  return parts.join("\n");
+};
+
+const recordBeatOf = (h: Harness, plan: RecordPlan, since: number, assertion: string): Promise<Response> =>
+  h.send(`${plan.path}?file=${encodeURIComponent(plan.file)}&since=${since}`, {
+    headers: { "cf-access-jwt-assertion": assertion },
+  });
+
+describe("a session page over a transcript held as records", () => {
+  it("reads a session born on the record path, which has no byte of its transcript archived", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const written = [entry(0), entry(1), entry(2)];
+    await recordedBody(h, you.laptop, "cafe0100", written);
+
+    const html = await read(h, "/dashboard/sessions/cafe0100", you.assertion);
+    expect(html).not.toContain("No transcript is archived for this session.");
+    const plan = recordPlanOf(html);
+    expect(plan.file).toBe("main");
+    expect(await rejoined(h, plan, you.assertion)).toBe(written.join("\n"));
+  });
+
+  // A replay converts a session the byte path wrote, and nothing deletes the byte objects it
+  // leaves behind. Reading those would show the transcript as it stood at the conversion and
+  // silently drop every record appended since, so the records are what the page reads.
+  it("reads the records of a converted session rather than the bytes the byte path left", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    await archivedBody(h, you.laptop, "cafe0101", `${entry(0)}\n${entry(1)}\n`);
+    await h.deliver();
+    const written = [entry(0), entry(1), entry(2)];
+    await recordedBody(h, you.laptop, "cafe0101", written);
+
+    const plan = recordPlanOf(await read(h, "/dashboard/sessions/cafe0101", you.assertion));
+    const whole = await rejoined(h, plan, you.assertion);
+    expect(whole).toBe(written.join("\n"));
+    expect(whole).toContain("prompt 002");
+  });
+
+  // A record is addressed by its ordinal, so the box follows the file by counting records and
+  // never by counting bytes: the beat says which objects hold records it has not read, and the
+  // window it asks for next opens exactly where the page's manifest stopped.
+  it("follows a session writing records, reading forward by ordinal", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const at = await recordedBody(h, you.laptop, "cafe0102", [entry(0), entry(1)]);
+    const plan = recordPlanOf(await read(h, "/dashboard/sessions/cafe0102", you.assertion));
+    expect(plan.follow).toEqual({ from: at, every: TRANSCRIPT_FOLLOW_MS });
+
+    const quiet: RecordReach = await (await recordBeatOf(h, plan, at, you.assertion)).json();
+    expect(quiet).toEqual({ running: true, spans: [] });
+
+    const grew = [entry(2), entry(3)];
+    await recordedBody(h, you.laptop, "cafe0102", grew, at);
+    const beat: RecordReach = await (await recordBeatOf(h, plan, at, you.assertion)).json();
+    expect(beat.running).toBe(true);
+    const window = followedRecords(beat.spans, at, TRANSCRIPT_STEP_BYTES);
+    expect(window).toMatchObject({ from: at, through: at + grew.length });
+    const read4 = await windowOf(h, plan, window.from, window.through, you.assertion);
+    expect(read4.status).toBe(200);
+    expect(await read4.text()).toBe(grew.join("\n"));
+  });
+
+  it("says a session nobody is running is no longer worth following", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    const at = await recordedBody(h, you.laptop, "cafe0103", [entry(0), entry(1)]);
+    const plan = recordPlanOf(await read(h, "/dashboard/sessions/cafe0103", you.assertion));
+    h.tick(SESSION_TTL_MS + 1);
+
+    const cold: RecordReach = await (await recordBeatOf(h, plan, at, you.assertion)).json();
+    expect(cold.running).toBe(false);
+    expect(recordPlanOf(await read(h, "/dashboard/sessions/cafe0103", you.assertion)).follow).toBeNull();
+  });
+
+  it("refuses a window no ordinal pair names, and a reader the session does not belong to", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    await recordedBody(h, you.laptop, "cafe0104", [entry(0), entry(1)]);
+    const plan = recordPlanOf(await read(h, "/dashboard/sessions/cafe0104", you.assertion));
+
+    expect(
+      (await h.send(`${plan.path}?file=main&records=2.1`, { headers: { "cf-access-jwt-assertion": you.assertion } }))
+        .status,
+    ).toBe(400);
+    expect((await recordBeatOf(h, plan, -1, you.assertion)).status).toBe(400);
+    expect((await windowOf(h, plan, 0, 2, await h.assertionFor("stranger@example.com"))).status).toBe(403);
   });
 });
 

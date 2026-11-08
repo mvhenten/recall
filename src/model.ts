@@ -576,6 +576,36 @@ export const parseStretchOffset = (value: string | null): Parsed<number> => {
     : fail("offset must be a whole number of bytes into the file");
 };
 
+const RECORD_WINDOW = /^([0-9]{1,16})\.([0-9]{1,16})$/;
+
+export interface RecordWindowAsked {
+  from: number;
+  through: number;
+}
+
+// Which records of a file a reader is asking for: the ordinal the window opens at, and the one
+// past its last record. A record is addressed by its place in the file and never by a byte of it,
+// so a window of one carries no offset and no length in bytes at all.
+export const parseRecordWindow = (value: string | null): Parsed<RecordWindowAsked> => {
+  const found = value === null ? null : RECORD_WINDOW.exec(value);
+  const from = Number(found?.[1]);
+  const through = Number(found?.[2]);
+  if (!isInteger(from, 0, Number.MAX_SAFE_INTEGER) || !isInteger(through, from + 1, Number.MAX_SAFE_INTEGER)) {
+    return fail("records must name a window as <from>.<through>, two whole ordinals with through past from");
+  }
+  return { ok: true, value: { from, through } };
+};
+
+// How many records of a file a box following it has read. It is a count and a place at once: the
+// records of a file are its lines in the order they were written, so the record at that ordinal is
+// the next one the box has not seen.
+export const parseRecordCursor = (value: string | null): Parsed<number> => {
+  const ordinal = Number(value);
+  return value !== null && value !== "" && isInteger(ordinal, 0, Number.MAX_SAFE_INTEGER)
+    ? { ok: true, value: ordinal }
+    : fail("since must be a whole number of records into the file");
+};
+
 // Which stretch of a file a reader is asking for, named the way the archive stores it. It is the
 // name and never a place in the archive: where a redacted stretch sits there is the sizes of the
 // stretches in front of it, which the manifest the reader is reading against already said.

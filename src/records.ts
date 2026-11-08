@@ -14,7 +14,8 @@
 // segments and `parseStretchKey` refuses a fifth, so the consumer that indexes the byte path reads
 // no record object and no change was needed there.
 
-import type { HeldFile } from "./transcripts";
+import type { RecordSpan } from "./transcript-plan";
+import type { RecordedFile } from "./transcripts";
 
 // How many records one append may carry, and how many bytes of them. Both are the ceiling the
 // endpoint answers 413 against. A record is one line and cannot be split, so the byte ceiling is
@@ -200,7 +201,7 @@ export const recordsReach = async (
 // `bytes` is a length of the archive and no place in the file the host holds. How many records of
 // the file the archive has is the one count that is a place in both, and a restore weighs a local
 // file against that.
-export const recordFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<HeldFile[]> => {
+export const recordFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<RecordedFile[]> => {
   const weighed = new Map<string, { bytes: number; records: number }>();
   for (const object of await listRecords(bucket, userId, sessionId)) {
     const held = weighed.get(object.file) ?? { bytes: 0, records: 0 };
@@ -210,9 +211,23 @@ export const recordFiles = async (bucket: R2Bucket, userId: string, sessionId: s
     });
   }
   return [...weighed]
-    .map(([file, held]): HeldFile => ({ held: "records", file, bytes: held.bytes, records: held.records }))
+    .map(([file, held]): RecordedFile => ({ held: "records", file, bytes: held.bytes, records: held.records }))
     .sort((left, right) => left.file.localeCompare(right.file));
 };
+
+// Where every object of one file sits in its records, in the order they were written. A reader
+// that wants a window of the file rather than the whole of it plans it against these: a window
+// opens and ends on an object boundary and nowhere else, which is the one shape
+// `readRecordsBetween` can answer, and the weight of each is what the window costs on the wire.
+export const recordSpans = async (
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+): Promise<RecordSpan[]> =>
+  (await listRecords(bucket, userId, sessionId))
+    .filter((object) => object.file === file)
+    .map((object) => ({ from: object.from, held: object.held, bytes: object.bytes + (object.closes ? 1 : 0) }));
 
 // One file of a session's transcript, read back out of its records. Each object is handed over in
 // ordinal order followed by the break that closed its last record, which is the file the host

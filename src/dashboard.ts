@@ -55,7 +55,17 @@ import {
 } from "./model";
 import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE, sizeText, TOKENS } from "./page";
 import { MAX_EMAIL_SHARES, SHARE_DAYS, type ShareView, shareTimeLeft } from "./shares";
-import { type Follow, gapsIn, listedRuns, type Plan, type Run, type Listing as RunListing } from "./transcript-plan";
+import {
+  type Follow,
+  gapsIn,
+  listedRuns,
+  listedSpans,
+  type Plan,
+  type RecordSpan,
+  type Run,
+  type Listing as RunListing,
+  type SpanListing,
+} from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
 import { MAIN_FILE } from "./transcripts";
 
@@ -1429,10 +1439,16 @@ export const TRANSCRIPT_FOLLOW_MS = 10_000;
 // What the page knows about one transcript file. A session with nothing archived and a session
 // asked for a file it never wrote are different answers, and the page says which rather than
 // handing the browser a manifest of no stretches.
+//
+// The archive takes a transcript on two paths and the page reads whichever holds the file. A file
+// the records hold is answered off them — that is what `/v2` writes, and a session born there has
+// nothing under the byte path's prefix at all — and the byte path answers for the rest, which is
+// what `/v1` left behind.
 export type TranscriptPlan =
   | { kind: "none" }
   | { kind: "missing"; file: string; files: string[] }
-  | { kind: "read"; file: string; files: string[]; bytes: number; runs: Run[] };
+  | { kind: "read"; file: string; files: string[]; bytes: number; runs: Run[] }
+  | { kind: "records"; file: string; files: string[]; records: number; spans: RecordSpan[] };
 
 // What the send box has to say for itself after a post, and nothing when it has nothing.
 export type Flash = { tone: "sent" } | { tone: "refused"; text: string };
@@ -1575,18 +1591,58 @@ const trimNote = (listing: RunListing, bytes: number): string =>
     ? ""
     : `<p class="callout">This file runs to ${sizeText(bytes)}. The last ${sizeText(bytes - listing.from)} of it is listed here; the stretches before that are not, so the box stops short of the start of the session.</p>`;
 
+// What a manifest of records held back says for itself, which is the same thing in the places
+// records are counted in: a record is a line of the file and never a byte of it, so what the box
+// stops short of is said in records.
+const spanTrimNote = (listing: SpanListing, records: number): string =>
+  listing.from === 0
+    ? ""
+    : `<p class="callout">This file holds ${records} records. The last ${listing.readable} of them are listed here; the records before that are not, so the box stops short of the start of the session.</p>`;
+
 // What the box follows, and nothing when there is nothing to follow. `from` is the end of the
-// manifest, which is the first byte the box has not been handed, so following starts where the
-// page stops and no byte is read twice. A session no host is holding writes nothing more, and
+// manifest, which is the first place the box has not been handed, so following starts where the
+// page stops and nothing is read twice. A session no host is holding writes nothing more, and
 // whether one is holding it is the fact the beat itself answers with, so the page that starts
 // following and the beat that ends it cannot disagree about what live means. Only the session's
-// own file keeps an extent cheap enough to beat against.
-const followOf = (view: SessionView, file: string, bytes: number): Follow | null =>
-  view.deviceId !== null && file === MAIN_FILE ? { from: bytes, every: TRANSCRIPT_FOLLOW_MS } : null;
+// own file keeps a mark cheap enough to beat against.
+const followOf = (view: SessionView, file: string, from: number): Follow | null =>
+  view.deviceId !== null && file === MAIN_FILE ? { from, every: TRANSCRIPT_FOLLOW_MS } : null;
+
+// The box itself, which is the same document whichever path holds the file: a scroller the
+// browser fills, the two notes it talks through, and the manifest it plans its reads against.
+const transcriptBox = (file: string, plan: Plan, notes: string): string =>
+  `${notes}
+<div class="scroller" id="tx" tabindex="0" aria-label="Transcript">
+<p class="txtop"><button type="button" id="txmore">Load earlier</button></p>
+<ol class="turns" id="txlist" role="list"></ol></div>
+<p class="txnote" id="txnote">Reading ${escapeHtml(file)}…</p>
+<p class="txnote" id="txtail"></p>
+<noscript><p class="callout">The transcript is read by the browser straight off the archive, so this box stays empty while scripts are off.</p></noscript>
+<script type="application/json" id="txplan">${planJson(plan)}</script>
+<script src="${TRANSCRIPT_SCRIPT_PATH}" defer></script>`;
 
 const transcriptCard = (view: SessionView): string => {
   const held = view.transcript;
   const id = view.session.sessionId;
+  const path = `${sessionPath(id)}/${TRANSCRIPT_SEGMENT}`;
+  if (held.kind === "records") {
+    const listing = listedSpans(held.spans);
+    const last = listing.spans[listing.spans.length - 1];
+    const plan: Plan = {
+      held: "records",
+      path,
+      file: held.file,
+      bytes: listing.bytes,
+      step: TRANSCRIPT_STEP_BYTES,
+      spans: listing.spans,
+      follow: followOf(view, held.file, last === undefined ? 0 : last.from + last.held),
+    };
+    return insightCard(
+      "Transcript",
+      `${held.file} · ${sizeText(listing.bytes)}`,
+      transcriptBox(held.file, plan, `${fileChips(id, held.files, held.file)}${spanTrimNote(listing, held.records)}`),
+    );
+  }
   if (held.kind === "none") {
     return insightCard(
       "Transcript",
@@ -1606,7 +1662,8 @@ const transcriptCard = (view: SessionView): string => {
   }
   const listing = listedRuns(held.runs);
   const plan: Plan = {
-    path: `${sessionPath(id)}/${TRANSCRIPT_SEGMENT}`,
+    held: "bytes",
+    path,
     file: held.file,
     readable: listing.readable,
     step: TRANSCRIPT_STEP_BYTES,
@@ -1616,15 +1673,11 @@ const transcriptCard = (view: SessionView): string => {
   return insightCard(
     "Transcript",
     `${held.file} · ${sizeText(held.bytes)}`,
-    `${fileChips(id, held.files, held.file)}${trimNote(listing, held.bytes)}${holeNote(listing)}
-<div class="scroller" id="tx" tabindex="0" aria-label="Transcript">
-<p class="txtop"><button type="button" id="txmore">Load earlier</button></p>
-<ol class="turns" id="txlist" role="list"></ol></div>
-<p class="txnote" id="txnote">Reading ${escapeHtml(held.file)}…</p>
-<p class="txnote" id="txtail"></p>
-<noscript><p class="callout">The transcript is read by the browser straight off the archive, so this box stays empty while scripts are off.</p></noscript>
-<script type="application/json" id="txplan">${planJson(plan)}</script>
-<script src="${TRANSCRIPT_SCRIPT_PATH}" defer></script>`,
+    transcriptBox(
+      held.file,
+      plan,
+      `${fileChips(id, held.files, held.file)}${trimNote(listing, held.bytes)}${holeNote(listing)}`,
+    ),
   );
 };
 
