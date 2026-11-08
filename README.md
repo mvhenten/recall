@@ -210,7 +210,7 @@ Delivery rides on Claude Code's cross-session inbox, which sits behind the serve
 
 The mailbox is a Durable Object, one per account, and a message carries at most 32 KiB. It stores no message at all, so there is nothing to cap and nothing to expire: a send pushes to the sockets attached at that moment, and the only thing the mailbox holds is the order it is waiting on, in the memory of the isolate the send is running in. Its durable storage holds nothing at all, and it keeps no alarm. A revoked device loses its sockets as it loses its login.
 
-Durable Objects run on the Workers Free plan, which allows 100,000 Durable Object requests a day; every send, push, receipt and reconnect counts against it.
+Each account is served by two Durable Objects: the mailbox, which stores nothing, and the object holding the account's own rows. Every send, push, receipt and reconnect is a request against the first. Every reading or writing of those rows is a request against the second — an API call, a dashboard page, an MCP tool call, an index pass — while the paths that touch no row of theirs are answered in the Worker and cost nothing: the bus, the artifacts collection, and the bytes of one stretch off the archive. The second object stores in SQLite, so the rows it reads and the rows it writes count against budgets of their own, which the mailbox never touched. The Workers Free plan allows 100,000 Durable Object requests a day.
 
 ### The board
 

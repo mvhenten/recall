@@ -418,6 +418,20 @@ export interface TenantApi {
   index(env: TenantEnv, userId: string, sessionId: string): Promise<boolean>;
 }
 
+// The artifacts collection, which the Worker answers for itself. Its rows are the account's and
+// its bytes are R2's, so nothing it does reads a row the tenant object holds, and a publish routed
+// through the object would stream a multipart body Worker to object to R2 for no gain.
+export interface AccountApi {
+  artifacts(
+    request: Request,
+    url: URL,
+    db: D1Database,
+    caller: Caller,
+    rawName: string | undefined,
+    rest: readonly string[],
+  ): Promise<Response>;
+}
+
 type Refusal = (status: number, title: string, text: string) => Response;
 
 const json = (body: unknown, status = 200, headers?: HeadersInit): Response => Response.json(body, { status, headers });
@@ -657,7 +671,82 @@ const dashboardAsk = (request: Request, url: URL): DashboardAsk => {
   };
 };
 
-export const createTenant = (deps: TenantDeps): TenantApi => {
+// One stretch stored gzipped, handed over as it stands. A gzip member has no inner range, so the
+// manifest never splits a read of one and the whole object is the answer: the browser inflates it,
+// which leaves this reading no byte of the archive to touch and puts under a third of them on the
+// wire. This route sits behind the Access assertion, so every reader of it is a browser and every
+// browser takes gzip — `fetch` cannot drop the header — and the member goes over as it is.
+const compressedStretch = async (
+  request: Request,
+  bucket: R2Bucket,
+  userId: string,
+  sessionId: string,
+  file: string,
+  name: string,
+  inflates: number,
+): Promise<Response> => {
+  if (request.headers.get("range") !== null) {
+    return error(416, `the stretch at ${name} is one gzip member, so it is read whole, as ${inflates} bytes`);
+  }
+  const object = await openStretch(bucket, userId, sessionId, file, name);
+  if (object === null) {
+    return error(404, `the archive holds no stretch of ${file} at ${name} of session ${sessionId}`);
+  }
+  return new Response(object.body, {
+    headers: {
+      "content-type": "application/x-ndjson",
+      "cache-control": "no-store",
+      "content-encoding": "gzip",
+    },
+  });
+};
+
+// The bytes of one stretch, streamed as they come off the archive. The key is built from the user
+// the Access assertion resolved to, so a caller reaches nothing outside its own prefix, and the
+// range is the browser's to choose: this reads no listing, joins no stretches and parses nothing,
+// which is the whole of why the window the reader sees is the browser's own business.
+//
+// It is answered in the Worker because it reads the archive and nothing else. A reader scrolling a
+// long transcript sends thousands of these, and routing each through the tenant object would buy
+// nothing it does not already have.
+const transcriptBytes = async (
+  request: Request,
+  url: URL,
+  bucket: R2Bucket,
+  userId: string,
+  rawSessionId: string,
+): Promise<Response> => {
+  const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
+  if (!session.ok) return error(400, session.error);
+  const file = parseTranscriptFile(url.searchParams.get("file"));
+  if (!file.ok) return error(400, file.error);
+  const at = parseStretchName(url.searchParams.get("at"));
+  if (!at.ok) return error(400, at.error);
+  const packed = packedStretch(at.value);
+  if (packed !== null) {
+    return compressedStretch(request, bucket, userId, session.value, file.value, at.value, packed.inflates);
+  }
+  const asked = parseByteRange(request.headers.get("range"));
+  if (!asked.ok) return error(416, asked.error);
+  const { offset, length } = asked.value;
+  const object = await openStretch(bucket, userId, session.value, file.value, at.value, { offset, length });
+  if (object === null) {
+    return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
+  }
+  if (offset + length > object.size) {
+    return error(416, `the stretch at ${at.value} holds ${object.size} bytes`);
+  }
+  return new Response(object.body, {
+    status: 206,
+    headers: {
+      "content-type": "application/x-ndjson",
+      "cache-control": "no-store",
+      "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
+    },
+  });
+};
+
+export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const devices = async (
     request: Request,
     env: TenantEnv,
@@ -1182,7 +1271,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // under is the dashboard's own notice; a private artifact of another account resolves to
   // neither, so the reader learns nothing about it.
   const shareTarget = async (
-    db: SqlDb,
+    db: D1Database,
     url: URL,
     userId: string,
     email: string,
@@ -1247,7 +1336,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   const sharesTab = async (
     request: Request,
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     email: string,
     live: Live,
@@ -1270,7 +1359,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // redirect: the response carries the page, because a minted address exists on that one response
   // and nowhere else.
   const shareMutation = async (
-    db: SqlDb,
+    db: D1Database,
     host: ArtifactSurface,
     record: ArtifactRecord,
     shares: ShareView[],
@@ -1374,7 +1463,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   const sharesPost = async (
     request: Request,
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     email: string,
     live: Live,
@@ -1554,77 +1643,6 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     return { kind: "read", file, files, bytes: archive.bytes, runs: archive.runs };
   };
 
-  // One stretch stored gzipped, handed over as it stands. A gzip member has no inner range, so the
-  // manifest never splits a read of one and the whole object is the answer: the browser inflates
-  // it, which leaves this reading no byte of the archive to touch and puts under a third of them on
-  // the wire. This route sits behind the Access assertion, so every reader of it is a browser and
-  // every browser takes gzip — `fetch` cannot drop the header — and the member goes over as it is.
-  const compressedStretch = async (
-    request: Request,
-    env: TenantEnv,
-    userId: string,
-    sessionId: string,
-    file: string,
-    name: string,
-    inflates: number,
-  ): Promise<Response> => {
-    if (request.headers.get("range") !== null) {
-      return error(416, `the stretch at ${name} is one gzip member, so it is read whole, as ${inflates} bytes`);
-    }
-    const object = await openStretch(env.TRANSCRIPTS, userId, sessionId, file, name);
-    if (object === null) {
-      return error(404, `the archive holds no stretch of ${file} at ${name} of session ${sessionId}`);
-    }
-    return new Response(object.body, {
-      headers: {
-        "content-type": "application/x-ndjson",
-        "cache-control": "no-store",
-        "content-encoding": "gzip",
-      },
-    });
-  };
-
-  // The bytes of one stretch, streamed as they come off the archive. The key is built from the
-  // user the Access assertion resolved to, so a caller reaches nothing outside its own prefix, and
-  // the range is the browser's to choose: this reads no listing, joins no stretches and parses
-  // nothing, which is the whole of why the window the reader sees is the browser's own business.
-  const transcriptBytes = async (
-    request: Request,
-    url: URL,
-    env: TenantEnv,
-    userId: string,
-    rawSessionId: string,
-  ): Promise<Response> => {
-    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!session.ok) return error(400, session.error);
-    const file = parseTranscriptFile(url.searchParams.get("file"));
-    if (!file.ok) return error(400, file.error);
-    const at = parseStretchName(url.searchParams.get("at"));
-    if (!at.ok) return error(400, at.error);
-    const packed = packedStretch(at.value);
-    if (packed !== null) {
-      return compressedStretch(request, env, userId, session.value, file.value, at.value, packed.inflates);
-    }
-    const asked = parseByteRange(request.headers.get("range"));
-    if (!asked.ok) return error(416, asked.error);
-    const { offset, length } = asked.value;
-    const object = await openStretch(env.TRANSCRIPTS, userId, session.value, file.value, at.value, { offset, length });
-    if (object === null) {
-      return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
-    }
-    if (offset + length > object.size) {
-      return error(416, `the stretch at ${at.value} holds ${object.size} bytes`);
-    }
-    return new Response(object.body, {
-      status: 206,
-      headers: {
-        "content-type": "application/x-ndjson",
-        "cache-control": "no-store",
-        "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
-      },
-    });
-  };
-
   // Whether anyone is still running the session, and the stretches of its file around and past
   // where the reader has read. A box following a live session beats against this, so it answers
   // off the cheapest readings there are: the extent the storage event caches says whether the
@@ -1763,7 +1781,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
 
   const insightsTab = async (
     db: SqlDb,
-    account: SqlDb,
+    account: D1Database,
     userId: string,
     email: string,
     live: Live,
@@ -1814,7 +1832,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
 
   const memoryBody = async (
     rawName: string,
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     email: string,
     live: Live,
@@ -1829,7 +1847,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // One page of the shelf's rows and the counts the chips and the heading print. No bytes are read
   // and the bucket is not listed.
   const artifactRows = async (
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     input: ArtifactListInput,
     cursor: Cursor,
@@ -1853,7 +1871,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // by name rather than read per row, so the read is bounded by the page and not by the account.
   // Where sharing is off it does not run at all and every count is zero.
   const shelfFor = async (
-    db: SqlDb,
+    db: D1Database,
     host: ArtifactSurface,
     userId: string,
     input: ArtifactListInput,
@@ -1882,7 +1900,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // publishing and unpublishing stay with `recall publish` and `recall unpublish`.
   const artifactsTab = async (
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     email: string,
     live: Live,
@@ -1900,7 +1918,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
 
   const memoryTab = async (
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     email: string,
     live: Live,
@@ -1932,7 +1950,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     return memorySearchPage(email, live, url, filter, counts, found, now);
   };
 
-  const save = async (request: Request, db: SqlDb, userId: string, name: string): Promise<Response> => {
+  const save = async (request: Request, db: D1Database, userId: string, name: string): Promise<Response> => {
     const input = parseSave(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
@@ -1967,7 +1985,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // publish under it. A caller who does mean to replace reaches the account-readable one, and the
   // write permission decides whether they may.
   const writeTarget = async (
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     name: string,
     replacing: boolean,
@@ -2002,7 +2020,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   const publish = async (
     request: Request,
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     host: ArtifactSurface,
     caller: Caller,
     name: string,
@@ -2085,7 +2103,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     return json({ artifact: viewOf(host, saved, shares), ownedByAnother: owner !== caller.userId });
   };
 
-  const unpublish = async (db: SqlDb, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
+  const unpublish = async (db: D1Database, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
     const target = await writeTarget(db, caller.userId, name, true);
     if (target instanceof Response) return target;
     if (target === null) {
@@ -2103,7 +2121,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
 
   const artifactsListing = async (
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     host: ArtifactSurface,
     userId: string,
     now: number,
@@ -2131,7 +2149,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // How many live shares one artifact holds, read for its owner alone: an account reading somebody
   // else's account-readable artifact learns nothing about who else holds a share on it.
   const sharesHeld = async (
-    db: SqlDb,
+    db: D1Database,
     host: ArtifactSurface,
     record: ArtifactRecord,
     userId: string,
@@ -2165,7 +2183,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   const artifactShareRoutes = async (
     request: Request,
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     host: ArtifactSurface,
     userId: string,
     name: string,
@@ -2240,7 +2258,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   const artifacts = async (
     request: Request,
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     caller: Caller,
     rawName: string | undefined,
     rest: readonly string[],
@@ -2291,7 +2309,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     return json({ artifact: viewOf(host, record, await sharesHeld(db, host, record, userId, now)) });
   };
 
-  const list = async (url: URL, db: SqlDb, userId: string): Promise<Response> => {
+  const list = async (url: URL, db: D1Database, userId: string): Promise<Response> => {
     const input = parseList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
@@ -2300,7 +2318,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   };
 
   const vectorRankings = async (
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
@@ -2318,7 +2336,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   };
 
   const textRankings = async (
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
@@ -2331,7 +2349,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     };
   };
 
-  const rank = async (db: SqlDb, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
+  const rank = async (db: D1Database, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
     if (input.mode === "vector") return vectorRankings(db, userId, input, types);
     if (input.mode === "text") {
       const text = await textRankings(db, userId, input, types);
@@ -2348,7 +2366,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     };
   };
 
-  const hits = async (db: SqlDb, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
+  const hits = async (db: D1Database, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
     const top = ranking.slice(0, limit);
     if (top.length === 0) return [];
     const described = await describeMemories(
@@ -2366,7 +2384,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // What a query finds: the memories in scope of its tags, and the ones it would have found had the
   // tags not been named. Both surfaces rank the same way and differ only in how they write a hit.
   const ranked = async (
-    db: SqlDb,
+    db: D1Database,
     userId: string,
     input: SearchInput,
   ): Promise<{ shown: MemoryHit[]; nearby: MemoryHit[] }> => {
@@ -2378,7 +2396,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     return { shown, nearby };
   };
 
-  const searched = async (db: SqlDb, userId: string, input: SearchInput): Promise<unknown> => {
+  const searched = async (db: D1Database, userId: string, input: SearchInput): Promise<unknown> => {
     const { shown, nearby } = await ranked(db, userId, input);
     const elsewhere = nearby.map(({ memory, score }) => ({
       score,
@@ -2390,13 +2408,13 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     return { hits: shown, elsewhere };
   };
 
-  const search = async (request: Request, db: SqlDb, userId: string): Promise<Response> => {
+  const search = async (request: Request, db: D1Database, userId: string): Promise<Response> => {
     const parsed = parseSearch(await readJson(request));
     if (!parsed.ok) return error(400, parsed.error);
     return json(await searched(db, userId, parsed.value));
   };
 
-  const v2MemoriesList = async (url: URL, db: SqlDb, caller: Caller): Promise<Response> => {
+  const v2MemoriesList = async (url: URL, db: D1Database, caller: Caller): Promise<Response> => {
     const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
     const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
@@ -2405,14 +2423,14 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     return json({ memories: page.memories.map(memoryView), nextCursor: page.nextCursor });
   };
 
-  const v2MemorySearch = async (request: Request, db: SqlDb, caller: Caller): Promise<Response> => {
+  const v2MemorySearch = async (request: Request, db: D1Database, caller: Caller): Promise<Response> => {
     const input = parseSearchMemories(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const { shown, nearby } = await ranked(db, caller.userId, input.value);
     return json({ hits: shown.map(memoryHitView), elsewhere: nearby.map(nearbyMemoryView) });
   };
 
-  const v2MemorySave = async (request: Request, db: SqlDb, caller: Caller, name: string): Promise<Response> => {
+  const v2MemorySave = async (request: Request, db: D1Database, caller: Caller, name: string): Promise<Response> => {
     const input = parseSaveMemory(await readJson(request));
     if (!input.ok) return error(400, input.error);
     const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
@@ -2424,7 +2442,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   // Recalling a memory is a write, so it is a POST and the GET beside it is a read and nothing
   // more. `/v1` folded the two into one GET behind a query parameter, which left every reader of a
   // memory deciding whether it meant to count as one.
-  const v2MemoryRecall = async (db: SqlDb, caller: Caller, name: string): Promise<Response> => {
+  const v2MemoryRecall = async (db: D1Database, caller: Caller, name: string): Promise<Response> => {
     const memory = await getMemory(db, caller.userId, name);
     if (!memory) return error(404, `no memory named ${name}`);
     const [recalled] = await recall(db, caller.userId, [memory.memoryId], deps.now());
@@ -2437,7 +2455,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
   const v2Memories = async (
     request: Request,
     url: URL,
-    db: SqlDb,
+    db: D1Database,
     caller: Caller,
     rawName: string | undefined,
     word: string | undefined,
@@ -2948,16 +2966,10 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
       dashboardNotice(status, title, text, "Back to the dashboard");
     const { tab, segments, rawSessionId, bytes, shareName, saving } = dashboardAsk(request, url);
     if (saving) return saveLabels(request, url, db, userId, lost);
-    // A ranged read renders no page, so it does not pay for the tally a page carries in its
-    // header: a scroll back through a long transcript is thousands of them, and a write batch
-    // apiece would be the whole cost of reading one. A box following a live session beats against
-    // the same route, and `from` is what tells the two apart: it asks how far the file now reaches
-    // rather than for the bytes of one stretch named in the manifest.
-    if (bytes) {
-      return url.searchParams.has("from")
-        ? transcriptTail(url, env, userId, rawSessionId)
-        : transcriptBytes(request, url, env, userId, rawSessionId);
-    }
+    // A read of the tail renders no page, so it does not pay for the tally a page carries in its
+    // header. It reads this tenant's rows for how far the file now reaches, which is what keeps it
+    // here while the bytes of a named stretch are answered in the Worker off the archive alone.
+    if (bytes) return transcriptTail(url, env, userId, rawSessionId);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (shareName !== null) {
@@ -3006,7 +3018,6 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
     }
     const { userId } = caller;
     const account = env.ACCOUNT;
-    if (collection === "artifacts") return artifacts(request, url, account, caller, rawName, rest);
     if (collection === "search" && rawName === undefined) {
       return request.method === "POST" ? search(request, account, userId) : error(405, "method not allowed");
     }
@@ -3048,7 +3059,6 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
       if (rawName !== undefined) return error(404, "not found");
       return v2History(request, url, db, caller);
     }
-    if (collection === "artifacts") return artifacts(request, url, env.ACCOUNT, caller, rawName, rest);
     if (collection === "memories") return v2Memories(request, url, env.ACCOUNT, caller, rawName, rest[0]);
     if (collection !== "messages") return error(404, "not found");
     if (rawName !== undefined) return error(404, "not found");
@@ -3064,6 +3074,7 @@ export const createTenant = (deps: TenantDeps): TenantApi => {
         : routeV1(request, url, env, caller, collection, rawName, rest);
     },
     dashboard,
+    artifacts,
     tool(made: ToolCall, env: TenantEnv, caller: Caller): Promise<ToolResult> {
       return runTool(env, caller)(made);
     },
@@ -3505,6 +3516,22 @@ export const createApp = (deps: Deps): App => {
       return (made: ToolCall): Promise<ToolResult> => tenant.tool(made, caller, handed());
     });
 
+  // The half the Worker answers out of itself, for the paths that read no tenant row. Its clock is
+  // a function rather than a moment, so one of these serves every request the Worker takes.
+  const account = createTenant({
+    embedder: deps.embedder,
+    artifacts:
+      deps.artifactHost === null
+        ? null
+        : {
+            hostname: deps.artifactHost.hostname,
+            bucket: deps.artifactHost.bucket,
+            dashboard: deps.artifactHost.dashboard,
+            sharing: deps.artifactHost.sharing !== null,
+          },
+    now: deps.now,
+  });
+
   // What a tenant object is handed on every call: the clock the Worker read, the embedder it was
   // built with, and the artifact surface of this deployment. They are built once, here, so the
   // object has nothing of its own to construct and nothing to disagree with the Worker about.
@@ -3526,7 +3553,7 @@ export const createApp = (deps: Deps): App => {
       dashboardNotice(status, title, text, "Back to the dashboard");
     const signIn = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Sign in again");
-    const { saving, posting, sending, sharing } = dashboardAsk(request, url);
+    const { saving, posting, sending, sharing, bytes, rawSessionId } = dashboardAsk(request, url);
     if (request.method !== "GET" && !saving && !posting && !sending && !sharing) {
       return lost(
         405,
@@ -3538,6 +3565,12 @@ export const createApp = (deps: Deps): App => {
     if (email instanceof Response) return email;
     const userId = await invited(env.DB, email, signIn);
     if (userId instanceof Response) return userId;
+    // The bytes of one named stretch come off the archive and read no row at all, so they are
+    // answered here rather than one round trip into the object apiece. `from` asks how far the
+    // file now reaches, which is a row this tenant holds, so that one goes on to the object.
+    if (bytes && !url.searchParams.has("from")) {
+      return transcriptBytes(request, url, env.TRANSCRIPTS, userId, rawSessionId);
+    }
     return tenantOf(env, userId).dashboard(request, userId, email, handed());
   };
 
@@ -3573,6 +3606,7 @@ export const createApp = (deps: Deps): App => {
       }
       return listen(request, env, caller);
     }
+    if (collection === "artifacts") return account.artifacts(request, url, env.DB, caller, rawName, rest);
     return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 
@@ -3621,6 +3655,7 @@ export const createApp = (deps: Deps): App => {
       }
       return listen(request, env, caller);
     }
+    if (collection === "artifacts") return account.artifacts(request, url, env.DB, caller, rawName, rest);
     return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 

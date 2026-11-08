@@ -41,7 +41,6 @@
 // standing ahead of the objects where one of them is lost outright. Nothing derived is ever asked
 // a question the objects can answer, so every reading that must not lag lists them.
 
-// The largest stretch one call may carry. A transcript of any size lands as a run of these.
 import type { SqlDb, SqlStatement } from "./tenant-sql";
 import {
   compressedStretchName,
@@ -53,6 +52,7 @@ import {
   stretchName,
 } from "./transcript-plan";
 
+// The largest stretch one call may carry. A transcript of any size lands as a run of these.
 export const MAX_STRETCH_BYTES = 1_048_576;
 
 // The name a session's own transcript is held under. Every other name is a delegated turn, which

@@ -1,11 +1,16 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { endSession, putSession } from "../src/store";
-import { tenantSql } from "../src/tenant-sql";
+import type { HistoryInput } from "../src/model";
+import { chunkMatches, endSession, putSession, searchSessionHistory } from "../src/store";
+import { type SqlDb, tenantSql } from "../src/tenant-sql";
 import { tenantRows } from "./harness";
 
 const storeOf = (userId: string) => env.TENANT.get(env.TENANT.idFromName(userId));
+
+// One account's own store, handed to the shipped reader as the tenant object hands it over.
+const inStore = <T>(userId: string, read: (db: SqlDb) => Promise<T>): Promise<T> =>
+  runInDurableObject(storeOf(userId), (_instance, state) => read(tenantSql(state.storage)));
 
 const caller = (userId: string) => ({ userId, deviceId: "device-1", name: "laptop", host: "laptop" });
 
@@ -40,10 +45,27 @@ const HISTORY_INSERT = `INSERT INTO session_history (user_id, session_id, device
    branch, commit_subject, started_at, last_activity_at, prompts, focus_first, focus_latest, mode, agent_name)
  VALUES (?1, ?2, 'device-1', 'laptop', 'laptop', '/x', 'repo', 'main', ?5, 1, 2, 3, ?3, ?4, 'interactive', ?6)`;
 
-const RANKED = `SELECT h.session_id FROM session_history h
-   JOIN session_history_fts f ON f.session_id = h.session_id AND f.user_id = h.user_id
-   WHERE session_history_fts MATCH ?2 AND h.user_id = ?1
-   ORDER BY bm25(session_history_fts), h.session_id`;
+const FILTER: HistoryInput = { host: "", repo: "", cursor: "", limit: 10, sort: "", query: "" };
+
+const NOW = 1_700_000_120_000;
+
+// The prose one session's chunks hold, for the same corpus in both stores. `session_chunks_fts` is
+// an external-content table: it holds no copy of a chunk and its terms are the insert trigger's to
+// write, so a store that carried the table and lost the trigger ranks nothing at all.
+const CHUNKS: ReadonlyArray<readonly [number, string, string, string]> = [
+  [1, "s-1", "user", "rank the chunks a search reads before it bounds the vector scan"],
+  [2, "s-1", "model", "the vector scan is bounded by the chunks the search ranks"],
+  [3, "s-2", "user", "move the board into the object and rank the board"],
+  [4, "s-3", "model", "write the migration once and scan the archive twice"],
+  [5, "s-3", "user", "scan the archive for a migration it never wrote"],
+];
+
+const CHUNK_QUERIES = ["rank", "scan", "board OR migration", "vector AND scan", "archive"];
+
+const CHUNK_INSERT = `INSERT INTO session_chunks (chunk_seq, user_id, session_id, ordinal, speaker, text, embedding, at)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)`;
+
+const EMBEDDING = new ArrayBuffer(4);
 
 describe("the tenant store", () => {
   it("takes a whole batch back when one statement of it fails", async () => {
@@ -116,10 +138,24 @@ describe("the tenant store", () => {
       await tenantRows(userId, HISTORY_INSERT, userId, sessionId, first, latest, subject, agent);
     }
     for (const query of QUERIES) {
-      const d1 = await env.DB.prepare(RANKED).bind(userId, query).all<{ session_id: string }>();
-      const object = await tenantRows<{ session_id: string }>(userId, RANKED, userId, query);
-      expect(d1.results.map((row) => row.session_id)).not.toEqual([]);
-      expect(object.map((row) => row.session_id)).toEqual(d1.results.map((row) => row.session_id));
+      const d1 = await searchSessionHistory(env.DB, userId, FILTER, query, FILTER.limit, NOW);
+      const object = await inStore(userId, (db) => searchSessionHistory(db, userId, FILTER, query, FILTER.limit, NOW));
+      expect(d1.sessions).not.toEqual([]);
+      expect(object).toEqual(d1);
+    }
+  });
+
+  it("ranks a chunk search the way D1 ranks it", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    for (const [chunkSeq, sessionId, speaker, text] of CHUNKS) {
+      await env.DB.prepare(CHUNK_INSERT).bind(chunkSeq, userId, sessionId, chunkSeq, speaker, text, EMBEDDING).run();
+      await tenantRows(userId, CHUNK_INSERT, chunkSeq, userId, sessionId, chunkSeq, speaker, text, EMBEDDING);
+    }
+    for (const query of CHUNK_QUERIES) {
+      const d1 = await chunkMatches(env.DB, userId, query, 10);
+      const object = await inStore(userId, (db) => chunkMatches(db, userId, query, 10));
+      expect(d1).not.toEqual([]);
+      expect(object).toEqual(d1);
     }
   });
 });

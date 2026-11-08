@@ -215,12 +215,9 @@ describe("session history", () => {
         client.userId,
         "SELECT branch, prompts, focus_latest FROM session_history WHERE session_id = 'resynced-session'",
       );
-    const results = [...(await history(laptop)), ...(await history(stranger))].sort((left, right) =>
-      String(left.branch).localeCompare(String(right.branch)),
-    );
-    expect(results).toEqual([
-      { branch: "feat/session-history", prompts: 9, focus_latest: "ship it" },
-      expect.objectContaining({ branch: "feat/stranger-session" }),
+    expect(await history(laptop)).toEqual([{ branch: "feat/session-history", prompts: 9, focus_latest: "ship it" }]);
+    expect(await history(stranger)).toEqual([
+      { branch: "feat/stranger-session", prompts: 3, focus_latest: "why is the worker test red" },
     ]);
   });
 
