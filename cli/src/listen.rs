@@ -378,10 +378,17 @@ fn archive(
     }
 }
 
+/// The floor the debounce never drops below, whatever the archive interval scales it down to.
+pub const MIN_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// How long a write waits for the writes behind it. A turn lands as a run of lines and a persisted
 /// tool output as a run of blocks, so a pass per event would send one file a dozen times over
-/// where a single pass carries all of it.
-pub const DEBOUNCE: Duration = Duration::from_millis(500);
+/// where a single pass carries all of it. Scaled off the archive interval rather than fixed, so a
+/// host that set a short interval because it wants its lines up sooner is not undercut by a
+/// debounce that outlasts the interval it configured.
+pub fn debounce(every: Duration) -> Duration {
+    MIN_DEBOUNCE.max(every / 4)
+}
 
 /// What a pass over the live transcripts runs on.
 enum Woken {
@@ -451,7 +458,7 @@ async fn archive_loop(
     mut watch: Option<watch::Watch>,
     mut wake: UnboundedReceiver<()>,
 ) {
-    wake_loop(every, DEBOUNCE, &mut wake, async || {
+    wake_loop(every, debounce(every), &mut wake, async || {
         let live = sessions::transcript_paths(&sessions_dir);
         if let Some(watch) = watch.as_mut() {
             for unwatched in watch.sync(&watched(&live)) {
@@ -1035,7 +1042,7 @@ mod tests {
             wake.send(()).unwrap();
         }
 
-        let _ = tokio::time::timeout(every / 2, wake_loop(every, DEBOUNCE, &mut woken, pass)).await;
+        let _ = tokio::time::timeout(every / 2, wake_loop(every, debounce(every), &mut woken, pass)).await;
 
         assert_eq!(
             ran.load(Ordering::Acquire),
@@ -1052,7 +1059,11 @@ mod tests {
         let (ran, pass) = passes();
         let (_wake, mut woken) = watch::wake();
 
-        let _ = tokio::time::timeout(every * 3 + every / 2, wake_loop(every, DEBOUNCE, &mut woken, pass)).await;
+        let _ = tokio::time::timeout(
+            every * 3 + every / 2,
+            wake_loop(every, debounce(every), &mut woken, pass),
+        )
+        .await;
 
         assert_eq!(
             ran.load(Ordering::Acquire),
@@ -1067,15 +1078,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_write_pushes_the_beat_out_rather_than_adding_a_pass_to_it() {
         let every = Duration::from_secs(10);
+        let debounce = debounce(every);
         let (ran, pass) = passes();
         let (wake, mut woken) = watch::wake();
         tokio::spawn(async move {
-            tokio::time::sleep(every - DEBOUNCE * 2).await;
+            tokio::time::sleep(every - debounce * 2).await;
             wake.send(()).unwrap();
             std::future::pending::<()>().await;
         });
 
-        let _ = tokio::time::timeout(every + every / 2, wake_loop(every, DEBOUNCE, &mut woken, pass)).await;
+        let _ = tokio::time::timeout(every + every / 2, wake_loop(every, debounce, &mut woken, pass)).await;
 
         assert_eq!(
             ran.load(Ordering::Acquire),
