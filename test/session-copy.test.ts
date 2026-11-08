@@ -103,8 +103,9 @@ const tenantChunks = (userId: string): Promise<D1Chunk[]> =>
     userId,
   );
 
-const copyFrom = async (client: Client, after: number): Promise<SessionCopyReport> => {
-  const response = await client.request("POST", `/v1/sessions/copy?after=${after}`);
+const copyFrom = async (client: Client, after: number, metadata = false): Promise<SessionCopyReport> => {
+  const flag = metadata ? "&metadata=complete" : "";
+  const response = await client.request("POST", `/v1/sessions/copy?after=${after}${flag}`);
   expect(response.status).toBe(200);
   const report: SessionCopyReport = await response.json();
   // Every corpus a test writes is well inside one call's budget, so a run that did not reach the
@@ -220,12 +221,12 @@ describe("copying the sessions an account held before they moved", () => {
     expect(again.checks.ok).toBe(true);
     expect(await tenantChunks(client.userId)).toEqual(after);
 
-    // A call carrying on from a frontier leaves the metadata alone rather than reading every table
-    // of D1 and attempting an insert per row again: `usage_events` is one row per event of every
-    // session the account ever ran, and doing that on each of a long run's calls would spend the
-    // budget re-conflicting what the opening call already wrote. `held: 0` is the read that did
-    // not happen; the counts beside it are still taken.
-    const carried = await copyFrom(client, after[0]?.chunk_seq ?? 1);
+    // A call told a call of its own run already wrote the metadata leaves it alone rather than
+    // reading every table of D1 and attempting an insert per row again: `usage_events` is one row
+    // per event of every session the account ever ran, and doing that on each of a long run's
+    // calls would spend the budget re-conflicting what the opening call already wrote. `held: 0`
+    // is the read that did not happen; the counts beside it are still taken.
+    const carried = await copyFrom(client, after[0]?.chunk_seq ?? 1, true);
     for (const row of carried.tables) {
       if (row.table === "chunks") continue;
       expect([row.table, row.copied, row.held]).toEqual([row.table, 0, 0]);
@@ -233,6 +234,45 @@ describe("copying the sessions an account held before they moved", () => {
     }
     expect(carried.checks.short).toEqual([]);
     expect(await tenantChunks(client.userId)).toEqual(after);
+  });
+
+  // The call that opens a run writes the metadata whatever it is told about the prose, because
+  // nothing the object holds can say whether an earlier call got through it. The object writes its
+  // own rows into these tables after the cutover, so one it has outgrown D1 on answers
+  // `tenant >= account` having never been copied into — and a continuation reading that as done
+  // would leave every row of it in D1 while the run reported itself verified.
+  it("writes the metadata on an opening call against a table the object has outgrown", async () => {
+    const h = await harness();
+    const client = await owner(h);
+    const sessionId = crypto.randomUUID();
+    const mine = crypto.randomUUID();
+    await seedSession(client.userId, sessionId, "rebuild the archive reader", true);
+    await env.DB.prepare(INSERT_COUNTED).bind(client.userId, sessionId).run();
+    // What the object counted for itself since the cutover, which outnumbers the one row D1 holds.
+    for (const file of ["main", "agent-a", "agent-b"]) {
+      await tenantRows(
+        client.userId,
+        "INSERT INTO counted_files (user_id, session_id, file) VALUES (?1, ?2, ?3)",
+        client.userId,
+        mine,
+        file,
+      );
+    }
+
+    // An opening call, however far along the prose it is told to start: the metadata is written.
+    const opened = await copyFrom(client, 99_999_999);
+    expect(tallyOf(opened, "countedFiles")).toEqual({ copied: 1, held: 0 });
+    expect(opened.metadata).toEqual({ complete: true });
+    const counted = await tenantRows<{ n: number }>(
+      client.userId,
+      "SELECT count(*) AS n FROM counted_files WHERE user_id = ?1",
+      client.userId,
+    );
+    expect(counted[0]?.n).toBe(4);
+
+    // And a call carrying the flag leaves it, which is the only thing that makes it skippable.
+    const carried = await copyFrom(client, 99_999_999, true);
+    expect(tallyOf(carried, "countedFiles")).toEqual({ copied: 0, held: 0 });
   });
 
   // What one call cannot account for, and why the script adds a run up rather than reading the

@@ -83,8 +83,14 @@ if (token === "") die(`this host is not signed in to ${endpoint}; run recall log
 
 const some = (list) => (list.length === 0 ? "none" : list.join(", "));
 
-const call = async (after) => {
-  const response = await fetch(`${endpoint}/v1/sessions/copy?after=${after}`, {
+// One call, told where to open the prose and whether a call of this run has already written every
+// table but it. Only a report says the second: the tables are written before a response is built,
+// so a call that answered at all got to the end of them, and no count of the object could stand in
+// — it holds the rows it wrote after the cutover beside the copied ones. A run that opens without
+// the flag writes them once more, which is what finishes a call that died in the middle.
+const call = async (after, metadata) => {
+  const flag = metadata ? "&metadata=complete" : "";
+  const response = await fetch(`${endpoint}/v1/sessions/copy?after=${after}${flag}`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
     signal: AbortSignal.timeout(600_000),
@@ -106,10 +112,14 @@ const call = async (after) => {
 const run = { walked: 0, copied: 0, missing: 0, embeddings: [], moved: 0, shifted: 0, calls: 0 };
 
 let after = opened;
-let report = await call(after);
+// The opening call of this process writes the metadata however it was invoked, so an interrupted
+// run picked up with --after finishes whatever the call that died left half-written.
+let report = await call(after, false);
 // Which sessions both stores held is a thing only the call that opened the run could see, so it
-// is kept here rather than read off the last one.
+// is kept here rather than read off the last one. The tables it wrote are kept for the same
+// reason: a continuation is handed no rows to tally.
 const straddling = report.straddling;
+const written = report.tables;
 for (;;) {
   const { chunks } = report;
   run.calls += 1;
@@ -122,16 +132,19 @@ for (;;) {
   if (chunks.done) break;
   say(`${report.userId}: ${chunks.copied} chunks this call, up to chunk_seq ${chunks.frontier}`);
   after = chunks.frontier;
-  report = await call(after);
+  report = await call(after, report.metadata.complete);
 }
 
 const { userId, chunks, checks } = report;
-if (run.calls > 1) say(`${userId}: the prose took ${run.calls} calls; the tables below are the last of them`);
+const wroteOf = (table) => written.find((row) => row.table === table) ?? { copied: 0, held: 0 };
+if (run.calls > 1) say(`${userId}: the prose took ${run.calls} calls; the counts below are from the last of them`);
 
+// What was copied comes from the call that did the copying and what each store holds from the
+// last one, because a continuation writes no metadata and so tallies none.
 for (const row of report.tables) {
-  const walked = row.table === "chunks" ? run.copied : row.copied;
+  const did = row.table === "chunks" ? { copied: run.copied, held: run.walked - run.copied } : wroteOf(row.table);
   say(
-    `${userId}: ${row.table}: copied ${walked}, left ${row.held} already held; ${row.account} in D1, ${row.tenant} in the object`,
+    `${userId}: ${row.table}: copied ${did.copied}, left ${did.held} already held; ${row.account} in D1, ${row.tenant} in the object`,
   );
 }
 say(`${userId}: tables the object is short of: ${some(checks.short)}`);

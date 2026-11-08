@@ -843,11 +843,15 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     //
     // `after` opens the walk of the prose where the call before it left off, so a corpus too big
     // for one request's budget is finished by calling again rather than by a run that restarts and
-    // re-reads what it already copied.
+    // re-reads what it already copied. `metadata=complete` says a call of the same run already
+    // wrote every table but the prose, which only a report of that call can tell the caller; left
+    // out, those tables are read and written again, which costs one pass and finishes a call that
+    // died in the middle of them.
     if (rawSessionId === "copy" && subresource === undefined && request.method === "POST") {
       const after = Number(url.searchParams.get("after") ?? "0");
       if (!Number.isSafeInteger(after) || after < 0) return error(400, "after must be a chunk_seq the copy reached");
-      return json(await copySessions(db, env.ACCOUNT, caller.userId, after));
+      const metadata = url.searchParams.get("metadata") === "complete";
+      return json(await copySessions(db, env.ACCOUNT, caller.userId, after, metadata));
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);

@@ -125,6 +125,13 @@ export interface SessionCopyReport {
   userId: string;
   // One per table the cutover moved, `session_chunks` last.
   tables: TableReport[];
+  // Whether every table but the prose has been read out of D1 and written, which this report
+  // existing is the proof of: the phase runs to its end before a response is built, so a call that
+  // died in the middle of it answered nothing at all. A continuation is handed this back and skips
+  // the phase on it. Nothing about the object says it — the object holds its own post-cutover rows
+  // beside the copied ones, so a count of either table is satisfied without a D1 row having
+  // crossed.
+  metadata: { complete: boolean };
   chunks: {
     // What this call walked of D1's prose. The two together are how much of it this call accounts
     // for, and summed over the run they are what says the whole corpus crossed — the object's own
@@ -529,12 +536,14 @@ const highestChunkSeq = async (db: AccountDb, userId: string): Promise<number> =
 // Running it again copies nothing: every row the object holds conflicts with itself and is left
 // standing, a chunk an earlier run brought over is found under the `chunk_seq` it came in with,
 // and the object's own chunks are already above D1's range and so move no second time. `after` is
-// where this call opens its walk of the prose, which is the frontier the call before it returned.
+// where this call opens its walk of the prose, which is the frontier the call before it returned,
+// and `metadataComplete` is what a call of the same run answered with before it.
 export const copySessions = async (
   tenant: TenantDb,
   account: AccountDb,
   userId: string,
   after: number,
+  metadataComplete: boolean,
 ): Promise<SessionCopyReport> => {
   const heldBefore = tenantSessionIds(tenant, userId);
   const fromD1 = await accountSessionIds(account, userId);
@@ -545,12 +554,19 @@ export const copySessions = async (
   // One table of D1 into the table of the object it became. `from`'s row type has to be one the
   // insert takes, which is what holds the two schemas to each other here rather than at the run.
   //
-  // The metadata is the opening call's work and a continuation only counts it. These tables are
-  // read whole and written a row at a time, and `usage_events` is one row per event of every
-  // session the account ever ran — doing that again on every call would have a long run spending
-  // its budget re-conflicting rows the first call wrote, which is the stall the frontier exists to
-  // remove. A continuation that finds a table short copies it after all, so an opening call that
-  // died part way through the metadata is finished rather than failing the run.
+  // The metadata is one call's work and the calls after it only count it. These tables are read
+  // whole and written a row at a time, and `usage_events` is one row per event of every session
+  // the account ever ran — doing that again on every call would have a long run spending its
+  // budget re-conflicting rows the first call wrote, which is the stall the frontier exists to
+  // remove.
+  //
+  // What says the phase is behind us is `metadataComplete`, which a caller only has because a call
+  // of this run answered with it, and a call only answers once the phase has run to its end. A
+  // count cannot stand in for it: the object holds its own post-cutover rows beside the copied
+  // ones, so `usage_daily`, `counted_files` or `session_history` can outnumber D1 on the object's
+  // own account and read as arrived having never been written to. Taken without the flag — a
+  // resumed `--after`, a hand-run call — the phase runs again, which costs one pass and is what
+  // finishes a call that died in the middle of it.
   const moved = async <A extends Owned, T extends Owned>(
     table: string,
     from: A & { $inferSelect: T["$inferInsert"] },
@@ -564,10 +580,7 @@ export const copySessions = async (
       account: await accountCount(account, from, userId),
       tenant: tenantCount(tenant, into, userId),
     });
-    if (after > 0) {
-      const standing = await counted(0, 0);
-      if (standing.tenant >= standing.account) return standing;
-    }
+    if (metadataComplete) return counted(0, 0);
     const rows = await allOf(account, from, userId, order);
     const copied = copyTable(tenant, into, rows);
     return counted(copied, rows.length - copied);
@@ -620,10 +633,12 @@ export const copySessions = async (
   const extra = [...heldAfter].filter((sessionId) => !fromD1.has(sessionId)).sort();
   const chunkIndex = indexIntegrity(tenant, sessionChunksFts, 1);
   const historyIndex = indexIntegrity(tenant, sessionHistoryFts, 0);
-  // A table the object holds fewer rows of than D1 did not arrive, whatever its tally said. The
-  // prose is not one of them: the object's chunk count holds what it indexed itself as well, so
-  // `tenant >= account` is satisfied by an account that was never copied into at all. How much of
-  // D1's prose the run walked is what accounts for it, and only the caller can add that up.
+  // A table the object holds fewer rows of than D1 did not arrive, whatever its tally said. It is
+  // a floor and not a proof, for the reason the prose is left out of it altogether: the object
+  // holds the rows it wrote after the cutover beside the copied ones, so a table it has outgrown
+  // D1 on satisfies `tenant >= account` whether or not a D1 row ever crossed. What carries the
+  // metadata is the phase having run to its end, which is `metadata.complete`; what carries the
+  // prose is the walk, which only the caller can add up over the run.
   const short = tables
     .filter((row) => row.table !== "chunks" && row.tenant < row.account)
     .map((row) => row.table)
@@ -632,6 +647,7 @@ export const copySessions = async (
   return {
     userId,
     tables,
+    metadata: { complete: true },
     chunks: {
       copied: chunks.copied,
       held: chunks.held,
