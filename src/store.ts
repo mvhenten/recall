@@ -1,5 +1,6 @@
 import { and, asc, count, desc, eq, getTableName, gt, gte, inArray, lt, lte, ne, or, type SQL, sql } from "drizzle-orm";
 import { type SQLiteColumn, type SQLiteTable, union, unionAll } from "drizzle-orm/sqlite-core";
+import type { ArtifactCopyReport } from "./artifact-copy";
 import {
   type ArtifactFile,
   type ArtifactListInput,
@@ -58,10 +59,12 @@ import {
   usageDay,
   usageDayStart,
 } from "./model";
-import { artifactRevisions, artifactShares, artifacts, memories, memoryTags, principals } from "./schema/account";
+import { artifactNames, artifactShares, mcpClients, memories, memoryTags } from "./schema/account";
 import { blobOf, toBytes } from "./schema/columns";
 import { artifactsFts, memoriesFts, sessionChunksFts, sessionHistoryFts } from "./schema/fts";
 import {
+  artifactRevisions,
+  artifacts,
   boardMessages,
   boardPickups,
   countedFiles as countedFilesTable,
@@ -1447,9 +1450,9 @@ interface ArtifactRow {
   lastWriter: string;
 }
 
-// `lastWriter` is the writer's first email. A device token carries a user and `principals` maps
-// several emails to one, so the account is as precise as the writer can be named; an account whose
-// emails have all been withdrawn names none.
+// `lastWriter` is the address the publish wrote onto the row. An account whose emails had all been
+// withdrawn when it published names none, which is the empty string the refusal already prints as
+// "a device of this account".
 const ARTIFACT_FIELDS = {
   name: artifacts.name,
   rev: artifacts.rev,
@@ -1465,9 +1468,7 @@ const ARTIFACT_FIELDS = {
   createdAt: artifacts.createdAt,
   updatedAt: artifacts.updatedAt,
   userId: artifacts.userId,
-  lastWriter: sql<string>`COALESCE((SELECT ${qualified(principals.email)} FROM ${principals}
-    WHERE ${qualified(principals.userId)} = ${qualified(artifacts.lastWriterUserId)}
-    ORDER BY ${qualified(principals.email)} LIMIT 1), '')`,
+  lastWriter: artifacts.lastWriter,
 };
 
 const toArtifact = (row: ArtifactRow): ArtifactRecord => ({
@@ -1514,8 +1515,40 @@ const ARTIFACT_ORDERS: Record<string, Order<ArtifactRecord>> = {
 
 export const artifactCursorDirection = (sort: string): "desc" | "asc" => orderFor(ARTIFACT_ORDERS, sort).direction;
 
-export const getArtifact = async (db: AccountDb, userId: string, name: string): Promise<ArtifactRecord | null> => {
-  const row = await db
+export interface ArtifactPage {
+  artifacts: ArtifactRecord[];
+  nextCursor: string;
+}
+
+export interface ArtifactMatches {
+  artifacts: ArtifactRecord[];
+  cut: boolean;
+}
+
+// What reading an artifact asks of a store. Every member names the account whose rows it wants,
+// because the Worker hands this to a reader that reaches whichever object a name resolved to
+// while the tenant object hands over its own; neither can read a row it was not asked for.
+export interface ArtifactReads {
+  artifact(userId: string, name: string): Promise<ArtifactRecord | null>;
+  artifactPage(userId: string, input: ArtifactListInput, cursor: Cursor): Promise<ArtifactPage>;
+  artifactMatches(userId: string, type: string, match: string, limit: number): Promise<ArtifactMatches>;
+  artifactTally(userId: string): Promise<ArtifactCounts>;
+}
+
+// The writes beside them, which only the Worker's collection makes.
+export interface ArtifactStore extends ArtifactReads {
+  claimArtifactRevision(userId: string, name: string): Promise<number>;
+  createArtifact(commit: ArtifactCommit): Promise<boolean>;
+  replaceArtifact(commit: ArtifactCommit, fromRev: number): Promise<boolean>;
+  deleteArtifact(userId: string, name: string): Promise<void>;
+  adoptArtifacts(userId: string): Promise<number>;
+  // The one-shot copy out of D1, which `./artifact-copy` holds and an operator drives once per
+  // account. It sits on the write side because it writes, and on no read path at all.
+  copyArtifacts(userId: string, now: number): Promise<ArtifactCopyReport>;
+}
+
+export const getArtifact = async (db: TenantDb, userId: string, name: string): Promise<ArtifactRecord | null> => {
+  const row = db
     .select(ARTIFACT_FIELDS)
     .from(artifacts)
     .where(and(eq(artifacts.userId, userId), eq(artifacts.name, name)))
@@ -1523,36 +1556,16 @@ export const getArtifact = async (db: AccountDb, userId: string, name: string): 
   return row === undefined ? null : toArtifact(row);
 };
 
-// Which artifact a name on the artifact hostname means. The reader's own comes first and is served
-// whatever its read permission says; otherwise the one published for the account to read. A name
-// that holds neither is the caller's 404, and so is one the read permission refuses.
-export const resolveArtifact = async (
-  db: AccountDb,
-  readerUserId: string,
-  name: string,
-): Promise<ArtifactRecord | null> => {
-  const own = await getArtifact(db, readerUserId, name);
-  if (own !== null) return own;
-  const shared = await db
-    .select(ARTIFACT_FIELDS)
-    .from(artifacts)
-    .where(and(eq(artifacts.name, name), eq(artifacts.readPerm, "account")))
-    .orderBy(asc(artifacts.userId))
-    .limit(1)
-    .get();
-  return shared === undefined ? null : toArtifact(shared);
-};
-
 const ofType = (type: string): SQL => (type === "" ? sql`1 = 1` : eq(artifacts.type, sql`${type}`));
 
 export const listArtifactPage = async (
-  db: AccountDb,
+  db: TenantDb,
   userId: string,
   input: ArtifactListInput,
   [cursorAt, cursorName]: Cursor,
 ): Promise<{ artifacts: ArtifactRecord[]; nextCursor: string }> => {
   const order = orderFor(ARTIFACT_ORDERS, input.sort);
-  const results = await db
+  const results = db
     .select(ARTIFACT_FIELDS)
     .from(artifacts)
     .where(and(eq(artifacts.userId, userId), ofType(input.type), order.keyset(cursorAt, cursorName)))
@@ -1568,13 +1581,13 @@ export const listArtifactPage = async (
 // The shelf by what a reader typed, name heaviest, then title, then description — the weights the
 // memory search already uses over the same three fields.
 export const searchArtifacts = async (
-  db: AccountDb,
+  db: TenantDb,
   userId: string,
   type: string,
   match: string,
   limit: number,
 ): Promise<{ artifacts: ArtifactRecord[]; cut: boolean }> => {
-  const results = await db
+  const results = db
     .select(ARTIFACT_FIELDS)
     .from(artifactsFts)
     .innerJoin(artifacts, eq(artifacts.artifactSeq, artifactsFts.rowid))
@@ -1592,8 +1605,8 @@ export interface ArtifactCounts {
 
 // The second read a page of the shelf costs: the total for the heading and a count per type for
 // the chips. It walks the account's own rows, which is what the memory counts already do.
-export const artifactCounts = async (db: AccountDb, userId: string): Promise<ArtifactCounts> => {
-  const results = await db
+export const artifactCounts = async (db: TenantDb, userId: string): Promise<ArtifactCounts> => {
+  const results = db
     .select({ type: artifacts.type, n: count() })
     .from(artifacts)
     .where(eq(artifacts.userId, userId))
@@ -1617,14 +1630,14 @@ export interface ArtifactCommit {
   write: WritePermission;
   files: ArtifactFile[];
   at: number;
-  writerUserId: string;
+  writer: string;
 }
 
 // The revision the caller owns, claimed before a byte of it is written. The upsert is what makes
 // the claim exclusive: two publishes of one name read the same live revision and each is handed a
 // different number here, so neither streams into the prefix the other will commit.
-export const claimRevision = async (db: AccountDb, userId: string, name: string): Promise<number> => {
-  const row = await db
+export const claimRevision = async (db: TenantDb, userId: string, name: string): Promise<number> => {
+  const row = db
     .insert(artifactRevisions)
     .values({ userId, name, revNext: 1 })
     .onConflictDoUpdate({
@@ -1659,14 +1672,14 @@ const artifactValues = (commit: ArtifactCommit) => ({
   fileCount: commit.files.length,
   bytes: bytesOf(commit),
   updatedAt: commit.at,
-  lastWriterUserId: commit.writerUserId,
+  lastWriter: commit.writer,
 });
 
 // The publish of a name that held nothing when the gates ran. `UNIQUE (user_id, name)` is what
 // decides a race between two first publishes: the second writes no row and is told the name is
 // taken rather than replacing what the first one just committed.
-export const createArtifact = async (db: AccountDb, commit: ArtifactCommit): Promise<boolean> => {
-  const written = await db
+export const createArtifact = async (db: TenantDb, commit: ArtifactCommit): Promise<boolean> => {
+  const written = db
     .insert(artifacts)
     .values({ ...artifactValues(commit), createdAt: commit.at })
     .onConflictDoNothing({ target: [artifacts.userId, artifacts.name] })
@@ -1681,8 +1694,8 @@ export const createArtifact = async (db: AccountDb, commit: ArtifactCommit): Pro
 // matches nothing, so the publish is refused rather than recreating an artifact whose files the
 // unpublish has already deleted. `created_at` is left alone, because the artifact is being
 // replaced and not recreated.
-export const replaceArtifact = async (db: AccountDb, commit: ArtifactCommit, fromRev: number): Promise<boolean> => {
-  const written = await db
+export const replaceArtifact = async (db: TenantDb, commit: ArtifactCommit, fromRev: number): Promise<boolean> => {
+  const written = db
     .update(artifacts)
     .set(artifactValues(commit))
     .where(and(eq(artifacts.userId, commit.userId), eq(artifacts.name, commit.name), eq(artifacts.rev, fromRev)))
@@ -1691,27 +1704,99 @@ export const replaceArtifact = async (db: AccountDb, commit: ArtifactCommit, fro
   return written.length > 0;
 };
 
-// The artifact and every share on its name, in one batch: a failure between two statements would
-// leave shares keyed to a name no artifact holds, and a later publish of that name would revive
-// them.
-export const deleteArtifactWithShares = async (db: AccountDb, userId: string, name: string): Promise<void> => {
+export const deleteArtifact = async (db: TenantDb, userId: string, name: string): Promise<void> => {
+  db.delete(artifacts)
+    .where(and(eq(artifacts.userId, userId), eq(artifacts.name, name)))
+    .run();
+};
+
+// What the account store holds of a name once the artifact itself is gone: every share keyed to it
+// and the claim on the name. One batch, because a failure between the two would leave shares
+// keyed to a name no artifact holds and a later publish of that name would revive them.
+export const releaseArtifactName = async (db: AccountDb, userId: string, name: string): Promise<void> => {
   await db.batch([
-    db.delete(artifacts).where(and(eq(artifacts.userId, userId), eq(artifacts.name, name))),
     db.delete(artifactShares).where(and(eq(artifactShares.userId, userId), eq(artifactShares.name, name))),
+    db.delete(artifactNames).where(and(eq(artifactNames.name, name), eq(artifactNames.userId, userId))),
   ]);
 };
 
-// Whether another account already publishes this name for the account to read. The hostname has no
-// user segment, so two account-readable artifacts under one name would be two artifacts at one
-// address; the second publish is refused rather than resolved by an arbitrary tie-break.
-export const accountReadableElsewhere = async (db: AccountDb, userId: string, name: string): Promise<boolean> => {
+export interface ArtifactRoute {
+  userId: string;
+  readPerm: ReadPermission;
+}
+
+// Which account a name on the artifact hostname belongs to. One read, and the only read that
+// crosses accounts: what the name holds is then read out of that account's own object.
+export const artifactRoute = async (db: AccountDb, name: string): Promise<ArtifactRoute | null> => {
   const row = await db
-    .select({ userId: artifacts.userId })
-    .from(artifacts)
-    .where(and(eq(artifacts.name, name), eq(artifacts.readPerm, "account"), ne(artifacts.userId, userId)))
-    .limit(1)
+    .select({ userId: artifactNames.userId, readPerm: artifactNames.readPerm })
+    .from(artifactNames)
+    .where(eq(artifactNames.name, name))
     .get();
-  return row !== undefined;
+  return row ?? null;
+};
+
+// The claim on a name, which is the whole of what makes a publish's address unambiguous. A name
+// nobody holds is taken outright; a name this account already holds has its permission moved; and
+// a name another account holds is taken only where that account published it privately and this
+// publish is for the whole account to read. Anything else writes nothing and is refused.
+export const claimArtifactName = async (
+  db: AccountDb,
+  userId: string,
+  name: string,
+  readPerm: ReadPermission,
+): Promise<boolean> => {
+  const claimed = await db
+    .insert(artifactNames)
+    .values({ name, userId, readPerm })
+    .onConflictDoUpdate({
+      target: artifactNames.name,
+      set: { userId: sql`excluded.user_id`, readPerm: sql`excluded.read_perm` },
+      setWhere: or(
+        eq(artifactNames.userId, sql`excluded.user_id`),
+        and(eq(artifactNames.readPerm, "private"), eq(sql`excluded.read_perm`, "account")),
+      ),
+    })
+    .returning({ name: artifactNames.name })
+    .all();
+  return claimed.length > 0;
+};
+
+// Whether another account already publishes this name for the account to read, read before a byte
+// of a publish is streamed. The hostname has no user segment, so two account-readable artifacts
+// under one name would be two artifacts at one address; the claim refuses the second outright
+// rather than resolving it by an arbitrary tie-break.
+export const accountReadableElsewhere = async (db: AccountDb, userId: string, name: string): Promise<boolean> => {
+  const route = await artifactRoute(db, name);
+  return route !== null && route.readPerm === "account" && route.userId !== userId;
+};
+
+// One account's own object reading its own rows, for the pages that object draws itself. A user
+// id that is not this object's matches nothing here, which is the split rather than a check.
+export const artifactReadsOf = (db: TenantDb): ArtifactReads => ({
+  artifact: (userId, name) => getArtifact(db, userId, name),
+  artifactPage: (userId, input, cursor) => listArtifactPage(db, userId, input, cursor),
+  artifactMatches: (userId, type, match, limit) => searchArtifacts(db, userId, type, match, limit),
+  artifactTally: (userId) => artifactCounts(db, userId),
+});
+
+// Which artifact a name on the artifact hostname means. The reader's own comes first and is
+// served whatever its read permission says. Otherwise one read of the account store says which
+// account claims the name, and that account's own object is asked for it; a name nothing claims,
+// one claimed privately, and one whose owner no longer publishes it for the account to read are
+// all the caller's 404.
+export const resolveArtifact = async (
+  account: AccountDb,
+  store: ArtifactReads,
+  readerUserId: string,
+  name: string,
+): Promise<ArtifactRecord | null> => {
+  const own = await store.artifact(readerUserId, name);
+  if (own !== null) return own;
+  const route = await artifactRoute(account, name);
+  if (route === null || route.userId === readerUserId || route.readPerm !== "account") return null;
+  const shared = await store.artifact(route.userId, name);
+  return shared !== null && shared.read === "account" ? shared : null;
 };
 
 interface ShareRow {
@@ -2041,6 +2126,17 @@ export const revokeShares = async (
   return revoked.length;
 };
 
+// Which account an Access service token acts for. A deployment adds a tenant to the connector by
+// writing this row, not by editing the Worker's env and deploying again.
+export const userForServiceClient = async (db: AccountDb, clientId: string): Promise<string | null> => {
+  const row = await db
+    .select({ userId: mcpClients.userId })
+    .from(mcpClients)
+    .where(eq(mcpClients.clientId, clientId))
+    .get();
+  return row?.userId ?? null;
+};
+
 const LEGACY_PAGE = 1_000;
 
 // The artifacts published before a row carried their type. The operator runs it once per
@@ -2049,7 +2145,7 @@ const LEGACY_PAGE = 1_000;
 //
 // The delimiter leaves out everything under the container layout, so only the bare keys answer and
 // a row that already exists is left exactly as it is.
-export const adoptArtifacts = async (db: AccountDb, bucket: R2Bucket, userId: string): Promise<number> => {
+export const adoptArtifacts = async (db: TenantDb, bucket: R2Bucket, userId: string): Promise<number> => {
   const prefix = `${userId}/`;
   const legacy: R2Object[] = [];
   let cursor: string | undefined;
@@ -2060,39 +2156,42 @@ export const adoptArtifacts = async (db: AccountDb, bucket: R2Bucket, userId: st
     cursor = page.cursor;
   }
   const known = new Set(
-    (await db.select({ name: artifacts.name }).from(artifacts).where(eq(artifacts.userId, userId)).all()).map(
-      (row) => row.name,
-    ),
+    db
+      .select({ name: artifacts.name })
+      .from(artifacts)
+      .where(eq(artifacts.userId, userId))
+      .all()
+      .map((row) => row.name),
   );
   const taking = legacy.filter((object) => !known.has(object.key.slice(prefix.length)));
+  if (taking.length === 0) return 0;
   // One statement per object, never one insert of many rows, for the hundred-parameter ceiling.
-  const adopting = taking.map((object) => {
-    const name = object.key.slice(prefix.length);
-    const files: ArtifactFile[] = [{ path: name, bytes: object.size, contentType: contentTypeFor(name) }];
-    return db
-      .insert(artifacts)
-      .values({
-        userId,
-        name,
-        rev: 0,
-        type: "site",
-        title: name,
-        description: "",
-        readPerm: "private",
-        writePerm: "owner",
-        entryPath: name,
-        files: JSON.stringify(files),
-        fileCount: 1,
-        bytes: object.size,
-        createdAt: object.uploaded.getTime(),
-        updatedAt: object.uploaded.getTime(),
-        lastWriterUserId: userId,
-      })
-      .onConflictDoNothing({ target: [artifacts.userId, artifacts.name] });
+  db.transaction((tx) => {
+    for (const object of taking) {
+      const name = object.key.slice(prefix.length);
+      const files: ArtifactFile[] = [{ path: name, bytes: object.size, contentType: contentTypeFor(name) }];
+      tx.insert(artifacts)
+        .values({
+          userId,
+          name,
+          rev: 0,
+          type: "site",
+          title: name,
+          description: "",
+          readPerm: "private",
+          writePerm: "owner",
+          entryPath: name,
+          files: JSON.stringify(files),
+          fileCount: 1,
+          bytes: object.size,
+          createdAt: object.uploaded.getTime(),
+          updatedAt: object.uploaded.getTime(),
+          lastWriter: "",
+        })
+        .onConflictDoNothing({ target: [artifacts.userId, artifacts.name] })
+        .run();
+    }
   });
-  const [first, ...rest] = adopting;
-  if (first === undefined) return 0;
-  await db.batch([first, ...rest]);
   return taking.length;
 };
 

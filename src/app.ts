@@ -83,6 +83,7 @@ import {
   type DeviceCodeLimits,
   decideDeviceCode,
   deviceForToken,
+  emailForUser,
   formatUserCode,
   hasDevice,
   listDevices,
@@ -193,10 +194,12 @@ import {
 } from "./shares";
 import {
   type ArtifactCounts,
+  type ArtifactReads,
+  type ArtifactStore,
   accountReadableElsewhere,
-  adoptArtifacts,
-  artifactCounts,
   artifactCursorDirection,
+  artifactReadsOf,
+  artifactRoute,
   artifactShareList,
   type ChunkCandidate,
   type Cursor,
@@ -204,15 +207,13 @@ import {
   chunkMatches,
   chunkReach,
   chunkVectors,
+  claimArtifactName,
   claimBoardMessages,
-  claimRevision,
   commitRecords,
   countedFiles,
-  createArtifact,
   createEmailShare,
   createLinkShare,
   decodeCursor,
-  deleteArtifactWithShares,
   deleteDeadEmailShare,
   deleteExpiredShare,
   deleteMemory,
@@ -228,7 +229,6 @@ import {
   type IndexMark,
   indexMark,
   labelTargets,
-  listArtifactPage,
   listBoard,
   listMemories,
   listSessionHistory,
@@ -251,12 +251,11 @@ import {
   recordReach,
   recordShareUse,
   recordUsage,
-  replaceArtifact,
+  releaseArtifactName,
   replaceLinkShare,
   resolveArtifact,
   revokeShares,
   saveMemory,
-  searchArtifacts,
   searchSessionHistory,
   sessionHistoryFilters,
   sessionOnDevice,
@@ -269,6 +268,7 @@ import {
   sharesFor,
   startCursor,
   textCandidates,
+  userForServiceClient,
   vectorCandidates,
   writeChunks,
   writeLabels,
@@ -355,9 +355,10 @@ export interface ArtifactHost extends Omit<ArtifactSurface, "sharing"> {
 // The connector endpoint, where a deployment switched it on. Its Access application admits a
 // browser sign-in and an Access service token, and the service token's common name names the user
 // it acts for, since a token carries no email to look up.
+// Which service tokens act for which accounts is a table in the account store, not a field here:
+// adding a tenant to the connector is a row rather than a config edit and a redeploy.
 export interface McpHost {
   verify: Verify;
-  serviceClients: Map<string, string>;
 }
 
 export interface Deps {
@@ -395,7 +396,9 @@ interface WorkerEnv extends Omit<AppEnv, "DB"> {
 const workerEnv = (env: AppEnv): WorkerEnv => ({ ...env, DB: accountStoreOf(env.DB) });
 
 // What the tenant half reads. `DB` is this account's own store and nobody else's; `ACCOUNT` is the
-// account store that still holds its artifacts and its memories, which later steps move across.
+// account store, which holds the rows a request reads before it knows whose it is — the
+// invitations, the devices, the claim on an artifact name and the shares on it — and this
+// account's memories, which a later step moves across.
 export interface TenantEnv {
   DB: TenantDb;
   ACCOUNT: AccountDb;
@@ -426,14 +429,18 @@ export interface TenantApi {
   index(env: TenantEnv, userId: string, sessionId: string): Promise<boolean>;
 }
 
-// The artifacts collection, which the Worker answers for itself. Its rows are the account's and
-// its bytes are R2's, so nothing it does reads a row the tenant object holds, and a publish routed
-// through the object would stream a multipart body Worker to object to R2 for no gain.
+// The artifacts collection, which the Worker answers for itself. Its rows are a tenant's and
+// reach it through `ArtifactStore`, which is a handful of calls into that account's object; its
+// bytes are R2's and never leave the Worker, because a publish routed through the object would
+// carry sixty-four megabytes Worker to object to storage and a file read would carry them back
+// the same way. The Worker is also the only half that can hold two tenants at once, which
+// resolving a name on the artifact hostname needs.
 export interface AccountApi {
   artifacts(
     request: Request,
     url: URL,
-    db: AccountDb,
+    account: AccountDb,
+    store: ArtifactStore,
     caller: Caller,
     rawName: string | undefined,
     rest: readonly string[],
@@ -643,6 +650,23 @@ const sharedArtifactName = (pathname: string): string | null => {
 
 const tenantOf = (env: Pick<AppEnv, "TENANT">, userId: string): DurableObjectStub<Tenant> =>
   env.TENANT.get(env.TENANT.idFromName(userId));
+
+// The artifact rows of whichever account a call names, which is the one reader that holds two
+// tenants at once: an account-readable name resolves to its owner in the account store and is
+// then read out of the owner's object. Nothing here passes a row of one account to another; the
+// user id on every call is the object the call goes to.
+const artifactStoreFor = (env: Pick<AppEnv, "TENANT">): ArtifactStore => ({
+  artifact: (userId, name) => tenantOf(env, userId).artifact(userId, name),
+  artifactPage: (userId, input, cursor) => tenantOf(env, userId).artifactPage(userId, input, cursor),
+  artifactMatches: (userId, type, match, limit) => tenantOf(env, userId).artifactMatches(userId, type, match, limit),
+  artifactTally: (userId) => tenantOf(env, userId).artifactTally(userId),
+  claimArtifactRevision: (userId, name) => tenantOf(env, userId).claimArtifactRevision(userId, name),
+  createArtifact: (commit) => tenantOf(env, commit.userId).createArtifact(commit),
+  replaceArtifact: (commit, fromRev) => tenantOf(env, commit.userId).replaceArtifact(commit, fromRev),
+  deleteArtifact: (userId, name) => tenantOf(env, userId).deleteArtifact(userId, name),
+  adoptArtifacts: (userId) => tenantOf(env, userId).adoptArtifacts(userId),
+  copyArtifacts: (userId, now) => tenantOf(env, userId).copyArtifacts(userId, now),
+});
 
 // Everything the dashboard reads off an address before it knows who is asking: which tab the
 // address names, which session, and which of the four POSTs it is. The Worker weighs the method
@@ -1279,7 +1303,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // under is the dashboard's own notice; a private artifact of another account resolves to
   // neither, so the reader learns nothing about it.
   const shareTarget = async (
-    db: AccountDb,
+    db: TenantDb,
+    account: AccountDb,
     url: URL,
     userId: string,
     email: string,
@@ -1288,12 +1313,15 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     lost: Refusal,
   ): Promise<ArtifactRecord | Response> => {
     const name = parseName(decodeSegment(rawName) ?? "");
-    const record = name.ok ? await resolveArtifact(db, userId, name.value) : null;
-    if (record === null) {
-      return lost(404, "No such artifact", "This recall publishes no artifact under this name.");
+    const record = name.ok ? await getArtifact(db, userId, name.value) : null;
+    if (record !== null) return record;
+    // Whose the name is, where it is not this account's. One read of the claim answers it, and
+    // the artifact itself is never read: the page says only that the name is somebody else's.
+    const route = name.ok ? await artifactRoute(account, name.value) : null;
+    if (route !== null && route.userId !== userId && route.readPerm === "account") {
+      return sharesPage(email, live, url, { kind: "foreign" });
     }
-    if (record.ownerUserId !== userId) return sharesPage(email, live, url, { kind: "foreign" });
-    return record;
+    return lost(404, "No such artifact", "This recall publishes no artifact under this name.");
   };
 
   // The question the query asks, against the shares the page holds. An id naming no live share is
@@ -1344,7 +1372,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const sharesTab = async (
     request: Request,
     url: URL,
-    db: AccountDb,
+    db: TenantDb,
+    account: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1354,9 +1383,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   ): Promise<Response> => {
     const host = deps.artifacts;
     if (host === null || !host.sharing) return sharesPage(email, live, url, { kind: "off" });
-    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
+    const target = await shareTarget(db, account, url, userId, email, live, rawName, lost);
     if (target instanceof Response) return target;
-    const shares = (await artifactShareList(db, userId, target.name, now)).map(shareViewOf);
+    const shares = (await artifactShareList(account, userId, target.name, now)).map(shareViewOf);
     const { ask, flash } = askFor(url, shares);
     const state: ShareState = { shares, flash, minted: null, ask, emailDraft: "" };
     const page = sharePageOf(host, target, state, pageToken(request), now);
@@ -1471,7 +1500,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const sharesPost = async (
     request: Request,
     url: URL,
-    db: AccountDb,
+    db: TenantDb,
+    account: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1482,9 +1512,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const host = deps.artifacts;
     if (host === null || !host.sharing) return sharesPage(email, live, url, { kind: "off" });
     const posted = await formPost(request, url);
-    const target = await shareTarget(db, url, userId, email, live, rawName, lost);
+    const target = await shareTarget(db, account, url, userId, email, live, rawName, lost);
     if (target instanceof Response) return target;
-    const shares = (await artifactShareList(db, userId, target.name, now)).map(shareViewOf);
+    const shares = (await artifactShareList(account, userId, target.name, now)).map(shareViewOf);
     const csrf = pageToken(request);
     // Nothing is created, extended or revoked for a post that did not come from this page, and the
     // refusal says nothing the page does not already draw.
@@ -1492,7 +1522,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       const state: ShareState = { shares, flash: UNTRUSTED_FLASH, minted: null, ask: null, emailDraft: "" };
       return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) }, 403);
     }
-    const state = await shareMutation(db, host, target, shares, posted.form, now);
+    const state = await shareMutation(account, host, target, shares, posted.form, now);
     return sharesPage(email, live, url, { kind: "page", page: sharePageOf(host, target, state, csrf, now) });
   };
 
@@ -1855,19 +1885,19 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // One page of the shelf's rows and the counts the chips and the heading print. No bytes are read
   // and the bucket is not listed.
   const artifactRows = async (
-    db: AccountDb,
+    store: ArtifactReads,
     userId: string,
     input: ArtifactListInput,
     cursor: Cursor,
   ): Promise<{ artifacts: ArtifactRecord[]; counts: ArtifactCounts; nextCursor: string; cut: boolean }> => {
     const match = input.query === "" ? null : ftsQuery(input.query);
     const [counts, page] = await Promise.all([
-      artifactCounts(db, userId),
+      store.artifactTally(userId),
       input.query === ""
-        ? listArtifactPage(db, userId, input, cursor).then((read) => ({ ...read, cut: false }))
+        ? store.artifactPage(userId, input, cursor).then((read) => ({ ...read, cut: false }))
         : match === null
           ? Promise.resolve({ artifacts: [], nextCursor: "", cut: false })
-          : searchArtifacts(db, userId, input.type, match, MAX_SEARCH_MATCHES).then((found) => ({
+          : store.artifactMatches(userId, input.type, match, MAX_SEARCH_MATCHES).then((found) => ({
               ...found,
               nextCursor: "",
             })),
@@ -1879,18 +1909,19 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // by name rather than read per row, so the read is bounded by the page and not by the account.
   // Where sharing is off it does not run at all and every count is zero.
   const shelfFor = async (
-    db: AccountDb,
+    store: ArtifactReads,
+    account: AccountDb,
     host: ArtifactSurface,
     userId: string,
     input: ArtifactListInput,
     cursor: Cursor,
     now: number,
   ): Promise<ArtifactShelf> => {
-    const page = await artifactRows(db, userId, input, cursor);
+    const page = await artifactRows(store, userId, input, cursor);
     const counted = !host.sharing
       ? new Map<string, number>()
       : await shareCountsFor(
-          db,
+          account,
           userId,
           page.artifacts.map((record) => record.name),
           now,
@@ -1908,7 +1939,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // publishing and unpublishing stay with `recall publish` and `recall unpublish`.
   const artifactsTab = async (
     url: URL,
-    db: AccountDb,
+    db: TenantDb,
+    account: AccountDb,
     userId: string,
     email: string,
     live: Live,
@@ -1920,7 +1952,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const input = parseArtifactList(url.searchParams, chosen.sort);
     if (!input.ok) return lost(400, "Filter refused", `${input.error}.`);
     const cursor = pageCursor(input.value.cursor, artifactCursorDirection(input.value.sort));
-    const shelf = await shelfFor(db, host, userId, input.value, cursor, deps.now());
+    const shelf = await shelfFor(artifactReadsOf(db), account, host, userId, input.value, cursor, deps.now());
     return artifactsPage(email, live, url, { kind: "shelf", shelf });
   };
 
@@ -1967,6 +1999,15 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json(saved, saved.created ? 201 : 200);
   };
 
+  // What a publish for the whole account to read is refused with when another account already
+  // publishes that name the same way. The artifact hostname has no user segment, so the name is
+  // the whole of the address and two accounts cannot both answer on it.
+  const nameTaken = (name: string): Response =>
+    error(
+      409,
+      `another account publishes ${name} for this recall to read, and the artifact hostname has one address per name; publish it under another name`,
+    );
+
   // What a publish is refused with when the name is taken: the artifact, its type, its size, when
   // it was last written and the email that wrote it, in a string the CLI prints verbatim and in
   // fields a tool reads.
@@ -1993,15 +2034,16 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // publish under it. A caller who does mean to replace reaches the account-readable one, and the
   // write permission decides whether they may.
   const writeTarget = async (
-    db: AccountDb,
+    account: AccountDb,
+    store: ArtifactStore,
     userId: string,
     name: string,
     replacing: boolean,
   ): Promise<ArtifactRecord | Response | null> => {
-    const own = await getArtifact(db, userId, name);
+    const own = await store.artifact(userId, name);
     if (own !== null) return own;
     if (!replacing) return null;
-    const shared = await resolveArtifact(db, userId, name);
+    const shared = await resolveArtifact(account, store, userId, name);
     if (shared === null || shared.write === "account") return shared;
     return error(403, "this artifact's write permission is owner, and only its owner replaces or deletes it");
   };
@@ -2028,7 +2070,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const publish = async (
     request: Request,
     url: URL,
-    db: AccountDb,
+    account: AccountDb,
+    store: ArtifactStore,
     host: ArtifactSurface,
     caller: Caller,
     name: string,
@@ -2052,14 +2095,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const total = declaredFiles.reduce((running, file) => running + file.bytes, 0);
     if (total > MAX_ARTIFACT_BYTES || declaredFiles.some((file) => file.bytes > MAX_FILE_BYTES)) return tooLarge();
     const replacing = url.searchParams.get("replace") === "true";
-    const target = await writeTarget(db, caller.userId, name, replacing);
+    const target = await writeTarget(account, store, caller.userId, name, replacing);
     if (target instanceof Response) return target;
     if (target !== null && !replacing) return conflict(target);
     const owner = target?.ownerUserId ?? caller.userId;
-    if (manifest.value.read === "account" && (await accountReadableElsewhere(db, owner, name))) {
-      return error(409, `another account publishes ${name} for this recall to read; publish it under another name`);
+    if (manifest.value.read === "account" && (await accountReadableElsewhere(account, owner, name))) {
+      return nameTaken(name);
     }
-    const rev = await claimRevision(db, owner, name);
+    const rev = await store.claimArtifactRevision(owner, name);
     const refuse = async (status: number, message: string): Promise<Response> => {
       await collect(host.bucket, owner, name, rev);
       return error(status, message);
@@ -2082,6 +2125,16 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       await stored;
       files.push({ path: file.path, bytes: file.bytes, contentType: contentTypeFor(file.path) });
     }
+    // The claim on the name, taken before the row that depends on it. A publish for the whole
+    // account to read takes a name no other account publishes that way, and the primary key is
+    // what decides a race between two of them rather than a read either could win. A private
+    // publish wants the name and does not need it: it loses the claim to the account that holds
+    // it and is reachable through this account's own object all the same.
+    const claimed = await claimArtifactName(account, owner, name, manifest.value.read);
+    if (!claimed && manifest.value.read === "account") {
+      await collect(host.bucket, owner, name, rev);
+      return nameTaken(name);
+    }
     const commit = {
       userId: owner,
       name,
@@ -2093,26 +2146,36 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       write: manifest.value.write,
       files,
       at: deps.now(),
-      writerUserId: caller.userId,
+      writer: await emailForUser(account, caller.userId),
     };
     const committed =
-      target === null ? await createArtifact(db, commit) : await replaceArtifact(db, commit, target.rev);
+      target === null ? await store.createArtifact(commit) : await store.replaceArtifact(commit, target.rev);
     if (!committed) {
       await collect(host.bucket, owner, name, rev);
-      const held = await getArtifact(db, owner, name);
+      const held = await store.artifact(owner, name);
       return held === null
         ? error(409, `${name} was written by another request while this one was publishing`)
         : conflict(held);
     }
-    const saved = await getArtifact(db, owner, name);
+    const saved = await store.artifact(owner, name);
     if (saved === null) throw new Error(`artifact ${name} vanished right after it was published`);
     if (target !== null) await collect(host.bucket, owner, name, target.rev);
-    const shares = await sharesHeld(db, host, saved, caller.userId, deps.now());
+    const shares = await sharesHeld(account, host, saved, caller.userId, deps.now());
     return json({ artifact: viewOf(host, saved, shares), ownedByAnother: owner !== caller.userId });
   };
 
-  const unpublish = async (db: AccountDb, bucket: R2Bucket, caller: Caller, name: string): Promise<Response> => {
-    const target = await writeTarget(db, caller.userId, name, true);
+  // The row first, then what the account store holds of the name, then the bytes. Nothing is
+  // hedged: the row going is what takes the artifact off every address, and a failure after it
+  // leaves shares and a claim on a name that resolves to nothing, which a second unpublish or a
+  // republish by the same account clears.
+  const unpublish = async (
+    account: AccountDb,
+    store: ArtifactStore,
+    bucket: R2Bucket,
+    caller: Caller,
+    name: string,
+  ): Promise<Response> => {
+    const target = await writeTarget(account, store, caller.userId, name, true);
     if (target instanceof Response) return target;
     if (target === null) {
       // An artifact published before a row carried its type has bytes and no row, and unpublishing
@@ -2122,14 +2185,16 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       await bucket.delete(legacy.key);
       return new Response(null, { status: 204 });
     }
-    await deleteArtifactWithShares(db, target.ownerUserId, name);
+    await store.deleteArtifact(target.ownerUserId, name);
+    await releaseArtifactName(account, target.ownerUserId, name);
     await deleteArtifactFiles(bucket, target.ownerUserId, name);
     return new Response(null, { status: 204 });
   };
 
   const artifactsListing = async (
     url: URL,
-    db: AccountDb,
+    account: AccountDb,
+    store: ArtifactReads,
     host: ArtifactSurface,
     userId: string,
     now: number,
@@ -2142,10 +2207,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     // One optional param turns the page's third read from the counts into the rows themselves,
     // which is what `recall shares` with no name walks instead of a collection of its own.
     const wanted = url.searchParams.get("shares") === "true" && host.sharing;
-    const page = await artifactRows(db, userId, input.value, cursor);
+    const page = await artifactRows(store, userId, input.value, cursor);
     const names = page.artifacts.map((record) => record.name);
-    const held = wanted ? await sharesFor(db, userId, names, now) : new Map<string, ShareRecord[]>();
-    const counted = wanted || !host.sharing ? new Map<string, number>() : await shareCountsFor(db, userId, names, now);
+    const held = wanted ? await sharesFor(account, userId, names, now) : new Map<string, ShareRecord[]>();
+    const counted =
+      wanted || !host.sharing ? new Map<string, number>() : await shareCountsFor(account, userId, names, now);
     const artifacts = page.artifacts.map((record) => {
       const shares = held.get(record.name) ?? [];
       const view = viewOf(host, record, wanted ? shares.length : (counted.get(record.name) ?? 0));
@@ -2157,14 +2223,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // How many live shares one artifact holds, read for its owner alone: an account reading somebody
   // else's account-readable artifact learns nothing about who else holds a share on it.
   const sharesHeld = async (
-    db: AccountDb,
+    account: AccountDb,
     host: ArtifactSurface,
     record: ArtifactRecord,
     userId: string,
     now: number,
   ): Promise<number> => {
     if (!host.sharing || record.ownerUserId !== userId) return 0;
-    return shareCount(db, userId, record.name, now);
+    return shareCount(account, userId, record.name, now);
   };
 
   // What a `DELETE` on the collection names, which is exactly one of three. Naming none or more
@@ -2192,6 +2258,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     request: Request,
     url: URL,
     db: AccountDb,
+    store: ArtifactReads,
     host: ArtifactSurface,
     userId: string,
     name: string,
@@ -2201,7 +2268,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (!host.sharing) {
       return error(404, "this recall shares no artifacts; its deployment binds no share audience");
     }
-    const record = await resolveArtifact(db, userId, name);
+    const record = await resolveArtifact(db, store, userId, name);
     if (record === null) return error(404, `no artifact named ${name}`);
     if (record.ownerUserId !== userId) return error(403, "only an artifact's owner shares it");
     const remaining = async (): Promise<ShareView[]> =>
@@ -2267,7 +2334,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const artifacts = async (
     request: Request,
     url: URL,
-    db: AccountDb,
+    account: AccountDb,
+    store: ArtifactStore,
     caller: Caller,
     rawName: string | undefined,
     rest: readonly string[],
@@ -2281,12 +2349,18 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const now = deps.now();
     if (rawName === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
-      return artifactsListing(url, db, host, userId, now);
+      return artifactsListing(url, account, store, host, userId, now);
     }
-    // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
-    // shadowed by an artifact named adopt.
+    // An artifact answers a PUT, a GET and a DELETE and never a POST, so neither the adopt nor
+    // the copy can be shadowed by an artifact named adopt or copy.
     if (rawName === "adopt" && rest.length === 0 && request.method === "POST") {
-      return json({ adopted: await adoptArtifacts(db, bucket, userId) });
+      return json({ adopted: await store.adoptArtifacts(userId) });
+    }
+    // The one-shot copy of this account's artifact rows out of D1 and into its own object, run
+    // once against a running deployment by `npm run copy-artifacts` and by nothing else. It is
+    // here rather than on a read path because a read path must never migrate anything.
+    if (rawName === "copy" && rest.length === 0 && request.method === "POST") {
+      return json(await store.copyArtifacts(userId, now));
     }
     const name = parseName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
@@ -2296,26 +2370,26 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const [word, ...tail] = rest;
     if (word === SHARES_SEGMENT) {
       if (tail.length > 1) return error(404, "not found");
-      return artifactShareRoutes(request, url, db, host, userId, name.value, tail[0], now);
+      return artifactShareRoutes(request, url, account, store, host, userId, name.value, tail[0], now);
     }
     if (word === "files") {
       if (request.method !== "GET") return error(405, "method not allowed");
       const subpath = tail.join("/");
       const lost = (): Response => error(404, `no file ${subpath} in artifact ${name.value}`);
       if (subpath === "") return lost();
-      const record = await resolveArtifact(db, userId, name.value);
+      const record = await resolveArtifact(account, store, userId, name.value);
       if (record === null) return lost();
       return artifactFile(request, bucket, record, subpath, lost);
     }
     if (word !== undefined) return error(404, "not found");
-    if (request.method === "PUT") return publish(request, url, db, host, caller, name.value);
-    if (request.method === "DELETE") return unpublish(db, bucket, caller, name.value);
+    if (request.method === "PUT") return publish(request, url, account, store, host, caller, name.value);
+    if (request.method === "DELETE") return unpublish(account, store, bucket, caller, name.value);
     if (request.method !== "GET") return error(405, "method not allowed");
     // The same artifact a read of one of its files names, so a shared artifact never answers its
     // files over the API while refusing to say anything about itself.
-    const record = await resolveArtifact(db, userId, name.value);
+    const record = await resolveArtifact(account, store, userId, name.value);
     if (record === null) return error(404, `no artifact named ${name.value}`);
-    return json({ artifact: viewOf(host, record, await sharesHeld(db, host, record, userId, now)) });
+    return json({ artifact: viewOf(host, record, await sharesHeld(account, host, record, userId, now)) });
   };
 
   const list = async (url: URL, db: AccountDb, userId: string): Promise<Response> => {
@@ -2983,8 +3057,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const live = await liveTally(db, userId, now);
     if (shareName !== null) {
       return request.method === "POST"
-        ? sharesPost(request, url, env.ACCOUNT, userId, email, live, shareName, now, lost)
-        : sharesTab(request, url, env.ACCOUNT, userId, email, live, shareName, now, lost);
+        ? sharesPost(request, url, db, env.ACCOUNT, userId, email, live, shareName, now, lost)
+        : sharesTab(request, url, db, env.ACCOUNT, userId, email, live, shareName, now, lost);
     }
     if (tab === null) {
       if (segments.length === 1) {
@@ -2998,7 +3072,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     }
     if (tab.path === BOARD_TAB.path) return boardTab(request, url, env, userId, email, live, now);
     if (tab.path === MEMORY_TAB.path) return memoryTab(url, env.ACCOUNT, userId, email, live, lost);
-    if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(url, env.ACCOUNT, userId, email, live, lost);
+    if (tab.path === ARTIFACTS_TAB.path) return artifactsTab(url, db, env.ACCOUNT, userId, email, live, lost);
     if (tab.path === HISTORY_TAB.path) return historyTab(url, db, userId, email, live, lost);
     if (tab.path === STATS_TAB.path) return statsTab(db, userId, email, live, now);
     if (tab.path === INSIGHTS_TAB.path) return insightsTab(db, env.ACCOUNT, userId, email, live, now);
@@ -3310,7 +3384,8 @@ export const createApp = (deps: Deps): App => {
     };
   };
 
-  const artifactSite = async (request: Request, url: URL, db: AccountDb, host: ArtifactHost): Promise<Response> => {
+  const artifactSite = async (request: Request, url: URL, env: WorkerEnv, host: ArtifactHost): Promise<Response> => {
+    const db = env.DB;
     const notice = (refusal: ArtifactRefusal): Response => artifactNotice(refusal, host.dashboard);
     const lost = (): Response => notice({ kind: "lost" });
     if (request.method !== "GET") return notice({ kind: "method" });
@@ -3333,7 +3408,7 @@ export const createApp = (deps: Deps): App => {
     if (!name.ok) return lost();
     const route = underBase(tail);
     if (route.kind === "elsewhere") return lost();
-    const record = await resolveArtifact(db, userId, name.value);
+    const record = await resolveArtifact(db, artifactStoreFor(env), userId, name.value);
     if (record === null) {
       return route.kind === "page" ? ((await legacySite(host, userId, name.value)) ?? lost()) : lost();
     }
@@ -3408,7 +3483,8 @@ export const createApp = (deps: Deps): App => {
   // they are one path: a share names its owner and the row is read directly rather than through
   // the account-readable fallback, so a share can never reach another account's artifact of the
   // same name.
-  const sharedSite = async (request: Request, url: URL, db: AccountDb, host: ArtifactHost): Promise<Response> => {
+  const sharedSite = async (request: Request, url: URL, env: WorkerEnv, host: ArtifactHost): Promise<Response> => {
+    const db = env.DB;
     const gone = (): Response => shareNotice({ kind: "gone" });
     if (request.method !== "GET") return shareNotice({ kind: "method" });
     const { sharing } = host;
@@ -3421,7 +3497,7 @@ export const createApp = (deps: Deps): App => {
     const resolved = await shareFor(request, url, db, sharing, lane, now);
     if (!resolved.ok) return shareNotice(resolved.refusal);
     const { share } = resolved;
-    const record = await getArtifact(db, share.userId, share.name);
+    const record = await artifactStoreFor(env).artifact(share.userId, share.name);
     if (record === null) return gone();
     const chrome: ArtifactChrome = {
       base: lane.base,
@@ -3497,8 +3573,8 @@ export const createApp = (deps: Deps): App => {
     }
     const { principal } = verified;
     if (principal.kind === "serviceToken") {
-      const owner = host.serviceClients.get(principal.commonName);
-      if (owner === undefined) {
+      const owner = await userForServiceClient(env.DB, principal.commonName);
+      if (owner === null) {
         return mcpRefusal(
           403,
           `the Access service token ${principal.commonName} acts for no user of this recall; the deployment names one token per user`,
@@ -3615,7 +3691,9 @@ export const createApp = (deps: Deps): App => {
       }
       return listen(request, env, caller);
     }
-    if (collection === "artifacts") return account.artifacts(request, url, env.DB, caller, rawName, rest);
+    if (collection === "artifacts") {
+      return account.artifacts(request, url, env.DB, artifactStoreFor(env), caller, rawName, rest);
+    }
     return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 
@@ -3624,8 +3702,8 @@ export const createApp = (deps: Deps): App => {
     const host = deps.artifactHost;
     if (host !== null && url.hostname === host.hostname) {
       return underSharePrefix(url.pathname)
-        ? sharedSite(request, url, env.DB, host)
-        : artifactSite(request, url, env.DB, host);
+        ? sharedSite(request, url, env, host)
+        : artifactSite(request, url, env, host);
     }
     if (url.pathname === MCP_PATH) return mcp(request, env);
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
@@ -3664,7 +3742,9 @@ export const createApp = (deps: Deps): App => {
       }
       return listen(request, env, caller);
     }
-    if (collection === "artifacts") return account.artifacts(request, url, env.DB, caller, rawName, rest);
+    if (collection === "artifacts") {
+      return account.artifacts(request, url, env.DB, artifactStoreFor(env), caller, rawName, rest);
+    }
     return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 

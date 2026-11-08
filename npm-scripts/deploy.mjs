@@ -245,9 +245,7 @@ const deployConfig = {
           ARTIFACT_SHARE_ACCESS_AUD: output("artifact_share_access_aud"),
           DASHBOARD_HOSTNAME: hostname,
         }),
-    ...(mcpConnector
-      ? { MCP_ACCESS_AUD: output("mcp_access_aud"), MCP_SERVICE_CLIENTS: output("mcp_service_clients") }
-      : {}),
+    ...(mcpConnector ? { MCP_ACCESS_AUD: output("mcp_access_aud") } : {}),
   },
 };
 const deployConfigPath = join(ROOT, "wrangler.deploy.json");
@@ -256,11 +254,19 @@ writeFileSync(deployConfigPath, `${JSON.stringify(deployConfig, null, 2)}\n`);
 wrangler(["d1", "migrations", "apply", "recall", "--remote", "-c", deployConfigPath]);
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+// Which account each Access service token acts for. Terraform still names the pairs, but they go
+// in as rows beside the invitations rather than as a Worker variable, so adding one later is a
+// write against the running deployment.
+const serviceClients = Object.entries(JSON.parse(output("mcp_service_clients") || "{}"));
 const sync = [
   `DELETE FROM principals WHERE email NOT IN (${emailOwners.map(([email]) => quote(email)).join(", ")});`,
   ...emailOwners.map(
     ([email, userId]) =>
       `INSERT INTO principals (email, user_id) VALUES (${quote(email)}, ${quote(userId)}) ON CONFLICT (email) DO UPDATE SET user_id = excluded.user_id;`,
+  ),
+  ...serviceClients.map(
+    ([clientId, userId]) =>
+      `INSERT INTO mcp_clients (client_id, user_id) VALUES (${quote(clientId)}, ${quote(userId)}) ON CONFLICT (client_id) DO UPDATE SET user_id = excluded.user_id;`,
   ),
   "DELETE FROM devices WHERE user_id NOT IN (SELECT user_id FROM principals);",
 ].join("\n");

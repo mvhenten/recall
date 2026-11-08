@@ -355,12 +355,7 @@ const config = {
           DASHBOARD_HOSTNAME: hostname,
         }
       : {}),
-    ...(mcpApp && connectorToken
-      ? {
-          MCP_ACCESS_AUD: mcpApp.aud,
-          MCP_SERVICE_CLIENTS: JSON.stringify({ [connectorToken.client_id]: user }),
-        }
-      : {}),
+    ...(mcpApp && connectorToken ? { MCP_ACCESS_AUD: mcpApp.aud } : {}),
   },
 };
 mkdirSync(WORK, { recursive: true });
@@ -368,6 +363,11 @@ const configPath = join(WORK, "wrangler.json");
 writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
 const principalPath = join(WORK, "principals.sql");
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+// Which account the connector's service token acts for is a row rather than a Worker variable, so
+// it is written here beside the invitations and off the same credentials.
+const connectorRow = connectorToken
+  ? `INSERT INTO mcp_clients (client_id, user_id) VALUES (${quote(connectorToken.client_id)}, ${quote(user)}) ON CONFLICT (client_id) DO UPDATE SET user_id = excluded.user_id;\n`
+  : "";
 writeFileSync(
   principalPath,
   emails
@@ -375,7 +375,7 @@ writeFileSync(
       (email) =>
         `INSERT INTO principals (email, user_id) VALUES (${quote(email)}, ${quote(user)}) ON CONFLICT (email) DO UPDATE SET user_id = excluded.user_id;\n`,
     )
-    .join(""),
+    .join("") + connectorRow,
 );
 
 run(["d1", "migrations", "apply", name, "--remote", "-c", configPath]);

@@ -276,7 +276,21 @@ export const harness = async ({
   let clock = 1_700_000_000_000;
   let retried = 0;
   const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
-  const serviceClients = new Map<string, string>();
+  // Which account a service token acts for is a row of the account store now, not a map the
+  // Worker was built with. A test still names the pair outright; the write it queues is drained
+  // before the next request goes in, so nothing a test does has to be awaited twice.
+  let clientRows: Promise<unknown> = Promise.resolve();
+  const serviceClients = {
+    set(clientId: string, userId: string): void {
+      clientRows = clientRows.then(() =>
+        env.DB.prepare(
+          "INSERT INTO mcp_clients (client_id, user_id) VALUES (?, ?) ON CONFLICT (client_id) DO UPDATE SET user_id = excluded.user_id",
+        )
+          .bind(clientId, userId)
+          .run(),
+      );
+    },
+  };
   const app = createApp({
     verify: accessVerifier(source, ISSUER, DASHBOARD_AUDIENCE),
     artifactHost:
@@ -289,7 +303,7 @@ export const harness = async ({
             dashboard: `${ORIGIN}/dashboard`,
             sharing: sharing === "off" ? null : { verify: accessVerifier(source, ISSUER, ARTIFACT_SHARE_AUDIENCE) },
           },
-    mcpHost: mcpConnector === "off" ? null : { verify: accessVerifier(source, ISSUER, MCP_AUDIENCE), serviceClients },
+    mcpHost: mcpConnector === "off" ? null : { verify: accessVerifier(source, ISSUER, MCP_AUDIENCE) },
     embedder,
     deviceCodeLimits,
     now: () => clock,
@@ -314,8 +328,10 @@ export const harness = async ({
   const serviceAssertionFor = (commonName: string, audience = MCP_AUDIENCE): Promise<string> =>
     signed({ common_name: commonName }, audience, "5m");
 
-  const send = (path: string, init: RequestInit = {}): Promise<Response> =>
-    app.fetch(new Request(`${ORIGIN}${path}`, init), env);
+  const send = async (path: string, init: RequestInit = {}): Promise<Response> => {
+    await clientRows;
+    return app.fetch(new Request(`${ORIGIN}${path}`, init), env);
+  };
 
   const sendToArtifactHost = (path: string, assertion: string | null, init: RequestInit = {}): Promise<Response> =>
     app.fetch(

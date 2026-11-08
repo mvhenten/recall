@@ -8,6 +8,13 @@
       "when": 1762000000000,
       "tag": "0021_session_chunks_fts_delete",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1762000000000,
+      "tag": "0022_artifact_names",
+      "breakpoints": true
     }
   ]
 }

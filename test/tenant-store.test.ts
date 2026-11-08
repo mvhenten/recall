@@ -5,7 +5,15 @@ import { describe, expect, it } from "vitest";
 import { type TenantDb, tenantStoreOf } from "../src/db";
 import type { HistoryInput } from "../src/model";
 import { labels } from "../src/schema/tenant";
-import { chunkMatches, endSession, putSession, searchSessionHistory } from "../src/store";
+import {
+  chunkMatches,
+  createArtifact,
+  endSession,
+  putSession,
+  searchArtifacts,
+  searchSessionHistory,
+} from "../src/store";
+import { TENANT_MIGRATIONS } from "../src/tenant-migrations";
 import { tenantRows } from "./harness";
 
 const storeOf = (userId: string) => env.TENANT.get(env.TENANT.idFromName(userId));
@@ -80,6 +88,29 @@ const CHUNK_RANKING = `SELECT c.chunk_seq FROM session_chunks_fts f
 
 const EMBEDDING = new ArrayBuffer(4);
 
+// What an artifact carries that the shelf's index reads. `artifacts_fts` is external-content over
+// `artifacts` and its terms are the insert trigger's to write, so the corpus goes into D1's copy
+// of the table and into the tenant object's, and the two rankings are held against each other.
+const ARTIFACTS: ReadonlyArray<readonly [string, string, string]> = [
+  ["rank-the-shelf", "bound the vector scan", "a shelf ranks the artifacts it holds"],
+  ["bound-the-shelf", "rank the shelf rows", "the shelf is bounded before it is drawn"],
+  ["board-deck", "rank the board", "the board deck moves into the object"],
+  ["migration-notes", "write it once", "the migration is written once"],
+  ["archive-report", "scan the shelf", "the archive is scanned and ranked"],
+];
+
+// name heaviest, then title, then description — the column order `artifacts_fts` was created in.
+const ARTIFACT_RANKING = `SELECT a.name FROM artifacts_fts f
+   JOIN artifacts a ON a.artifact_seq = f.rowid
+   WHERE artifacts_fts MATCH ?2 AND a.user_id = ?1
+   ORDER BY bm25(artifacts_fts, 5.0, 2.0, 1.0) LIMIT 51`;
+
+const ARTIFACT_QUERIES = ["rank", "scan", "archive", "board OR migration", "vector AND scan"];
+
+const ARTIFACT_INSERT = `INSERT INTO artifacts (user_id, name, rev, type, title, description, read_perm,
+   write_perm, entry_path, files, file_count, bytes, created_at, updated_at, last_writer_user_id)
+ VALUES (?1, ?2, 1, 'document', ?3, ?4, 'private', 'owner', 'index.md', '[]', 1, 12, 1, 1, ?1)`;
+
 describe("the tenant store", () => {
   it("takes a whole batch back when one statement of it fails", async () => {
     const userId = `user-${crypto.randomUUID()}`;
@@ -125,7 +156,7 @@ describe("the tenant store", () => {
       userId,
       "SELECT name, applied_at FROM __migrations ORDER BY name",
     );
-    expect(first).toHaveLength(1);
+    expect(first.map((row) => row.name)).toEqual(TENANT_MIGRATIONS.map((migration) => migration.name));
     await tenantRows(
       userId,
       "INSERT INTO labels (user_id, kind, value, label) VALUES (?, 'host', ?, ?)",
@@ -157,6 +188,36 @@ describe("the tenant store", () => {
       const object = await inStore(userId, (db) => searchSessionHistory(db, userId, FILTER, query, FILTER.limit, NOW));
       expect(ranked).not.toEqual([]);
       expect(object.sessions.map((found) => found.sessionId)).toEqual(ranked);
+    }
+  });
+
+  it("ranks an artifact search the way bm25 weights it", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    for (const [name, title, description] of ARTIFACTS) {
+      await env.DB.prepare(ARTIFACT_INSERT).bind(userId, name, title, description).run();
+      const written = await inStore(userId, (db) =>
+        createArtifact(db, {
+          userId,
+          name,
+          rev: 1,
+          type: "document",
+          title,
+          description,
+          read: "private",
+          write: "owner",
+          files: [{ path: "index.md", bytes: 12, contentType: "text/markdown" }],
+          at: NOW,
+          writer: "someone@example.com",
+        }),
+      );
+      expect(written).toBe(true);
+    }
+    for (const query of ARTIFACT_QUERIES) {
+      const { results } = await env.DB.prepare(ARTIFACT_RANKING).bind(userId, query).all<{ name: string }>();
+      const ranked = results.map((row) => row.name);
+      expect(ranked).not.toEqual([]);
+      const found = await inStore(userId, (db) => searchArtifacts(db, userId, "", query, 50));
+      expect(found.artifacts.map((artifact) => artifact.name)).toEqual(ranked);
     }
   });
 

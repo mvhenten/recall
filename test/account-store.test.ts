@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { accountStoreOf } from "../src/db";
-import { createArtifact, getMemory, saveMemory, searchArtifacts, textCandidates, vectorCandidates } from "../src/store";
+import { getMemory, saveMemory, textCandidates, vectorCandidates } from "../src/store";
 
 const db = accountStoreOf(env.DB);
 
@@ -21,20 +21,6 @@ const MEMORY_RANKING = `SELECT m.memory_id FROM memories_fts f
    WHERE memories_fts MATCH ?2 AND m.user_id = ?1
    ORDER BY (SELECT count(*) FROM memory_tags t WHERE t.memory_id = m.memory_id AND t.tag = ?3) DESC,
      bm25(memories_fts, 5.0, 2.0, 1.0) LIMIT 50`;
-
-const ARTIFACTS: ReadonlyArray<readonly [string, string, string]> = [
-  ["rank-the-shelf", "bound the vector scan", "a shelf ranks the artifacts it holds"],
-  ["bound-the-shelf", "rank the shelf rows", "the shelf is bounded before it is drawn"],
-  ["board-deck", "rank the board", "the board deck moves into the object"],
-  ["migration-notes", "write it once", "the migration is written once"],
-  ["archive-report", "scan the shelf", "the archive is scanned and ranked"],
-];
-
-// name heaviest, then title, then description — the column order `artifacts_fts` was created in.
-const ARTIFACT_RANKING = `SELECT a.name FROM artifacts_fts f
-   JOIN artifacts a ON a.artifact_seq = f.rowid
-   WHERE artifacts_fts MATCH ?2 AND a.user_id = ?1
-   ORDER BY bm25(artifacts_fts, 5.0, 2.0, 1.0) LIMIT 51`;
 
 const QUERIES = ["rank", "scan", "archive", "board OR migration", "vector AND scan"];
 
@@ -64,33 +50,6 @@ describe("the account store", () => {
       expect(found.map((candidate) => candidate.memoryId)).toEqual(ranked);
       const scope = found.map((candidate) => candidate.inScope);
       expect(scope).toEqual([...scope].sort((left, right) => Number(right) - Number(left)));
-    }
-  });
-
-  it("ranks an artifact search the way bm25 weights it", async () => {
-    const userId = `user-${crypto.randomUUID()}`;
-    for (const [name, title, description] of ARTIFACTS) {
-      const written = await createArtifact(db, {
-        userId,
-        name,
-        rev: 1,
-        type: "document",
-        title,
-        description,
-        read: "private",
-        write: "owner",
-        files: [{ path: "index.md", bytes: 12, contentType: "text/markdown" }],
-        at: NOW,
-        writerUserId: userId,
-      });
-      expect(written).toBe(true);
-    }
-    for (const query of QUERIES) {
-      const { results } = await env.DB.prepare(ARTIFACT_RANKING).bind(userId, query).all<{ name: string }>();
-      const ranked = results.map((row) => row.name);
-      expect(ranked).not.toEqual([]);
-      const found = await searchArtifacts(db, userId, "", query, 50);
-      expect(found.artifacts.map((artifact) => artifact.name)).toEqual(ranked);
     }
   });
 

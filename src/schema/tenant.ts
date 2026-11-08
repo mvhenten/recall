@@ -194,6 +194,50 @@ export const boardMessages = sqliteTable(
   (table) => [primaryKey({ columns: [table.userId, table.messageId] })],
 );
 
+// What this account has published, one row per artifact. The bytes live in R2 under
+// `<user id>/<name>/<rev>/<path>`, and `rev` is what makes a publish atomic: the new revision's
+// files are written under a prefix no reader can reach, and the row moving forward is the publish.
+// Which account a name belongs to is D1's `artifact_names`; everything the name holds is here.
+//
+// `last_writer` is the email a publish wrote onto the row rather than a key into `principals`: a
+// display field read out of an account table would be this object reaching across the split on
+// every listing, and the address that wrote the revision is what the reader is being told anyway.
+export const artifacts = sqliteTable(
+  "artifacts",
+  {
+    artifactSeq: integer("artifact_seq").primaryKey(),
+    userId: text("user_id").notNull(),
+    name: text("name").notNull(),
+    rev: integer("rev").notNull(),
+    type: text("type", { enum: ["site", "document", "audio"] }).notNull(),
+    title: text("title").notNull(),
+    description: text("description").notNull(),
+    readPerm: text("read_perm", { enum: ["private", "account"] }).notNull(),
+    writePerm: text("write_perm", { enum: ["owner", "account"] }).notNull(),
+    entryPath: text("entry_path").notNull(),
+    files: text("files").notNull(),
+    fileCount: integer("file_count").notNull(),
+    bytes: integer("bytes").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    lastWriter: text("last_writer").notNull(),
+  },
+  (table) => [unique().on(table.userId, table.name)],
+);
+
+// Which revision the next publish of a name owns, claimed before a byte of it lands, so two
+// publishes racing under one name stream into prefixes of their own. The counter never goes back.
+// WITHOUT ROWID in `migrations/tenant/0002_artifacts.sql`.
+export const artifactRevisions = sqliteTable(
+  "artifact_revisions",
+  {
+    userId: text("user_id").notNull(),
+    name: text("name").notNull(),
+    revNext: integer("rev_next").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.name] })],
+);
+
 // WITHOUT ROWID likewise. The primary key is the whole of the single-taker guarantee.
 export const boardPickups = sqliteTable(
   "board_pickups",
