@@ -1,4 +1,5 @@
 import { and, asc, eq, sql } from "drizzle-orm";
+import type { SQLiteColumn, SQLiteTable } from "drizzle-orm/sqlite-core";
 import type { AccountDb, TenantDb, TenantTx } from "./db";
 import { toBytes } from "./schema/columns";
 import { sessionChunksFts, sessionHistoryFts } from "./schema/fts";
@@ -30,6 +31,7 @@ import {
   usageDaily,
   usageEvents,
 } from "./schema/tenant";
+import { jsonEach, raiseChunkReach } from "./store";
 
 // The one-shot copy of an account's sessions out of D1 and into that account's own object, driven
 // by `POST /v1/sessions/copy` and by nothing else. It is not a request path: no read or write of a
@@ -54,54 +56,63 @@ const CHUNK_PAGE = 250;
 // one insert of many rows, for the hundred-parameter ceiling on the object's SQLite.
 const WRITE_BATCH = 200;
 
-export interface Tally {
+// How many chunks one call takes before it hands the frontier back. The prose is the half of this
+// that can run to hundreds of megabytes and the only half whose cost is the embedding index, so a
+// corpus too big for one request's budget is finished by the caller looping on `after` rather than
+// by a run that dies and leaves the next one re-reading what it already copied.
+const CHUNK_BUDGET = 5_000;
+
+// A table of either store keyed by the account it belongs to, which every one of these is.
+type Owned = SQLiteTable & { userId: SQLiteColumn };
+
+// What one table did, and what each store holds of it afterwards. The counts are the half the
+// tallies cannot say: every insert of a table conflicting reads as `copied: 0, held: N`, which is
+// exactly what a table that arrived twice over reads as too.
+export interface TableReport {
+  table: string;
   copied: number;
   held: number;
-}
-
-interface Sides {
   account: number;
   tenant: number;
 }
 
 export interface SessionCopyChecks {
-  // The row count on each side, table by table. The object may hold more of any of them: a session
-  // that started after the deployment cut over is the object's alone.
-  rows: { sessions: Sides; history: Sides; index: Sides; chunks: Sides; records: Sides; usage: Sides };
-  // Session ids D1 holds that the object does not. Anything here is a session that did not arrive.
+  // The tables the object holds fewer rows of than D1, which is the whole of what says a table did
+  // not arrive. It may hold more of any of them: a session started after the cutover is its own.
+  short: string[];
+  // Session ids D1 holds that the object does not.
   missing: string[];
   // Session ids the object holds that D1 does not, which a session started after the cutover
   // accounts for.
   extra: string[];
   // D1 chunks with no row in the object under the `chunk_seq` they were written with.
   missingChunks: number;
-  // The chunks whose embedding does not come back out of the object as the bytes D1 holds. A
-  // vector is quantized int8, so one re-encoded byte moves every score computed from it.
+  // The chunks this run wrote whose embedding does not come back out of the object as the bytes
+  // D1 holds. A vector is quantized int8, so one re-encoded byte moves every score computed from
+  // it. A chunk an earlier run brought over is left out: its vector was held against D1's then.
   embeddings: number[];
-  // What SQLite makes of `session_chunks_fts` against `session_chunks`, empty when the two agree.
-  // The index is external-content and the copy moves rowids by hand, so this is the one thing no
-  // count can see: an entry left at a mover's old rowid answers a later query with the copied
-  // chunk that now holds it.
-  chunkIndex: string;
-  // The same read of `session_history_fts`, which stores its own copy of the text and is written
-  // by the triggers alone.
-  historyIndex: string;
+  // What SQLite makes of `session_chunks_fts` against `session_chunks`. The index is
+  // external-content and the copy moves rowids by hand, so this is the one thing no count can
+  // see: an entry left at a mover's old rowid answers a later query with the copied chunk that
+  // now holds it.
+  chunkIndex: IndexCheck;
+  // The same read of `session_history_fts`, which stores its own copy of the text.
+  historyIndex: IndexCheck;
   ok: boolean;
+}
+
+// What the integrity check made of an index, and whether the check ran at all. A statement that
+// fails for any other reason leaves the index unread, which is not the same finding as an index
+// and its rows disagreeing and does not read as one.
+export interface IndexCheck {
+  corrupt: boolean;
+  error: string;
 }
 
 export interface SessionCopyReport {
   userId: string;
-  sessions: Tally;
-  history: Tally;
-  index: Tally;
-  records: Tally;
-  openChunks: Tally;
-  countedFiles: Tally;
-  usageEvents: Tally;
-  usageDaily: Tally;
-  labels: Tally;
-  boardMessages: Tally;
-  boardPickups: Tally;
+  // One per table the cutover moved, `session_chunks` last.
+  tables: TableReport[];
   chunks: {
     copied: number;
     held: number;
@@ -111,19 +122,36 @@ export interface SessionCopyReport {
     // The object's own chunks moved up the sequence to free a `chunk_seq` a copied one came in
     // under.
     moved: number;
+    // The `chunk_seq` this call read up to, which the next one is given as `after`.
+    frontier: number;
+    // Whether the frontier is the end of D1's chunks.
+    done: boolean;
   };
-  // The sessions both stores held before this run: the object's row is the later one and stands,
-  // and what D1 holds of them that the object does not is added beside it.
+  // The sessions both stores held when the run opened: the object's row is the later one and
+  // stands, and what D1 holds of them that the object does not is added beside it. Only the call
+  // that opens the run can say which those were, so a continuation names none.
   straddling: string[];
   checks: SessionCopyChecks;
 }
 
 // One page of a table nothing writes any more, taken by offset. A keyset walk would say the same
 // thing against a still side and cost a composite comparison per table.
-const allRows = async <T>(read: (offset: number) => Promise<T[]>): Promise<T[]> => {
-  const rows: T[] = [];
+const allOf = async <T extends Owned>(
+  db: AccountDb,
+  table: T,
+  userId: string,
+  order: readonly SQLiteColumn[],
+): Promise<Array<T["$inferSelect"]>> => {
+  const rows: Array<T["$inferSelect"]> = [];
   for (let offset = 0; ; offset += READ_PAGE) {
-    const page = await read(offset);
+    const page = await db
+      .select()
+      .from(table)
+      .where(eq(table.userId, userId))
+      .orderBy(...order.map(asc))
+      .limit(READ_PAGE)
+      .offset(offset)
+      .all();
     rows.push(...page);
     if (page.length < READ_PAGE) return rows;
   }
@@ -132,162 +160,28 @@ const allRows = async <T>(read: (offset: number) => Promise<T[]>): Promise<T[]> 
 // The rows of one table, written one statement at a time and in batches the object commits whole.
 // A row the object already holds conflicts with itself and is left exactly as it stands, which is
 // what makes the object's row the one that wins and a second run cost nothing.
-const writeEach = <T>(db: TenantDb, rows: readonly T[], one: (tx: TenantTx, row: T) => number): Tally => {
+const copyTable = <T extends Owned>(db: TenantDb, table: T, rows: ReadonlyArray<T["$inferInsert"]>): number => {
   let copied = 0;
   for (let start = 0; start < rows.length; start += WRITE_BATCH) {
     const batch = rows.slice(start, start + WRITE_BATCH);
     db.transaction((tx) => {
-      for (const row of batch) copied += one(tx, row);
+      for (const row of batch) {
+        // Whichever column is returned, what is read of it is that a row landed rather than
+        // conflicting with one the object already holds.
+        copied += tx.insert(table).values(row).onConflictDoNothing().returning({ owner: table.userId }).all().length;
+      }
     });
   }
-  return { copied, held: rows.length - copied };
+  return copied;
 };
 
-const accountSessions = (db: AccountDb, userId: string): Promise<Array<typeof legacySessions.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacySessions)
-      .where(eq(legacySessions.userId, userId))
-      .orderBy(asc(legacySessions.sessionId))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
+const accountCount = async (db: AccountDb, table: Owned, userId: string): Promise<number> => {
+  const rows = await db.values<[number]>(sql`SELECT count(*) FROM ${table} WHERE ${table.userId} = ${userId}`);
+  return rows[0]?.[0] ?? 0;
+};
 
-const accountHistory = (db: AccountDb, userId: string): Promise<Array<typeof legacySessionHistory.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacySessionHistory)
-      .where(eq(legacySessionHistory.userId, userId))
-      .orderBy(asc(legacySessionHistory.sessionId))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountIndex = (db: AccountDb, userId: string): Promise<Array<typeof legacySessionIndex.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacySessionIndex)
-      .where(eq(legacySessionIndex.userId, userId))
-      .orderBy(asc(legacySessionIndex.sessionId))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountRecords = (db: AccountDb, userId: string): Promise<Array<typeof legacySessionRecords.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacySessionRecords)
-      .where(eq(legacySessionRecords.userId, userId))
-      .orderBy(asc(legacySessionRecords.sessionId), asc(legacySessionRecords.file))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountOpenChunks = (
-  db: AccountDb,
-  userId: string,
-): Promise<Array<typeof legacySessionOpenChunks.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacySessionOpenChunks)
-      .where(eq(legacySessionOpenChunks.userId, userId))
-      .orderBy(
-        asc(legacySessionOpenChunks.sessionId),
-        asc(legacySessionOpenChunks.file),
-        asc(legacySessionOpenChunks.speaker),
-      )
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountCountedFiles = (db: AccountDb, userId: string): Promise<Array<typeof legacyCountedFiles.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacyCountedFiles)
-      .where(eq(legacyCountedFiles.userId, userId))
-      .orderBy(asc(legacyCountedFiles.sessionId), asc(legacyCountedFiles.file))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountUsageEvents = (db: AccountDb, userId: string): Promise<Array<typeof legacyUsageEvents.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacyUsageEvents)
-      .where(eq(legacyUsageEvents.userId, userId))
-      .orderBy(asc(legacyUsageEvents.sessionId), asc(legacyUsageEvents.seq))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountUsageDaily = (db: AccountDb, userId: string): Promise<Array<typeof legacyUsageDaily.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacyUsageDaily)
-      .where(eq(legacyUsageDaily.userId, userId))
-      .orderBy(
-        asc(legacyUsageDaily.day),
-        asc(legacyUsageDaily.host),
-        asc(legacyUsageDaily.repo),
-        asc(legacyUsageDaily.account),
-        asc(legacyUsageDaily.provider),
-        asc(legacyUsageDaily.model),
-      )
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountLabels = (db: AccountDb, userId: string): Promise<Array<typeof legacyLabels.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacyLabels)
-      .where(eq(legacyLabels.userId, userId))
-      .orderBy(asc(legacyLabels.kind), asc(legacyLabels.value))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountBoardMessages = (db: AccountDb, userId: string): Promise<Array<typeof legacyBoardMessages.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacyBoardMessages)
-      .where(eq(legacyBoardMessages.userId, userId))
-      .orderBy(asc(legacyBoardMessages.messageId))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
-
-const accountBoardPickups = (db: AccountDb, userId: string): Promise<Array<typeof legacyBoardPickups.$inferSelect>> =>
-  allRows((offset) =>
-    db
-      .select()
-      .from(legacyBoardPickups)
-      .where(eq(legacyBoardPickups.userId, userId))
-      .orderBy(asc(legacyBoardPickups.messageId))
-      .limit(READ_PAGE)
-      .offset(offset)
-      .all(),
-  );
+const tenantCount = (db: TenantDb, table: Owned, userId: string): number =>
+  db.values<[number]>(sql`SELECT count(*) FROM ${table} WHERE ${table.userId} = ${userId}`)[0]?.[0] ?? 0;
 
 interface LegacyChunk {
   chunkSeq: number;
@@ -299,12 +193,9 @@ interface LegacyChunk {
   at: number;
 }
 
-type ChunkRow = [number, string, number, string, string, unknown, number];
-
-const speakerOf = (value: string): "user" | "model" => {
-  if (value === "user" || value === "model") return value;
-  throw new Error(`D1 holds a chunk spoken by neither the user nor the model: ${value}`);
-};
+// The speaker is read as the union both schemas hold the column to with a CHECK, the way a row
+// shape is the caller's assertion everywhere `values` is used.
+type ChunkRow = [number, string, number, "user" | "model", string, unknown, number];
 
 // One page of the account's chunks, keyed by the sequence the copy preserves rather than by an
 // offset, because this is the one table big enough for the walk to cost something. The rows come
@@ -322,7 +213,7 @@ const accountChunkPage = async (db: AccountDb, userId: string, after: number): P
     chunkSeq: row[0],
     sessionId: row[1],
     ordinal: row[2],
-    speaker: speakerOf(row[3]),
+    speaker: row[3],
     text: row[4],
     embedding: toBytes(row[5]),
     at: row[6],
@@ -337,10 +228,14 @@ interface ChunkState {
   moved: number;
   missing: number;
   embeddings: number[];
-  // The `chunk_seq` the next moved row takes, above every key either store has handed out.
-  next: number;
   // The ordinal the next shifted chunk of a session takes.
   ordinals: Map<string, number>;
+}
+
+// Where one chunk ended up, and whether this run is what put it there.
+interface Placed {
+  ordinal: number;
+  held: boolean;
 }
 
 // The object's own chunk, moved off a `chunk_seq` a copied one came in under. `chunk_seq` is
@@ -351,7 +246,17 @@ interface ChunkState {
 // Moving up rather than renumbering the copy is also what keeps `chunk_seq` meaning recency: the
 // vector scan bounds itself to the highest keys, and a chunk the object wrote after the cutover is
 // the newest prose the account has.
-const moveChunk = (tx: TenantTx, userId: string, from: number, text: string, to: number): void => {
+//
+// Where it moves to is read here rather than counted up from a number taken before the run: the
+// object goes on serving its account while this runs, and a session archiving a stretch between
+// two pages takes the next key for itself.
+const moveChunk = (tx: TenantTx, userId: string, from: number, text: string, highest: number): void => {
+  const top = tx
+    .select({ top: sql<number>`COALESCE(MAX(${sessionChunks.chunkSeq}), 0)` })
+    .from(sessionChunks)
+    .where(eq(sessionChunks.userId, userId))
+    .get();
+  const to = Math.max(highest, top?.top ?? 0) + 1;
   tx.run(sql`INSERT INTO ${sessionChunksFts} (${sessionChunksFts}, rowid, text) VALUES ('delete', ${from}, ${text})`);
   tx.update(sessionChunks)
     .set({ chunkSeq: to })
@@ -382,11 +287,17 @@ const nextOrdinal = (tx: TenantTx, userId: string, sessionId: string, state: Chu
 // One chunk, written under the `chunk_seq` it came in with. The insert trigger writes its index
 // entry, the way it does for every chunk the object indexes itself.
 //
-// Three things can stand in the way of it, and the row already at that key says which. A row with
-// the same session and the same prose is this chunk, copied by an earlier run, and is left alone.
-// A row of another session is the object's own and moves up. What is left is an ordinal of this
-// session the object already indexes, which the chunk climbs past.
-const placeChunk = (tx: TenantTx, userId: string, row: LegacyChunk, state: ChunkState): number => {
+// Three things can stand in the way of it, and the row already at that key says which. A row of
+// the same session carrying the same prose at the same instant is this chunk, copied by an earlier
+// run, and is left alone — all three, because a session replayed after the cutover is re-indexed
+// from ordinal zero and writes the pre-cutover prose again under the low keys D1 handed this
+// account, so the session and the text alone would pass over a chunk of history and the copy would
+// report itself sound. `at` is copied verbatim, so a second run still recognises its own work, and
+// `ordinal` cannot join it because a shifted chunk does not keep the one it came in with.
+//
+// A row that is not this chunk is the object's own and moves up. What is left is an ordinal of
+// this session the object already indexes, which the chunk climbs past.
+const placeChunk = (tx: TenantTx, userId: string, row: LegacyChunk, state: ChunkState, highest: number): Placed => {
   const values = {
     chunkSeq: row.chunkSeq,
     userId,
@@ -406,24 +317,33 @@ const placeChunk = (tx: TenantTx, userId: string, row: LegacyChunk, state: Chunk
       .all().length === 1;
   if (landed(row.ordinal)) {
     state.copied += 1;
-    return row.ordinal;
+    return { ordinal: row.ordinal, held: false };
   }
   const standing = tx
-    .select({ sessionId: sessionChunks.sessionId, ordinal: sessionChunks.ordinal, text: sessionChunks.text })
+    .select({
+      sessionId: sessionChunks.sessionId,
+      ordinal: sessionChunks.ordinal,
+      text: sessionChunks.text,
+      at: sessionChunks.at,
+    })
     .from(sessionChunks)
     .where(and(eq(sessionChunks.userId, userId), eq(sessionChunks.chunkSeq, row.chunkSeq)))
     .get();
-  if (standing !== undefined && standing.sessionId === row.sessionId && standing.text === row.text) {
+  if (
+    standing !== undefined &&
+    standing.sessionId === row.sessionId &&
+    standing.text === row.text &&
+    standing.at === row.at
+  ) {
     state.held += 1;
-    return standing.ordinal;
+    return { ordinal: standing.ordinal, held: true };
   }
   if (standing !== undefined) {
-    moveChunk(tx, userId, row.chunkSeq, standing.text, state.next);
-    state.next += 1;
+    moveChunk(tx, userId, row.chunkSeq, standing.text, highest);
     state.moved += 1;
     if (landed(row.ordinal)) {
       state.copied += 1;
-      return row.ordinal;
+      return { ordinal: row.ordinal, held: false };
     }
   }
   const ordinal = nextOrdinal(tx, userId, row.sessionId, state);
@@ -432,24 +352,7 @@ const placeChunk = (tx: TenantTx, userId: string, row: LegacyChunk, state: Chunk
   }
   state.copied += 1;
   state.shifted += 1;
-  return ordinal;
-};
-
-// How far a session's chunks now reach, which is the ordinal the next pass of either indexing path
-// takes. A shifted chunk that left this behind would be written over by the next stretch the
-// session archives.
-const raiseReach = (db: TenantDb, userId: string, reach: ReadonlyMap<string, number>): void => {
-  db.transaction((tx) => {
-    for (const [sessionId, chunks] of reach) {
-      tx.insert(sessionIndex)
-        .values({ userId, sessionId, archived: 0, bytes: 0, chunks })
-        .onConflictDoUpdate({
-          target: [sessionIndex.userId, sessionIndex.sessionId],
-          set: { chunks: sql`MAX(session_index.chunks, excluded.chunks)` },
-        })
-        .run();
-    }
-  });
+  return { ordinal, held: false };
 };
 
 const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
@@ -458,14 +361,23 @@ const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
 // The page read back out of the object and held against the page that went in. It runs beside the
 // copy rather than after it so that the vectors are compared while they are still in hand: a
 // second pass over the whole corpus to check them would read every chunk out of D1 twice.
-const verifyChunkPage = (db: TenantDb, userId: string, page: readonly LegacyChunk[], state: ChunkState): void => {
-  const seqs = JSON.stringify(page.map((row) => row.chunkSeq));
+//
+// Every row is asked for, and only the ones this run wrote are compared byte for byte. A chunk the
+// object was already holding was embedded by whichever model was live when it was indexed, and a
+// vector that differs for that reason is not this copy's doing.
+const verifyChunkPage = (
+  db: TenantDb,
+  userId: string,
+  page: readonly LegacyChunk[],
+  placed: ReadonlyMap<number, Placed>,
+  state: ChunkState,
+): void => {
   const stored = new Map(
     db
       .values<[number, unknown]>(
         sql`SELECT ${sessionChunks.chunkSeq}, ${sessionChunks.embedding} FROM ${sessionChunks}
           WHERE ${sessionChunks.userId} = ${userId}
-            AND ${sessionChunks.chunkSeq} IN (SELECT value FROM json_each(${seqs}))`,
+            AND ${sessionChunks.chunkSeq} IN ${jsonEach(page.map((row) => row.chunkSeq))}`,
       )
       .map(([chunkSeq, embedding]): [number, Uint8Array] => [chunkSeq, toBytes(embedding)]),
   );
@@ -475,25 +387,27 @@ const verifyChunkPage = (db: TenantDb, userId: string, page: readonly LegacyChun
       state.missing += 1;
       continue;
     }
+    if (placed.get(row.chunkSeq)?.held === true) continue;
     if (!sameBytes(got, row.embedding)) state.embeddings.push(row.chunkSeq);
   }
 };
 
+interface ChunkPass extends ChunkState {
+  frontier: number;
+  done: boolean;
+}
+
 // The account's prose, a page at a time, so that neither the vectors nor the text of a corpus that
-// runs to hundreds of megabytes is ever held whole. Each page is one batch: a run that stops part
-// way leaves every page before it committed, and the next run walks from the start and passes over
-// them a chunk at a time.
+// runs to hundreds of megabytes is ever held whole. Each page is one batch, and the call stops on
+// its budget and hands back the `chunk_seq` it read to, so a corpus bigger than one request walks
+// forward over as many calls as it takes rather than restarting.
 const copyChunks = async (
   tenant: TenantDb,
   account: AccountDb,
   userId: string,
   highest: number,
-): Promise<ChunkState> => {
-  const top = tenant
-    .select({ top: sql<number>`COALESCE(MAX(${sessionChunks.chunkSeq}), 0)` })
-    .from(sessionChunks)
-    .where(eq(sessionChunks.userId, userId))
-    .get();
+  after: number,
+): Promise<ChunkPass> => {
   const state: ChunkState = {
     copied: 0,
     held: 0,
@@ -501,25 +415,30 @@ const copyChunks = async (
     moved: 0,
     missing: 0,
     embeddings: [],
-    next: Math.max(highest, top?.top ?? 0) + 1,
     ordinals: new Map(),
   };
-  let after = 0;
+  let frontier = after;
+  let seen = 0;
   for (;;) {
-    const page = await accountChunkPage(account, userId, after);
-    if (page.length === 0) return state;
+    const page = await accountChunkPage(account, userId, frontier);
+    if (page.length === 0) return { ...state, frontier, done: true };
     const reach = new Map<string, number>();
+    const placed = new Map<number, Placed>();
     tenant.transaction((tx) => {
       for (const row of page) {
-        const ordinal = placeChunk(tx, userId, row, state);
-        reach.set(row.sessionId, Math.max(reach.get(row.sessionId) ?? 0, ordinal + 1));
+        const put = placeChunk(tx, userId, row, state, highest);
+        placed.set(row.chunkSeq, put);
+        reach.set(row.sessionId, Math.max(reach.get(row.sessionId) ?? 0, put.ordinal + 1));
       }
+      for (const [sessionId, chunks] of reach) raiseChunkReach(tx, userId, sessionId, chunks);
     });
-    raiseReach(tenant, userId, reach);
-    verifyChunkPage(tenant, userId, page, state);
+    verifyChunkPage(tenant, userId, page, placed, state);
     const last = page.at(-1);
-    if (last === undefined || page.length < CHUNK_PAGE) return state;
-    after = last.chunkSeq;
+    if (last === undefined) return { ...state, frontier, done: true };
+    frontier = last.chunkSeq;
+    seen += page.length;
+    if (page.length < CHUNK_PAGE) return { ...state, frontier, done: true };
+    if (seen >= CHUNK_BUDGET) return { ...state, frontier, done: false };
   }
 };
 
@@ -533,26 +452,29 @@ const copyChunks = async (
 // against, which is the one-argument form.
 //
 // Caught rather than thrown, so a corrupt index is reported with the rest of the checks instead of
-// ending the run as a failed request that says nothing about any of them.
+// ending the run as a failed request that says nothing about any of them. Corruption is the one
+// class this names: a statement that fails for any other reason leaves the index unread, which is
+// a different thing to tell an operator than an index that disagrees with its rows.
 const indexIntegrity = (
   db: TenantDb,
   table: typeof sessionChunksFts | typeof sessionHistoryFts,
   rank: 0 | 1,
-): string => {
+): IndexCheck => {
   try {
     db.run(
       rank === 1
         ? sql`INSERT INTO ${table} (${table}, rank) VALUES ('integrity-check', 1)`
         : sql`INSERT INTO ${table} (${table}) VALUES ('integrity-check')`,
     );
-    return "";
+    return { corrupt: false, error: "" };
   } catch (error) {
-    return error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    return { corrupt: /corrupt|malformed/i.test(message), error: message };
   }
 };
 
-const tenantCount = (db: TenantDb, query: ReturnType<typeof sql>): number => db.values<[number]>(query)[0]?.[0] ?? 0;
-
+// Every session a store knows of, live or over. Both halves are asked because a session ends by
+// moving from one table to the other, and the copy is about whether the account can reach it.
 const tenantSessionIds = (db: TenantDb, userId: string): Set<string> =>
   new Set(
     db
@@ -564,42 +486,14 @@ const tenantSessionIds = (db: TenantDb, userId: string): Set<string> =>
       .map(([sessionId]) => sessionId),
   );
 
-interface Counted {
-  sessions: number;
-  history: number;
-  index: number;
-  chunks: number;
-  records: number;
-  usage: number;
-}
-
-const accountCounts = async (db: AccountDb, userId: string): Promise<Counted> => {
-  const one = async (query: ReturnType<typeof sql>): Promise<number> => {
-    const rows = await db.values<[number]>(query);
-    return rows[0]?.[0] ?? 0;
-  };
-  return {
-    sessions: await one(sql`SELECT count(*) FROM ${legacySessions} WHERE ${legacySessions.userId} = ${userId}`),
-    history: await one(
-      sql`SELECT count(*) FROM ${legacySessionHistory} WHERE ${legacySessionHistory.userId} = ${userId}`,
-    ),
-    index: await one(sql`SELECT count(*) FROM ${legacySessionIndex} WHERE ${legacySessionIndex.userId} = ${userId}`),
-    chunks: await one(sql`SELECT count(*) FROM ${legacySessionChunks} WHERE ${legacySessionChunks.userId} = ${userId}`),
-    records: await one(
-      sql`SELECT count(*) FROM ${legacySessionRecords} WHERE ${legacySessionRecords.userId} = ${userId}`,
-    ),
-    usage: await one(sql`SELECT count(*) FROM ${legacyUsageEvents} WHERE ${legacyUsageEvents.userId} = ${userId}`),
-  };
+const accountSessionIds = async (db: AccountDb, userId: string): Promise<Set<string>> => {
+  const rows = await db.values<[string]>(
+    sql`SELECT ${legacySessions.sessionId} FROM ${legacySessions} WHERE ${legacySessions.userId} = ${userId}
+      UNION SELECT ${legacySessionHistory.sessionId} FROM ${legacySessionHistory}
+        WHERE ${legacySessionHistory.userId} = ${userId}`,
+  );
+  return new Set(rows.map(([sessionId]) => sessionId));
 };
-
-const tenantCounts = (db: TenantDb, userId: string): Counted => ({
-  sessions: tenantCount(db, sql`SELECT count(*) FROM ${sessions} WHERE ${sessions.userId} = ${userId}`),
-  history: tenantCount(db, sql`SELECT count(*) FROM ${sessionHistory} WHERE ${sessionHistory.userId} = ${userId}`),
-  index: tenantCount(db, sql`SELECT count(*) FROM ${sessionIndex} WHERE ${sessionIndex.userId} = ${userId}`),
-  chunks: tenantCount(db, sql`SELECT count(*) FROM ${sessionChunks} WHERE ${sessionChunks.userId} = ${userId}`),
-  records: tenantCount(db, sql`SELECT count(*) FROM ${sessionRecords} WHERE ${sessionRecords.userId} = ${userId}`),
-  usage: tenantCount(db, sql`SELECT count(*) FROM ${usageEvents} WHERE ${usageEvents.userId} = ${userId}`),
-});
 
 const highestChunkSeq = async (db: AccountDb, userId: string): Promise<number> => {
   const rows = await db.values<[number]>(
@@ -614,114 +508,107 @@ const highestChunkSeq = async (db: AccountDb, userId: string): Promise<number> =
 //
 // Running it again copies nothing: every row the object holds conflicts with itself and is left
 // standing, a chunk an earlier run brought over is found under the `chunk_seq` it came in with,
-// and the object's own chunks are already above D1's range and so move no second time.
+// and the object's own chunks are already above D1's range and so move no second time. `after` is
+// where this call opens its walk of the prose, which is the frontier the call before it returned.
 export const copySessions = async (
   tenant: TenantDb,
   account: AccountDb,
   userId: string,
+  after: number,
 ): Promise<SessionCopyReport> => {
   const heldBefore = tenantSessionIds(tenant, userId);
-  const live = await accountSessions(account, userId);
-  const past = await accountHistory(account, userId);
-  const fromD1 = new Set([...live, ...past].map((row) => row.sessionId));
-  const straddling = [...fromD1].filter((sessionId) => heldBefore.has(sessionId)).sort();
+  const fromD1 = await accountSessionIds(account, userId);
+  // Only the call that opens the run can tell a session the object wrote itself from one an
+  // earlier call of this same run copied into it.
+  const straddling = after === 0 ? [...fromD1].filter((sessionId) => heldBefore.has(sessionId)).sort() : [];
 
-  const copied = {
-    sessions: writeEach(
-      tenant,
-      live,
-      (tx, row) =>
-        tx.insert(sessions).values(row).onConflictDoNothing().returning({ id: sessions.sessionId }).all().length,
-    ),
-    history: writeEach(
-      tenant,
-      past,
-      (tx, row) =>
-        tx.insert(sessionHistory).values(row).onConflictDoNothing().returning({ id: sessionHistory.sessionId }).all()
-          .length,
-    ),
-    index: writeEach(
-      tenant,
-      await accountIndex(account, userId),
-      (tx, row) =>
-        tx.insert(sessionIndex).values(row).onConflictDoNothing().returning({ id: sessionIndex.sessionId }).all()
-          .length,
-    ),
-    records: writeEach(
-      tenant,
-      await accountRecords(account, userId),
-      (tx, row) =>
-        tx.insert(sessionRecords).values(row).onConflictDoNothing().returning({ file: sessionRecords.file }).all()
-          .length,
-    ),
-    openChunks: writeEach(
-      tenant,
-      await accountOpenChunks(account, userId),
-      (tx, row) =>
-        tx.insert(sessionOpenChunks).values(row).onConflictDoNothing().returning({ file: sessionOpenChunks.file }).all()
-          .length,
-    ),
-    countedFiles: writeEach(
-      tenant,
-      await accountCountedFiles(account, userId),
-      (tx, row) =>
-        tx.insert(countedFiles).values(row).onConflictDoNothing().returning({ file: countedFiles.file }).all().length,
-    ),
-    usageEvents: writeEach(
-      tenant,
-      await accountUsageEvents(account, userId),
-      (tx, row) =>
-        tx.insert(usageEvents).values(row).onConflictDoNothing().returning({ seq: usageEvents.seq }).all().length,
-    ),
-    usageDaily: writeEach(
-      tenant,
-      await accountUsageDaily(account, userId),
-      (tx, row) =>
-        tx.insert(usageDaily).values(row).onConflictDoNothing().returning({ day: usageDaily.day }).all().length,
-    ),
-    labels: writeEach(
-      tenant,
-      await accountLabels(account, userId),
-      (tx, row) => tx.insert(labels).values(row).onConflictDoNothing().returning({ value: labels.value }).all().length,
-    ),
-    boardMessages: writeEach(
-      tenant,
-      await accountBoardMessages(account, userId),
-      (tx, row) =>
-        tx.insert(boardMessages).values(row).onConflictDoNothing().returning({ id: boardMessages.messageId }).all()
-          .length,
-    ),
-    boardPickups: writeEach(
-      tenant,
-      await accountBoardPickups(account, userId),
-      (tx, row) =>
-        tx.insert(boardPickups).values(row).onConflictDoNothing().returning({ id: boardPickups.messageId }).all()
-          .length,
-    ),
+  // One table of D1 into the table of the object it became. `from`'s row type has to be one the
+  // insert takes, which is what holds the two schemas to each other here rather than at the run.
+  const moved = async <A extends Owned, T extends Owned>(
+    table: string,
+    from: A & { $inferSelect: T["$inferInsert"] },
+    into: T,
+    order: readonly SQLiteColumn[],
+  ): Promise<TableReport> => {
+    const rows = await allOf(account, from, userId, order);
+    const copied = copyTable(tenant, into, rows);
+    return {
+      table,
+      copied,
+      held: rows.length - copied,
+      account: await accountCount(account, from, userId),
+      tenant: tenantCount(tenant, into, userId),
+    };
   };
 
-  const chunks = await copyChunks(tenant, account, userId, await highestChunkSeq(account, userId));
+  const tables: TableReport[] = [
+    await moved("sessions", legacySessions, sessions, [legacySessions.sessionId]),
+    await moved("history", legacySessionHistory, sessionHistory, [legacySessionHistory.sessionId]),
+    await moved("index", legacySessionIndex, sessionIndex, [legacySessionIndex.sessionId]),
+    await moved("records", legacySessionRecords, sessionRecords, [
+      legacySessionRecords.sessionId,
+      legacySessionRecords.file,
+    ]),
+    await moved("openChunks", legacySessionOpenChunks, sessionOpenChunks, [
+      legacySessionOpenChunks.sessionId,
+      legacySessionOpenChunks.file,
+      legacySessionOpenChunks.speaker,
+    ]),
+    await moved("countedFiles", legacyCountedFiles, countedFiles, [
+      legacyCountedFiles.sessionId,
+      legacyCountedFiles.file,
+    ]),
+    await moved("usageEvents", legacyUsageEvents, usageEvents, [legacyUsageEvents.sessionId, legacyUsageEvents.seq]),
+    await moved("usageDaily", legacyUsageDaily, usageDaily, [
+      legacyUsageDaily.day,
+      legacyUsageDaily.host,
+      legacyUsageDaily.repo,
+      legacyUsageDaily.account,
+      legacyUsageDaily.provider,
+      legacyUsageDaily.model,
+    ]),
+    await moved("labels", legacyLabels, labels, [legacyLabels.kind, legacyLabels.value]),
+    await moved("boardMessages", legacyBoardMessages, boardMessages, [legacyBoardMessages.messageId]),
+    await moved("boardPickups", legacyBoardPickups, boardPickups, [legacyBoardPickups.messageId]),
+  ];
+
+  const highest = await highestChunkSeq(account, userId);
+  const chunks = await copyChunks(tenant, account, userId, highest, after);
+  tables.push({
+    table: "chunks",
+    copied: chunks.copied,
+    held: chunks.held,
+    account: await accountCount(account, legacySessionChunks, userId),
+    tenant: tenantCount(tenant, sessionChunks, userId),
+  });
+
   const heldAfter = tenantSessionIds(tenant, userId);
   const missing = [...fromD1].filter((sessionId) => !heldAfter.has(sessionId)).sort();
   const extra = [...heldAfter].filter((sessionId) => !fromD1.has(sessionId)).sort();
   const chunkIndex = indexIntegrity(tenant, sessionChunksFts, 1);
   const historyIndex = indexIntegrity(tenant, sessionHistoryFts, 0);
-  const counts = { account: await accountCounts(account, userId), tenant: tenantCounts(tenant, userId) };
-  const sidesOf = (key: keyof Counted): Sides => ({ account: counts.account[key], tenant: counts.tenant[key] });
+  // A table the object holds fewer rows of than D1 did not arrive, whatever its tally said. The
+  // prose is left out of this until the walk reaches the end of it, because a call that stopped on
+  // its budget is short of the rest by design.
+  const short = tables
+    .filter((row) => row.tenant < row.account && (chunks.done || row.table !== "chunks"))
+    .map((row) => row.table)
+    .sort();
+
   return {
     userId,
-    ...copied,
-    chunks: { copied: chunks.copied, held: chunks.held, shifted: chunks.shifted, moved: chunks.moved },
+    tables,
+    chunks: {
+      copied: chunks.copied,
+      held: chunks.held,
+      shifted: chunks.shifted,
+      moved: chunks.moved,
+      frontier: chunks.frontier,
+      done: chunks.done,
+    },
     straddling,
     checks: {
-      rows: {
-        sessions: sidesOf("sessions"),
-        history: sidesOf("history"),
-        index: sidesOf("index"),
-        chunks: sidesOf("chunks"),
-        records: sidesOf("records"),
-        usage: sidesOf("usage"),
-      },
+      short,
       missing,
       extra,
       missingChunks: chunks.missing,
@@ -729,11 +616,13 @@ export const copySessions = async (
       chunkIndex,
       historyIndex,
       ok:
+        chunks.done &&
+        short.length === 0 &&
         missing.length === 0 &&
         chunks.missing === 0 &&
         chunks.embeddings.length === 0 &&
-        chunkIndex === "" &&
-        historyIndex === "",
+        chunkIndex.error === "" &&
+        historyIndex.error === "",
     },
   };
 };

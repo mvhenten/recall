@@ -38,6 +38,18 @@ const INSERT_DAY = `INSERT INTO usage_daily (user_id, day, host, repo, account, 
    input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
  VALUES (?1, '2026-10-19', 'laptop', 'repo:recall', 'max', 'anthropic', 'opus', 3, 900, 120, 40, 7)`;
 
+const INSERT_COUNTED = "INSERT INTO counted_files (user_id, session_id, file) VALUES (?1, ?2, 'main')";
+
+const INSERT_OPEN_CHUNK = `INSERT INTO session_open_chunks (user_id, session_id, file, speaker, pieces, at)
+ VALUES (?1, ?2, 'main', 'user', '["half a turn the last append left open"]', ?3)`;
+
+const INSERT_BOARD = `INSERT INTO board_messages (user_id, message_id, scope, target, from_device_id, from_host,
+   from_name, body, created_at, expires_at)
+ VALUES (?1, ?2, 'fleet', ?1, 'device-d1', 'laptop', 'laptop', 'read the archive before you rebuild it', ?3, ?4)`;
+
+const INSERT_PICKUP = `INSERT INTO board_pickups (user_id, message_id, session_id, device_id, host, picked_up_at)
+ VALUES (?1, ?2, ?3, 'device-d1', 'laptop', ?4)`;
+
 // What the account said in the sessions that were archived before they moved. Each chunk carries a
 // word of its own, so a search run over the copy says which chunk answered it.
 const PROSE: ReadonlyArray<readonly ["user" | "model", string]> = [
@@ -94,7 +106,17 @@ const tenantChunks = (userId: string): Promise<D1Chunk[]> =>
 const copy = async (client: Client): Promise<SessionCopyReport> => {
   const response = await client.request("POST", "/v1/sessions/copy");
   expect(response.status).toBe(200);
-  return response.json();
+  const report: SessionCopyReport = await response.json();
+  // Every corpus a test writes is well inside one call's budget, so a run that did not reach the
+  // end of the prose is this harness and not the copy.
+  expect(report.chunks.done).toBe(true);
+  return report;
+};
+
+const tallyOf = (report: SessionCopyReport, table: string): { copied: number; held: number } => {
+  const row = report.tables.find((one) => one.table === table);
+  if (row === undefined) throw new Error(`the report names no table ${table}`);
+  return { copied: row.copied, held: row.held };
 };
 
 const owner = async (h: Harness): Promise<Client> => h.user("copy-sessions");
@@ -107,33 +129,63 @@ describe("copying the sessions an account held before they moved", () => {
     const over = crypto.randomUUID();
     await seedSession(client.userId, live, "rebuild the archive reader", true);
     await seedSession(client.userId, over, "why the indexer skips a stretch", false);
+    const messageId = crypto.randomUUID();
     await env.DB.prepare(INSERT_RECORD).bind(client.userId, over).run();
     await env.DB.prepare(INSERT_LABEL).bind(client.userId).run();
     await env.DB.prepare(INSERT_USAGE).bind(client.userId, live, AT).run();
     await env.DB.prepare(INSERT_DAY).bind(client.userId).run();
+    await env.DB.prepare(INSERT_COUNTED).bind(client.userId, over).run();
+    await env.DB.prepare(INSERT_OPEN_CHUNK).bind(client.userId, live, AT).run();
+    await env.DB.prepare(INSERT_BOARD)
+      .bind(client.userId, messageId, AT, AT + 604_800_000)
+      .run();
+    await env.DB.prepare(INSERT_PICKUP).bind(client.userId, messageId, live, AT).run();
     expect((await client.session(live)).status).toBe(404);
 
     const report = await copy(client);
-    expect(report.sessions).toEqual({ copied: 1, held: 0 });
-    expect(report.history).toEqual({ copied: 2, held: 0 });
-    expect(report.index).toEqual({ copied: 2, held: 0 });
-    expect(report.records).toEqual({ copied: 1, held: 0 });
-    expect(report.usageEvents).toEqual({ copied: 1, held: 0 });
-    expect(report.usageDaily).toEqual({ copied: 1, held: 0 });
-    expect(report.labels).toEqual({ copied: 1, held: 0 });
-    expect(report.chunks).toEqual({ copied: PROSE.length * 2, held: 0, shifted: 0, moved: 0 });
+    expect(tallyOf(report, "sessions")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "history")).toEqual({ copied: 2, held: 0 });
+    expect(tallyOf(report, "index")).toEqual({ copied: 2, held: 0 });
+    expect(tallyOf(report, "records")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "openChunks")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "countedFiles")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "usageEvents")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "usageDaily")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "labels")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "boardMessages")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "boardPickups")).toEqual({ copied: 1, held: 0 });
+    expect(tallyOf(report, "chunks")).toEqual({ copied: PROSE.length * 2, held: 0 });
+    expect(report.chunks.shifted).toBe(0);
+    expect(report.chunks.moved).toBe(0);
     expect(report.straddling).toEqual([]);
+    expect(report.checks.short).toEqual([]);
     expect(report.checks.missing).toEqual([]);
     expect(report.checks.extra).toEqual([]);
     expect(report.checks.missingChunks).toBe(0);
     expect(report.checks.embeddings).toEqual([]);
-    expect(report.checks.chunkIndex).toBe("");
-    expect(report.checks.historyIndex).toBe("");
+    expect(report.checks.chunkIndex).toEqual({ corrupt: false, error: "" });
+    expect(report.checks.historyIndex).toEqual({ corrupt: false, error: "" });
     expect(report.checks.ok).toBe(true);
+
+    // Every table the cutover moved holds in the object what D1 holds of it, which is the one
+    // thing a tally cannot say: a table whose every insert conflicted reads as `copied: 0`.
+    for (const row of report.tables) expect([row.table, row.tenant]).toEqual([row.table, row.account]);
 
     // Every chunk kept the key D1 wrote it under, which is what `session_chunks_fts` ranks by and
     // what the vector scan reads as recency.
     expect(await tenantChunks(client.userId)).toEqual(await accountChunks(client.userId));
+
+    // The rows no session page reads, which arrive or do not and only a count would say.
+    const kept = await tenantRows<{ counted: number; open: number; posted: number; taken: number; labelled: number }>(
+      client.userId,
+      `SELECT (SELECT count(*) FROM counted_files WHERE user_id = ?1) AS counted,
+         (SELECT count(*) FROM session_open_chunks WHERE user_id = ?1) AS open,
+         (SELECT count(*) FROM board_messages WHERE user_id = ?1) AS posted,
+         (SELECT count(*) FROM board_pickups WHERE user_id = ?1) AS taken,
+         (SELECT count(*) FROM labels WHERE user_id = ?1) AS labelled`,
+      client.userId,
+    );
+    expect(kept).toEqual([{ counted: 1, open: 1, posted: 1, taken: 1, labelled: 1 }]);
 
     expect((await client.session(live)).status).toBe(200);
     const history = await client.request("GET", "/v1/sessions?scope=history");
@@ -155,11 +207,14 @@ describe("copying the sessions an account held before they moved", () => {
     const after = await tenantChunks(client.userId);
 
     const again = await copy(client);
-    expect(again.sessions).toEqual({ copied: 0, held: 1 });
-    expect(again.history).toEqual({ copied: 0, held: 1 });
-    expect(again.index).toEqual({ copied: 0, held: 1 });
-    expect(again.chunks).toEqual({ copied: 0, held: PROSE.length, shifted: 0, moved: 0 });
-    expect(again.checks.chunkIndex).toBe("");
+    expect(tallyOf(again, "sessions")).toEqual({ copied: 0, held: 1 });
+    expect(tallyOf(again, "history")).toEqual({ copied: 0, held: 1 });
+    expect(tallyOf(again, "index")).toEqual({ copied: 0, held: 1 });
+    expect(tallyOf(again, "chunks")).toEqual({ copied: 0, held: PROSE.length });
+    expect(again.chunks.shifted).toBe(0);
+    expect(again.chunks.moved).toBe(0);
+    expect(again.checks.short).toEqual([]);
+    expect(again.checks.chunkIndex).toEqual({ corrupt: false, error: "" });
     expect(again.checks.ok).toBe(true);
     expect(await tenantChunks(client.userId)).toEqual(after);
   });
@@ -194,13 +249,14 @@ describe("copying the sessions an account held before they moved", () => {
 
     const report = await copy(client);
     expect(report.straddling).toEqual([sessionId]);
-    expect(report.sessions).toEqual({ copied: 0, held: 1 });
+    expect(tallyOf(report, "sessions")).toEqual({ copied: 0, held: 1 });
     expect(report.chunks.copied).toBe(PROSE.length);
     expect(report.chunks.moved).toBe(1);
     expect(report.chunks.shifted).toBeGreaterThan(0);
     // SQLite's own read of the index the move hand-wrote: no entry left at the rowid the mover
     // vacated, and the one it moved to is there.
-    expect(report.checks.chunkIndex).toBe("");
+    expect(report.checks.chunkIndex).toEqual({ corrupt: false, error: "" });
+    expect(report.checks.short).toEqual([]);
     expect(report.checks.missingChunks).toBe(0);
     expect(report.checks.embeddings).toEqual([]);
     expect(report.checks.ok).toBe(true);
@@ -240,5 +296,40 @@ describe("copying the sessions an account held before they moved", () => {
       "SELECT rowid AS chunk_seq FROM session_chunks_fts WHERE session_chunks_fts MATCH 'sparkline'",
     );
     expect(matched.map((row) => row.chunk_seq)).toEqual([mover?.chunk_seq]);
+  });
+
+  // The copy that would be passed over if the prose alone said a chunk had already arrived. A
+  // session replayed after the cutover is re-indexed from ordinal zero, so the object writes the
+  // pre-cutover prose again under the low keys D1 handed this account — the same session and the
+  // same text at a `chunk_seq` D1 uses, and a copy that read that as its own earlier work would
+  // drop a chunk of history and report itself sound. The instant the chunk was spoken is what
+  // tells the two apart.
+  it("copies a chunk whose prose the object already holds under the key D1 wrote it under", async () => {
+    const h = await harness();
+    const client = await owner(h);
+    const sessionId = crypto.randomUUID();
+    await seedSession(client.userId, sessionId, "rebuild the archive reader", true);
+    const before = await accountChunks(client.userId);
+    const first = before[0];
+    if (first === undefined) throw new Error("the seed wrote no chunk");
+
+    expect((await client.sync(sessionId)).status).toBe(204);
+    await tenantRows(
+      client.userId,
+      "INSERT INTO session_chunks (chunk_seq, user_id, session_id, ordinal, speaker, text, embedding, at) VALUES (?1, ?2, ?3, 0, 'model', ?4, ?5, ?6)",
+      first.chunk_seq,
+      client.userId,
+      sessionId,
+      first.text,
+      (await embeddingFor(first.text)).slice().buffer,
+      AT + 9_000,
+    );
+
+    const report = await copy(client);
+    expect(tallyOf(report, "chunks")).toEqual({ copied: PROSE.length, held: 0 });
+    expect(report.chunks.moved).toBe(1);
+    expect(report.checks.short).toEqual([]);
+    expect(report.checks.ok).toBe(true);
+    expect(await tenantChunks(client.userId)).toHaveLength(PROSE.length + 1);
   });
 });

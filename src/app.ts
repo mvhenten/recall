@@ -836,13 +836,18 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         })),
       });
     }
-    // The one-shot copy of this account's sessions out of D1 and into its own object, run against
-    // a running deployment by `npm run copy-sessions` and by nothing else. A session answers a
-    // GET, a PUT and a DELETE at its own id and never a POST, so a session id of `copy` shadows
-    // nothing. It is here rather than on a read path because a read path must never migrate
-    // anything.
+    // The copy of this account's sessions out of D1 and into its own object, run against a running
+    // deployment by `npm run copy-sessions` and by nothing else. A session answers a GET, a PUT
+    // and a DELETE at its own id and never a POST, so a session id of `copy` shadows nothing. It
+    // is here rather than on a read path because a read path must never migrate anything.
+    //
+    // `after` opens the walk of the prose where the call before it left off, so a corpus too big
+    // for one request's budget is finished by calling again rather than by a run that restarts and
+    // re-reads what it already copied.
     if (rawSessionId === "copy" && subresource === undefined && request.method === "POST") {
-      return json(await copySessions(db, env.ACCOUNT, caller.userId));
+      const after = Number(url.searchParams.get("after") ?? "0");
+      if (!Number.isSafeInteger(after) || after < 0) return error(400, "after must be a chunk_seq the copy reached");
+      return json(await copySessions(db, env.ACCOUNT, caller.userId, after));
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);

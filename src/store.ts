@@ -86,7 +86,8 @@ import type { Speaker } from "./turns";
 
 // A list of values goes in as one JSON parameter and is unpacked by `json_each`, because SQLite
 // binds at most a hundred parameters to a statement and both stores hold it to that.
-const jsonEach = (values: readonly unknown[]): SQL => sql`(SELECT value FROM json_each(${JSON.stringify(values)}))`;
+export const jsonEach = (values: readonly unknown[]): SQL =>
+  sql`(SELECT value FROM json_each(${JSON.stringify(values)}))`;
 
 // A column written with the table it belongs to. Drizzle drops the table from a column it puts in
 // the select list of a single-table query, and an unqualified name inside a correlated subquery
@@ -2504,6 +2505,24 @@ export const chunkReach = async (db: TenantDb, userId: string, sessionId: string
   return row === undefined ? 0 : row.chunks;
 };
 
+// The counter moved on, which only ever climbs: two paths index one session and a reach that went
+// backwards would have the next pass write over prose that is already indexed. The row is opened
+// at nothing but the reach where the session has none, since the mark the byte path reads is the
+// archive's and not this.
+//
+// `guard` is what the write is weighed against — the mark a record append read, `undefined` where
+// there is nothing to lose the row to.
+export const raiseChunkReach = (tx: TenantTx, userId: string, sessionId: string, chunks: number, guard?: SQL): void => {
+  const row = sql`SELECT ${userId}, ${sessionId}, 0, 0, ${chunks}`;
+  tx.insert(sessionIndex)
+    .select(guard === undefined ? row : sql`${row} WHERE ${guard}`)
+    .onConflictDoUpdate({
+      target: [sessionIndex.userId, sessionIndex.sessionId],
+      set: { chunks: sql`MAX(session_index.chunks, excluded.chunks)` },
+    })
+    .run();
+};
+
 export interface RecordCommit {
   userId: string;
   sessionId: string;
@@ -2569,13 +2588,7 @@ export const commitRecords = async (db: TenantDb, commit: RecordCommit): Promise
         .run();
     });
     if (chunks.length > 0) {
-      tx.insert(sessionIndex)
-        .select(sql`SELECT ${userId}, ${sessionId}, 0, 0, ${chunkFrom + chunks.length} WHERE ${markStands(commit)}`)
-        .onConflictDoUpdate({
-          target: [sessionIndex.userId, sessionIndex.sessionId],
-          set: { chunks: sql`MAX(session_index.chunks, excluded.chunks)` },
-        })
-        .run();
+      raiseChunkReach(tx, userId, sessionId, chunkFrom + chunks.length, markStands(commit));
     }
     tx.run(sql`DELETE FROM ${sessionOpenChunks}
       WHERE ${sessionOpenChunks.userId} = ${userId} AND ${sessionOpenChunks.sessionId} = ${sessionId}
