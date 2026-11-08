@@ -1,5 +1,6 @@
 import { and, asc, count, desc, eq, getTableName, gt, gte, inArray, lt, lte, ne, or, type SQL, sql } from "drizzle-orm";
 import { type SQLiteColumn, type SQLiteTable, union, unionAll } from "drizzle-orm/sqlite-core";
+import type { ArtifactCopyReport } from "./artifact-copy";
 import {
   type ArtifactFile,
   type ArtifactListInput,
@@ -1541,6 +1542,9 @@ export interface ArtifactStore extends ArtifactReads {
   replaceArtifact(commit: ArtifactCommit, fromRev: number): Promise<boolean>;
   deleteArtifact(userId: string, name: string): Promise<void>;
   adoptArtifacts(userId: string): Promise<number>;
+  // The one-shot copy out of D1, which `./artifact-copy` holds and an operator drives once per
+  // account. It sits on the write side because it writes, and on no read path at all.
+  copyArtifacts(userId: string, now: number): Promise<ArtifactCopyReport>;
 }
 
 export const getArtifact = async (db: TenantDb, userId: string, name: string): Promise<ArtifactRecord | null> => {

@@ -665,6 +665,7 @@ const artifactStoreFor = (env: Pick<AppEnv, "TENANT">): ArtifactStore => ({
   replaceArtifact: (commit, fromRev) => tenantOf(env, commit.userId).replaceArtifact(commit, fromRev),
   deleteArtifact: (userId, name) => tenantOf(env, userId).deleteArtifact(userId, name),
   adoptArtifacts: (userId) => tenantOf(env, userId).adoptArtifacts(userId),
+  copyArtifacts: (userId, now) => tenantOf(env, userId).copyArtifacts(userId, now),
 });
 
 // Everything the dashboard reads off an address before it knows who is asking: which tab the
@@ -2350,10 +2351,16 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (request.method !== "GET") return error(405, "method not allowed");
       return artifactsListing(url, account, store, host, userId, now);
     }
-    // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
-    // shadowed by an artifact named adopt.
+    // An artifact answers a PUT, a GET and a DELETE and never a POST, so neither the adopt nor
+    // the copy can be shadowed by an artifact named adopt or copy.
     if (rawName === "adopt" && rest.length === 0 && request.method === "POST") {
       return json({ adopted: await store.adoptArtifacts(userId) });
+    }
+    // The one-shot copy of this account's artifact rows out of D1 and into its own object, run
+    // once against a running deployment by `npm run copy-artifacts` and by nothing else. It is
+    // here rather than on a read path because a read path must never migrate anything.
+    if (rawName === "copy" && rest.length === 0 && request.method === "POST") {
+      return json(await store.copyArtifacts(userId, now));
     }
     const name = parseName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);

@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { createTenant, type TenantApi, type TenantCall, type TenantEnv } from "./app";
+import { type ArtifactCopyReport, copyArtifacts } from "./artifact-copy";
 import type { ArtifactListInput, ArtifactRecord } from "./artifacts";
 import { accountStoreOf, type TenantDb, tenantStoreOf } from "./db";
 import type { Caller } from "./device";
@@ -103,6 +104,13 @@ export class Tenant extends DurableObject<Env> {
     const bucket = this.env.ARTIFACTS;
     if (bucket === undefined) throw new Error("this deployment binds no artifact bucket");
     return adoptArtifacts(this.db, bucket, userId);
+  }
+
+  // The one artifact call that reads D1, because what it copies is in D1 and what it writes is
+  // this object's rows. An operator runs it once per account against a running deployment; no
+  // read or write of an artifact reaches it.
+  copyArtifacts(userId: string, now: number): Promise<ArtifactCopyReport> {
+    return copyArtifacts(this.db, accountStoreOf(this.env.DB), userId, now);
   }
 
   private store(): TenantEnv {
