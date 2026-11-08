@@ -71,6 +71,12 @@ export interface TranscriptFile extends Extent {
   /// How many bytes of this file the archive holds, which is the stretches it was written as laid
   /// end to end.
   bytes: number;
+  /// How many records the archive holds of this file, and nothing for one written as bytes. The
+  /// two paths answer in places of different kinds: a stretch names a place in the file on disk,
+  /// and a record names a line of it, which redaction cannot move. A reader weighing what it holds
+  /// against the archive reads this wherever it stands at anything, and `through` where it does
+  /// not.
+  records: number;
 }
 
 const filePrefix = (userId: string, sessionId: string, file: string): string => `${userId}/${sessionId}/${file}/`;
@@ -689,5 +695,5 @@ export const cacheArchived = (
 // short of one.
 export const archivedFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> =>
   (await archivedTranscript(bucket, userId, sessionId)).map(
-    ({ file, bytes, through, named }): TranscriptFile => ({ file, bytes, through, named }),
+    ({ file, bytes, through, named }): TranscriptFile => ({ file, bytes, through, named, records: 0 }),
   );

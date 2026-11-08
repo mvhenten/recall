@@ -32,6 +32,7 @@ fn the_reader_holds_what_the_shared_file_says() {
     assert_eq!(texts(&shared["promptMarks"]), crate::adopt::PROMPT_MARKS);
     assert_eq!(text(&shared["sidechainMark"]), crate::adopt::SIDECHAIN_MARK);
     assert_eq!(text(&shared["mainFile"]), crate::transcripts::MAIN);
+    assert_eq!(text(&shared["binaryRecord"]), crate::transcripts::BINARY_RECORD);
     assert_eq!(
         number(&shared["maxStretchBytes"]),
         crate::transcripts::MAX_APPEND_BYTES as u64

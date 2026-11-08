@@ -18,9 +18,14 @@
 //! Every record is redacted on its way out, so a secret a session printed is never sent at all. A
 //! run of records is redacted as the stretch of the file it is — one reading, not one per line —
 //! because a private key block runs across the lines it is written on and no reading of a single
-//! line could see it. A redaction that swallowed a line break would leave fewer records than the
-//! file holds lines, and the ordinals either side of it would mean two different places; that
-//! stops the file rather than being sent.
+//! line could see it. Such a block stands out as one placeholder for each line it stood on, so the
+//! file keeps the lines it had: a redaction that swallowed a break would leave fewer records than
+//! the file holds lines, and every ordinal past it would name another line than it did.
+//!
+//! A record crosses as a JSON string, and a persisted tool output holds whatever a command
+//! printed, so a line that is not valid UTF-8 carries its own bytes in base64 behind a marker the
+//! service decodes before it stores them. Nothing is sent lossily and nothing is refused for the
+//! bytes it holds.
 //!
 //! A line the session is still writing is no record: the archive of a file of turns always ends on
 //! a line break, so a session resumed on the same file carries on from the start of a record and no
@@ -38,6 +43,7 @@
 
 use crate::redact;
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader};
@@ -58,6 +64,13 @@ pub const MAX_RECORDS: usize = 1_000;
 pub const MAX_APPEND_BYTES: usize = 1_048_576;
 
 const NEWLINE: u8 = b'\n';
+
+/// What a record that is not valid UTF-8 opens with, and what the bytes behind it are written in.
+/// The service holds the same marker, and `schemas/transcript-entry.json` is where the two read it
+/// from so neither can move it alone.
+pub const BINARY_RECORD: &str = "\0base64:";
+
+const BASE64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// What a file of a session holds. A file of turns is what the usage readers parse; a tool output
 /// is bytes a turn pointed at, which they never read and which no token was ever spent on.
@@ -220,9 +233,12 @@ pub enum Appended {
     Refused(i64),
 }
 
-/// What the service takes: a run of redacted records under the ordinal the first of them holds.
+/// What the service takes: a run of redacted records under the ordinal the first of them holds,
+/// and whether a line break closes the last of them. That break is the one byte no ordinal
+/// accounts for — a file is its records laid out with one between them — so an archive told
+/// nothing of it reads back a byte short of the file it holds.
 pub trait Store {
-    fn append(&self, session_id: &str, file: &str, from: i64, records: &[String]) -> Result<Appended>;
+    fn append(&self, session_id: &str, file: &str, from: i64, records: &[String], closed: bool) -> Result<Appended>;
 }
 
 /// Where a pass picks a file up. `proven` is false for a place this run worked out for itself
@@ -280,10 +296,12 @@ pub struct Reader<R: BufRead> {
     spent: bool,
 }
 
-/// One batch as it goes up: the records, and the lines of the file they were read from, which go
-/// back on the queue where the service refuses them.
+/// One batch as it goes up: the records, whether a line break closes the last of them, and the
+/// lines of the file they were read from, which go back on the queue where the service refuses
+/// them.
 struct Batch {
     records: Vec<String>,
+    closed: bool,
     lines: Vec<Line>,
 }
 
@@ -386,9 +404,10 @@ impl<R: BufRead> Reader<R> {
     /// sends one, and the rest go back on the queue for the append after it.
     ///
     /// The whole stretch goes through the redactor at once and the records are cut out of what
-    /// comes back, so a secret written across two lines is read as the one secret it is. A
-    /// redaction that swallowed the break between them would leave the batch with fewer records
-    /// than lines, and every ordinal past it would name a line it does not; that stops the file.
+    /// comes back, so a secret written across two lines is read as the one secret it is. The
+    /// redactor keeps the breaks it wrote over, which is what lets the records be cut out at all;
+    /// a batch that came back with fewer breaks than it went in with would have every ordinal past
+    /// the secret naming a line it does not, so it stops the file rather than sending one.
     fn batch(&mut self, file: &str, limit: usize) -> Result<Option<Batch>> {
         let mut lines: Vec<Line> = Vec::new();
         let mut groups: Vec<usize> = Vec::new();
@@ -429,13 +448,7 @@ impl<R: BufRead> Reader<R> {
             if taken + group > shown.len() {
                 break;
             }
-            records.push(
-                shown[taken..taken + group]
-                    .iter()
-                    .map(|line| String::from_utf8_lossy(line))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+            records.push(written(&shown[taken..taken + group].join(&NEWLINE)));
             taken += group;
         }
         let held_back = complete < first;
@@ -464,9 +477,16 @@ impl<R: BufRead> Reader<R> {
         let read: usize = groups[..records.len()].iter().sum();
         let rest = lines.split_off(read);
         self.restore_lines(rest);
+        // The break that closed the last line this batch carries, which is every line of a file of
+        // turns and every line of a tool output but the one a session stopped part way through.
+        let ends = lines.last().is_some_and(|line| line.closed);
         self.at += records.len() as i64;
         self.before = Some(NEWLINE);
-        Ok(Some(Batch { records, lines }))
+        Ok(Some(Batch {
+            records,
+            closed: ends,
+            lines,
+        }))
     }
 
     fn restore_lines(&mut self, lines: Vec<Line>) {
@@ -498,6 +518,19 @@ fn spread(lines: &[Line]) -> Vec<u8> {
 
 fn breaks(bytes: &[u8]) -> usize {
     bytes.iter().filter(|byte| **byte == NEWLINE).count()
+}
+
+/// One record written out for the wire. A record crosses as a JSON string, and a persisted tool
+/// output holds whatever a command printed, so a line that is not valid UTF-8 would go up as the
+/// replacement character over and over and the archive would hold bytes the host never read. Such
+/// a line carries its own bytes in base64 behind the marker, which the service decodes back before
+/// it stores them; a line that is valid UTF-8 and opens with the marker goes the same way, so
+/// reading one back is never a guess.
+fn written(record: &[u8]) -> String {
+    match std::str::from_utf8(record) {
+        Ok(text) if !text.starts_with(BINARY_RECORD) => text.to_string(),
+        _ => format!("{BINARY_RECORD}{}", BASE64.encode(record)),
+    }
 }
 
 /// How many of a batch's records fit the body one append may hold. The ceiling is on the body the
@@ -537,7 +570,7 @@ pub fn send_from(
         let Some(batch) = reader.batch(file, limit)? else {
             break;
         };
-        match store.append(session_id, file, place.next, &batch.records)? {
+        match store.append(session_id, file, place.next, &batch.records, batch.closed)? {
             Appended::Written(next) => {
                 records += batch.records.len() as i64;
                 place = Place::reached(next);
@@ -566,6 +599,21 @@ pub fn send_from(
 pub fn open(source: &Source, pass: Pass) -> Result<Reader<BufReader<std::fs::File>>> {
     let file = std::fs::File::open(&source.path).with_context(|| format!("reading {}", source.path.display()))?;
     Ok(Reader::new(BufReader::new(file), source.holds, pass))
+}
+
+/// How many records one file on disk holds. A restore weighs a file it already has against the
+/// archive in records rather than in bytes, because redaction leaves a record at another length
+/// than the line it was read from and no count of the archive's bytes is a place in the local
+/// file. Counting as the final pass would counts the line a session is still writing, which is the
+/// reading that leaves a live transcript alone.
+pub fn records_held(path: &Path, holds: Holds) -> Result<i64> {
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut reader = Reader::new(BufReader::new(file), holds, Pass::Final);
+    let mut held = 0;
+    while reader.record()?.is_some() {
+        held += 1;
+    }
+    Ok(held)
 }
 
 /// A run of passes over the sessions on this host. It carries where each file is waiting and how
@@ -696,31 +744,81 @@ mod tests {
     /// ordinal it really waits at, which is how the records endpoint weighs one.
     #[derive(Debug, Default)]
     struct Fake {
-        files: RefCell<HashMap<String, Vec<String>>>,
+        files: RefCell<HashMap<String, Vec<Held>>>,
         offered: RefCell<usize>,
     }
 
+    /// One append as the archive keeps it: the records, and whether a line break closed the last
+    /// of them. The service stores the two together because nothing else says where the file ends.
+    #[derive(Debug, Clone)]
+    struct Held {
+        records: Vec<String>,
+        closed: bool,
+    }
+
     impl Fake {
-        /// One file as it reads back: the records laid out with a break between two, which is what
-        /// the service hands a reader.
+        /// One file as it reads back: every append laid out as its records with a break between
+        /// two, closed by the break that closed its last record. It is the file the host sent, to
+        /// the byte.
+        fn raw(&self, file: &str) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for held in self.files.borrow().get(file).cloned().unwrap_or_default() {
+                for (index, record) in held.records.iter().enumerate() {
+                    if index > 0 {
+                        bytes.push(NEWLINE);
+                    }
+                    bytes.extend_from_slice(&read(record));
+                }
+                if held.closed {
+                    bytes.push(NEWLINE);
+                }
+            }
+            bytes
+        }
+
         fn body(&self, file: &str) -> String {
-            self.files.borrow().get(file).cloned().unwrap_or_default().join("\n")
+            String::from_utf8(self.raw(file)).unwrap()
+        }
+
+        fn records(&self, file: &str) -> Vec<String> {
+            self.files
+                .borrow()
+                .get(file)
+                .map(|held| held.iter().flat_map(|one| one.records.clone()).collect())
+                .unwrap_or_default()
         }
 
         fn next(&self, file: &str) -> i64 {
-            self.files.borrow().get(file).map(Vec::len).unwrap_or(0) as i64
+            self.records(file).len() as i64
+        }
+    }
+
+    /// A record as the service stores it, which is the bytes the host read: a marked one carries
+    /// them in base64 and is decoded back.
+    fn read(record: &str) -> Vec<u8> {
+        match record.strip_prefix(BINARY_RECORD) {
+            Some(encoded) => BASE64.decode(encoded).unwrap(),
+            None => record.as_bytes().to_vec(),
         }
     }
 
     impl Store for Fake {
-        fn append(&self, _session_id: &str, file: &str, from: i64, records: &[String]) -> Result<Appended> {
+        fn append(
+            &self,
+            _session_id: &str,
+            file: &str,
+            from: i64,
+            records: &[String],
+            closed: bool,
+        ) -> Result<Appended> {
             assert!(records.len() <= MAX_RECORDS, "an append carries at most {MAX_RECORDS}");
             assert!(!records.is_empty(), "an append carries at least one record");
             assert!(
                 records.iter().all(|record| !record.is_empty()),
                 "a record holds at least one character"
             );
-            let body = serde_json::json!({ "file": file, "from": from, "records": records }).to_string();
+            let body =
+                serde_json::json!({ "file": file, "from": from, "records": records, "closed": closed }).to_string();
             assert!(
                 body.len() <= MAX_APPEND_BYTES,
                 "a body of {} bytes is more than the {MAX_APPEND_BYTES} an append may hold",
@@ -729,11 +827,15 @@ mod tests {
             *self.offered.borrow_mut() += 1;
             let mut held = self.files.borrow_mut();
             let file = held.entry(file.to_string()).or_default();
-            if from != file.len() as i64 {
-                return Ok(Appended::Refused(file.len() as i64));
+            let reach = file.iter().map(|one| one.records.len()).sum::<usize>() as i64;
+            if from != reach {
+                return Ok(Appended::Refused(reach));
             }
-            file.extend(records.iter().cloned());
-            Ok(Appended::Written(file.len() as i64))
+            file.push(Held {
+                records: records.to_vec(),
+                closed,
+            });
+            Ok(Appended::Written(reach + records.len() as i64))
         }
     }
 
@@ -842,14 +944,14 @@ mod tests {
         std::fs::write(&transcript, "one\ntwo\nthree\n").unwrap();
         assert_eq!(archive.send(&service, "s-1", &transcript, Pass::Open).unwrap(), 1);
 
-        assert_eq!(service.body("main"), "one\ntwo\nthree");
-        assert_eq!(service.body("agent-a"), "ay");
+        assert_eq!(service.body("main"), "one\ntwo\nthree\n");
+        assert_eq!(service.body("agent-a"), "ay\n");
         assert_eq!(
             archive.send(&service, "s-1", &transcript, Pass::Open).unwrap(),
             0,
             "a pass over a transcript that has not grown sends nothing"
         );
-        assert_eq!(service.body("main"), "one\ntwo\nthree", "no line is written twice");
+        assert_eq!(service.body("main"), "one\ntwo\nthree\n", "no line is written twice");
     }
 
     #[test]
@@ -909,7 +1011,7 @@ mod tests {
             offered + 2,
             "the probe that was refused, and the append it placed"
         );
-        assert_eq!(service.body("main"), "one\ntwo\nthree", "and no record goes up twice");
+        assert_eq!(service.body("main"), "one\ntwo\nthree\n", "and no record goes up twice");
         assert_eq!(service.next("main"), 3);
     }
 
@@ -923,7 +1025,7 @@ mod tests {
 
         // Another host archived the first twenty-five records of the same session.
         let ahead: Vec<String> = text.lines().take(25).map(str::to_string).collect();
-        service.append("s-1", MAIN, 0, &ahead).unwrap();
+        service.append("s-1", MAIN, 0, &ahead, true).unwrap();
 
         let mut reader = open(&source, Pass::Final).unwrap();
         let sent = send_from(&service, "s-1", MAIN, &mut reader, Place::nothing()).unwrap();
@@ -932,8 +1034,8 @@ mod tests {
         assert_eq!(sent.records, 15, "the fifteen the other host had not reached");
         assert_eq!(
             service.body("main"),
-            text.trim_end_matches('\n'),
-            "and the file is whole"
+            text,
+            "and the file is whole, to the break that ends it"
         );
     }
 
@@ -974,48 +1076,62 @@ mod tests {
             .send(&service, "s-1", &transcript, Pass::Open)
             .unwrap();
 
-        assert_eq!(service.body("main"), format!("{{\"text\":\"export {PLACEHOLDER}\"}}"));
+        assert_eq!(service.body("main"), format!("{{\"text\":\"export {PLACEHOLDER}\"}}\n"));
         assert_eq!(
             service.body("tool-results.b374nf1qv"),
-            "Authorization: Bearer [redacted:bearer-token]",
+            "Authorization: Bearer [redacted:bearer-token]\n",
             "a persisted output goes through the same reading as the transcript that points at it"
         );
     }
 
     #[test]
-    fn a_secret_written_across_a_record_boundary_never_reaches_the_wire() {
+    fn a_secret_written_across_a_record_boundary_is_redacted_and_the_file_still_sends() {
         let sandbox = Sandbox::new("boundary");
         // A private key block, which is written across the lines it takes. Nothing reading one line
         // at a time could see it, so the records of a batch are read as the stretch of the file
-        // they are written on.
+        // they are written on; and the block stands out as one placeholder per line it stood on,
+        // so the file keeps as many records as it has lines.
         let key = format!(
             "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\n",
             "Zm9vYmFy".repeat(8)
         );
-        sandbox.persisted("s-1", "b374nf1qv", &format!("the key was:\n{key}and that was it\n"));
+        let output = format!("the key was:\n{key}and that was it\n");
+        sandbox.persisted("s-1", "b374nf1qv", &output);
         let transcript = sandbox.transcript("s-1", "one\n");
         let service = Fake::default();
 
-        let refused = Archive::default().send(&service, "s-1", &transcript, Pass::Open);
+        Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
 
-        let error = format!(
-            "{:#}",
-            refused.expect_err("a key written across records is not one a pass may send line by line")
+        let archived = service.body("tool-results.b374nf1qv");
+        assert!(
+            !archived.contains("PRIVATE KEY") && !archived.contains("Zm9vYmFy"),
+            "no part of the key is in the archive: {archived}"
         );
-        assert!(error.contains("written across the records"), "{error}");
         assert_eq!(
-            service.body("tool-results.b374nf1qv"),
-            "",
-            "and nothing of the file is in the archive, the lines in front of the key included"
+            archived,
+            "the key was:\n[redacted:private-key]\n[redacted:private-key]\n[redacted:private-key]\nand that was it\n",
+            "the block stands out line for line, so the file goes up whole"
         );
-        assert_eq!(service.body("main"), "one", "the files it could read went up");
+        assert_eq!(
+            archived.matches('\n').count(),
+            output.matches('\n').count(),
+            "and the archive holds as many records as the file has lines"
+        );
+        assert_eq!(service.next("tool-results.b374nf1qv"), 5);
+        assert_eq!(
+            service.body("main"),
+            "one\n",
+            "the session's own file went up beside it"
+        );
     }
 
     #[test]
     fn a_secret_at_the_end_of_a_file_a_session_is_still_writing_waits_for_the_whole_of_it() {
         let sandbox = Sandbox::new("growing");
         let full = format!("one\n{{\"text\":\"export {TOKEN}\"}}\n");
-        let archived = format!("one\n{{\"text\":\"export {PLACEHOLDER}\"}}");
+        let archived = format!("one\n{{\"text\":\"export {PLACEHOLDER}\"}}\n");
         for cut in 1..full.len() {
             let transcript = sandbox.transcript(&format!("s-{cut}"), &full[..cut]);
             let service = Fake::default();
@@ -1084,10 +1200,10 @@ mod tests {
         assert!(error.contains("tool-results"), "{error}");
         assert_eq!(
             service.body("main"),
-            "one",
+            "one\n",
             "and the files it could name went up rather than waiting on the one it could not"
         );
-        assert_eq!(service.body("agent-a"), "ay");
+        assert_eq!(service.body("agent-a"), "ay\n");
 
         std::fs::write(&transcript, "one\ntwo\n").unwrap();
         assert_eq!(
@@ -1095,7 +1211,7 @@ mod tests {
             1,
             "a name is nothing a later pass changes, so the beats after the first carry on"
         );
-        assert_eq!(service.body("main"), "one\ntwo");
+        assert_eq!(service.body("main"), "one\ntwo\n");
     }
 
     #[test]
@@ -1113,8 +1229,8 @@ mod tests {
         assert!(*service.offered.borrow() >= 4, "a thousand records at a time, at most");
         assert_eq!(
             service.body("main"),
-            text.trim_end_matches('\n'),
-            "and the appends lay back out as the file"
+            text,
+            "and the appends lay back out as the file, to its final break"
         );
     }
 
@@ -1131,7 +1247,7 @@ mod tests {
             refused.expect_err("a record no append can carry is not a record a later pass carries either")
         );
         assert!(error.contains("no append can carry"), "{error}");
-        assert_eq!(service.body("main"), "one", "and the records in front of it went up");
+        assert_eq!(service.body("main"), "one\n", "and the records in front of it went up");
     }
 
     /// A file read back out of the archive and sent again, which is what `recall sessions
@@ -1149,8 +1265,8 @@ mod tests {
         let whole = Fake::default();
         let resumed = Fake::default();
         let halfway: Vec<String> = text.lines().take(1_200).map(str::to_string).collect();
-        resumed.append("s-1", MAIN, 0, &halfway[..1_000]).unwrap();
-        resumed.append("s-1", MAIN, 1_000, &halfway[1_000..]).unwrap();
+        resumed.append("s-1", MAIN, 0, &halfway[..1_000], true).unwrap();
+        resumed.append("s-1", MAIN, 1_000, &halfway[1_000..], true).unwrap();
 
         let first = replay(&whole, MAIN, &text);
         let rest = replay(&resumed, MAIN, &text);
@@ -1170,7 +1286,7 @@ mod tests {
         let again = replay(&whole, MAIN, &text);
         assert_eq!(again.records, 0, "a second replay of the same file sends nothing");
         assert_eq!(again.next, 2_500);
-        assert_eq!(whole.body(MAIN), text.trim_end_matches('\n'));
+        assert_eq!(whole.body(MAIN), text);
     }
 
     #[test]
@@ -1187,6 +1303,59 @@ mod tests {
             0,
             "and a second replay of it sends nothing"
         );
+    }
+
+    /// A tool output holds whatever a command printed, which is not always text. A record crosses
+    /// as a JSON string, so the bytes of a line no encoding reads go up in base64 behind the
+    /// marker and come back out of the archive as themselves.
+    #[test]
+    fn a_tool_output_that_is_not_text_goes_up_as_the_bytes_it_is() {
+        let sandbox = Sandbox::new("binary");
+        let mut output = b"readable\n".to_vec();
+        output.extend_from_slice(&[0xff, 0x00, 0xfe, 0x80, b'a']);
+        output.push(NEWLINE);
+        output.extend_from_slice(b"and readable again\n");
+        let dir = sandbox.dir.join("project").join("s-1").join("tool-results");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b374nf1qv.txt"), &output).unwrap();
+        let transcript = sandbox.transcript("s-1", "one\n");
+        let service = Fake::default();
+
+        Archive::default()
+            .send(&service, "s-1", &transcript, Pass::Final)
+            .unwrap();
+
+        let records = service.records("tool-results.b374nf1qv");
+        assert_eq!(records.len(), 3, "a record a line, as for any other file");
+        assert!(
+            records[1].starts_with(BINARY_RECORD),
+            "the line that is not text carries its bytes behind the marker: {:?}",
+            records[1]
+        );
+        assert_eq!(
+            service.raw("tool-results.b374nf1qv"),
+            output,
+            "and the archive holds the file byte for byte"
+        );
+    }
+
+    /// The marker is what says a record carries bytes rather than text, so a line that is text and
+    /// opens with it is sent the same way. Reading one back is then never a guess.
+    #[test]
+    fn a_line_that_opens_with_the_marker_is_sent_as_bytes_rather_than_read_as_one() {
+        let service = Fake::default();
+        let text = format!("{BINARY_RECORD}not really base64\nplain\n");
+
+        replay(&service, "tool-results.b374nf1qv", &text);
+
+        let records = service.records("tool-results.b374nf1qv");
+        assert_eq!(records.len(), 2);
+        assert_ne!(
+            records[0],
+            text.lines().next().unwrap(),
+            "it does not go up as it stands"
+        );
+        assert_eq!(service.body("tool-results.b374nf1qv"), text, "and reads back as itself");
     }
 
     #[test]
@@ -1209,7 +1378,7 @@ mod tests {
         );
         assert_eq!(
             service.body("main"),
-            "one\ntwo\nthree",
+            "one\ntwo\nthree\n",
             "the records already written are left alone"
         );
     }

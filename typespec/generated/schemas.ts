@@ -10,6 +10,7 @@ export const AppendRecordsSchema = z.object({
   file: z.string().min(1),
   from: z.int().min(0),
   records: z.array(z.string().min(1)).min(1).max(1000),
+  closed: z.boolean(),
 });
 
 export const RecordsAcceptedSchema = z.object({

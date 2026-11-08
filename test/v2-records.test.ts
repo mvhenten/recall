@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { Embedder } from "../src/model";
-import { MAX_RECORDS_BYTES, MAX_RECORDS_PER_APPEND, RECORDS_PREFIX } from "../src/records";
+import { BINARY_RECORD, MAX_RECORDS_BYTES, MAX_RECORDS_PER_APPEND, RECORDS_PREFIX } from "../src/records";
 import { harness, wordEmbedder } from "./harness";
 
 const line = (entry: Record<string, unknown>): string => JSON.stringify(entry);
@@ -190,8 +190,10 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
   // The reverse order, which the mark alone cannot answer: the queue drains first and indexes the
   // prose at ordinals the record append would then index it at a second time. One session takes
-  // one path into the index, and the one it took is the one that wrote it.
-  it("refuses records for a session the byte path already wrote", async () => {
+  // one path into the index, so an append landing in the middle of a file the byte path wrote is
+  // refused — and told the one ordinal that is not, which is the replay that takes the session
+  // over.
+  it("refuses records in the middle of a session the byte path already wrote", async () => {
     const { user, deliver } = await harness();
     const client = await user("crossed");
     const session = crypto.randomUUID();
@@ -203,10 +205,106 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     const indexed = await chunkCount(client.userId, session);
     expect(indexed).toBeGreaterThan(0);
 
-    const refused = await client.v2.records(session, "main", 0, records);
+    const refused = await client.v2.records(session, "main", 4, records.slice(4));
     expect(refused.status).toBe(409);
-    expect(await refused.text()).toContain("two paths");
+    const conflict: { error: string; next: number } = await refused.json();
+    expect(conflict.error).toContain("written as bytes");
+    expect(conflict.next).toBe(0);
     expect(await chunkCount(client.userId, session)).toBe(indexed);
+  });
+
+  // The migration the refusal above stands beside. A replay opens at ordinal 0 and carries the
+  // whole file after it, so it takes the session off the byte path: the mark is cleared, the
+  // chunks that path wrote are dropped, and what is left is the records' chunks and nothing else.
+  it("takes a session the byte path wrote over from it when a replay opens at ordinal 0", async () => {
+    const { user, deliver } = await harness();
+    const client = await user("takeover");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+
+    // The byte path wrote one conversation, and the replay carries another: the same session, read
+    // again from a file that has since been rewritten. The two share no word, so a chunk of either
+    // is unmistakable in the index.
+    const first = conversation();
+    const second = ["retention", "throttling", "migration", "tenancy", "scheduling", "replication"].flatMap(
+      (subject, at) => about(at, subject),
+    );
+
+    expect((await client.archive(session, "main", 0, `${first.join("\n")}\n`)).status).toBe(200);
+    await deliver();
+    const byBytes = await env.DB.prepare("SELECT chunk_seq FROM session_chunks WHERE user_id = ? AND session_id = ?")
+      .bind(client.userId, session)
+      .all<{ chunk_seq: number }>();
+    expect(byBytes.results.length).toBeGreaterThan(0);
+
+    expect((await client.v2.records(session, "main", 0, second)).status).toBe(200);
+    expect((await client.v2.end(session)).status).toBe(204);
+
+    // The replay's conversation on a session that never touched the byte path, which is what the
+    // taken-over one has to hold: the records' chunks, all of them, and nothing else's.
+    const alone = crypto.randomUUID();
+    await client.v2.sync(alone);
+    expect((await client.v2.records(alone, "main", 0, second)).status).toBe(200);
+    expect((await client.v2.end(alone)).status).toBe(204);
+
+    const taken = await chunksOf(client.userId, session);
+    expect(setOf(taken)).toEqual(setOf(await chunksOf(client.userId, alone)));
+    expect(taken.map((chunk) => chunk.text).join("\n")).not.toContain("pagination");
+
+    // The ordinals run from nothing with no hole in them and the shared counter says the same
+    // number, so no chunk of the byte path is left under one of them and none is orphaned.
+    const ordinals = await env.DB.prepare(
+      "SELECT ordinal FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
+    )
+      .bind(client.userId, session)
+      .all<{ ordinal: number }>();
+    expect(ordinals.results.map((row) => row.ordinal)).toEqual(taken.map((_, at) => at));
+    const counted = await env.DB.prepare(
+      "SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?",
+    )
+      .bind(client.userId, session)
+      .first<{ archived: number; bytes: number; chunks: number }>();
+    expect(counted).toEqual({ archived: 0, bytes: 0, chunks: taken.length });
+
+    // The full-text index lost the chunks with them. `chunk_seq` is the table's own rowid and
+    // SQLite hands the highest ones out again, so a row left behind would be matched under an id
+    // the next chunk takes and answer a search with prose that chunk never held.
+    const dropped = new Set(byBytes.results.map((row) => row.chunk_seq));
+    const matched = await env.DB.prepare(
+      "SELECT rowid AS seq FROM session_chunks_fts WHERE session_chunks_fts MATCH 'pagination'",
+    ).all<{ seq: number }>();
+    expect(matched.results.map((row) => row.seq).filter((seq) => dropped.has(seq))).toEqual([]);
+  });
+
+  // A byte-path stretch that lands after the takeover indexes nothing: the mark it reads is gone
+  // and the guard every one of its writes carries refuses them, so there is no order of the two
+  // that leaves one session holding chunks from both paths.
+  it("leaves the byte path writing nothing once a replay has taken the session over", async () => {
+    const { user, deliver } = await harness();
+    const client = await user("raced");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    expect((await client.archive(session, "main", 0, `${records.slice(0, 6).join("\n")}\n`)).status).toBe(200);
+    await deliver();
+    expect((await client.v2.records(session, "main", 0, records)).status).toBe(200);
+    const taken = await chunkCount(client.userId, session);
+
+    // The rest of the file goes up the byte way, which wakes the consumer on a session now on the
+    // record mark.
+    expect(
+      (
+        await client.archive(
+          session,
+          "main",
+          `${records.slice(0, 6).join("\n")}\n`.length,
+          `${records.slice(6).join("\n")}\n`,
+        )
+      ).status,
+    ).toBe(200);
+    await deliver();
+    expect(await chunkCount(client.userId, session)).toBe(taken);
   });
 
   // A delegated file is the model talking to itself and derives nothing, so an append of one must
@@ -371,13 +469,13 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     expect((await client.v2.records(session, "main", 0, records.slice(0, 4))).status).toBe(200);
     const stored = await client.v2.transcript(session, "main");
-    expect((await stored.text()).split("\n")).toEqual(records.slice(0, 4));
+    expect(await stored.text()).toBe(`${records.slice(0, 4).join("\n")}\n`);
 
     // The mark is at 4 and the archive holds an object at 4, which only a writer that stored
     // records and lost the file leaves behind; the host sends other prose at the same ordinal.
     const [kept, other] = records.slice(4, 6);
     await env.TRANSCRIPTS.put(`${RECORDS_PREFIX}/${client.userId}/${session}/main/${"0".repeat(15)}4`, kept ?? "", {
-      customMetadata: { records: "1" },
+      customMetadata: { records: "1", closes: "1" },
     });
     const rewritten = await client.v2.records(session, "main", 4, [other ?? ""]);
     expect(rewritten.status).toBe(409);
@@ -436,11 +534,80 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     const read = await client.v2.transcript(session, "main");
     expect(read.status).toBe(200);
-    expect((await read.text()).split("\n")).toEqual(records);
+    expect(await read.text()).toBe(`${records.join("\n")}\n`);
 
     const described = await client.v2.session(session);
     const { files: held }: { files: Array<{ file: string }> } = await described.json();
     expect(held.map((file) => file.file)).toContain("main");
+  });
+
+  // A file is its records with one break between them, and the break that ends it is the one byte
+  // no ordinal accounts for. A tool output a session stopped writing part way through a line ends
+  // on no break at all, and the archive answers both as the host sent them.
+  it("reads a file back on the break that closed it and never on one it did not have", async () => {
+    const { user } = await harness();
+    const client = await user("breaks");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+
+    const lines = ["first line of the output", "and the last, which the session was cut off inside"];
+    expect((await client.v2.records(session, "tool-results.b374nf1qv", 0, lines, false)).status).toBe(200);
+    const open = await client.v2.transcript(session, "tool-results.b374nf1qv");
+    expect(await open.text()).toBe(lines.join("\n"));
+
+    expect((await client.v2.records(session, "main", 0, [prompt(0, "one turn")])).status).toBe(200);
+    const shut = await client.v2.transcript(session, "main");
+    expect(await shut.text()).toBe(`${prompt(0, "one turn")}\n`);
+
+    const listed = await client.v2.files(session);
+    const { files }: { files: Array<{ file: string; bytes: number; records: number }> } = await listed.json();
+    expect(files).toEqual([
+      {
+        file: "main",
+        bytes: prompt(0, "one turn").length + 1,
+        through: prompt(0, "one turn").length + 1,
+        named: true,
+        records: 1,
+      },
+      {
+        file: "tool-results.b374nf1qv",
+        bytes: lines.join("\n").length,
+        through: lines.join("\n").length,
+        named: true,
+        records: 2,
+      },
+    ]);
+  });
+
+  // A tool output holds whatever a command printed, and a record crosses as a JSON string. A line
+  // no encoding reads carries its bytes in base64 behind the marker, and the archive holds the
+  // bytes rather than whatever a lossy decoding made of them.
+  it("stores a record that is not text as the bytes it stands for", async () => {
+    const { user } = await harness();
+    const client = await user("binary");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+
+    const raw = new Uint8Array([0xff, 0x00, 0xfe, 0x80, 0x61]);
+    const marked = `${BINARY_RECORD}${btoa(String.fromCharCode(...raw))}`;
+    expect((await client.v2.records(session, "tool-results.b374nf1qv", 0, ["readable", marked], false)).status).toBe(
+      200,
+    );
+
+    const read = await client.v2.transcript(session, "tool-results.b374nf1qv");
+    const held = new Uint8Array(await read.arrayBuffer());
+    expect([...held]).toEqual([...new TextEncoder().encode("readable\n"), ...raw]);
+  });
+
+  it("refuses an append whose marked record carries no base64", async () => {
+    const { user } = await harness();
+    const client = await user("mismarked");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+
+    const refused = await client.v2.records(session, "tool-results.b374nf1qv", 0, [`${BINARY_RECORD}not base64!`]);
+    expect(refused.status).toBe(400);
+    expect(await refused.text()).toContain("no base64 behind its marker");
   });
 
   it("refuses to read or append to another account's session", async () => {

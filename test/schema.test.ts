@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import shared from "../schemas/transcript-entry.json";
 import { DASHBOARD_DEVICE, HEAD_BYTES } from "../src/app";
 import { GLOBAL_TAG, IDLE_AFTER_MS, parseTranscriptFile, TRANSCRIPT_FILE } from "../src/model";
+import { BINARY_RECORD } from "../src/records";
 import { MAIN_FILE, MAX_STRETCH_BYTES } from "../src/transcripts";
 import { readTurns } from "../src/turns";
 
@@ -23,6 +24,7 @@ const prompts = (line: string, file: string = shared.mainFile): string[] =>
 describe("the shared transcript-entry file", () => {
   it("holds the constants the service declares", () => {
     expect(MAIN_FILE).toBe(shared.mainFile);
+    expect(BINARY_RECORD).toBe(shared.binaryRecord);
     expect(MAX_STRETCH_BYTES).toBe(shared.maxStretchBytes);
     expect(HEAD_BYTES).toBe(shared.headBytes);
     expect(IDLE_AFTER_MS).toBe(shared.idleAfterMs);

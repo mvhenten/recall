@@ -750,6 +750,12 @@ pub struct HeldFile {
     pub through: i64,
     #[serde(default)]
     pub named: bool,
+    /// How many records the archive holds of this file, and nothing for one held as bytes. The
+    /// two paths answer in places of different kinds — a stretch names a byte of the file and a
+    /// record names a line — so which of them wrote a file is what says whether a reader weighs
+    /// its own copy in records or in bytes.
+    #[serde(default)]
+    pub records: i64,
 }
 
 #[derive(Deserialize)]
@@ -1218,18 +1224,24 @@ impl Client {
     /// ordinal is a position and never a field, and `from` has to be the ordinal the file is
     /// waiting for: a run offered anywhere else is refused with the one it really waits at, which
     /// is where the next run begins.
-    pub fn append_records(&self, session_id: &str, file: &str, from: i64, records: &[String]) -> Result<Appended> {
+    pub fn append_records(
+        &self,
+        session_id: &str,
+        file: &str,
+        from: i64,
+        records: &[String],
+        closed: bool,
+    ) -> Result<Appended> {
         let mut response = self
             .authed(
                 self.agent
                     .post(self.url(&format!("{}/records", Self::session_path(session_id)))),
             )
-            .send_json(serde_json::json!({ "file": file, "from": from, "records": records }))?;
+            .send_json(serde_json::json!({ "file": file, "from": from, "records": records, "closed": closed }))?;
         if response.status().as_u16() == 409 {
-            // Every refusal of a run of records carries the ordinal the file really waits at,
-            // because the only thing a host can do with one is send again from there. The one
-            // that does not is a session the byte path already wrote, which no run of records may
-            // join; nothing can act on that, so it is reported as the service wrote it.
+            // Every refusal of a run of records carries the ordinal to send from, because the only
+            // thing a host can do with one is send again from there. A session the byte path wrote
+            // is answered ordinal 0, which is the replay that takes it over.
             let refused: serde_json::Value = response.body_mut().read_json()?;
             if let Some(next) = refused.get("next").and_then(serde_json::Value::as_i64) {
                 return Ok(Appended::Refused(next));
@@ -1626,7 +1638,10 @@ mod tests {
             session_id: "9f8a1b2c".to_string(),
         };
 
-        assert_eq!(host.addressed(), serde_json::json!({ "scope": "host", "target": "d-1" }));
+        assert_eq!(
+            host.addressed(),
+            serde_json::json!({ "scope": "host", "target": "d-1" })
+        );
         assert_eq!(
             session.addressed(),
             serde_json::json!({ "scope": "session", "target": "9f8a1b2c" }),

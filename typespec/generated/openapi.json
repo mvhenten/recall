@@ -10,7 +10,7 @@
     "schemas": {
       "AppendRecords": {
         "type": "object",
-        "required": ["file", "from", "records"],
+        "required": ["file", "from", "records", "closed"],
         "properties": {
           "file": {
             "type": "string",
@@ -28,6 +28,10 @@
             },
             "minItems": 1,
             "maxItems": 1000
+          },
+          "closed": {
+            "type": "boolean",
+            "description": "Whether a line break closes the last record this append carries. Records join with one break\nbetween them and a file is the records of it laid out that way, so the break that ends the\nfile is the one thing no ordinal says: a transcript always ends on one, and a tool output the\nsession stopped writing part way through a line does not."
           }
         }
       },
@@ -634,7 +638,8 @@
       },
       "TranscriptLine": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "description": "One line of a transcript file, redacted, under the ordinal it holds in that file. A line that is\nnot valid UTF-8 would cross as a JSON string lossily, so it is carried as the marker\n`\\u0000base64:` and the line's own bytes in base64; the archive decodes it back and holds the\nbytes the host read. A line that is valid UTF-8 and opens with that marker is carried the same\nway, which is what makes reading one unambiguous."
       },
       "UsageDelta": {
         "type": "object",

@@ -1156,6 +1156,11 @@ export interface IndexedChunk {
 // What one indexing pass produced, written in one batch with the mark that says how far it read.
 // The chunks are appended under ordinals that only climb, so a session indexed again after it was
 // resumed adds to what is there and nothing already indexed is rewritten or lost.
+// It all lands in one batch, and every statement of it lands only while the session is off the
+// record mark. A session taken over by a replay goes on the mark in the batch that drops the
+// chunks this path wrote, so a pass that read its bite before the takeover and writes after it
+// writes nothing at all: there is no ordering of the two that leaves one session holding chunks
+// from both paths.
 export const writeChunks = async (
   db: D1Database,
   userId: string,
@@ -1164,23 +1169,25 @@ export const writeChunks = async (
   chunks: IndexedChunk[],
   reached: number,
 ): Promise<void> => {
-  if (chunks.length > 0) {
-    await db.batch(
-      chunks.map((chunk, index) =>
-        db
-          .prepare(
-            `INSERT INTO session_chunks (user_id, session_id, ordinal, speaker, text, embedding, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (user_id, session_id, ordinal) DO NOTHING`,
-          )
-          .bind(userId, sessionId, from + index, chunk.speaker, chunk.text, chunk.embedding, chunk.at),
-      ),
-    );
-  }
-  await db
-    .prepare("UPDATE session_index SET bytes = ?3, chunks = ?4 WHERE user_id = ?1 AND session_id = ?2")
-    .bind(userId, sessionId, reached, from + chunks.length)
-    .run();
+  const offRecord = `NOT EXISTS (
+     SELECT 1 FROM session_records WHERE user_id = ?1 AND session_id = ?2 AND file = '${MAIN_FILE}')`;
+  await db.batch([
+    ...chunks.map((chunk, index) =>
+      db
+        .prepare(
+          `INSERT INTO session_chunks (user_id, session_id, ordinal, speaker, text, embedding, at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE ${offRecord}
+           ON CONFLICT (user_id, session_id, ordinal) DO NOTHING`,
+        )
+        .bind(userId, sessionId, from + index, chunk.speaker, chunk.text, chunk.embedding, chunk.at),
+    ),
+    db
+      .prepare(
+        `UPDATE session_index SET bytes = ?3, chunks = ?4
+         WHERE user_id = ?1 AND session_id = ?2 AND ${offRecord}`,
+      )
+      .bind(userId, sessionId, reached, from + chunks.length),
+  ]);
 };
 
 export interface ChunkCandidate {
@@ -2141,6 +2148,11 @@ export interface RecordCommit {
   chunkFrom: number;
   chunks: IndexedChunk[];
   open: readonly OpenChunk[];
+  /// Whether this append takes a session the byte path wrote over from it. A replay opens at
+  /// ordinal 0 and carries the whole file after it, so what the byte path indexed is prose these
+  /// records index again: its mark and its chunks go in the batch below, in front of the chunks
+  /// that replace them.
+  takeover: boolean;
 }
 
 // The mark the append was weighed against, still standing. Every statement of the commit carries
@@ -2160,8 +2172,25 @@ const markStands = (at: number): string =>
 // file to another append and nothing it carried was written; ordinals are implicit in position, so
 // a host knows its next `from` without asking and pipelines two appends as a matter of course.
 export const commitRecords = async (db: D1Database, commit: RecordCommit): Promise<boolean> => {
-  const { userId, sessionId, file, held, chunkFrom, chunks, open, next } = commit;
+  const { userId, sessionId, file, held, chunkFrom, chunks, open, next, takeover } = commit;
   const results = await db.batch([
+    // A takeover first, so everything below it is written over a session the byte path no longer
+    // holds anything of. The two statements and the mark at the foot of the batch land together,
+    // which is what leaves no instant where one session is on both paths.
+    ...(takeover
+      ? [
+          db
+            .prepare(`DELETE FROM session_chunks WHERE user_id = ?1 AND session_id = ?2 AND ${markStands(4)}`)
+            .bind(userId, sessionId, file, held),
+          db
+            .prepare(
+              `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks)
+               SELECT ?1, ?2, 0, 0, 0 WHERE ${markStands(4)}
+               ON CONFLICT (user_id, session_id) DO UPDATE SET archived = 0, bytes = 0, chunks = 0`,
+            )
+            .bind(userId, sessionId, file, held),
+        ]
+      : []),
     ...chunks.map((chunk, index) =>
       db
         .prepare(

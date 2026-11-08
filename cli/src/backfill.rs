@@ -611,7 +611,14 @@ mod tests {
     }
 
     impl transcripts::Store for Fake {
-        fn append(&self, session_id: &str, file: &str, from: i64, records: &[String]) -> Result<transcripts::Appended> {
+        fn append(
+            &self,
+            session_id: &str,
+            file: &str,
+            from: i64,
+            records: &[String],
+            _closed: bool,
+        ) -> Result<transcripts::Appended> {
             let mut archive = self.archive.borrow_mut();
             let held = archive.entry((session_id.to_string(), file.to_string())).or_default();
             if from != held.len() as i64 {

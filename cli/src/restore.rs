@@ -20,6 +20,7 @@
 //! turns go on naming the directory the session ran in.
 
 use crate::api::{Client, HeldFile, PastSession};
+use crate::transcripts;
 use crate::transcripts::{MAIN, TOOL_RESULT};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -80,12 +81,21 @@ pub struct Restored {
 /// one loss a restore must never take. So a file on disk the archive reaches past under such a key
 /// is a disagreement and not a part: it stops the restore and says so, and a caller that wants the
 /// archive's copy of it says so by moving the local one out of the way.
+///
+/// A file the archive holds as records answers in records, which is the one place the two share.
+/// What it holds is the file redacted, so its bytes run to another length than the file on disk
+/// and weighing the two in bytes would read a complete transcript as a part on the very host still
+/// writing it. A record is a line and redaction cannot move a line, so the lines on disk against
+/// the records in the archive is the reading the byte path does in bytes.
 fn stale(path: &Path, held: &HeldFile) -> Result<bool> {
     let found = match std::fs::metadata(path) {
         Ok(found) => found,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
+    if held.records > 0 {
+        return Ok(transcripts::records_held(path, transcripts::holds_of(&held.file))? < held.records);
+    }
     let size = found.len() as i64;
     if size >= held.through {
         return Ok(false);
@@ -206,6 +216,7 @@ mod tests {
             bytes: through,
             through,
             named: true,
+            records: 0,
         }
     }
 
@@ -260,6 +271,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A file the archive holds as records weighs in records. Its bytes are the file redacted and
+    /// run far past what the host holds, so the byte reading would call a complete transcript a
+    /// part and write the redacted copy over the live one.
+    #[test]
+    fn a_file_held_as_records_is_weighed_in_records_and_never_in_bytes() {
+        let dir = crate::scratch("restore-records");
+        let path = dir.join("s-3.jsonl");
+        let held = |records: i64, bytes: i64| HeldFile {
+            file: MAIN.to_string(),
+            bytes,
+            through: bytes,
+            named: true,
+            records,
+        };
+
+        let text = "{\"text\":\"AKIAZZ7EXAMPLE9QTVB2\"}\n{\"text\":\"two\"}\n";
+        std::fs::write(&path, text).unwrap();
+        let redacted = (text.len() + 8) as i64;
+
+        assert!(
+            !stale(&path, &held(2, redacted)).unwrap(),
+            "a complete transcript is left alone, however much longer the records of it run"
+        );
+        assert!(
+            stale(&path, &held(3, redacted)).unwrap(),
+            "a local file short of the records the archive holds is a part, and is fetched"
+        );
+        assert!(
+            !stale(&path, &held(1, redacted)).unwrap(),
+            "and one holding more records than the archive is the live transcript"
+        );
+
+        // The line a session is still writing is no record, so a host part way through one holds
+        // the records in front of it and nothing more.
+        std::fs::write(&path, format!("{text}{{\"text\":\"half")).unwrap();
+        assert!(
+            !stale(&path, &held(2, redacted)).unwrap(),
+            "a half-written line leaves the file level with the archive rather than ahead of it"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A reach under a key of one offset is a place in the file only if the host that wrote it did
     /// not redact, and nothing in the archive says which. So the one reading that could throw away
     /// a complete transcript — the local file shorter than the reach — is refused outright instead
@@ -273,6 +327,7 @@ mod tests {
             bytes: through,
             through,
             named: false,
+            records: 0,
         };
 
         assert!(

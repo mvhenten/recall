@@ -739,8 +739,15 @@ fn adopt_sessions() -> Result<ExitCode> {
 }
 
 impl transcripts::Store for Client {
-    fn append(&self, session_id: &str, file: &str, from: i64, records: &[String]) -> Result<transcripts::Appended> {
-        self.append_records(session_id, file, from, records)
+    fn append(
+        &self,
+        session_id: &str,
+        file: &str,
+        from: i64,
+        records: &[String],
+        closed: bool,
+    ) -> Result<transcripts::Appended> {
+        self.append_records(session_id, file, from, records, closed)
     }
 }
 

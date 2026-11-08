@@ -6,7 +6,9 @@
 // One object per append, under `records/<user id>/<session id>/<file>/<first ordinal>`. The
 // ordinal is zero-padded so a listing sorts in the order the records were written, and the count
 // of lines in the object rides in its metadata, since nothing else in the key says where the
-// object ends. Those two numbers are the whole of what the archive knows about a record object.
+// object ends. Beside the count rides the one byte no ordinal accounts for: whether a line break
+// closed the last record, which is what makes a readback the file to its final byte rather than
+// one short of it.
 //
 // The `records/` prefix is what keeps the two paths apart in one bucket. A byte-path key is four
 // segments and `parseStretchKey` refuses a fifth, so the consumer that indexes the byte path reads
@@ -22,6 +24,16 @@ export const MAX_RECORDS_BYTES = 1_048_576;
 
 export const RECORDS_PREFIX = "records";
 
+// What a record that is not valid UTF-8 opens with. A record crosses as a JSON string, so a line
+// of a tool output holding bytes no encoding reads would go up corrupted and the archive would
+// hold prose the host never wrote. Such a line carries its own bytes in base64 behind this marker
+// and is decoded back here, so the object holds the bytes the host read and a readback is the file
+// to the byte. A line that is valid UTF-8 and opens with the marker is sent the same way, which is
+// what makes reading one unambiguous.
+export const BINARY_RECORD = "\u0000base64:";
+
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
 // Wide enough that an ordinal can never carry past it: a session writing a record a millisecond
 // for a century reaches sixteen digits short of filling it.
 const ORDINAL_DIGITS = 16;
@@ -29,6 +41,67 @@ const ORDINAL_DIGITS = 16;
 // Where the count of lines an object holds is kept. R2 hands custom metadata back with a listing,
 // so the reach of a file is one listing and no read of a body.
 const HELD = "records";
+
+// Whether a line break closes the last record of an object. A file is its objects laid end to end
+// with that break between them, so the one byte no ordinal accounts for is the one that ends a
+// record, and a tool output the session stopped writing part way through a line ends without it.
+// It rides beside the count because the file it belongs to is read back as a stream of objects and
+// nothing else in the archive says where its last line stopped.
+const CLOSES = "closes";
+
+const BREAK = 10;
+
+// One record as the bytes the host read it as. A record that opens with the marker carries those
+// bytes in base64 and is decoded; anything else is the string itself.
+const recordBytes = (record: string): Uint8Array => {
+  if (!record.startsWith(BINARY_RECORD)) return new TextEncoder().encode(record);
+  const raw = atob(record.slice(BINARY_RECORD.length));
+  const bytes = new Uint8Array(raw.length);
+  for (let at = 0; at < raw.length; at += 1) bytes[at] = raw.charCodeAt(at);
+  return bytes;
+};
+
+// What is wrong with the first record of an append the archive cannot read the bytes of, and
+// nothing where it can read all of them. A marker with anything but base64 behind it is a host
+// this archive cannot store for, and decoding it where it lands would leave the object holding
+// whatever the decoder made of it.
+export const recordsFault = (records: readonly string[]): string => {
+  for (const [at, record] of records.entries()) {
+    if (!record.startsWith(BINARY_RECORD)) continue;
+    const encoded = record.slice(BINARY_RECORD.length);
+    if (encoded.length % 4 !== 0 || !BASE64.test(encoded)) return `record ${at} carries no base64 behind its marker`;
+  }
+  return "";
+};
+
+// The body one append is stored as: its records as the host read them, one line break between two.
+const recordsBody = (records: readonly string[]): Uint8Array => {
+  const parts = records.map(recordBytes);
+  const whole = new Uint8Array(parts.reduce((bytes, part) => bytes + part.length, records.length - 1));
+  let at = 0;
+  for (const [index, part] of parts.entries()) {
+    if (index > 0) {
+      whole[at] = BREAK;
+      at += 1;
+    }
+    whole.set(part, at);
+    at += part.length;
+  }
+  return whole;
+};
+
+// Whether the body already stored at an ordinal and the records a writer is offering there are
+// the same prose as far as the shorter of them runs. It is weighed whole rather than record by
+// record: a record carries the blank lines in front of it, so the breaks in a body do not divide
+// it into the records it holds and nothing read back off one could be lined up against them.
+export const recordsAgree = (stored: Uint8Array, records: readonly string[]): boolean => {
+  const offered = recordsBody(records);
+  const held = Math.min(stored.length, offered.length);
+  for (let at = 0; at < held; at += 1) {
+    if (stored[at] !== offered[at]) return false;
+  }
+  return true;
+};
 
 const sessionPrefix = (userId: string, sessionId: string): string => `${RECORDS_PREFIX}/${userId}/${sessionId}/`;
 
@@ -46,6 +119,7 @@ interface RecordObject {
   from: number;
   held: number;
   bytes: number;
+  closes: boolean;
 }
 
 // Every record object of one session, in the order the records were written. An object whose name
@@ -62,6 +136,7 @@ const listRecords = async (bucket: R2Bucket, userId: string, sessionId: string):
       const [file, name, ...rest] = object.key.slice(prefix.length).split("/");
       const from = Number(name);
       const held = Number(object.customMetadata?.[HELD]);
+      const closes = object.customMetadata?.[CLOSES];
       const wrote =
         file !== undefined &&
         file !== "" &&
@@ -69,9 +144,10 @@ const listRecords = async (bucket: R2Bucket, userId: string, sessionId: string):
         Number.isSafeInteger(from) &&
         name === ordinalName(from) &&
         Number.isSafeInteger(held) &&
-        held > 0;
+        held > 0 &&
+        (closes === "0" || closes === "1");
       if (!wrote) throw new Error(`${object.key} is no record object this archive wrote`);
-      objects.push({ key: object.key, file, from, held, bytes: object.size });
+      objects.push({ key: object.key, file, from, held, bytes: object.size, closes: closes === "1" });
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor !== undefined);
@@ -94,24 +170,40 @@ export const recordsReach = async (
 };
 
 // The files of a session the record path holds, and what each weighs as the transcript it joins
-// back to: the objects laid end to end with the newline that divides two appends. Nothing here is
-// a span of a file on disk the way a byte-path stretch is — a record is a whole line verbatim —
-// so the archive accounts for every byte of what it holds and for no byte it does not.
+// back to: the objects laid end to end, each closed by the break that closed its last record.
+// Nothing here is a span of a file on disk the way a byte-path stretch is — a record is a whole
+// line verbatim, and redaction leaves a line at another length than the one the host read — so
+// `through` is a length of the archive and no place in the file the host holds. How many records
+// of the file the archive has is the one count that is a place in both, and a restore weighs a
+// local file against that.
 export const recordFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
-  const weighed = new Map<string, number>();
+  const weighed = new Map<string, { bytes: number; records: number }>();
   for (const object of await listRecords(bucket, userId, sessionId)) {
-    const bytes = weighed.get(object.file);
-    weighed.set(object.file, bytes === undefined ? object.bytes : bytes + object.bytes + 1);
+    const held = weighed.get(object.file) ?? { bytes: 0, records: 0 };
+    weighed.set(object.file, {
+      bytes: held.bytes + object.bytes + (object.closes ? 1 : 0),
+      records: Math.max(held.records, object.from + object.held),
+    });
   }
   return [...weighed]
-    .map(([file, bytes]): TranscriptFile => ({ file, bytes, through: bytes, named: true }))
+    .map(
+      ([file, held]): TranscriptFile => ({
+        file,
+        bytes: held.bytes,
+        through: held.bytes,
+        named: true,
+        records: held.records,
+      }),
+    )
     .sort((left, right) => left.file.localeCompare(right.file));
 };
 
-// One file of a session's transcript, read back out of its records. The objects are handed over in
-// ordinal order with a newline between them, which is the file the host sent: a record is one
-// JSONL line and an append is a run of them, so the only byte an append boundary costs is the one
-// that ends its last line.
+// One file of a session's transcript, read back out of its records. Each object is handed over in
+// ordinal order followed by the break that closed its last record, which is the file the host
+// sent, byte for byte: a record is one line and an append is a run of them, so the only byte an
+// append boundary costs is the one that ends its last line — and the file ends on that same byte
+// unless the session stopped writing part way through the line, which is what an object that
+// closes on nothing says.
 export const readRecords = async (
   bucket: R2Bucket,
   userId: string,
@@ -131,25 +223,25 @@ export const readRecords = async (
       next += 1;
       const body = await bucket.get(object.key);
       if (body === null) throw new Error(`the archive lost ${object.key} of ${file}`);
-      if (next > 1) controller.enqueue(new Uint8Array([10]));
       controller.enqueue(new Uint8Array(await body.arrayBuffer()));
+      if (object.closes) controller.enqueue(new Uint8Array([BREAK]));
     },
   });
 };
 
-// One append read back as the records it holds, or null where the archive holds no object at that
-// ordinal. It is what a writer beaten to its own key reads to find out whether the records already
-// stored there are the ones it was sending.
+// One append read back as the bytes it is stored as, or null where the archive holds no object at
+// that ordinal. It is what a writer beaten to its own key reads to find out whether the records
+// already stored there are the ones it was sending.
 export const readRecordAppend = async (
   bucket: R2Bucket,
   userId: string,
   sessionId: string,
   file: string,
   from: number,
-): Promise<string[] | null> => {
+): Promise<Uint8Array | null> => {
   const body = await bucket.get(recordKey(userId, sessionId, file, from));
   if (body === null) return null;
-  return (await body.text()).split("\n");
+  return new Uint8Array(await body.arrayBuffer());
 };
 
 // The records of one file between two ordinals. An append whose `from` runs ahead of the mark is
@@ -195,10 +287,11 @@ export const putRecords = async (
   file: string,
   from: number,
   records: readonly string[],
+  closes: boolean,
 ): Promise<boolean> => {
-  const written = await bucket.put(recordKey(userId, sessionId, file, from), records.join("\n"), {
+  const written = await bucket.put(recordKey(userId, sessionId, file, from), recordsBody(records), {
     httpMetadata: { contentType: "application/x-ndjson" },
-    customMetadata: { [HELD]: String(records.length) },
+    customMetadata: { [HELD]: String(records.length), [CLOSES]: closes ? "1" : "0" },
     onlyIf: { etagDoesNotMatch: "*" },
   });
   return written !== null;

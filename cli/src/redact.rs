@@ -14,6 +14,11 @@
 //! largest body the caller may send can redact to more than that, and a caller says how much it
 //! can take rather than finding out from a service that refuses the body.
 //!
+//! A secret written across lines keeps them: a PEM block stands out as one placeholder for each
+//! line it ran on, with the breaks where they were. A file is sent as records and a record is a
+//! line, so a redaction that folded a block into one line would leave the file with fewer records
+//! than it has lines and every ordinal past the block would name another line than it did.
+//!
 //! A secret may sit across the cut between one stretch and the next. A stretch is cut at a line
 //! end and a secret does not span lines, so the cut is almost never inside one; a PEM block does
 //! span lines, and a line longer than a whole stretch is cut wherever it runs on. So a match, or a
@@ -38,8 +43,12 @@ pub struct Redacted {
 
 const OPENS: &[u8] = b"[redacted:";
 
-fn hidden(kind: &str) -> usize {
-    OPENS.len() + kind.len() + 1
+const NEWLINE: u8 = b'\n';
+
+/// How long a secret is written out as: one placeholder for the line it stood on, and one more for
+/// every line it ran on to, with the breaks between them.
+fn hidden(kind: &str, breaks: usize) -> usize {
+    (OPENS.len() + kind.len() + 1) * (breaks + 1) + breaks
 }
 
 /// A stretch as it is written out: runs of the file as they were read, and the secrets between
@@ -53,6 +62,12 @@ enum Piece<'a> {
         kind: &'static str,
         lead: usize,
         span: usize,
+        /// How many line breaks the secret was written across. A PEM block is the one secret that
+        /// runs over more than one line, and it is written out as one placeholder per line it
+        /// stood on, so the line structure of the file survives the redaction. A placeholder that
+        /// swallowed the breaks would leave the file with fewer lines than it had, and a record is
+        /// a line: every ordinal past the block would then name a line it does not.
+        breaks: usize,
     },
 }
 
@@ -91,17 +106,27 @@ pub fn within(input: &[u8], before: Option<u8>, whole: bool, limit: usize) -> Re
                 bytes.extend_from_slice(run);
                 at += run.len();
             }
-            Piece::Hidden { kind, lead, span } => {
-                if hidden(kind) > limit - bytes.len() {
+            Piece::Hidden {
+                kind,
+                lead,
+                span,
+                breaks,
+            } => {
+                if hidden(kind, *breaks) > limit - bytes.len() {
                     bytes.truncate(bytes.len() - lead);
                     return Redacted {
                         bytes,
                         source: at - lead,
                     };
                 }
-                bytes.extend_from_slice(OPENS);
-                bytes.extend_from_slice(kind.as_bytes());
-                bytes.push(b']');
+                for line in 0..=*breaks {
+                    if line > 0 {
+                        bytes.push(NEWLINE);
+                    }
+                    bytes.extend_from_slice(OPENS);
+                    bytes.extend_from_slice(kind.as_bytes());
+                    bytes.push(b']');
+                }
                 at += span;
             }
         }
@@ -144,6 +169,7 @@ fn pieces(input: &[u8], before: Option<u8>, whole: bool) -> (Vec<Piece<'_>>, usi
                     kind: hit.kind,
                     lead: hit.from - at,
                     span: hit.to - hit.from,
+                    breaks: input[hit.from..hit.to].iter().filter(|byte| **byte == NEWLINE).count(),
                 });
                 kept = hit.to;
                 at = hit.to;
@@ -564,7 +590,8 @@ mod tests {
         );
         assert_eq!(
             stripped("-----BEGIN OPENSSH PRIVATE KEY-----\nZmFrZQ==\nfake\n-----END OPENSSH PRIVATE KEY-----\n"),
-            "[redacted:private-key]\n"
+            "[redacted:private-key]\n[redacted:private-key]\n[redacted:private-key]\n[redacted:private-key]\n",
+            "a block written across four lines stands out as four, so the file keeps the lines it had"
         );
         assert_eq!(
             stripped("\"key\":\"-----BEGIN RSA PRIVATE KEY-----\\nZmFrZQ==\\n-----END RSA PRIVATE KEY-----\\n\""),
@@ -690,10 +717,16 @@ mod tests {
         let head = redact(&block[..60], None, false);
 
         assert_eq!(head.source, 0, "a block with no end line yet sends none of itself");
+        let written = String::from_utf8(redact(block, None, false).bytes).unwrap();
         assert_eq!(
-            String::from_utf8(redact(block, None, false).bytes).unwrap(),
-            "[redacted:private-key]\n",
-            "and the pass that holds the whole block writes it out as one"
+            written,
+            "[redacted:private-key]\n".repeat(4),
+            "and the pass that holds the whole block writes a placeholder on each of its lines"
+        );
+        assert_eq!(
+            written.matches('\n').count(),
+            String::from_utf8_lossy(block).matches('\n').count(),
+            "which leaves the file as many lines as it was written on"
         );
     }
 
