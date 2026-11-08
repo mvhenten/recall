@@ -1365,7 +1365,7 @@ mod tests {
     #[test]
     fn a_backlog_several_times_the_byte_ceiling_goes_up_as_the_appends_it_takes() {
         let sandbox = Sandbox::new("backlog");
-        let text = heavy(40, 90_000);
+        let text = heavy(40, MAX_APPEND_BYTES / 10);
         let transcript = sandbox.transcript("s-1", &text);
         let service = Fake::default();
 
