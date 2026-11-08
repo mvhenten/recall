@@ -14,8 +14,9 @@ export const toBytes = (value: unknown): Uint8Array => {
 // out of whatever buffer it was cut from before it is bound.
 export const blobOf = (bytes: Uint8Array): ArrayBufferLike => bytes.slice().buffer;
 
+// Write-only: every read of an embedding goes through `db.values` and maps the blob with `toBytes`
+// itself, because a vector scan names its columns positionally.
 export const vector = customType<{ data: Uint8Array; driverData: ArrayBufferLike }>({
   dataType: () => "blob",
   toDriver: blobOf,
-  fromDriver: (value: ArrayBufferLike): Uint8Array => toBytes(value),
 });

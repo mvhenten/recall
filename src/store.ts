@@ -1,5 +1,5 @@
 import { and, asc, count, desc, eq, getTableName, gt, gte, inArray, lt, lte, ne, or, type SQL, sql } from "drizzle-orm";
-import { type SQLiteColumn, unionAll } from "drizzle-orm/sqlite-core";
+import { type SQLiteColumn, type SQLiteTable, union, unionAll } from "drizzle-orm/sqlite-core";
 import {
   type ArtifactFile,
   type ArtifactListInput,
@@ -79,9 +79,6 @@ import type { ShareMode, ShareRecord } from "./shares";
 import { MAIN_FILE } from "./transcripts";
 import type { Speaker } from "./turns";
 
-// Where a tenant statement runs: the store itself, or the transaction a batch of them shares.
-type TenantRunner = TenantDb | TenantTx;
-
 // A list of values goes in as one JSON parameter and is unpacked by `json_each`, because SQLite
 // binds at most a hundred parameters to a statement and both stores hold it to that.
 const jsonEach = (values: readonly unknown[]): SQL => sql`(SELECT value FROM json_each(${JSON.stringify(values)}))`;
@@ -106,8 +103,7 @@ interface MemoryRow {
   tags: string;
 }
 
-// The tags a memory carries, gathered in the row that carries it: a page of a listing is one read
-// however many tags the memories on it hold.
+// A page of a listing is one read however many tags the memories on it hold.
 const MEMORY_FIELDS = {
   memoryId: memories.memoryId,
   userId: memories.userId,
@@ -240,12 +236,10 @@ export const decodeCursor = (cursor: string, direction: "desc" | "asc"): Cursor 
   return [at, parsed[1]];
 };
 
-// One order of one list: the predicate that walks past the cursor, the order the index serving it
-// supplies, which way the cursor runs, and where a row's own cursor comes from. Nothing is ordered
-// in the Worker, so a list grows an order by growing this table and nothing else.
-//
-// The keyset is written out rather than built from comparisons because a cursor is a number on one
-// order and a name on the next, and SQLite compares the bound value against the column either way.
+// Nothing is ordered in the Worker, so a list grows an order by growing this table and nothing
+// else. The keyset is written out rather than built from comparisons because a cursor is a number
+// on one order and a name on the next, and SQLite compares the bound value against the column
+// either way.
 interface Order<Row> {
   keyset: (at: number | string, id: string) => SQL;
   by: SQL[];
@@ -433,7 +427,7 @@ const toSession = (row: SessionRow): Session => ({
   pid: row.pid,
 });
 
-const expireSessions = (db: TenantRunner, userId: string, now: number): void => {
+const expireSessions = (db: TenantTx, userId: string, now: number): void => {
   db.delete(sessions)
     .where(and(eq(sessions.userId, userId), lte(sessions.lastActivityAt, now - SESSION_TTL_MS)))
     .run();
@@ -504,8 +498,8 @@ export const putSession = async (
   });
 };
 
-// Whether the session was there to end. RETURNING is what counts the rows a delete reached, which
-// a Durable Object's SQLite does not otherwise report through drizzle.
+// RETURNING is what counts the rows a delete reached, which a Durable Object's SQLite does not
+// otherwise report through drizzle.
 export const endSession = async (db: TenantDb, userId: string, sessionId: string): Promise<boolean> => {
   const ended = db
     .delete(sessions)
@@ -528,9 +522,8 @@ export const listSessions = async (db: TenantDb, userId: string, now: number): P
     })
     .map(toSession);
 
-// Every session the account has on record, with the one still running marked. `live` is the moment
-// a session counts as gone.
-const pastSessionsFrom = (db: TenantRunner, live: number) =>
+// `live` is the moment a session counts as gone.
+const pastSessionsFrom = (db: TenantDb, live: number) =>
   db
     .select({
       sessionId: sessionHistory.sessionId,
@@ -830,22 +823,21 @@ export const readLabels = async (db: TenantDb, userId: string): Promise<Labels> 
 // Every host and account the user has on record, live or past, plus the ones already labelled, so a
 // label survives on the page that set it even once its value stops appearing in the data.
 export const labelTargets = async (db: TenantDb, userId: string): Promise<LabelTargets> => {
-  const results = db.all<{ kind: string; value: string }>(sql`
-      SELECT DISTINCT 'host' AS kind, ${sessions.host} AS value FROM ${sessions}
-        WHERE ${sessions.userId} = ${userId} AND ${sessions.host} <> ''
-      UNION
-      SELECT DISTINCT 'host', ${sessionHistory.host} FROM ${sessionHistory}
-        WHERE ${sessionHistory.userId} = ${userId} AND ${sessionHistory.host} <> ''
-      UNION
-      SELECT DISTINCT 'host', ${usageDaily.host} FROM ${usageDaily}
-        WHERE ${usageDaily.userId} = ${userId} AND ${usageDaily.host} <> ''
-      UNION
-      SELECT DISTINCT 'account', ${usageDaily.account} FROM ${usageDaily}
-        WHERE ${usageDaily.userId} = ${userId} AND ${usageDaily.account} <> ''
-      UNION
-      SELECT DISTINCT ${labelsTable.kind}, ${labelsTable.value} FROM ${labelsTable}
-        WHERE ${labelsTable.userId} = ${userId}
-      ORDER BY kind, value`);
+  const targets = (table: SQLiteTable, kind: SQL<string>, value: SQLiteColumn, where: SQL | undefined) =>
+    db
+      .selectDistinct({ kind: kind.as("kind"), value: sql<string>`${value}`.as("value") })
+      .from(table)
+      .where(where);
+  const mine = (owner: SQLiteColumn, value: SQLiteColumn) => and(eq(owner, userId), ne(value, ""));
+  const results = union(
+    targets(sessions, sql`'host'`, sessions.host, mine(sessions.userId, sessions.host)),
+    targets(sessionHistory, sql`'host'`, sessionHistory.host, mine(sessionHistory.userId, sessionHistory.host)),
+    targets(usageDaily, sql`'host'`, usageDaily.host, mine(usageDaily.userId, usageDaily.host)),
+    targets(usageDaily, sql`'account'`, usageDaily.account, mine(usageDaily.userId, usageDaily.account)),
+    targets(labelsTable, sql`${labelsTable.kind}`, labelsTable.value, eq(labelsTable.userId, userId)),
+  )
+    .orderBy(sql`kind`, sql`value`)
+    .all();
   const values = (kind: string): string[] => results.filter((row) => row.kind === kind).map((row) => row.value);
   return { hosts: values("host"), accounts: values("account") };
 };
@@ -908,7 +900,7 @@ const toModelTotals = (row: ModelRow): ModelTotals => ({
 // Every window the pages draw reads the daily rollup and nothing else: the counters land in
 // usage_daily on the same write that records the raw event, so the current day is already live
 // there and no window ever touches usage_events.
-const usageDays = (db: TenantRunner, userId: string, fromDay: string) =>
+const usageDays = (db: TenantTx, userId: string, fromDay: string) =>
   db
     .select({
       bucket: usageDaily.day,
@@ -923,7 +915,7 @@ const usageDays = (db: TenantRunner, userId: string, fromDay: string) =>
 
 // The month a delta falls in is the month of the UTC day the rollup already keyed it under, so the
 // long horizon reads the same column the windows do and the two can never disagree.
-const usageMonths = (db: TenantRunner, userId: string) => {
+const usageMonths = (db: TenantTx, userId: string) => {
   const month = sql<string>`substr(${usageDaily.day}, 1, 7)`;
   return db
     .select({ bucket: month, provider: usageDaily.provider, model: usageDaily.model, ...countSums(usageDaily) })
@@ -933,7 +925,7 @@ const usageMonths = (db: TenantRunner, userId: string) => {
     .orderBy(month, asc(usageDaily.provider), asc(usageDaily.model));
 };
 
-const usageSplit = (db: TenantRunner, userId: string, fromDay: string, field: UsageSplitField, value: SQLiteColumn) =>
+const usageSplit = (db: TenantTx, userId: string, fromDay: string, field: UsageSplitField, value: SQLiteColumn) =>
   db
     .select({
       field: sql<UsageSplitField>`${field}`.as("field"),
@@ -946,14 +938,14 @@ const usageSplit = (db: TenantRunner, userId: string, fromDay: string, field: Us
     .where(and(eq(usageDaily.userId, userId), gte(usageDaily.day, fromDay)))
     .groupBy(value, usageDaily.provider, usageDaily.model);
 
-const usageSplits = (db: TenantRunner, userId: string, fromDay: string) =>
+const usageSplits = (db: TenantTx, userId: string, fromDay: string) =>
   unionAll(
     usageSplit(db, userId, fromDay, "host", usageDaily.host),
     usageSplit(db, userId, fromDay, "repo", usageDaily.repo),
     usageSplit(db, userId, fromDay, "account", usageDaily.account),
   );
 
-const sessionsPerDay = (db: TenantRunner, userId: string, since: number) => {
+const sessionsPerDay = (db: TenantTx, userId: string, since: number) => {
   const day = sql<string>`date(${sessionHistory.startedAt} / 1000, 'unixepoch')`;
   return db
     .select({ day, sessions: count() })
@@ -968,7 +960,7 @@ const sessionsPerDay = (db: TenantRunner, userId: string, since: number) => {
 // fortnight. Overlapping sessions still each count their own stretch: this is session time, not
 // wall-clock time, and the page says so. The all-time ranking passes since 0, which leaves the clip
 // at now and nothing else.
-const repoHours = (db: TenantRunner, userId: string, since: number, until: number, limit: number) => {
+const repoHours = (db: TenantTx, userId: string, since: number, until: number, limit: number) => {
   const ms = sql<number>`SUM(MAX(MIN(${sessionHistory.lastActivityAt}, ${until})
     - MAX(${sessionHistory.startedAt}, ${since}), 0))`;
   return db
@@ -986,7 +978,7 @@ const repoHours = (db: TenantRunner, userId: string, since: number, until: numbe
     .limit(limit);
 };
 
-const rhythm = (db: TenantRunner, userId: string, since: number) => {
+const rhythm = (db: TenantTx, userId: string, since: number) => {
   const weekday = sql<number>`CAST(strftime('%w', ${sessionHistory.startedAt} / 1000, 'unixepoch') AS INTEGER)`;
   const hour = sql<number>`CAST(strftime('%H', ${sessionHistory.startedAt} / 1000, 'unixepoch') AS INTEGER)`;
   return db
@@ -1217,21 +1209,35 @@ export const recordUsage = async (
   };
   db.transaction((tx) => {
     // The rollup moves only where the raw event is new, which is what makes a redelivered delta
-    // count once: a guard on another table is a shape the insert builder cannot take.
-    tx.run(sql`INSERT INTO ${usageDaily} (user_id, day, host, repo, account, provider, model, prompts,
-        input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
-      SELECT ${userId}, ${usageDay(input.at)}, ${input.host}, ${input.repo}, ${input.account}, ${input.provider},
-        ${input.model}, ${counters.prompts}, ${counters.inputTokens}, ${counters.outputTokens},
-        ${counters.cacheWriteTokens}, ${counters.cacheReadTokens}
-      WHERE NOT EXISTS (SELECT 1 FROM ${usageEvents}
-        WHERE ${usageEvents.userId} = ${userId} AND ${usageEvents.sessionId} = ${sessionId}
-          AND ${usageEvents.seq} = ${input.seq})
-      ON CONFLICT (user_id, day, host, repo, account, provider, model) DO UPDATE SET
-        prompts = usage_daily.prompts + excluded.prompts,
-        input_tokens = usage_daily.input_tokens + excluded.input_tokens,
-        output_tokens = usage_daily.output_tokens + excluded.output_tokens,
-        cache_write_tokens = usage_daily.cache_write_tokens + excluded.cache_write_tokens,
-        cache_read_tokens = usage_daily.cache_read_tokens + excluded.cache_read_tokens`);
+    // count once: a guard on another table is a shape the insert builder's `values` cannot take.
+    tx.insert(usageDaily)
+      .select(
+        sql`SELECT ${userId}, ${usageDay(input.at)}, ${input.host}, ${input.repo}, ${input.account},
+          ${input.provider}, ${input.model}, ${counters.prompts}, ${counters.inputTokens},
+          ${counters.outputTokens}, ${counters.cacheWriteTokens}, ${counters.cacheReadTokens}
+        WHERE NOT EXISTS (SELECT 1 FROM ${usageEvents}
+          WHERE ${usageEvents.userId} = ${userId} AND ${usageEvents.sessionId} = ${sessionId}
+            AND ${usageEvents.seq} = ${input.seq})`,
+      )
+      .onConflictDoUpdate({
+        target: [
+          usageDaily.userId,
+          usageDaily.day,
+          usageDaily.host,
+          usageDaily.repo,
+          usageDaily.account,
+          usageDaily.provider,
+          usageDaily.model,
+        ],
+        set: {
+          prompts: sql`usage_daily.prompts + excluded.prompts`,
+          inputTokens: sql`usage_daily.input_tokens + excluded.input_tokens`,
+          outputTokens: sql`usage_daily.output_tokens + excluded.output_tokens`,
+          cacheWriteTokens: sql`usage_daily.cache_write_tokens + excluded.cache_write_tokens`,
+          cacheReadTokens: sql`usage_daily.cache_read_tokens + excluded.cache_read_tokens`,
+        },
+      })
+      .run();
     tx.insert(usageEvents)
       .values({
         userId,
@@ -1314,11 +1320,14 @@ export const writeChunks = async (
 ): Promise<void> => {
   db.transaction((tx) => {
     chunks.forEach((chunk, index) => {
-      tx.run(sql`INSERT INTO ${sessionChunks} (user_id, session_id, ordinal, speaker, text, embedding, at)
-        SELECT ${userId}, ${sessionId}, ${from + index}, ${chunk.speaker}, ${chunk.text},
-          ${blobOf(chunk.embedding)}, ${chunk.at}
-        WHERE ${offRecord(userId, sessionId)}
-        ON CONFLICT (user_id, session_id, ordinal) DO NOTHING`);
+      tx.insert(sessionChunks)
+        .select(
+          sql`SELECT NULL, ${userId}, ${sessionId}, ${from + index}, ${chunk.speaker}, ${chunk.text},
+            ${blobOf(chunk.embedding)}, ${chunk.at}
+          WHERE ${offRecord(userId, sessionId)}`,
+        )
+        .onConflictDoNothing({ target: [sessionChunks.userId, sessionChunks.sessionId, sessionChunks.ordinal] })
+        .run();
     });
     tx.update(sessionIndex)
       .set({ bytes: reached, chunks: from + chunks.length })
@@ -2212,25 +2221,29 @@ export const claimBoardMessages = async (
 ): Promise<BoardMessage[]> =>
   db
     .transaction((tx) => {
-      tx.run(sql`INSERT INTO ${boardPickups} (user_id, message_id, session_id, device_id, host, picked_up_at)
-        SELECT ${userId}, message_id, ${taker.sessionId}, ${taker.deviceId}, ${taker.host}, ${taker.pickedUpAt} FROM
-          (SELECT ${boardMessages.messageId}, ${BOARD_THROUGH}
-           FROM ${boardMessages}
-           WHERE ${boardMessages.userId} = ${userId} AND ${boardMessages.expiresAt} > ${now}
-             AND ((${boardMessages.scope} = 'fleet' AND ${boardMessages.target} = ${userId})
-               OR (${boardMessages.scope} = 'host' AND ${boardMessages.target} = ${taker.deviceId})
-               OR (${boardMessages.scope} = 'session' AND ${boardMessages.target} = ${taker.sessionId}
-                 AND EXISTS (SELECT 1 FROM ${sessions}
-                   WHERE ${sessions.userId} = ${boardMessages.userId}
-                     AND ${sessions.sessionId} = ${boardMessages.target}
-                     AND ${sessions.deviceId} = ${taker.deviceId})))
-             AND NOT EXISTS (SELECT 1 FROM ${boardPickups}
-               WHERE ${boardPickups.userId} = ${boardMessages.userId}
-                 AND ${boardPickups.messageId} = ${boardMessages.messageId}
-                 AND (${boardPickups.sessionId} <> ${taker.sessionId}
-                   OR ${boardPickups.deviceId} <> ${taker.deviceId})))
-        WHERE through <= ${MAX_PICKUP_BYTES}
-        ON CONFLICT (user_id, message_id) DO NOTHING`);
+      tx.insert(boardPickups)
+        .select(
+          sql`SELECT ${userId}, message_id, ${taker.sessionId}, ${taker.deviceId}, ${taker.host},
+            ${taker.pickedUpAt} FROM
+            (SELECT ${boardMessages.messageId}, ${BOARD_THROUGH}
+             FROM ${boardMessages}
+             WHERE ${boardMessages.userId} = ${userId} AND ${boardMessages.expiresAt} > ${now}
+               AND ((${boardMessages.scope} = 'fleet' AND ${boardMessages.target} = ${userId})
+                 OR (${boardMessages.scope} = 'host' AND ${boardMessages.target} = ${taker.deviceId})
+                 OR (${boardMessages.scope} = 'session' AND ${boardMessages.target} = ${taker.sessionId}
+                   AND EXISTS (SELECT 1 FROM ${sessions}
+                     WHERE ${sessions.userId} = ${boardMessages.userId}
+                       AND ${sessions.sessionId} = ${boardMessages.target}
+                       AND ${sessions.deviceId} = ${taker.deviceId})))
+               AND NOT EXISTS (SELECT 1 FROM ${boardPickups}
+                 WHERE ${boardPickups.userId} = ${boardMessages.userId}
+                   AND ${boardPickups.messageId} = ${boardMessages.messageId}
+                   AND (${boardPickups.sessionId} <> ${taker.sessionId}
+                     OR ${boardPickups.deviceId} <> ${taker.deviceId})))
+          WHERE through <= ${MAX_PICKUP_BYTES}`,
+        )
+        .onConflictDoNothing({ target: [boardPickups.userId, boardPickups.messageId] })
+        .run();
       return tx.all<BoardRow>(sql`
         SELECT * FROM
           (SELECT ${boardMessages.messageId}, ${boardMessages.scope}, ${boardMessages.target},
@@ -2419,8 +2432,8 @@ const markStands = (commit: RecordCommit): SQL =>
 // file to another append and nothing it carried was written; ordinals are implicit in position, so
 // a host knows its next `from` without asking and pipelines two appends as a matter of course.
 //
-// Every statement here is an INSERT guarded by a SELECT, which drizzle's insert builder cannot
-// express, so the batch is written out and only the table and column names come from the schema.
+// Every insert here is guarded by a SELECT, which the insert builder's `values` cannot express, so
+// the rows are written out and the builder supplies the column list from the schema.
 export const commitRecords = async (db: TenantDb, commit: RecordCommit): Promise<boolean> => {
   const { userId, sessionId, file, chunkFrom, chunks, open, next, takeover } = commit;
   return db.transaction((tx) => {
@@ -2431,35 +2444,52 @@ export const commitRecords = async (db: TenantDb, commit: RecordCommit): Promise
       tx.run(sql`DELETE FROM ${sessionChunks}
         WHERE ${sessionChunks.userId} = ${userId} AND ${sessionChunks.sessionId} = ${sessionId}
           AND ${markStands(commit)}`);
-      tx.run(sql`INSERT INTO ${sessionIndex} (user_id, session_id, archived, bytes, chunks)
-        SELECT ${userId}, ${sessionId}, 0, 0, 0 WHERE ${markStands(commit)}
-        ON CONFLICT (user_id, session_id) DO UPDATE SET archived = 0, bytes = 0, chunks = 0`);
+      tx.insert(sessionIndex)
+        .select(sql`SELECT ${userId}, ${sessionId}, 0, 0, 0 WHERE ${markStands(commit)}`)
+        .onConflictDoUpdate({
+          target: [sessionIndex.userId, sessionIndex.sessionId],
+          set: { archived: 0, bytes: 0, chunks: 0 },
+        })
+        .run();
     }
     chunks.forEach((chunk, index) => {
-      tx.run(sql`INSERT INTO ${sessionChunks} (user_id, session_id, ordinal, speaker, text, embedding, at)
-        SELECT ${userId}, ${sessionId}, ${chunkFrom + index}, ${chunk.speaker}, ${chunk.text},
-          ${blobOf(chunk.embedding)}, ${chunk.at}
-        WHERE ${markStands(commit)}`);
+      tx.insert(sessionChunks)
+        .select(
+          sql`SELECT NULL, ${userId}, ${sessionId}, ${chunkFrom + index}, ${chunk.speaker}, ${chunk.text},
+            ${blobOf(chunk.embedding)}, ${chunk.at}
+          WHERE ${markStands(commit)}`,
+        )
+        .run();
     });
     if (chunks.length > 0) {
-      tx.run(sql`INSERT INTO ${sessionIndex} (user_id, session_id, archived, bytes, chunks)
-        SELECT ${userId}, ${sessionId}, 0, 0, ${chunkFrom + chunks.length} WHERE ${markStands(commit)}
-        ON CONFLICT (user_id, session_id) DO UPDATE SET chunks = MAX(session_index.chunks, excluded.chunks)`);
+      tx.insert(sessionIndex)
+        .select(sql`SELECT ${userId}, ${sessionId}, 0, 0, ${chunkFrom + chunks.length} WHERE ${markStands(commit)}`)
+        .onConflictDoUpdate({
+          target: [sessionIndex.userId, sessionIndex.sessionId],
+          set: { chunks: sql`MAX(session_index.chunks, excluded.chunks)` },
+        })
+        .run();
     }
     tx.run(sql`DELETE FROM ${sessionOpenChunks}
       WHERE ${sessionOpenChunks.userId} = ${userId} AND ${sessionOpenChunks.sessionId} = ${sessionId}
         AND ${sessionOpenChunks.file} = ${file} AND ${markStands(commit)}`);
     for (const chunk of open) {
-      tx.run(sql`INSERT INTO ${sessionOpenChunks} (user_id, session_id, file, speaker, pieces, at)
-        SELECT ${userId}, ${sessionId}, ${file}, ${chunk.speaker}, ${JSON.stringify(chunk.pieces)}, ${chunk.at}
-        WHERE ${markStands(commit)}`);
+      tx.insert(sessionOpenChunks)
+        .select(
+          sql`SELECT ${userId}, ${sessionId}, ${file}, ${chunk.speaker}, ${JSON.stringify(chunk.pieces)}, ${chunk.at}
+          WHERE ${markStands(commit)}`,
+        )
+        .run();
     }
-    // The mark, and the row count that says whether this append still owned the file.
-    const marked = tx.all<{ written: number }>(sql`INSERT INTO ${sessionRecords} (user_id, session_id, file,
-        next_ordinal)
-      SELECT ${userId}, ${sessionId}, ${file}, ${next} WHERE ${markStands(commit)}
-      ON CONFLICT (user_id, session_id, file) DO UPDATE SET next_ordinal = excluded.next_ordinal
-      RETURNING 1 AS written`);
+    const marked = tx
+      .insert(sessionRecords)
+      .select(sql`SELECT ${userId}, ${sessionId}, ${file}, ${next} WHERE ${markStands(commit)}`)
+      .onConflictDoUpdate({
+        target: [sessionRecords.userId, sessionRecords.sessionId, sessionRecords.file],
+        set: { nextOrdinal: sql`excluded.next_ordinal` },
+      })
+      .returning({ file: sessionRecords.file })
+      .all();
     return marked.length === 1;
   });
 };
