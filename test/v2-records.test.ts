@@ -190,8 +190,8 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
   // The reverse order, which the mark alone cannot answer: the queue drains first and indexes the
   // prose at ordinals the record append would then index it at a second time. One session takes
-  // one path into the index, so an append landing in the middle of a file the byte path wrote is
-  // refused — and told the one ordinal that is not, which is the replay that takes the session
+  // one path into the index, so an append landing in the middle of a file the records do not reach
+  // is refused — and told the one ordinal that is not, which is the replay that takes the session
   // over.
   it("refuses records in the middle of a session the byte path already wrote", async () => {
     const { user, deliver } = await harness();
@@ -208,9 +208,113 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     const refused = await client.v2.records(session, "main", 4, records.slice(4));
     expect(refused.status).toBe(409);
     const conflict: { error: string; next: number } = await refused.json();
-    expect(conflict.error).toContain("written as bytes");
+    expect(conflict.error).toContain("holds 0 records");
     expect(conflict.next).toBe(0);
     expect(await chunkCount(client.userId, session)).toBe(indexed);
+  });
+
+  // A writer that stored its records and lost the file before it could write the mark leaves the
+  // archive ahead of a session that holds no record mark at all. Both calls left to it have to
+  // terminate: one at the ordinal the objects reach, which is where the records go on, and the
+  // takeover is what carries the index over the whole of what is there.
+  it("takes a session over from the ordinal its stored records already reach", async () => {
+    const { user, deliver } = await harness();
+    const client = await user("stranded");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+
+    const first = conversation();
+    const second = ["retention", "throttling", "migration"].flatMap((subject, at) => about(at, subject));
+
+    expect((await client.archive(session, "main", 0, `${first.join("\n")}\n`)).status).toBe(200);
+    await deliver();
+    expect(await chunkCount(client.userId, session)).toBeGreaterThan(0);
+
+    // The records of a replay that stored them and never wrote its mark: the objects hold the
+    // whole file and `session_records` holds nothing.
+    await env.TRANSCRIPTS.put(
+      `${RECORDS_PREFIX}/${client.userId}/${session}/main/${"0".repeat(16)}`,
+      second.join("\n"),
+      { customMetadata: { records: String(second.length), closes: "1" } },
+    );
+    const marked = await env.DB.prepare(
+      "SELECT next_ordinal FROM session_records WHERE user_id = ? AND session_id = ? AND file = 'main'",
+    )
+      .bind(client.userId, session)
+      .first<{ next_ordinal: number }>();
+    expect(marked).toBeNull();
+
+    const resumed = await client.v2.records(session, "main", second.length, about(3, "tenancy"));
+    expect(resumed.status).toBe(200);
+
+    // The byte path is gone and the records are indexed from ordinal 0, stranded span and all.
+    const counted = await env.DB.prepare(
+      "SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?",
+    )
+      .bind(client.userId, session)
+      .first<{ archived: number; bytes: number; chunks: number }>();
+    const taken = await chunksOf(client.userId, session);
+    expect(counted).toEqual({ archived: 0, bytes: 0, chunks: taken.length });
+    const ordinals = await env.DB.prepare(
+      "SELECT ordinal FROM session_chunks WHERE user_id = ? AND session_id = ? ORDER BY ordinal",
+    )
+      .bind(client.userId, session)
+      .all<{ ordinal: number }>();
+    expect(ordinals.results.map((row) => row.ordinal)).toEqual(taken.map((_, at) => at));
+    expect(taken.map((chunk) => chunk.text).join("\n")).not.toContain("pagination");
+  });
+
+  // An object written before the archive kept the byte that says whether a break closed its last
+  // record. Every reading of such a session has to carry on as if one did, because that is the
+  // only thing the record path ever stored then and there is no bucket surgery short of it.
+  it("reads a record object that names no closing break as one that closes on a break", async () => {
+    const { user } = await harness();
+    const client = await user("unmarked");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const records = conversation();
+
+    await env.TRANSCRIPTS.put(
+      `${RECORDS_PREFIX}/${client.userId}/${session}/main/${"0".repeat(16)}`,
+      records.join("\n"),
+      { customMetadata: { records: String(records.length) } },
+    );
+
+    const read = await client.v2.transcript(session, "main");
+    expect(read.status).toBe(200);
+    expect(await read.text()).toBe(`${records.join("\n")}\n`);
+
+    const listed = await client.v2.files(session);
+    expect(listed.status).toBe(200);
+    const { files }: { files: Array<{ file: string; records: number }> } = await listed.json();
+    expect(files).toEqual([
+      { held: "records", file: "main", bytes: records.join("\n").length + 1, records: records.length },
+    ]);
+
+    expect((await client.v2.records(session, "main", records.length, about(6, "retention"))).status).toBe(200);
+  });
+
+  // A file ends on the record a session stopped writing part way through, and the archive holds no
+  // place inside a record. An append behind that one would store its bytes under an ordinal of
+  // their own and the two would read back as a single line, leaving the archive counting one
+  // record more than the file holds for ever.
+  it("refuses an append behind a record no break closed", async () => {
+    const { user } = await harness();
+    const client = await user("unclosed");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const file = "tool-results.b374nf1qv";
+
+    expect((await client.v2.records(session, file, 0, ["head", "tai"], false)).status).toBe(200);
+
+    const refused = await client.v2.records(session, file, 2, ["l of it", "next"]);
+    expect(refused.status).toBe(409);
+    const conflict: { error: string; next: number } = await refused.json();
+    expect(conflict.error).toContain("no break closed");
+    expect(conflict.next).toBe(2);
+
+    const read = await client.v2.transcript(session, file);
+    expect(await read.text()).toBe("head\ntai");
   });
 
   // The migration the refusal above stands beside. A replay opens at ordinal 0 and carries the
@@ -562,20 +666,8 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
     const listed = await client.v2.files(session);
     const { files }: { files: Array<{ file: string; bytes: number; records: number }> } = await listed.json();
     expect(files).toEqual([
-      {
-        file: "main",
-        bytes: prompt(0, "one turn").length + 1,
-        through: prompt(0, "one turn").length + 1,
-        named: true,
-        records: 1,
-      },
-      {
-        file: "tool-results.b374nf1qv",
-        bytes: lines.join("\n").length,
-        through: lines.join("\n").length,
-        named: true,
-        records: 2,
-      },
+      { held: "records", file: "main", bytes: prompt(0, "one turn").length + 1, records: 1 },
+      { held: "records", file: "tool-results.b374nf1qv", bytes: lines.join("\n").length, records: 2 },
     ]);
   });
 

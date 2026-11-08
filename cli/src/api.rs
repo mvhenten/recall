@@ -10,11 +10,13 @@ use ureq::http::Response;
 use ureq::{Agent, RequestBuilder};
 
 /// A business date as `/v2` writes one: an instant carrying its offset. Everything this host keeps
-/// is epoch milliseconds, so the two readings live here and nowhere else.
-pub fn written(ms: i64) -> String {
-    Timestamp::from_millisecond(ms)
-        .unwrap_or(Timestamp::UNIX_EPOCH)
-        .to_string()
+/// is epoch milliseconds, so the two readings live here and nowhere else. A number no instant can
+/// be read out of is corrupt local state: reading it as the epoch would archive 1970 as the date
+/// the session ran, which nothing downstream could tell from a session that really did.
+pub fn written(ms: i64) -> Result<String> {
+    Ok(Timestamp::from_millisecond(ms)
+        .with_context(|| format!("{ms} is no instant this host can write as a date"))?
+        .to_string())
 }
 
 mod iso {
@@ -22,7 +24,7 @@ mod iso {
     use serde::Deserialize;
 
     pub fn serialize<S: Serializer>(ms: &i64, out: S) -> Result<S::Ok, S::Error> {
-        out.serialize_str(&written(*ms))
+        out.serialize_str(&written(*ms).map_err(serde::ser::Error::custom)?)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(read: D) -> Result<i64, D::Error> {
@@ -705,21 +707,21 @@ pub struct SessionBody<'a> {
 impl SessionBody<'_> {
     /// The record as `/v2` takes one: the two dates carrying their offsets, and a mode that names
     /// the reading the host could not make rather than leaving the field blank.
-    fn sent(&self, focus: &crate::sessions::Focus) -> serde_json::Value {
-        serde_json::json!({
+    fn sent(&self, focus: &crate::sessions::Focus) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
             "host": self.host,
             "cwd": self.cwd,
             "repo": self.repo,
             "branch": self.branch,
             "commit": self.commit,
-            "startedAt": written(self.started_at),
-            "lastActivityAt": written(self.last_activity_at),
+            "startedAt": written(self.started_at)?,
+            "lastActivityAt": written(self.last_activity_at)?,
             "prompts": self.prompts,
             "focus": focus,
             "mode": mode_out(self.mode),
             "permissionMode": self.permission_mode,
             "pid": self.pid,
-        })
+        }))
     }
 }
 
@@ -735,27 +737,42 @@ struct HistoryIds {
     next_cursor: String,
 }
 
-/// One of a session's transcript files as the archive holds it: how many bytes of it are stored,
-/// how far into the file on disk those bytes reach, and whether every key behind that reach names
-/// both ends of the span of the file it holds. The first two differ because a stretch goes up
-/// redacted, and it is the second that an archive resumes from and a restore weighs a local file
-/// against, so nothing a host keeps locally can put the two out of step.
-///
-/// `named` reads as false where the service does not say, which leaves the reach unproven: the
-/// reading that stops rather than the one that writes a local transcript over.
+/// One of a session's transcript files as the archive holds it, said apart by the path that wrote
+/// it. The two answer in places of different kinds — a stretch names a byte of the file on disk
+/// and a record names a line of it, which redaction cannot move — so which of them holds a file is
+/// what says whether a reader weighs its own copy in bytes or in records.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HeldFile {
-    pub file: String,
-    pub bytes: i64,
-    pub through: i64,
-    #[serde(default)]
-    pub named: bool,
-    /// How many records the archive holds of this file, and nothing for one held as bytes. The
-    /// two paths answer in places of different kinds — a stretch names a byte of the file and a
-    /// record names a line — so which of them wrote a file is what says whether a reader weighs
-    /// its own copy in records or in bytes.
-    #[serde(default)]
-    pub records: i64,
+#[serde(tag = "held", rename_all = "camelCase")]
+pub enum HeldFile {
+    /// `bytes` is what the archive stores and `through` is how far into the file on disk that
+    /// reaches; the two differ because a stretch goes up redacted. `named` is whether every key
+    /// behind the reach names both ends of the span it holds, and reads as false where the service
+    /// does not say — the reading that stops rather than the one that writes a local transcript
+    /// over.
+    Bytes {
+        file: String,
+        bytes: i64,
+        through: i64,
+        #[serde(default)]
+        named: bool,
+    },
+    /// `bytes` is a length of the archive and no place in the file on disk, so a reader weighs its
+    /// own copy against `records` and against nothing else.
+    Records { file: String, bytes: i64, records: i64 },
+}
+
+impl HeldFile {
+    pub fn file(&self) -> &str {
+        match self {
+            HeldFile::Bytes { file, .. } | HeldFile::Records { file, .. } => file,
+        }
+    }
+
+    pub fn bytes(&self) -> i64 {
+        match self {
+            HeldFile::Bytes { bytes, .. } | HeldFile::Records { bytes, .. } => *bytes,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1021,7 +1038,7 @@ impl Client {
     }
 
     pub fn list(&self, tags: &[String], since: i64, cursor: &str, limit: u32) -> Result<Page> {
-        let mut query = vec![format!("since={}", encode(&written(since))), format!("limit={limit}")];
+        let mut query = vec![format!("since={}", encode(&written(since)?)), format!("limit={limit}")];
         query.extend(tags.iter().map(|tag| format!("tags={}", encode(tag))));
         if !cursor.is_empty() {
             query.push(format!("cursor={}", encode(cursor)));
@@ -1135,7 +1152,7 @@ impl Client {
         };
         let response = self
             .authed(self.agent.put(self.url(&Self::session_path(session_id))))
-            .send_json(body.sent(&focus))?;
+            .send_json(body.sent(&focus)?)?;
         check(response, &format!("syncing session {session_id}"))?;
         Ok(())
     }
@@ -1184,7 +1201,7 @@ impl Client {
                 bail!("a usage delta of session {session_id} is no JSON object");
             };
             let at = fields.get("at").and_then(serde_json::Value::as_i64).unwrap_or_default();
-            fields.insert("at".to_string(), written(at).into());
+            fields.insert("at".to_string(), written(at)?.into());
             fields.entry("durable").or_insert(false.into());
             fields.insert("host".to_string(), host.into());
             fields.insert("repo".to_string(), repo.into());
@@ -1587,7 +1604,7 @@ mod tests {
     #[test]
     fn a_date_goes_up_as_an_instant_carrying_its_offset_and_reads_back_as_itself() {
         let shaped = |at: i64| {
-            let written = written(at);
+            let written = written(at).unwrap();
             let (date, time) = written.split_once('T').expect("a date and a time");
             assert_eq!(date.len(), 10, "{written}");
             assert!(time.ends_with('Z'), "{written}");
@@ -1611,7 +1628,7 @@ mod tests {
             "branch": "",
             "commit": "",
             "startedAt": "2025-11-01T13:26:40.123+01:00",
-            "lastActivityAt": written(1_762_000_000_000),
+            "lastActivityAt": written(1_762_000_000_000).unwrap(),
             "prompts": 0,
             "focus": { "first": "", "latest": "" },
             "mode": "Headless",

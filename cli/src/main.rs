@@ -813,8 +813,9 @@ fn backfill_sessions() -> Result<ExitCode> {
 ///
 /// A session still running is left alone: the host writing it is the one that archives it. A file
 /// the record path already holds refuses the first run of records with the ordinal it waits at,
-/// which costs one call and sends nothing. A session the byte path wrote is refused outright —
-/// the service holds the two as two paths — and that, like any other failure, is reported and
+/// which costs one call and sends nothing. A session the byte path wrote is taken over by the
+/// replay: the records open at ordinal 0 and carry the whole file, and the service drops what the
+/// byte path indexed in the batch that writes the record mark. A file that fails is reported and
 /// passed over rather than stopping the run.
 fn replay_sessions(client: &Client) -> Result<ExitCode> {
     let live: std::collections::HashSet<String> = client
@@ -847,17 +848,20 @@ fn replay_sessions(client: &Client) -> Result<ExitCode> {
             }
         };
         for file in &held.files {
-            match replay_file(client, session_id, &file.file) {
+            match replay_file(client, session_id, file.file()) {
                 Ok(sent) => {
                     replayed += 1;
                     println!(
                         "replayed {} of {session_id}: {} records sent, {} lines dropped, waiting at {}",
-                        file.file, sent.records, sent.dropped, sent.next
+                        file.file(),
+                        sent.records,
+                        sent.dropped,
+                        sent.next
                     );
                 }
                 Err(error) => {
                     skipped += 1;
-                    eprintln!("recall: skipped {} of {session_id}: {error:#}", file.file);
+                    eprintln!("recall: skipped {} of {session_id}: {error:#}", file.file());
                 }
             }
         }
@@ -1273,7 +1277,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let result = client()?.search(&api::SearchRequest {
                 query: &query,
                 tags: &tags,
-
                 limit,
                 min_score,
                 mode: &mode,

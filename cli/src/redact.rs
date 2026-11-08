@@ -8,11 +8,7 @@
 //!
 //! A match is written out as `[redacted:<kind>]`, which says what was there. That is shorter or
 //! longer than what it replaced, so a stretch runs to a different length than the bytes it was
-//! read from, and every answer here says how many of those bytes it accounts for. A placeholder is
-//! longer than most of what it stands in — twenty-eight bytes for an access key id's twenty — so a
-//! stretch read to the
-//! largest body the caller may send can redact to more than that, and a caller says how much it
-//! can take rather than finding out from a service that refuses the body.
+//! read from, and every answer here says how many of those bytes it accounts for.
 //!
 //! A secret written across lines keeps them: a PEM block stands out as one placeholder for each
 //! line it ran on, with the breaks where they were. A file is sent as records and a record is a
@@ -45,23 +41,13 @@ const OPENS: &[u8] = b"[redacted:";
 
 const NEWLINE: u8 = b'\n';
 
-/// How long a secret is written out as: one placeholder for the line it stood on, and one more for
-/// every line it ran on to, with the breaks between them.
-fn hidden(kind: &str, breaks: usize) -> usize {
-    (OPENS.len() + kind.len() + 1) * (breaks + 1) + breaks
-}
-
 /// A stretch as it is written out: runs of the file as they were read, and the secrets between
-/// them under the names of what they were. `lead` is how much of the run in front of a secret is
-/// the name that said what it was — nothing for a secret written over marker and all, and the
-/// marker and what stood between for one that keeps its place in the file.
+/// them under the names of what they were.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Piece<'a> {
     Kept(&'a [u8]),
     Hidden {
         kind: &'static str,
-        lead: usize,
-        span: usize,
         /// How many line breaks the secret was written across. A PEM block is the one secret that
         /// runs over more than one line, and it is written out as one placeholder per line it
         /// stood on, so the line structure of the file survives the redaction. A placeholder that
@@ -73,52 +59,18 @@ enum Piece<'a> {
 
 /// The stretch, redacted, and how much of it that accounts for. `before` is the byte of the file
 /// just in front of the stretch, and nothing for a stretch that starts at the file's first byte.
-pub fn redact(input: &[u8], before: Option<u8>, whole: bool) -> Redacted {
-    within(input, before, whole, usize::MAX)
-}
-
-/// The stretch, redacted and written out to at most `limit` bytes, and how much of the stretch
-/// that accounts for. A placeholder is longer than most of what it stands in, so a stretch read to
-/// the largest body a caller may send can redact to more than that and the cut has to come back.
 ///
-/// Where it comes back to is a place the rest of the file reads the same from. Nothing is cut
-/// inside a placeholder, nothing between a name and the value it named — a header's scheme and a
-/// registry's `_authToken=` are read in front of the run they stand for, and a stretch opening
-/// past them would send that run as the prose it then looks like — and nothing out of the middle
-/// of a secret written over marker and all. What is left is the runs of the file written out as
-/// they were read, which a stretch may open anywhere in: the service holds a file as a run of byte
-/// ranges, so a line cut in two still reads whole.
-pub fn within(input: &[u8], before: Option<u8>, whole: bool, limit: usize) -> Redacted {
+/// What comes back is the runs of the file as they were read with the secrets between them written
+/// out under the names of what they were, which a stretch may open anywhere in: a record is cut
+/// out of this afterwards, so a line read in two still reads whole. Nothing is cut short for
+/// length — what one append may carry is counted off the records, after they are cut.
+pub fn within(input: &[u8], before: Option<u8>, whole: bool) -> Redacted {
     let (pieces, source) = pieces(input, before, whole);
-    let mut bytes = Vec::with_capacity(input.len().min(limit));
-    let mut at = 0;
-    for (index, piece) in pieces.iter().enumerate() {
+    let mut bytes = Vec::with_capacity(input.len());
+    for piece in &pieces {
         match piece {
-            Piece::Kept(run) => {
-                if run.len() > limit - bytes.len() {
-                    let take = (limit - bytes.len()).min(run.len() - leading(pieces.get(index + 1)));
-                    bytes.extend_from_slice(&run[..take]);
-                    return Redacted {
-                        bytes,
-                        source: at + take,
-                    };
-                }
-                bytes.extend_from_slice(run);
-                at += run.len();
-            }
-            Piece::Hidden {
-                kind,
-                lead,
-                span,
-                breaks,
-            } => {
-                if hidden(kind, *breaks) > limit - bytes.len() {
-                    bytes.truncate(bytes.len() - lead);
-                    return Redacted {
-                        bytes,
-                        source: at - lead,
-                    };
-                }
+            Piece::Kept(run) => bytes.extend_from_slice(run),
+            Piece::Hidden { kind, breaks } => {
                 for line in 0..=*breaks {
                     if line > 0 {
                         bytes.push(NEWLINE);
@@ -127,28 +79,17 @@ pub fn within(input: &[u8], before: Option<u8>, whole: bool, limit: usize) -> Re
                     bytes.extend_from_slice(kind.as_bytes());
                     bytes.push(b']');
                 }
-                at += span;
             }
         }
     }
     Redacted { bytes, source }
 }
 
-/// How much of the run in front of a secret named what it was, and nothing where no secret
-/// follows. Those bytes go up with the secret or not at all: a stretch that ended between them
-/// would leave the next one opening on a run of bytes with nothing left to say what they are.
-fn leading(next: Option<&Piece<'_>>) -> usize {
-    match next {
-        Some(Piece::Hidden { lead, .. }) => *lead,
-        _ => 0,
-    }
-}
-
 /// One line of a session's own prose, redacted. A prompt is a whole line in hand rather than a
 /// stretch of a file, so there is nothing in front of it and nothing left to arrive: a secret
 /// pasted into one is written out as a placeholder like any other.
 pub fn text(line: &str) -> String {
-    String::from_utf8_lossy(&redact(line.as_bytes(), None, true).bytes).into_owned()
+    String::from_utf8_lossy(&within(line.as_bytes(), None, true).bytes).into_owned()
 }
 
 /// The run of a stretch that is written out, piece by piece, and where it is cut.
@@ -167,8 +108,6 @@ fn pieces(input: &[u8], before: Option<u8>, whole: bool) -> (Vec<Piece<'_>>, usi
                 found.push(Piece::Kept(&input[kept..hit.from]));
                 found.push(Piece::Hidden {
                     kind: hit.kind,
-                    lead: hit.from - at,
-                    span: hit.to - hit.from,
                     breaks: input[hit.from..hit.to].iter().filter(|byte| **byte == NEWLINE).count(),
                 });
                 kept = hit.to;
@@ -535,7 +474,7 @@ mod tests {
     use super::*;
 
     fn stripped(text: &str) -> String {
-        String::from_utf8(redact(text.as_bytes(), None, true).bytes).unwrap()
+        String::from_utf8(within(text.as_bytes(), None, true).bytes).unwrap()
     }
 
     #[test]
@@ -640,12 +579,12 @@ mod tests {
             let before = bytes[at - 1];
 
             assert_eq!(
-                String::from_utf8(redact(tail, Some(before), true).bytes).unwrap(),
+                String::from_utf8(within(tail, Some(before), true).bytes).unwrap(),
                 String::from_utf8_lossy(tail),
                 "a stretch cut at {at} opens inside a word, which the byte in front of it says"
             );
             assert_ne!(
-                String::from_utf8(redact(tail, None, true).bytes).unwrap(),
+                String::from_utf8(within(tail, None, true).bytes).unwrap(),
                 String::from_utf8_lossy(tail),
                 "and the same bytes read as the start of a file are a secret, which is why the byte is passed"
             );
@@ -676,12 +615,12 @@ mod tests {
     #[test]
     fn a_secret_across_the_cut_between_two_stretches_holds_the_cut_back_to_where_it_began() {
         let line = b"before ghp_3kQ9fakeTOKENvalue0000000000000000 after";
-        let whole = String::from_utf8(redact(line, None, true).bytes).unwrap();
+        let whole = String::from_utf8(within(line, None, true).bytes).unwrap();
         for cut in 1..line.len() {
-            let head = redact(&line[..cut], None, false);
+            let head = within(&line[..cut], None, false);
             let before = head.source.checked_sub(1).map(|at| line[at]);
             let mut sent = head.bytes.clone();
-            sent.extend_from_slice(&redact(&line[head.source..], before, true).bytes);
+            sent.extend_from_slice(&within(&line[head.source..], before, true).bytes);
             assert_eq!(
                 String::from_utf8(sent).unwrap(),
                 whole,
@@ -698,7 +637,7 @@ mod tests {
     fn a_stretch_the_file_ends_in_writes_out_everything_it_holds() {
         let line = b"before ghp_3kQ9fakeTOKENvalue0000000000000000 after";
         for cut in 1..=line.len() {
-            let head = redact(&line[..cut], None, true);
+            let head = within(&line[..cut], None, true);
             assert_eq!(
                 head.source, cut,
                 "a pass told the file ends here holds nothing back, at a cut at {cut}"
@@ -714,10 +653,10 @@ mod tests {
     #[test]
     fn a_pem_block_across_the_cut_waits_for_the_line_that_closes_it() {
         let block = b"-----BEGIN RSA PRIVATE KEY-----\nZmFrZQ==\nZmFrZQ==\n-----END RSA PRIVATE KEY-----\n";
-        let head = redact(&block[..60], None, false);
+        let head = within(&block[..60], None, false);
 
         assert_eq!(head.source, 0, "a block with no end line yet sends none of itself");
-        let written = String::from_utf8(redact(block, None, false).bytes).unwrap();
+        let written = String::from_utf8(within(block, None, false).bytes).unwrap();
         assert_eq!(
             written,
             "[redacted:private-key]\n".repeat(4),
@@ -728,26 +667,6 @@ mod tests {
             String::from_utf8_lossy(block).matches('\n').count(),
             "which leaves the file as many lines as it was written on"
         );
-    }
-
-    #[test]
-    fn a_stretch_written_out_to_a_length_is_cut_where_the_rest_of_it_reads_the_same_from() {
-        let line = "id AKIAZZ7EXAMPLE9QTVB2 and Authorization: Bearer abcdefghijklmnop end\n";
-        let whole = stripped(line);
-        for limit in 1..=whole.len() {
-            let head = within(line.as_bytes(), None, true, limit);
-            assert!(head.bytes.len() <= limit, "a stretch written out to {limit} fits in it");
-            assert!(head.source <= line.len());
-
-            let before = head.source.checked_sub(1).map(|at| line.as_bytes()[at]);
-            let mut sent = head.bytes.clone();
-            sent.extend_from_slice(&redact(&line.as_bytes()[head.source..], before, true).bytes);
-            assert_eq!(
-                String::from_utf8(sent).unwrap(),
-                whole,
-                "the stretch after one cut at {limit} carries on where it left off"
-            );
-        }
     }
 
     #[test]

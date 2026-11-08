@@ -169,6 +169,7 @@ import {
   readRecordsBetween,
   recordFiles,
   recordsAgree,
+  recordsEnd,
   recordsFault,
   recordsReach,
 } from "./records";
@@ -291,6 +292,7 @@ import {
   archivedSince,
   archivedTranscript,
   cacheArchived,
+  type HeldFile,
   MAIN_FILE,
   MAX_STRETCH_BYTES,
   openStretch,
@@ -301,7 +303,6 @@ import {
   type StretchBody,
   type Stretched,
   storedStretch,
-  type TranscriptFile,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
 import {
@@ -3011,15 +3012,16 @@ export const createApp = (deps: Deps): App => {
   // Every file of a session the archive holds, whichever path wrote it. The record path is the one
   // `/v2` writes with and the byte path is what `/v1` left behind, so a file the records hold is
   // answered off them and the byte path answers for the rest.
-  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<TranscriptFile[]> => {
+  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<HeldFile[]> => {
     const [recorded, archived] = await Promise.all([
       recordFiles(bucket, userId, sessionId),
       archivedFiles(bucket, userId, sessionId),
     ]);
     const held = new Set(recorded.map((file) => file.file));
-    return [...recorded, ...archived.filter((file) => !held.has(file.file))].sort((left, right) =>
-      left.file.localeCompare(right.file),
-    );
+    const byBytes = archived
+      .filter((file) => !held.has(file.file))
+      .map(({ file, bytes, through, named }): HeldFile => ({ held: "bytes", file, bytes, through, named }));
+    return [...recorded, ...byBytes].sort((left, right) => left.file.localeCompare(right.file));
   };
 
   const v2Session = async (bucket: R2Bucket, db: D1Database, caller: Caller, target: string): Promise<Response> => {
@@ -3142,31 +3144,31 @@ export const createApp = (deps: Deps): App => {
       const taken: V2RecordsAccepted = { file: file.value, next };
       return json(taken);
     };
-    // One session, one path into the index. A session the byte path already wrote cannot take
-    // records in the middle of its own file: the two would index the same prose, and the chunk
-    // counter they share belongs to whichever of them reached it first.
+    // One session, one path into the index. A session the byte path already wrote is taken over
+    // whole or not at all: the record mark is written, the byte mark cleared and the chunks the
+    // byte path wrote dropped, all in the batch that carries this append — so the two never index
+    // the same prose and the chunk counter they share is held by one of them.
     //
-    // A replay is the one append that may cross. It opens at ordinal 0 and carries the whole file
-    // after it, so nothing the byte path indexed is prose this one leaves behind: the session is
-    // taken over — the byte mark cleared and the chunks the byte path wrote dropped — in the very
-    // batch that writes the record mark, and the byte path's own writes are refused from the
-    // moment that mark stands. Every other ordinal is the interleaving the refusal exists for.
+    // Nothing here weighs where the append opens. A session on the byte path holds no record mark,
+    // so the fold below reads the file from ordinal 0 whatever `from` says, which is the whole of
+    // what a takeover needs; an append landing in the middle of a file the records do not reach is
+    // refused by the ordinal check for the ordinary reason and told to send from 0.
     const mark = await indexMark(db, userId, sessionId);
     const crossing = file.value === MAIN_FILE && mark !== null && mark.archived > 0;
     const takeover = crossing && !(await onRecordMark(db, userId, sessionId));
-    if (takeover && from !== 0) {
-      return conflict(
-        0,
-        `session ${sessionId} holds ${file.value} written as bytes; replay it from 0 to take the session over`,
-      );
-    }
-    // The mark says where the file is waiting, and the objects are the arbiter. The two part
-    // company only where a writer stored records and did not live to write the mark, so the
-    // listing is paid for on the conflicting call alone and never on the ordinary one.
+    // The mark says where the file is waiting, and the objects are the arbiter: the two part
+    // company only where a writer stored records and did not live to write the mark. The objects
+    // also carry the one thing the mark cannot, which is whether a break closed the record in
+    // front of this append, so they are read on every call rather than on the conflicting one.
     const marked = await recordReach(db, userId, sessionId, file.value);
-    if (from !== marked) {
-      const held = await recordsReach(bucket, userId, sessionId, file.value);
-      if (from !== held) return refuse(held);
+    const end = await recordsEnd(bucket, userId, sessionId, file.value);
+    if (from !== marked && from !== end.reach) return refuse(end.reach);
+    // A record the session stopped writing part way through is the last record its file takes. An
+    // append behind it would store its bytes under an ordinal of their own, and the file would
+    // read back with the two run together under the first of them — one line where the archive
+    // counts two, which is a restore calling a whole file a part for ever.
+    if (from === end.reach && !end.closes) {
+      return conflict(end.reach, `${file.value} ends on a record no break closed; it takes no more records`);
     }
     // A put that does not land means the archive already holds an append at this ordinal. The
     // conditional put weighs presence and never content, so what is stored there is read back

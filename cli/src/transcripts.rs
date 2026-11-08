@@ -432,7 +432,7 @@ impl<R: BufRead> Reader<R> {
         // nothing back, and only the pass that knows the session has ended can say the file holds
         // no more. Anything else leaves a match at the end of the stretch unfinished.
         let whole = self.spent && self.held.is_empty() && self.pass == Pass::Final;
-        let red = redact::within(&stretch, self.before, whole, usize::MAX);
+        let red = redact::within(&stretch, self.before, whole);
         let used = &stretch[..red.source];
         if breaks(&red.bytes) != breaks(used) {
             bail!(

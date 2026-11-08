@@ -308,7 +308,7 @@ fn session_name(session: &PastSession) -> &str {
 pub fn render_session(session: &PastSession, files: &[HeldFile]) -> String {
     let held: String = files
         .iter()
-        .map(|file| format!("- {} ({} bytes)\n", file.file, file.bytes))
+        .map(|file| format!("- {} ({} bytes)\n", file.file(), file.bytes()))
         .collect();
     format!(
         "---\nname: {}\nhandle: {}\nsession: {}\nhost: {}\ncwd: {}\nwhere: {}\nstarted: {}\nlast active: {}\nprompts: {}\nstate: {}\n---\n\n{}\n\nTranscript:\n\n{}",

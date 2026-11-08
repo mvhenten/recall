@@ -19,6 +19,7 @@
     "extraChars": "._-"
   },
   "maxStretchBytes": 1048576,
+  "maxAppendBytes": 1048576,
   "headBytes": 8192,
   "idleAfterMs": 300000,
   "globalTag": "global",

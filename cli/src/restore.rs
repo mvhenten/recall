@@ -93,18 +93,21 @@ fn stale(path: &Path, held: &HeldFile) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
-    if held.records > 0 {
-        return Ok(transcripts::records_held(path, transcripts::holds_of(&held.file))? < held.records);
-    }
+    let (file, through, named) = match held {
+        HeldFile::Records { file, records, .. } => {
+            return Ok(transcripts::records_held(path, transcripts::holds_of(file))? < *records);
+        }
+        HeldFile::Bytes {
+            file, through, named, ..
+        } => (file, *through, *named),
+    };
     let size = found.len() as i64;
-    if size >= held.through {
+    if size >= through {
         return Ok(false);
     }
-    if !held.named {
+    if !named {
         bail!(
-            "the archive of {} reaches {} bytes into the file under a key of one offset that no reading can place in the file, and {} holds {size}; it cannot be told a part from a whole transcript read back redacted, so it is left where it is",
-            held.file,
-            held.through,
+            "the archive of {file} reaches {through} bytes into the file under a key of one offset that no reading can place in the file, and {} holds {size}; it cannot be told a part from a whole transcript read back redacted, so it is left where it is",
             path.display()
         );
     }
@@ -158,12 +161,12 @@ pub fn restore(
     }
     let mut done = Restored::default();
     for held in files {
-        let path = file_path(projects, cwd, &session.session_id, &held.file);
+        let path = file_path(projects, cwd, &session.session_id, held.file());
         if !stale(&path, held)? {
             done.kept.push(path);
             continue;
         }
-        let bytes = download(client, &session.session_id, &held.file, &path)?;
+        let bytes = download(client, &session.session_id, held.file(), &path)?;
         done.written.push(Written { path, bytes });
     }
     Ok(done)
@@ -211,12 +214,11 @@ mod tests {
     }
 
     fn named(through: i64) -> HeldFile {
-        HeldFile {
+        HeldFile::Bytes {
             file: MAIN.to_string(),
             bytes: through,
             through,
             named: true,
-            records: 0,
         }
     }
 
@@ -278,11 +280,9 @@ mod tests {
     fn a_file_held_as_records_is_weighed_in_records_and_never_in_bytes() {
         let dir = crate::scratch("restore-records");
         let path = dir.join("s-3.jsonl");
-        let held = |records: i64, bytes: i64| HeldFile {
+        let held = |records: i64, bytes: i64| HeldFile::Records {
             file: MAIN.to_string(),
             bytes,
-            through: bytes,
-            named: true,
             records,
         };
 
@@ -322,12 +322,11 @@ mod tests {
     fn a_reach_no_key_places_in_the_file_never_writes_over_a_local_one() {
         let dir = crate::scratch("restore-legacy");
         let path = dir.join("s-2.jsonl");
-        let legacy = |through: i64| HeldFile {
+        let legacy = |through: i64| HeldFile::Bytes {
             file: MAIN.to_string(),
             bytes: through,
             through,
             named: false,
-            records: 0,
         };
 
         assert!(
