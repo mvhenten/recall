@@ -631,6 +631,9 @@ export type Appended =
       /// count it held before plus what the stretch just stored accounts for. The reach the stretch
       /// was weighed against came off the same listing, so this costs no second one.
       archived: number;
+      /// How many bytes of the file the archive held in front of this stretch, off that same
+      /// listing. It is where a session this store has never indexed is marked as read to.
+      held: number;
     }
   | ({ kind: "refused" } & Extent);
 
@@ -670,7 +673,8 @@ export const appendStretch = async (
   // land is the one kept. The count below comes off the name rather than off the body, so two
   // writers whose gzip left them bodies of different lengths still leave the same count behind.
   await putStretch(bucket, userId, sessionId, file, nameOf(from, through, body), body);
-  return { kind: "written", through, archived: (runs[runs.length - 1]?.to ?? 0) + holdsOf(body) };
+  const held = runs[runs.length - 1]?.to ?? 0;
+  return { kind: "written", through, archived: held + holdsOf(body), held };
 };
 
 // The one thing worth keeping off the objects: how many bytes of a session's own transcript the
@@ -681,13 +685,27 @@ export const appendStretch = async (
 // A delegated turn derives nothing — the index never reads one — so its stretch writes no row at
 // all. The archive answers for those files by listing them, which is the only reading that can
 // answer without lagging.
-export const cacheArchived = (db: SqlDb, userId: string, sessionId: string, archived: number): SqlStatement =>
+//
+// The row a session is first seen by opens marked as read to where the archive already stood, not
+// to zero, so what this store has never indexed is not a gap it reads the whole of. A session the
+// store moved to while its host was running holds a file megabytes long, and a mark opening at
+// zero would have the consumer read and embed every byte of it again, one message of its queue at
+// a time. Opening it level leaves the first stretch the only gap there is, and the archive behind
+// it is reached by a replay and nothing else. A session already carrying a row is left where its
+// own passes put it, since the seed is the insert alone.
+export const cacheArchived = (
+  db: SqlDb,
+  userId: string,
+  sessionId: string,
+  archived: number,
+  held: number,
+): SqlStatement =>
   db
     .prepare(
-      `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, 0, 0)
+      `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?1, ?2, ?3, ?4, 0)
        ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
     )
-    .bind(userId, sessionId, archived);
+    .bind(userId, sessionId, archived, held);
 
 // How far into each of a session's files the archive reaches, counted off the objects and nothing
 // else. Every caller that acts on the answer reads it here — a host working out where to send the

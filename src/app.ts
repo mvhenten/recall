@@ -1067,7 +1067,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       // already paid for. The row is what a following box and the indexer are weighed against, so
       // it goes down before the storage event wakes either of them.
       if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived).run();
+        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived, landed.held).run();
       }
       return json({ file: file.value, through: landed.through });
     }
@@ -1081,7 +1081,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       // at all. It is folded in with MAX, so a stretch landing below one already there leaves the
       // row where the further one put it.
       if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength).run();
+        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength, asked.from).run();
       }
       return json({ file: file.value, offset: asked.from + body.byteLength });
     }
