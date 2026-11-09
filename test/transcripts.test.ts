@@ -74,7 +74,7 @@ describe("transcript archive", () => {
     await client.sync("s-1");
 
     expect(await held(await client.transcript("s-1"))).toEqual({});
-    expect((await client.archive("s-1", "main", 0, "one\ntwo\n")).status).toBe(200);
+    await client.archive("s-1", "main", 0, "one\ntwo\n");
     await client.archive("s-1", "main", 8, "three\n");
     await client.archive("s-1", "agent-7f21", 0, "delegated\n");
 
@@ -256,8 +256,7 @@ describe("transcript archive", () => {
     await client.sync("s-span");
     await client.archiveSpan("s-span", "main", 0, 400, "one\n");
     await client.archiveSpan("s-span", "main", 400, 900, "two\nthree\n");
-    const read = await client.archiveSpan("s-span", "main", 900, 2_000, "four\n");
-    expect(read.status).toBe(200);
+    await client.archiveSpan("s-span", "main", 900, 2_000, "four\n");
 
     // The reader has taken the first two stretches: fourteen bytes of the archive, nine hundred
     // bytes of the file, and the cursor is the first of those.
@@ -280,8 +279,8 @@ describe("transcript archive", () => {
     const userId = `legacy-${crypto.randomUUID()}`;
     const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
     await client.sync("s-legacy");
-    expect((await client.archiveLegacy("s-legacy", "main", 0, "one\ntwo\n")).status).toBe(200);
-    expect((await client.archiveLegacy("s-legacy", "main", 8, "three\n")).status).toBe(200);
+    await client.archiveLegacy("s-legacy", "main", 0, "one\ntwo\n");
+    await client.archiveLegacy("s-legacy", "main", 8, "three\n");
 
     expect(await held(await client.transcript("s-legacy"))).toEqual({ main: 14 });
     expect(await holds(await client.transcript("s-legacy"))).toEqual({ main: 14 });
@@ -289,7 +288,7 @@ describe("transcript archive", () => {
 
     // The host updates: it takes the place the archive reaches into the file and sends a stretch
     // that redacts shorter than the span it accounts for, under a key naming both ends.
-    expect((await client.archiveSpan("s-legacy", "main", 14, 30, "four\n")).status).toBe(200);
+    await client.archiveSpan("s-legacy", "main", 14, 30, "four\n");
     expect(await held(await client.transcript("s-legacy"))).toEqual({ main: 30 });
     expect(await holds(await client.transcript("s-legacy"))).toEqual({ main: 19 });
     expect(await (await client.readTranscript("s-legacy", "main")).text()).toBe("one\ntwo\nthree\nfour\n");
@@ -380,8 +379,8 @@ describe("transcript archive", () => {
     const first = turns(40, "first");
     const second = turns(30, "second");
 
-    expect((await client.archiveGzip("s-gzip", "main", 0, 9_000, first)).status).toBe(200);
-    expect((await client.archiveGzip("s-gzip", "main", 9_000, 20_000, second)).status).toBe(200);
+    await client.archiveGzip("s-gzip", "main", 0, 9_000, first);
+    await client.archiveGzip("s-gzip", "main", 9_000, 20_000, second);
 
     const stored = await env.TRANSCRIPTS.list({ prefix: `${userId}/s-gzip/main/` });
     expect(stored.objects.map((object) => object.key)).toEqual([
@@ -428,8 +427,8 @@ describe("transcript archive", () => {
     const plain = turns(20, "plain");
     const packed = turns(20, "packed");
 
-    expect((await client.archiveSpan("s-mixing", "main", 0, 9_000, plain)).status).toBe(200);
-    expect((await client.archiveGzip("s-mixing", "main", 9_000, 20_000, packed)).status).toBe(200);
+    await client.archiveSpan("s-mixing", "main", 0, 9_000, plain);
+    await client.archiveGzip("s-mixing", "main", 9_000, 20_000, packed);
 
     expect(await held(await client.transcript("s-mixing"))).toEqual({ main: 20_000 });
     expect(await holds(await client.transcript("s-mixing"))).toEqual({ main: bytes(plain) + bytes(packed) });
@@ -526,23 +525,23 @@ describe("transcript archive", () => {
     const written = ['{"type":"user","text":"one"}\n{"ty', 'pe":"user","text":"two"}\n{"type":"u', 'ser"}\n'];
     let from = 0;
     for (const stretch of written) {
-      expect((await client.archive("s-whole", "main", from, stretch)).status).toBe(200);
+      await client.archive("s-whole", "main", from, stretch);
       from += bytes(stretch);
     }
 
     expect(await (await client.readTranscript("s-whole", "main")).text()).toBe(written.join(""));
   });
 
+  // A session that ended is still a session on record, so its archive answers and takes more
+  // prose. Only the live row moved; the files did not.
   it("keeps a session's files once its row has moved to the history", async () => {
     const h = await harness();
     const client = await h.user("historian");
     await client.sync("s-5");
-    await client.archive("s-5", "main", 0, "one\n");
+    expect((await client.v2.records("s-5", "main", 0, ["one"])).status).toBe(200);
     expect((await client.request("DELETE", "/v2/sessions/s-5")).status).toBe(204);
 
-    const resumed = await client.archive("s-5", "main", 4, "two\n");
-
-    expect(resumed.status).toBe(200);
-    expect(await held(await client.transcript("s-5"))).toEqual({ main: 8 });
+    expect((await client.v2.records("s-5", "main", 1, ["two"])).status).toBe(200);
+    expect(await (await client.readTranscript("s-5", "main")).text()).toBe("one\ntwo\n");
   });
 });

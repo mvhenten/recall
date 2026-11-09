@@ -23,10 +23,7 @@
     "presetup": "npm run build:browser",
     "setup": "node npm-scripts/setup.mjs",
     "release": "node npm-scripts/release.mjs",
-    "recompress-archive": "node npm-scripts/recompress-archive.mjs",
-    "copy-artifacts": "node npm-scripts/copy-artifacts.mjs",
-    "copy-memories": "node npm-scripts/copy-memories.mjs",
-    "copy-sessions": "node npm-scripts/copy-sessions.mjs"
+    "recompress-archive": "node npm-scripts/recompress-archive.mjs"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.4",

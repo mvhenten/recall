@@ -6,25 +6,6 @@ export const MemoryTypeSchema = z.enum(["User", "Feedback", "Project", "Referenc
 
 export const SearchModeSchema = z.enum(["Hybrid", "Vector", "Text"]);
 
-export const CopyOutcomeSchema = z.enum(["Stored", "AlreadyStored", "Blocked"]);
-
-export const CopyTableSchema = z.enum([
-  "Sessions",
-  "History",
-  "Index",
-  "Records",
-  "OpenChunks",
-  "UsageDaily",
-  "Labels",
-  "CountedFiles",
-  "UsageEvents",
-  "BoardMessages",
-  "BoardPickups",
-  "Chunks",
-]);
-
-export const CopyIdentitySchema = z.enum(["Key", "WholeRow", "Walked"]);
-
 export const AppendRecordsSchema = z.object({
   file: z.string().min(1),
   from: z.int().min(0),
@@ -252,74 +233,4 @@ export const NearbyMemorySchema = z.object({
     )
     .max(50),
   description: z.string().min(1).max(500),
-});
-
-export const CopiedRowSchema = z.object({
-  rowId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
-  outcome: CopyOutcomeSchema,
-});
-
-export const CopiedTableSchema = z.object({
-  table: CopyTableSchema,
-  stored: z.int(),
-  alreadyStored: z.int(),
-  blocked: z.int(),
-  blockedIds: z
-    .array(z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/))
-    .max(50),
-  collided: z.int(),
-  collidedIds: z
-    .array(z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/))
-    .max(50),
-  identity: CopyIdentitySchema,
-  inAccount: z.int(),
-  inTenant: z.int(),
-});
-
-export const CopySessionsSchema = z.object({
-  after: z.int().min(0),
-  metadataComplete: z.boolean(),
-});
-
-export const IndexSoundSchema = z.object({
-  state: z.literal("Sound"),
-});
-
-export const IndexCorruptSchema = z.object({
-  state: z.literal("Corrupt"),
-  error: z.string().min(1),
-});
-
-export const IndexUnreadSchema = z.object({
-  state: z.literal("Unread"),
-  error: z.string().min(1),
-});
-
-export const CopiedChunksSchema = z.object({
-  stored: z.int(),
-  alreadyStored: z.int(),
-  inAccount: z.int(),
-  shifted: z.int(),
-  moved: z.int(),
-  frontier: z.int(),
-  done: z.boolean(),
-});
-
-export const CopyChecksSchema = z.object({
-  missing: z.array(z.string()),
-  extra: z.array(z.string()),
-  missingChunks: z.int(),
-  embeddings: z.array(z.number()),
-  chunkIndex: z.union([IndexSoundSchema, IndexCorruptSchema, IndexUnreadSchema]),
-  historyIndex: z.union([IndexSoundSchema, IndexCorruptSchema, IndexUnreadSchema]),
-  ok: z.boolean(),
-});
-
-export const SessionCopySchema = z.object({
-  userId: z.string().min(1),
-  tables: z.array(CopiedTableSchema),
-  metadataComplete: z.boolean(),
-  chunks: CopiedChunksSchema,
-  straddling: z.array(z.string()),
-  checks: CopyChecksSchema,
 });

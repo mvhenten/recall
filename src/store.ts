@@ -1,6 +1,5 @@
 import { and, asc, count, desc, eq, getTableName, gt, gte, inArray, lt, lte, ne, or, type SQL, sql } from "drizzle-orm";
 import { type SQLiteColumn, type SQLiteTable, union, unionAll } from "drizzle-orm/sqlite-core";
-import type { ArtifactCopyReport } from "./artifact-copy";
 import {
   type ArtifactFile,
   type ArtifactListInput,
@@ -1280,9 +1279,9 @@ export const recordUsage = async (
   });
 };
 
-// How far one session's archive runs and how far the index has read of it. `archived` is a cache
-// of the objects, moved by the storage event that wrote them; `indexed` and `chunks` are the
-// index's own and no listing could recover them.
+// How far one session's archive runs and how far the index read of it before the byte path was
+// retired. Nothing writes `archived` any more; it is read to tell a session the byte path wrote
+// from one that never touched it, which is what a replay takes over.
 export interface IndexMark {
   archived: number;
   indexed: number;
@@ -1506,9 +1505,6 @@ export interface ArtifactStore extends ArtifactReads {
   replaceArtifact(commit: ArtifactCommit, fromRev: number): Promise<boolean>;
   deleteArtifact(userId: string, name: string): Promise<void>;
   adoptArtifacts(userId: string): Promise<number>;
-  // The one-shot copy out of D1, which `./artifact-copy` holds and an operator drives once per
-  // account. It sits on the write side because it writes, and on no read path at all.
-  copyArtifacts(userId: string, now: number): Promise<ArtifactCopyReport>;
 }
 
 export const getArtifact = async (db: TenantDb, userId: string, name: string): Promise<ArtifactRecord | null> => {
@@ -2407,10 +2403,9 @@ export const recordReach = async (db: TenantDb, userId: string, sessionId: strin
 };
 
 // Whether a session's own transcript is on the record mark. A session with a row for `main` indexes
-// itself in the request that appends to it, so the consumer the byte path's storage event wakes
-// leaves it alone rather than indexing the same prose a second time. The mark is read for `main`
-// alone: a delegated file derives nothing either way, and a row for one of those would otherwise
-// stop the byte path from ever indexing the session's own prose.
+// itself in the request that appends to it, so a replay reading one knows the prose is already in
+// the index and takes nothing over. The mark is read for `main` alone: a delegated file derives
+// nothing either way, and a row for one of those would say the session had crossed when it had not.
 export const onRecordMark = async (db: TenantDb, userId: string, sessionId: string): Promise<boolean> =>
   db
     .select({ file: sessionRecords.file })

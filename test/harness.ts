@@ -123,29 +123,17 @@ export interface Client {
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   /// One stretch of a file no secret was taken out of, so the span of the file it accounts for is
   /// its own length. Nothing writes the byte archive over the API any more, so this lands the
-  /// object and the reach the archive is read against directly.
-  archive(sessionId: string, file: string, from: number, body: string | Uint8Array): Promise<Response>;
+  /// object and the reach the archive is read against directly, and there is no answer to weigh.
+  archive(sessionId: string, file: string, from: number, body: string | Uint8Array): Promise<void>;
   /// One stretch that accounts for a span of the file its own bytes do not run to, which is every
   /// stretch a secret was taken out of.
-  archiveSpan(
-    sessionId: string,
-    file: string,
-    from: number,
-    through: number,
-    body: string | Uint8Array,
-  ): Promise<Response>;
+  archiveSpan(sessionId: string, file: string, from: number, through: number, body: string | Uint8Array): Promise<void>;
   /// One stretch as every host sent one: the span of the file it accounts for, and the bytes
   /// gzipped.
-  archiveGzip(
-    sessionId: string,
-    file: string,
-    from: number,
-    through: number,
-    body: string | Uint8Array,
-  ): Promise<Response>;
+  archiveGzip(sessionId: string, file: string, from: number, through: number, body: string | Uint8Array): Promise<void>;
   /// One stretch as a host from before redaction wrote one: one offset, meaning a place in the
   /// archive and in the file at once.
-  archiveLegacy(sessionId: string, file: string, offset: number, body: string | Uint8Array): Promise<Response>;
+  archiveLegacy(sessionId: string, file: string, offset: number, body: string | Uint8Array): Promise<void>;
   transcript(sessionId: string): Promise<Response>;
   readTranscript(sessionId: string, file: string): Promise<Response>;
   /// One file read back by a reader that takes the gzip members the archive stores, which is every
@@ -612,16 +600,14 @@ export const harness = async ({
       name: string,
       body: string | Uint8Array,
       gzip: boolean,
-    ): Promise<Response> => {
+    ): Promise<void> => {
       const account = await accountId();
       await env.TRANSCRIPTS.put(`${account}/${sessionId}/${file}/${name}`, body, {
         httpMetadata: { contentType: "application/x-ndjson", ...(gzip ? { contentEncoding: "gzip" } : {}) },
       });
-      if (file === MAIN) {
-        const held = (await archivedFiles(env.TRANSCRIPTS, account, sessionId)).find((one) => one.file === MAIN);
-        await reach(account, sessionId, held?.bytes ?? 0);
-      }
-      return new Response(null, { status: 200 });
+      if (file !== MAIN) return;
+      const held = (await archivedFiles(env.TRANSCRIPTS, account, sessionId)).find((one) => one.file === MAIN);
+      await reach(account, sessionId, held?.bytes ?? 0);
     };
     return {
       v2,

@@ -37,7 +37,7 @@
 // the archive. What is here reads the files that path never wrote, which a replay converts and
 // which the session page and the transcript endpoint serve until it has.
 
-import { isStretchName, legacyStretchName, type NamedStretch, namedStretch, type Run } from "./transcript-plan";
+import { legacyStretchName, type NamedStretch, namedStretch, type Run } from "./transcript-plan";
 
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
 export const MAX_STRETCH_BYTES = 1_048_576;
@@ -77,23 +77,6 @@ export type RecordedFile = Extract<HeldFile, { held: "records" }>;
 const filePrefix = (userId: string, sessionId: string, file: string): string => `${userId}/${sessionId}/${file}/`;
 
 const sessionPrefix = (userId: string, sessionId: string): string => `${userId}/${sessionId}/`;
-
-// Who wrote which file of which session, read off whatever named it: an object a listing caught,
-// or the key a storage event carries. A key the archive did not write, and an event for anything
-// but a write, is no stretch and is passed over rather than guessed at.
-export interface Stretched {
-  userId: string;
-  sessionId: string;
-  file: string;
-}
-
-export const parseStretchKey = (key: string): Stretched | null => {
-  const [userId, sessionId, file, name, ...rest] = key.split("/");
-  if (userId === undefined || sessionId === undefined || file === undefined || name === undefined) return null;
-  if (rest.length > 0 || userId === "" || sessionId === "" || file === "") return null;
-  if (!isStretchName(name)) return null;
-  return { userId, sessionId, file };
-};
 
 interface Span {
   from: number;

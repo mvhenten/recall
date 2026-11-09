@@ -1,4 +1,3 @@
-import { SessionCopySchema } from "../typespec/generated/schemas";
 import { EMAIL_ONLY, emailOf } from "./access";
 import {
   type ArtifactChrome,
@@ -103,7 +102,6 @@ import { ARTIFACT_SORTS, CURSOR_PARAM, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY
 import { DEVICE_HEADER, MAX_BODY_BYTES, type Mailbox, ORDERS_HEADER, type Sender, type SendInput } from "./mailbox";
 import { render } from "./markdown";
 import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
-import { copyMemories } from "./memory-copy";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -170,7 +168,6 @@ import {
   recordsFault,
   recordsReach,
 } from "./records";
-import { copySessions } from "./session-copy";
 import {
   ARTIFACT_PREFIX,
   FILE_SEGMENT,
@@ -299,7 +296,6 @@ import {
   memoryView,
   nearbyMemoryView,
   parseAppendRecords,
-  parseCopySessions,
   parseMemoryList,
   parseMemoryName,
   parseSaveMemory,
@@ -641,7 +637,6 @@ const artifactStoreFor = (env: Pick<AppEnv, "TENANT">): ArtifactStore => ({
   replaceArtifact: (commit, fromRev) => tenantOf(env, commit.userId).replaceArtifact(commit, fromRev),
   deleteArtifact: (userId, name) => tenantOf(env, userId).deleteArtifact(userId, name),
   adoptArtifacts: (userId) => tenantOf(env, userId).adoptArtifacts(userId),
-  copyArtifacts: (userId, now) => tenantOf(env, userId).copyArtifacts(userId, now),
 });
 
 // Everything the dashboard reads off an address before it knows who is asking: which tab the
@@ -1411,16 +1406,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   // Whether anyone is still running the session, and the stretches of its file around and past
-  // where the reader has read. A box following a live session beats against this, so it answers
-  // off the cheapest readings there are: the extent the storage event caches says whether the
-  // file has grown past where the reader has read, and a beat that finds it has not opens no
-  // object and lists nothing at all.
-  //
-  // That extent is a cache and lags the objects for as long as the event behind it is in flight,
-  // so it is trusted to say a file has grown and never to say it has not. A session no event has
-  // ever landed for keeps no row at all, and that one never corrects itself; with no row the
-  // objects are listed regardless, so a reader is never left watching a box that beats on in
-  // silence about a session writing away.
+  // where the reader has read. Nothing writes the byte archive any more, so a file held as bytes
+  // cannot grow and the listing is the whole of the answer: a beat over one costs the page below
+  // and never a row read first to find out whether to pay for it.
   //
   // The cursor is where the reader has read to and the stretch it read to the end of, and the two
   // come off the manifest the archive itself wrote: a read is taken whole, so `from` is always the
@@ -1479,14 +1467,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (!from.ok) return error(400, from.error);
     const after = parseStretchCursor(url.searchParams.get("after"));
     if (!after.ok) return error(400, after.error);
-    const [mark, device] = await Promise.all([
-      indexMark(env.DB, userId, session.value),
+    const [device, runs] = await Promise.all([
       liveSessionDevice(env.DB, userId, session.value, deps.now()),
+      archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value),
     ]);
-    const grown = mark === null || mark.archived > from.value;
-    const runs = grown
-      ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value)
-      : [];
     const reach: Reach = { running: device !== null, runs };
     return json(reach, 200, { "cache-control": "no-store" });
   };
@@ -2102,16 +2086,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (request.method !== "GET") return error(405, "method not allowed");
       return artifactsListing(url, account, store, host, userId, now);
     }
-    // An artifact answers a PUT, a GET and a DELETE and never a POST, so neither the adopt nor
-    // the copy can be shadowed by an artifact named adopt or copy.
+    // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
+    // shadowed by an artifact named adopt.
     if (rawName === "adopt" && rest.length === 0 && request.method === "POST") {
       return json({ adopted: await store.adoptArtifacts(userId) });
-    }
-    // The one-shot copy of this account's artifact rows out of D1 and into its own object, run
-    // once against a running deployment by `npm run copy-artifacts` and by nothing else. It is
-    // here rather than on a read path because a read path must never migrate anything.
-    if (rawName === "copy" && rest.length === 0 && request.method === "POST") {
-      return json(await store.copyArtifacts(userId, now));
     }
     const name = parseName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
@@ -2286,12 +2264,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     }
     if (rawName === "search" && word === undefined && request.method === "POST") {
       return v2MemorySearch(request, db, caller);
-    }
-    // The one-shot copy of this account's memories out of D1 and into its own object, run once
-    // against a running deployment by `npm run copy-memories` and by nothing else. It is here
-    // rather than on a read path because a read path must never migrate anything.
-    if (rawName === "copy" && word === undefined && request.method === "POST") {
-      return json(await copyMemories(db, env.ACCOUNT, caller.userId, deps.embedder));
     }
     const name = parseMemoryName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
@@ -2720,34 +2692,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const db = env.DB;
     if (rawSessionId === undefined) {
       return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
-    }
-    // The copy of this account's sessions out of D1 and into its own object, run against a running
-    // deployment by `npm run copy-sessions` and by nothing else. A session answers a GET, a PUT
-    // and a DELETE at its own id and never a POST, so a session id of `copy` shadows nothing. It
-    // is here rather than on a read path because a read path must never migrate anything.
-    //
-    // `after` opens the walk of the prose where the call before it left off, so a corpus too big
-    // for one request's budget is finished by calling again rather than by a run that restarts and
-    // re-reads what it already copied. `metadataComplete` says a call of the same run already
-    // wrote every table but the prose, which only a report of that call can tell the caller; false,
-    // those tables are read and written again, which costs one pass and finishes a call that died
-    // in the middle of them.
-    //
-    // The report is held against the contract on the way out, which is the one route that does.
-    // Everything an operator reads the run's soundness off is in it, the caps on its id lists
-    // included, and a report that has drifted from what the contract says should stop the run
-    // rather than be read as one that verified.
-    if (rawSessionId === "copy" && subresource === undefined && request.method === "POST") {
-      const input = parseCopySessions(await readJson(request));
-      if (!input.ok) return error(400, input.error);
-      const report = await copySessions(
-        db,
-        env.ACCOUNT,
-        caller.userId,
-        input.value.after,
-        input.value.metadataComplete,
-      );
-      return json(SessionCopySchema.parse(report));
     }
     const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!sessionId.ok) return error(400, sessionId.error);

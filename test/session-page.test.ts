@@ -112,7 +112,7 @@ const archivedBody = async (h: Harness, client: Client, sessionId: string, body:
   const now = h.now();
   expect((await client.sync(sessionId, { startedAt: now - 600_000, lastActivityAt: now })).status).toBe(204);
   const bytes = new TextEncoder().encode(body);
-  expect((await client.archive(sessionId, "main", at, bytes)).status).toBe(200);
+  await client.archive(sessionId, "main", at, bytes);
   return at + bytes.byteLength;
 };
 
@@ -122,7 +122,7 @@ const archivedBody = async (h: Harness, client: Client, sessionId: string, body:
 const archivedBefore = async (h: Harness, client: Client, sessionId: string, body: string, at = 0): Promise<void> => {
   const now = h.now();
   expect((await client.sync(sessionId, { startedAt: now - 600_000, lastActivityAt: now })).status).toBe(204);
-  expect((await client.archiveLegacy(sessionId, "main", at, new TextEncoder().encode(body))).status).toBe(200);
+  await client.archiveLegacy(sessionId, "main", at, new TextEncoder().encode(body));
 };
 
 // One stretch, fetched the way the browser fetches it: the manifest names the object and the span
@@ -216,7 +216,7 @@ describe("a session page", () => {
       ).status,
     ).toBe(204);
     expect((await you.laptop.usage("9f8a1b2c", { account: "work", at: now })).status).toBe(204);
-    expect((await you.laptop.archive("9f8a1b2c", "main", 0, `${entry(1)}\n`)).status).toBe(200);
+    await you.laptop.archive("9f8a1b2c", "main", 0, `${entry(1)}\n`);
 
     const ledger = await read(h, "/dashboard", you.assertion);
     expect(ledger).toContain('<a href="/dashboard/sessions/9f8a1b2c">laptop-9f8a</a>');
@@ -339,7 +339,7 @@ describe("the transcript manifest", () => {
     const h = await harness();
     const you = await owner(h);
     await archivedBody(h, you.laptop, "cafe0002", transcriptOf(2));
-    expect((await you.laptop.archive("cafe0002", "task-7", 0, transcriptOf(1))).status).toBe(200);
+    await you.laptop.archive("cafe0002", "task-7", 0, transcriptOf(1));
     const path = "/dashboard/sessions/cafe0002";
 
     expect(planOf(await read(h, path, you.assertion)).file).toBe("main");
@@ -375,7 +375,7 @@ describe("the transcript bytes", () => {
     const body = transcriptOf(60);
     const now = h.now();
     expect((await you.laptop.sync("beef0003", { startedAt: now - 600_000, lastActivityAt: now })).status).toBe(204);
-    expect((await you.laptop.archiveGzip("beef0003", "main", 0, 90_000, body)).status).toBe(200);
+    await you.laptop.archiveGzip("beef0003", "main", 0, 90_000, body);
     const plan = planOf(await read(h, "/dashboard/sessions/beef0003", you.assertion));
     const read0 = plan.runs[0]?.reads[0];
     if (read0 === undefined) throw new Error("the manifest names no stretch");
@@ -530,7 +530,7 @@ describe("following a transcript as it is written", () => {
     const h = await harness();
     const you = await owner(h);
     await archivedBody(h, you.laptop, "beef0013", transcriptOf(3));
-    expect((await you.laptop.archive("beef0013", "task-7", 0, transcriptOf(2))).status).toBe(200);
+    await you.laptop.archive("beef0013", "task-7", 0, transcriptOf(2));
     const plan = planOf(await read(h, "/dashboard/sessions/beef0013?file=task-7", you.assertion));
     const main = { ...plan, file: "main" };
 
@@ -627,7 +627,7 @@ describe("a session page over a transcript held as records", () => {
     const written = [entry(0), entry(1)];
     await recordedBody(h, you.laptop, "cafe0105", written);
     const delegated = transcriptOf(2);
-    expect((await you.laptop.archive("cafe0105", "task-7", 0, delegated)).status).toBe(200);
+    await you.laptop.archive("cafe0105", "task-7", 0, delegated);
 
     const path = "/dashboard/sessions/cafe0105";
     const html = await read(h, path, you.assertion);

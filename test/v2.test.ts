@@ -20,17 +20,6 @@ interface V2Device {
 const OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 describe("the /v2 surface", () => {
-  it("takes a token a host already holds", async () => {
-    const { invite, login, clientWithToken } = await harness();
-    const email = await invite(`crossing-${crypto.randomUUID()}@example.com`);
-    const client = clientWithToken(await login(email));
-
-    // The same bearer, against both surfaces. A device row is looked up by the digest of its token
-    // and knows nothing about paths, so an updated CLI carries its login across unchanged.
-    expect((await client.request("GET", "/v2/devices")).status).toBe(200);
-    expect((await client.request("GET", "/v2/devices")).status).toBe(200);
-  });
-
   it("refuses a request carrying no token", async () => {
     const { send } = await harness();
     expect((await send("/v2/devices")).status).toBe(401);
