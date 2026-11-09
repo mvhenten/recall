@@ -26,6 +26,8 @@ output "artifact_access_aud" {
   value = var.artifact_hostname == "" ? "" : one(cloudflare_zero_trust_access_application.artifacts[*].aud)
 }
 
+# The audience of the application fronting /oauth/consent, which is the audience the Worker holds
+# a connector sign-in to. It also still opens /mcp for a browser that carries an assertion of it.
 output "mcp_access_aud" {
   value = var.mcp_connector ? one(cloudflare_zero_trust_access_application.mcp[*].aud) : ""
 }

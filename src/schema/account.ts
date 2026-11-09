@@ -65,6 +65,55 @@ export const mcpClients = sqliteTable("mcp_clients", {
   userId: text("user_id").notNull(),
 });
 
+// A web MCP client that registered itself under RFC 7591. It carries no secret: a client running
+// in a browser can keep none, so what binds a redemption is the code and the PKCE verifier, and
+// `redirect_uris` is the one thing registration decides.
+export const oauthClients = sqliteTable("oauth_clients", {
+  clientId: text("client_id").primaryKey(),
+  clientName: text("client_name").notNull(),
+  redirectUris: text("redirect_uris").notNull(),
+  createdAt: integer("created_at").notNull(),
+});
+
+// One authorize address, held while the user signs in to Access and decides. It exists so the
+// consent page carries an id and not the client's own parameters: nothing the browser posts back
+// decides which client, which callback or which challenge the code is bound to. A request nobody
+// completes is swept by the next one that starts. `state` is empty where the client sent none.
+export const oauthRequests = sqliteTable("oauth_requests", {
+  requestId: text("request_id").primaryKey(),
+  clientId: text("client_id").notNull(),
+  redirectUri: text("redirect_uri").notNull(),
+  state: text("state").notNull(),
+  codeChallenge: text("code_challenge").notNull(),
+  createdAt: integer("created_at").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+});
+
+// An authorization code, as its SHA-256. It is spent by the delete that reads it, so a replay
+// finds nothing; the row names the account that consented and the challenge the verifier has to
+// answer to.
+export const oauthCodes = sqliteTable("oauth_codes", {
+  codeSha256: text("code_sha256").primaryKey(),
+  clientId: text("client_id").notNull(),
+  userId: text("user_id").notNull(),
+  redirectUri: text("redirect_uri").notNull(),
+  codeChallenge: text("code_challenge").notNull(),
+  createdAt: integer("created_at").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+});
+
+// The tokens the connector issued, as digests. They are opaque rather than signed, so `/mcp` reads
+// one by looking it up and a revoke is a delete; `kind` separates the hour-long access token from
+// the month-long refresh token it is rotated with.
+export const oauthTokens = sqliteTable("oauth_tokens", {
+  tokenSha256: text("token_sha256").primaryKey(),
+  clientId: text("client_id").notNull(),
+  userId: text("user_id").notNull(),
+  kind: text("kind", { enum: ["access", "refresh"] }).notNull(),
+  createdAt: integer("created_at").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+});
+
 // WITHOUT ROWID in `migrations/0016_artifact_shares.sql`. It does not follow the artifacts into
 // the tenant object: nothing joins a share to a tenant table, and splitting the routing from the
 // metadata would make one revoke two writes against two stores.

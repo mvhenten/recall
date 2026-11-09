@@ -141,11 +141,41 @@ import {
 } from "./model";
 import { boundaryOf, readMultipart } from "./multipart";
 import {
+  AUTHORIZATION_SERVER_PATH,
+  AUTHORIZE_PATH,
+  type AuthorizeAsk,
+  askRefusal,
+  authorizationServerMetadata,
+  CONNECTOR_ORIGINS,
+  CONSENT_PATH,
+  clientFor,
+  forgetAuthorization,
+  grantCode,
+  PROTECTED_RESOURCE_PATH,
+  pendingAuthorization,
+  protectedResourceMetadata,
+  REGISTER_PATH,
+  readAuthorizeAsk,
+  readRegistration,
+  redeemCode,
+  redirectBack,
+  redirectFor,
+  refreshGrant,
+  registerClient,
+  registrationResponse,
+  resourceMetadataUrl,
+  startAuthorization,
+  TOKEN_PATH,
+  tokenResponse,
+  userForAccessToken,
+} from "./oauth";
+import {
   ARTIFACT_CSP,
   artifactPage,
   CSRF_COOKIE,
   confirmPage,
   enterCodePage,
+  grantPage,
   messagePage,
   readCookie,
   SENT_COOKIE,
@@ -3058,7 +3088,65 @@ export const createApp = (deps: Deps): App => {
       : messagePage(200, "Device denied", "The device gets no access. You can close this page.");
   };
 
+  // What a browser-side client is answered with so its own page may read the answer. The list of
+  // origins is closed and echoed one at a time rather than widened to `*`, and nothing here allows
+  // credentials: a web client carries a bearer token and never this host's Access cookie.
+  const corsHeaders = (request: Request): Record<string, string> => {
+    const origin = request.headers.get("origin");
+    if (origin === null || !CONNECTOR_ORIGINS.includes(origin)) return {};
+    return {
+      "access-control-allow-origin": origin,
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "authorization, content-type, accept, mcp-protocol-version, mcp-method, mcp-name",
+      "access-control-expose-headers": "www-authenticate",
+      "access-control-max-age": "86400",
+      vary: "origin",
+    };
+  };
+
+  const withHeaders = (answer: Response, extra: Record<string, string>): Response => {
+    if (Object.keys(extra).length === 0) return answer;
+    const headers = new Headers(answer.headers);
+    for (const [name, value] of Object.entries(extra)) headers.set(name, value);
+    return new Response(answer.body, { status: answer.status, headers });
+  };
+
+  const preflight = (request: Request): Response =>
+    new Response(null, { status: 204, headers: { ...corsHeaders(request), "cache-control": "no-store" } });
+
+  const seeOther = (location: string): Response =>
+    new Response(null, { status: 303, headers: { location, "cache-control": "no-store" } });
+
   const mcpCaller = async (request: Request, env: WorkerEnv, host: McpHost): Promise<Caller | Response> => {
+    const own = new URL(request.url).origin;
+    // The one header a web MCP client starts its whole connect flow from. It rides every refusal
+    // this endpoint makes for want of a credential, and names the document that leads to the
+    // authorization server, the registration endpoint and the sign-in.
+    const challenge = {
+      "www-authenticate": `Bearer resource_metadata="${resourceMetadataUrl(own)}"`,
+      ...corsHeaders(request),
+    };
+    // Origin validation is a MUST on every incoming connection, whichever scheme proves the
+    // caller, so it runs before any of them. This host is a browser signed in to Access here; the
+    // others are the web clients that reach the connector as a custom connector.
+    const origin = request.headers.get("origin");
+    if (origin !== null && origin !== own && !CONNECTOR_ORIGINS.includes(origin)) {
+      return mcpRefusal(
+        403,
+        `${MCP_PATH} answers ${[own, ...CONNECTOR_ORIGINS].join(", ")} and this request declared the origin ${origin}; a client that is not a browser sends no Origin header`,
+      );
+    }
+    const authorization = request.headers.get("authorization") ?? "";
+    if (authorization.startsWith("Bearer ")) {
+      const userId = await userForAccessToken(env.DB, authorization.slice(7), deps.now());
+      if (userId === null) {
+        return mcpRefusal(401, "this access token is unknown, expired or revoked; connect the connector again", {
+          ...challenge,
+          "www-authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl(own)}"`,
+        });
+      }
+      return connectorDevice(env.DB, userId, deps.now());
+    }
     const assertion = request.headers.get("cf-access-jwt-assertion");
     const sentServiceHeaders = request.headers.get("cf-access-client-id") !== null;
     if (assertion === null) {
@@ -3066,7 +3154,8 @@ export const createApp = (deps: Deps): App => {
         401,
         sentServiceHeaders
           ? "Cloudflare Access let the request through without an assertion, so the CF-Access-Client-Id and CF-Access-Client-Secret pair is not a service token this account issued"
-          : `no Cloudflare Access assertion reached ${MCP_PATH}: sign in to Access in a browser first, or send CF-Access-Client-Id and CF-Access-Client-Secret for a service token`,
+          : `no credential reached ${MCP_PATH}: add it as a custom connector and sign in, send Authorization: Bearer with a token that flow issued, or sign in to Access in a browser`,
+        challenge,
       );
     }
     const verified = await host.verify(assertion);
@@ -3074,16 +3163,7 @@ export const createApp = (deps: Deps): App => {
       return mcpRefusal(
         401,
         `Cloudflare Access ${sentServiceHeaders ? "service token" : "sign-in"} rejected: ${verified.reason}`,
-      );
-    }
-    // Origin validation is a MUST on every incoming connection, whichever scheme proved the caller,
-    // so it runs before either branch rather than inside the browser one.
-    const origin = request.headers.get("origin");
-    const own = new URL(request.url).origin;
-    if (origin !== null && origin !== own) {
-      return mcpRefusal(
-        403,
-        `${MCP_PATH} answers ${own} alone and this request declared the origin ${origin}; a client that is not a browser sends no Origin header`,
+        challenge,
       );
     }
     const { principal } = verified;
@@ -3104,8 +3184,172 @@ export const createApp = (deps: Deps): App => {
     return connectorDevice(env.DB, userId, deps.now());
   };
 
-  const mcp = (request: Request, env: WorkerEnv): Promise<Response> =>
-    mcpEndpoint(request, async () => {
+  const oauthError = (error: string, description: string, status = 400): Response =>
+    json({ error, error_description: description }, status, { "cache-control": "no-store" });
+
+  // Each discovery document answers at its own address and at that address with the connector's
+  // path appended: a client that builds the second out of the resource URL finds the same bytes
+  // either way. They are public and uncredentialed, so they answer any origin.
+  const WELL_KNOWN: ReadonlyArray<readonly [string, (origin: string) => unknown]> = [
+    [PROTECTED_RESOURCE_PATH, protectedResourceMetadata],
+    [AUTHORIZATION_SERVER_PATH, authorizationServerMetadata],
+  ];
+
+  const metadataFor = (pathname: string): ((origin: string) => unknown) | null => {
+    for (const [path, document] of WELL_KNOWN) {
+      if (pathname === path || pathname === `${path}${MCP_PATH}`) return document;
+    }
+    return null;
+  };
+
+  const registerOauthClient = async (request: Request, db: AccountDb): Promise<Response> => {
+    if (request.method !== "POST") return oauthError("invalid_request", `${REGISTER_PATH} answers a POST`, 405);
+    const read = readRegistration(await readJson(request));
+    if (!read.ok) return oauthError(read.error, read.description);
+    const now = deps.now();
+    const client = await registerClient(db, read.clientName, read.redirectUris, now);
+    return json(registrationResponse(client, now), 201, { "cache-control": "no-store" });
+  };
+
+  // The authorize address, which carries no credential and renders no sign-in: it judges what the
+  // client asked for and sends the browser on to the consent path, which is the one address of the
+  // connector that sits behind Access. A refusal the client could act on goes back to its callback
+  // as an error; one that would need an address recall cannot trust is a page instead.
+  const authorize = async (request: Request, url: URL, db: AccountDb): Promise<Response> => {
+    if (request.method !== "GET") {
+      return messagePage(405, "Not allowed", `${AUTHORIZE_PATH} answers a GET.`);
+    }
+    const ask: AuthorizeAsk = readAuthorizeAsk(url);
+    const client = ask.clientId === "" ? null : await clientFor(db, ask.clientId);
+    if (client === null) {
+      return messagePage(
+        400,
+        "Unknown client",
+        "The client asking for access has not registered with this recall. Remove the connector and add it again.",
+      );
+    }
+    const redirectUri = redirectFor(ask, client);
+    if (redirectUri === null) {
+      return messagePage(
+        400,
+        "Wrong callback",
+        "The address the client asked to be sent back to is not one it registered. Remove the connector and add it again.",
+      );
+    }
+    const refused = askRefusal(ask, url.origin);
+    if (refused !== null) {
+      const back = redirectBack(redirectUri, ask.state, url.origin, {
+        error: refused.error,
+        error_description: refused.description,
+      });
+      return seeOther(back);
+    }
+    const requestId = await startAuthorization(db, ask, redirectUri, deps.now());
+    return seeOther(`${url.origin}${CONSENT_PATH}?request=${requestId}`);
+  };
+
+  const consent = async (request: Request, url: URL, env: WorkerEnv, host: McpHost): Promise<Response> => {
+    if (request.method !== "GET" && request.method !== "POST") {
+      return messagePage(405, "Not allowed", `${CONSENT_PATH} answers a GET and the form it draws.`);
+    }
+    const email = await approver(request, host.verify);
+    if (email instanceof Response) return email;
+    const userId = await invited(env.DB, email, messagePage);
+    if (userId instanceof Response) return userId;
+    const expired = (): Response =>
+      messagePage(
+        404,
+        "Nothing to connect",
+        "This sign-in has expired or was already finished. Start again from the client.",
+      );
+    if (request.method === "GET") {
+      const asked = await pendingAuthorization(env.DB, url.searchParams.get("request") ?? "", deps.now());
+      if (asked === null) return expired();
+      return grantPage(email, asked.clientName, new URL(asked.redirectUri).origin, asked.requestId, randomToken());
+    }
+    const form = new URLSearchParams(await request.text());
+    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
+    const csrf = form.get("csrf") ?? "";
+    if (request.headers.get("origin") !== url.origin || cookie === null || !sameSecret(cookie, csrf)) {
+      return messagePage(403, "Request refused", "The form did not come from this page. Reload it and try again.");
+    }
+    const asked = await pendingAuthorization(env.DB, form.get("request") ?? "", deps.now());
+    if (asked === null) return expired();
+    const action = form.get("action");
+    if (action !== "approve" && action !== "deny") {
+      return messagePage(400, "Bad request", "Choose Connect or Cancel.");
+    }
+    if (action === "deny") {
+      await forgetAuthorization(env.DB, asked.requestId);
+      return seeOther(
+        redirectBack(asked.redirectUri, asked.state, url.origin, {
+          error: "access_denied",
+          error_description: "the sign-in was cancelled",
+        }),
+      );
+    }
+    const code = await grantCode(env.DB, asked, userId, deps.now());
+    return seeOther(redirectBack(asked.redirectUri, asked.state, url.origin, { code }));
+  };
+
+  const oauthToken = async (request: Request, url: URL, db: AccountDb): Promise<Response> => {
+    if (request.method !== "POST") return oauthError("invalid_request", `${TOKEN_PATH} answers a POST`, 405);
+    const params = await readParams(request);
+    const read = (name: string): string => (typeof params[name] === "string" ? params[name] : "");
+    const resources = read("resource") === "" ? [] : [read("resource")];
+    const grantType = read("grant_type");
+    const now = deps.now();
+    if (grantType === "authorization_code") {
+      const outcome = await redeemCode(
+        db,
+        {
+          code: read("code"),
+          codeVerifier: read("code_verifier"),
+          clientId: read("client_id"),
+          redirectUri: read("redirect_uri"),
+          resources,
+        },
+        url.origin,
+        now,
+      );
+      if (!outcome.ok) return oauthError(outcome.error, outcome.description);
+      return json(tokenResponse(outcome.issued), 200, { "cache-control": "no-store" });
+    }
+    if (grantType === "refresh_token") {
+      const outcome = await refreshGrant(db, read("refresh_token"), read("client_id"), url.origin, resources, now);
+      if (!outcome.ok) return oauthError(outcome.error, outcome.description);
+      return json(tokenResponse(outcome.issued), 200, { "cache-control": "no-store" });
+    }
+    return oauthError("unsupported_grant_type", "grant_type must be authorization_code or refresh_token");
+  };
+
+  // The connector's OAuth surface, which exists only where the connector does: a deployment
+  // serving no connector discovers nothing here, as it answers nothing on /mcp. Everything but
+  // the consent path carries no credential of this host at all, which is why only that one sits
+  // behind the Access application.
+  const oauth = async (request: Request, url: URL, env: WorkerEnv): Promise<Response | null> => {
+    const path = url.pathname;
+    const document = metadataFor(path);
+    const endpoints = [REGISTER_PATH, TOKEN_PATH, AUTHORIZE_PATH, CONSENT_PATH];
+    if (document === null && !endpoints.includes(path)) return null;
+    const host = deps.mcpHost;
+    if (host === null) return error(404, "not found");
+    if (request.method === "OPTIONS") return preflight(request);
+    if (document !== null) {
+      if (request.method !== "GET") return error(405, "method not allowed");
+      return json(document(url.origin), 200, {
+        "cache-control": "public, max-age=3600",
+        "access-control-allow-origin": "*",
+      });
+    }
+    if (path === REGISTER_PATH) return withHeaders(await registerOauthClient(request, env.DB), corsHeaders(request));
+    if (path === TOKEN_PATH) return withHeaders(await oauthToken(request, url, env.DB), corsHeaders(request));
+    if (path === AUTHORIZE_PATH) return authorize(request, url, env.DB);
+    return consent(request, url, env, host);
+  };
+
+  const mcp = async (request: Request, env: WorkerEnv): Promise<Response> => {
+    const answered = await mcpEndpoint(request, async () => {
       const host = deps.mcpHost;
       if (host === null) {
         return mcpRefusal(404, "this recall serves no MCP connector; its deployment has not switched one on");
@@ -3115,6 +3359,8 @@ export const createApp = (deps: Deps): App => {
       const tenant = tenantOf(env, caller.userId);
       return (made: ToolCall): Promise<ToolResult> => tenant.tool(made, caller, handed());
     });
+    return withHeaders(answered, corsHeaders(request));
+  };
 
   // The half the Worker answers out of itself, for the paths that read no tenant row. Its clock is
   // a function rather than a moment, so one of these serves every request the Worker takes.
@@ -3219,7 +3465,11 @@ export const createApp = (deps: Deps): App => {
         ? sharedSite(request, url, env, host)
         : artifactSite(request, url, env, host);
     }
-    if (url.pathname === MCP_PATH) return mcp(request, env);
+    if (url.pathname === MCP_PATH) {
+      return request.method === "OPTIONS" ? preflight(request) : mcp(request, env);
+    }
+    const connecting = await oauth(request, url, env);
+    if (connecting !== null) return connecting;
     if (url.pathname === "/device") return devicePage(request, url, env.DB);
     if (url.pathname === TRANSCRIPT_SCRIPT_PATH) return transcriptScript();
     if (url.pathname === "/dashboard" || url.pathname.startsWith("/dashboard/")) {

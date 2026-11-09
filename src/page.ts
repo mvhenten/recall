@@ -149,6 +149,35 @@ export const confirmPage = (email: string, userCode: string, deviceName: string,
     },
   );
 
+// What the connector's interactive sign-in ends on. Access has just proved the email; this is the
+// one step that is the user's rather than Access's, so a client already holding an Access session
+// still says yes before a token is minted for it.
+//
+// Approving answers a redirect to the client's own callback, and `form-action` is checked across a
+// redirect, so the policy names that one origin beside this one. It is the origin of an address the
+// client registered and no other.
+export const grantPage = (
+  email: string,
+  clientName: string,
+  callbackOrigin: string,
+  requestId: string,
+  csrf: string,
+): Response =>
+  page(
+    200,
+    "Connect recall",
+    `<p><strong>${escapeHtml(clientName)}</strong> asks to read and write your recall memories as ${escapeHtml(email)}.</p>
+<p>It reaches the memory tools and nothing else.</p>
+<form method="post" action="/oauth/consent">
+<input type="hidden" name="request" value="${escapeHtml(requestId)}"><input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+<button type="submit" name="action" value="approve">Connect</button><button type="submit" name="action" value="deny">Cancel</button>
+</form>`,
+    {
+      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callbackOrigin}; frame-ancestors 'none'; base-uri 'none'`,
+      "set-cookie": `${CSRF_COOKIE}=${csrf}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict`,
+    },
+  );
+
 export const readCookie = (header: string | null, name: string): string | null => {
   for (const part of (header ?? "").split(";")) {
     const [key, ...value] = part.trim().split("=");

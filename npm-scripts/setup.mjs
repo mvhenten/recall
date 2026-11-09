@@ -262,16 +262,19 @@ const artifactApp =
         policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
       });
 
-const mcpDomain = `${hostname}/mcp`;
+// Only the sign-in step of the connector's authorization flow sits behind Access. /mcp itself
+// answers the 401 a web MCP client discovers the flow from, and an Access application over that
+// path answers the 401 instead, without the header the whole flow turns on.
+const consentDomain = `${hostname}/oauth/consent`;
 const mcpApp = mcpConnector
-  ? await upsertApp(mcpDomain, {
+  ? await upsertApp(consentDomain, {
       name: `${name} connector`,
       type: "self_hosted",
       session_duration: "24h",
       app_launcher_visible: false,
       allowed_idps: otp ? [otp.id] : [],
-      service_auth_401_redirect: true,
-      destinations: [{ type: "public", uri: mcpDomain }],
+      auto_redirect_to_identity: true,
+      destinations: [{ type: "public", uri: consentDomain }],
       policies: [
         ...(connectorPolicy ? [{ id: connectorPolicy.id, precedence: 1 }] : []),
         ...(approvers ? [{ id: approvers.id, precedence: 2 }] : []),

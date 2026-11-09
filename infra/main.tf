@@ -8,8 +8,12 @@ locals {
   share_link_prefix  = "/link"
   share_email_prefix = "/email"
 
-  # The path the connector answers on, which MCP_PATH in src/mcp.ts names too.
-  mcp_prefix = "/mcp"
+  # The one address of the connector that sits behind an Access login, which CONSENT_PATH in
+  # src/oauth.ts names too. The endpoint itself, the two discovery documents, the registration
+  # endpoint and the token endpoint are all deliberately outside it: a web MCP client starts its
+  # connect flow from an unauthenticated request to /mcp and the 401 it answers, and an Access
+  # application over that path answers the 401 itself, stripping the header the whole flow turns on.
+  oauth_consent_prefix = "/oauth/consent"
 }
 
 data "cloudflare_zero_trust_organization" "this" {
@@ -113,10 +117,15 @@ resource "cloudflare_zero_trust_access_application" "artifacts" {
   ]
 }
 
-# The connector answers on a path of the main hostname, so it takes an application of its own
-# rather than a second host. Access matches the longest path first, so this one covers /mcp and the
-# bypass over the hostname is unchanged. It admits the approver emails and the connector service
-# tokens, and answers 401 instead of redirecting, since nothing behind it renders a login page.
+# The sign-in step of the connector's authorization flow, which is the whole of what Access covers
+# here. The browser lands on this path carrying the client's authorization request, Access redirects
+# it to the one-time PIN, and the assertion it comes back with is what names the account the token
+# is minted for. It redirects rather than answering 401 because a person is reading it.
+#
+# Access matches the longest path first, so this covers /oauth/consent and the bypass over the
+# hostname leaves /mcp, the discovery documents, /oauth/register, /oauth/authorize and /oauth/token
+# to the Worker. The connector's service tokens still admit a machine here; the Worker refuses a
+# service-token assertion on this page, because the consent is a person's to give.
 resource "cloudflare_zero_trust_access_application" "mcp" {
   count                     = var.mcp_connector ? 1 : 0
   account_id                = var.account_id
@@ -125,11 +134,11 @@ resource "cloudflare_zero_trust_access_application" "mcp" {
   session_duration          = "24h"
   app_launcher_visible      = false
   allowed_idps              = [var.otp_idp_id]
-  service_auth_401_redirect = true
+  auto_redirect_to_identity = true
   destinations = [
     {
       type = "public"
-      uri  = "${var.hostname}${local.mcp_prefix}"
+      uri  = "${var.hostname}${local.oauth_consent_prefix}"
     }
   ]
   policies = [

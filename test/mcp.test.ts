@@ -89,7 +89,7 @@ describe("the connector handshake", () => {
     });
     expect(refused.status).toBe(401);
     expect(refused.headers.get("content-type")).toBe("text/event-stream");
-    expect(await refused.text()).toContain("sign in to Access in a browser first");
+    expect(await refused.text()).toContain("no credential reached /mcp");
   });
 
   it("refuses a malformed message and an unknown method with JSON-RPC errors", async () => {
@@ -189,7 +189,7 @@ describe("the connector's two Access schemes", () => {
     const bare = await h.rpc({ id: 1, method: "tools/list" });
     expect(bare.status).toBe(401);
     expect(((await bare.json()) as { error: { message: string } }).error.message).toContain(
-      "sign in to Access in a browser first",
+      "no credential reached /mcp",
     );
 
     const serviceHeaders = await h.rpc({ id: 1, method: "tools/list" }, { "cf-access-client-id": "abc.access" });

@@ -670,6 +670,11 @@ export const harness = async ({
       if (row === null) throw new Error(`${email} is not invited`);
       return row.user_id;
     },
+    // Every connector token one account holds, taken away. The endpoint reads a bearer token by
+    // looking it up, so this is the whole of a revoke and no route performs one.
+    revokeOauthTokens: async (userId: string): Promise<void> => {
+      await env.DB.prepare("DELETE FROM oauth_tokens WHERE user_id = ?").bind(userId).run();
+    },
     // What the Worker before artifact types wrote: one object at the bare key, with no row naming
     // it. Nothing writes this layout any more, so a test of what it reads back has to lay it down.
     writeLegacyArtifact: async (userId: string, name: string, body: string): Promise<void> => {
