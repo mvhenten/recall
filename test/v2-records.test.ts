@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { Embedder } from "../src/model";
 import { BINARY_RECORD, MAX_RECORDS_BYTES, MAX_RECORDS_PER_APPEND, RECORDS_PREFIX } from "../src/records";
-import { harness, tenantRows, wordEmbedder } from "./harness";
+import { type Client, harness, tenantRows, wordEmbedder } from "./harness";
 
 const line = (entry: Record<string, unknown>): string => JSON.stringify(entry);
 
@@ -74,6 +74,25 @@ const setOf = (chunks: ChunkRow[]): string[] =>
 
 const chunkCount = async (userId: string, sessionId: string): Promise<number> =>
   (await chunksOf(userId, sessionId)).length;
+
+// A session whose prose is in the index and whose record mark never landed, which is what a
+// conversion that wrote its objects and died before its commit leaves behind: the objects hold the
+// whole file, the index holds chunks of it, and the file still waits at ordinal 0. The path that
+// indexed those chunks is gone, so the state is stood by taking the mark and the open chunk away
+// from a session the record path indexed — the two the commit writes together with the chunks.
+const stranded = async (client: Client, session: string, records: string[]): Promise<void> => {
+  expect((await client.v2.records(session, "main", 0, records)).status).toBe(200);
+  for (const table of ["session_records", "session_open_chunks"]) {
+    await tenantRows(
+      client.userId,
+      `DELETE FROM ${table} WHERE user_id = ? AND session_id = ?`,
+      client.userId,
+      session,
+    );
+  }
+  expect(await recordMark(client.userId, session)).toBeNull();
+  expect((await chunksOf(client.userId, session)).length).toBeGreaterThan(0);
+};
 
 // One point two concurrent requests can be steered by, so a test can say which of them reaches the
 // archive first and which one finds the mark moved.
@@ -216,6 +235,55 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     // The records are indexed from ordinal 0, stranded span and all.
     const taken = await chunksOf(client.userId, session);
+    expect(await ordinalsOf(client.userId, session)).toEqual(taken.map((_, at) => at));
+  });
+
+  // The chunks a session held before the record path reached it are prose the commit that carries
+  // the mark off zero reads again from ordinal 0, so they are dropped under the ones that replace
+  // them. Left standing, the session answers every search about it twice.
+  it("drops the chunks of a stranded session on the append that carries its mark off zero", async () => {
+    const { user } = await harness();
+    const client = await user("stranded-append");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const written = conversation();
+    await stranded(client, session, written);
+
+    const more = about(9, "tenancy");
+    expect((await client.v2.records(session, "main", written.length, more)).status).toBe(200);
+    expect((await client.v2.end(session)).status).toBe(204);
+
+    // The same prose on a session that never lost anything, which is what the taken-over one has
+    // to hold: these chunks, all of them, and nothing underneath.
+    const alone = crypto.randomUUID();
+    await client.v2.sync(alone);
+    expect((await client.v2.records(alone, "main", 0, [...written, ...more])).status).toBe(200);
+    expect((await client.v2.end(alone)).status).toBe(204);
+
+    const taken = await chunksOf(client.userId, session);
+    expect(setOf(taken)).toEqual(setOf(await chunksOf(client.userId, alone)));
+    expect(await ordinalsOf(client.userId, session)).toEqual(taken.map((_, at) => at));
+  });
+
+  // The same session ended rather than appended to. Nothing else carries its mark off zero, so the
+  // end is the commit that has to drop them.
+  it("drops them when a stranded session is ended rather than appended to", async () => {
+    const { user } = await harness();
+    const client = await user("stranded-end");
+    const session = crypto.randomUUID();
+    await client.v2.sync(session);
+    const written = conversation();
+    await stranded(client, session, written);
+
+    expect((await client.v2.end(session)).status).toBe(204);
+
+    const alone = crypto.randomUUID();
+    await client.v2.sync(alone);
+    expect((await client.v2.records(alone, "main", 0, written)).status).toBe(200);
+    expect((await client.v2.end(alone)).status).toBe(204);
+
+    const taken = await chunksOf(client.userId, session);
+    expect(setOf(taken)).toEqual(setOf(await chunksOf(client.userId, alone)));
     expect(await ordinalsOf(client.userId, session)).toEqual(taken.map((_, at) => at));
   });
 

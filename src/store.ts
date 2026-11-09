@@ -2465,6 +2465,11 @@ export interface RecordCommit {
   chunkFrom: number;
   chunks: IndexedChunk[];
   open: readonly OpenChunk[];
+  /// Whether this commit is the first the session's own file ever carried over an index that
+  /// already holds chunks. Only a session indexed before the record path took over can be in that
+  /// state, and the prose those chunks hold is prose this commit indexes again from ordinal 0, so
+  /// they go in the batch below, in front of the chunks that replace them.
+  takeover: boolean;
 }
 
 // The mark the append was weighed against, still standing. Every statement of the commit carries
@@ -2487,8 +2492,20 @@ const markStands = (commit: RecordCommit): SQL =>
 // Every insert here is guarded by a SELECT, which the insert builder's `values` cannot express, so
 // the rows are written out and the builder supplies the column list from the schema.
 export const commitRecords = async (db: TenantDb, commit: RecordCommit): Promise<boolean> => {
-  const { userId, sessionId, file, chunkFrom, chunks, open, next } = commit;
+  const { userId, sessionId, file, chunkFrom, chunks, open, next, takeover } = commit;
   return db.transaction((tx) => {
+    // The takeover first, so everything below it is written over an index holding nothing of the
+    // session. It lands in the same batch as the mark at the foot, which is what leaves no instant
+    // where the session is half indexed by each.
+    if (takeover) {
+      tx.run(sql`DELETE FROM ${sessionChunks}
+        WHERE ${sessionChunks.userId} = ${userId} AND ${sessionChunks.sessionId} = ${sessionId}
+          AND ${markStands(commit)}`);
+      tx.insert(sessionIndex)
+        .select(sql`SELECT ${userId}, ${sessionId}, 0, 0, 0 WHERE ${markStands(commit)}`)
+        .onConflictDoUpdate({ target: [sessionIndex.userId, sessionIndex.sessionId], set: { chunks: 0 } })
+        .run();
+    }
     chunks.forEach((chunk, index) => {
       tx.insert(sessionChunks)
         .select(

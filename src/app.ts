@@ -425,6 +425,15 @@ const readJson = (request: Request): Promise<unknown> => request.json().catch(()
 
 const embeddingText = (name: string, description: string, body: string): string => `${name}\n${description}\n\n${body}`;
 
+// Whether this is the first thing the session's own file ever commits over an index that already
+// holds chunks of it. The record path writes the mark and the chunks in one batch, so a session it
+// alone indexed cannot reach that state: a file waiting at ordinal 0 and chunks on record together
+// mean the prose was indexed by the path that came before, and the commit below reads the file
+// from ordinal 0 and indexes every word of it again. The old chunks are dropped under the new ones
+// rather than left beneath them, which is the difference between a session answering a search once
+// and answering it twice.
+const takesOver = (marked: number, chunks: number): boolean => marked === 0 && chunks > 0;
+
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
 const GRANT_ERRORS = {
@@ -2444,6 +2453,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         chunkFrom: 0,
         chunks: [],
         open: [],
+        takeover: false,
       };
       if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
       return accepted(next);
@@ -2457,7 +2467,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const text = [...behind, ...records].join("\n");
     const carried = await openChunks(db, userId, sessionId, file.value);
     const { closed: shut, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
-    const chunkFrom = await chunkReach(db, userId, sessionId);
+    const carriedChunks = await chunkReach(db, userId, sessionId);
+    const takeover = takesOver(marked, carriedChunks);
+    const chunkFrom = takeover ? 0 : carriedChunks;
     const indexed = await embedChunks(shut);
     // The mark the work above was read against, still standing. A host knows its next `from`
     // without asking and pipelines two appends, and the second read the chunks and the open chunk
@@ -2471,6 +2483,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       chunkFrom,
       chunks: indexed,
       open,
+      takeover,
     };
     if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
     // The span this append indexed opens the session wherever the mark stood at nothing, which is
@@ -2504,15 +2517,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const behind = await readRecordsBetween(bucket, userId, sessionId, MAIN_FILE, held, next);
     const tail = chunkTurnsCarrying(readTurns(behind.join("\n"), MAIN_FILE), open);
     const indexed = await embedChunks([...tail.closed, ...closeChunks(tail.open)]);
+    const takeover = takesOver(held, chunkFrom);
     await commitRecords(db, {
       userId,
       sessionId,
       file: MAIN_FILE,
       held,
       next,
-      chunkFrom,
+      chunkFrom: takeover ? 0 : chunkFrom,
       chunks: indexed,
       open: [],
+      takeover,
     });
   };
 
