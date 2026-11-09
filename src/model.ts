@@ -1,5 +1,3 @@
-import { isStretchName } from "./transcript-plan";
-import { MAX_STRETCH_BYTES } from "./transcripts";
 import type { Speaker } from "./turns";
 
 export const memoryTypes = ["user", "feedback", "project", "reference"] as const;
@@ -537,20 +535,17 @@ export const parseSessionId = (value: string): Parsed<string> =>
 
 export const TRANSCRIPT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
 
-// Which of a session's transcript files a stretch belongs to: `main` for the session's own, and one
+// The name a session's own transcript is held under. Every other name is a delegated turn, which
+// the index never reads.
+export const MAIN_FILE = "main";
+
+// Which of a session's transcript files a record belongs to: `main` for the session's own, and one
 // name per delegated turn. It becomes part of an object key, so a name that could reach out of the
 // session's own prefix is refused.
 export const parseTranscriptFile = (value: string | null): Parsed<string> =>
   value !== null && TRANSCRIPT_FILE.test(value)
     ? { ok: true, value }
     : fail("file must open with a letter or digit and hold at most 101 of letters, digits, . _ and -");
-
-export const parseStretchOffset = (value: string | null): Parsed<number> => {
-  const offset = Number(value);
-  return value !== null && value !== "" && isInteger(offset, 0, Number.MAX_SAFE_INTEGER)
-    ? { ok: true, value: offset }
-    : fail("offset must be a whole number of bytes into the file");
-};
 
 const RECORD_WINDOW = /^([0-9]{1,16})\.([0-9]{1,16})$/;
 
@@ -580,42 +575,4 @@ export const parseRecordCursor = (value: string | null): Parsed<number> => {
   return value !== null && value !== "" && isInteger(ordinal, 0, Number.MAX_SAFE_INTEGER)
     ? { ok: true, value: ordinal }
     : fail("since must be a whole number of records into the file");
-};
-
-// Which stretch of a file a reader is asking for, named the way the archive stores it. It is the
-// name and never a place in the archive: where a redacted stretch sits there is the sizes of the
-// stretches in front of it, which the manifest the reader is reading against already said.
-export const parseStretchName = (value: string | null): Parsed<string> =>
-  value !== null && isStretchName(value)
-    ? { ok: true, value }
-    : fail("at must name a stretch, as <start>, <start>.<end> or <start>.<end>.<inflates> in sixteen digits each");
-
-// Which stretch a box following a file has read to the end of, and nothing when it has read nothing
-// of it. It is what bounds the listing a beat pays for: a stretch keyed by both its ends sits where
-// the sizes of the stretches in front of it put it, and this says which those are without the beat
-// listing them.
-export const parseStretchCursor = (value: string | null): Parsed<string> =>
-  value === null || value === "" || isStretchName(value)
-    ? { ok: true, value: value ?? "" }
-    : fail("after must name a stretch, as <start>, <start>.<end> or <start>.<end>.<inflates> in sixteen digits each");
-
-const BYTE_RANGE = /^bytes=([0-9]{1,16})-([0-9]{1,16})$/;
-
-export interface ByteRange {
-  offset: number;
-  length: number;
-}
-
-// The one range shape a reader of the archive asks for: both ends named, and neither open. A
-// suffix range or an open end would have the answer's length depend on how long the stretch turned
-// out to be, and the reader already knows that from the manifest it is reading against.
-export const parseByteRange = (header: string | null): Parsed<ByteRange> => {
-  const found = BYTE_RANGE.exec(header ?? "");
-  const first = Number(found?.[1]);
-  const last = Number(found?.[2]);
-  return found !== null &&
-    isInteger(first, 0, Number.MAX_SAFE_INTEGER) &&
-    isInteger(last, first, first + MAX_STRETCH_BYTES - 1)
-    ? { ok: true, value: { offset: first, length: last - first + 1 } }
-    : fail(`range must be bytes=<first>-<last>, spanning at most ${MAX_STRETCH_BYTES} bytes`);
 };

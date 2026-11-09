@@ -169,7 +169,9 @@ describe("the /v2 surface", () => {
     const client = await user("files");
     const session = crypto.randomUUID();
     await client.v2.sync(session);
-    await client.archive(session, "main", 0, '{"type":"user","message":{"content":"hello"}}\n');
+    expect(
+      (await client.v2.records(session, "main", 0, ['{"type":"user","message":{"content":"hello"}}'])).status,
+    ).toBe(200);
 
     const listed = await client.v2.files(session);
     expect(listed.status).toBe(200);

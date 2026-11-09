@@ -18,8 +18,6 @@ const about = (subject: string): string =>
     answer(`${subject} works like this: ${`${subject} does its job. `.repeat(20)}`),
   ].join("");
 
-const bytes = (text: string): number => new TextEncoder().encode(text).byteLength;
-
 // The lines of a transcript as the records an append carries, which is how prose reaches the index.
 const recordsOf = (text: string): string[] => text.split("\n").filter((line) => line !== "");
 
@@ -183,15 +181,18 @@ describe("searching sessions by meaning", () => {
 });
 
 describe("restoring a stored session", () => {
-  it("reads a transcript file back whole, however many stretches it arrived in", async () => {
+  it("reads a transcript file back whole, however many appends it arrived in", async () => {
     const h = await harness();
     const client = await h.user("restorer");
     await client.sync("s-restore");
     const whole = named("nufogruzup") + about("the restore path");
-    const head = whole.slice(0, Math.floor(whole.length / 2));
-    await client.archive("s-restore", "main", 0, head);
-    await client.archive("s-restore", "main", bytes(head), whole.slice(head.length));
-    await client.archive("s-restore", "agent-7f21", 0, answer("a delegated turn"));
+    const written = recordsOf(whole);
+    const head = written.slice(0, Math.floor(written.length / 2));
+    expect((await client.v2.records("s-restore", "main", 0, head)).status).toBe(200);
+    expect((await client.v2.records("s-restore", "main", head.length, written.slice(head.length))).status).toBe(200);
+    expect((await client.v2.records("s-restore", "agent-7f21", 0, recordsOf(answer("a delegated turn")))).status).toBe(
+      200,
+    );
 
     const read = await client.readTranscript("s-restore", "main");
 

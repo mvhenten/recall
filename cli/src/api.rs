@@ -816,18 +816,8 @@ impl HeldFile {
 
 #[derive(Deserialize)]
 struct HeldFiles {
-    files: Vec<HeldFile>,
     #[serde(default)]
     counted: Vec<String>,
-}
-
-/// What the archive holds of one session: a row per file, and the files whose tokens have been
-/// counted. The two move apart — a running session's records are archived on a beat of their own,
-/// with no counting pass behind them — so neither ever stands in for the other.
-#[derive(Debug, Default)]
-pub struct Held {
-    pub files: Vec<HeldFile>,
-    pub counted: HashSet<String>,
 }
 
 /// The ordinal one file is waiting for, which is what an append answers with whether it landed or
@@ -1271,10 +1261,12 @@ impl Client {
         Ok(events.len())
     }
 
-    /// What the archive holds of one session: a row per transcript file, counted off the stored
-    /// objects, and which files have had their tokens counted. It answers only for a session the
-    /// account already has on record, and it is a listing, so it is asked once per session.
-    pub fn transcript_files(&self, session_id: &str) -> Result<Held> {
+    /// Which of a session's transcript files have had their tokens counted. It answers only for a
+    /// session the account already has on record, and it is a listing, so it is asked once per
+    /// session. The files the archive holds move apart from these — a running session's records
+    /// are archived on a beat of their own, with no counting pass behind them — so neither ever
+    /// stands in for the other.
+    pub fn counted_files(&self, session_id: &str) -> Result<HashSet<String>> {
         let response = self
             .authed(
                 self.agent
@@ -1284,10 +1276,7 @@ impl Client {
         let held: HeldFiles = check(response, &format!("reading the archive of session {session_id}"))?
             .body_mut()
             .read_json()?;
-        Ok(Held {
-            files: held.files,
-            counted: held.counted.into_iter().collect(),
-        })
+        Ok(held.counted.into_iter().collect())
     }
 
     /// Appends a run of records to one of a session's transcript files and answers the ordinal the
@@ -1312,8 +1301,7 @@ impl Client {
             .send(&append_body(file, from, records, closed)[..])?;
         if response.status().as_u16() == 409 {
             // Every refusal of a run of records carries the ordinal to send from, because the only
-            // thing a host can do with one is send again from there. A session the byte path wrote
-            // is answered ordinal 0, which is the replay that takes it over.
+            // thing a host can do with one is send again from there.
             let refused: serde_json::Value = response.body_mut().read_json()?;
             if let Some(next) = refused.get("next").and_then(serde_json::Value::as_i64) {
                 return Ok(Appended::Refused(next));

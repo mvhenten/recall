@@ -3,13 +3,10 @@
 // windows it wants off a route that opens the archive and streams it. Nothing here asks the server
 // where an entry ends or what a window is.
 //
-// The archive takes a transcript on two paths and the manifest says which this file is held on. A
-// file the byte path wrote is walked in bytes: a stretch is a span of the file on disk, a stretch
-// boundary is not a line boundary, and the part line at each edge of a batch is carried to the
-// batch beside it. A file the record path wrote is walked in ordinals: a record is one whole line
-// verbatim, so a window of them needs no range, no joining and no remnant at all.
+// A file is walked in ordinals: a record is one whole line verbatim, so a window of them needs no
+// range, no joining and no remnant at all.
 //
-// The arithmetic of both walks lives in transcript-plan, and what counts as a turn lives in turns,
+// The arithmetic of the walk lives in transcript-plan, and what counts as a turn lives in turns,
 // which is the reader the index itself runs. This file is the document and the network around
 // them. npm-scripts/build-browser.mjs bundles it to the script served at /transcript.js.
 //
@@ -18,21 +15,10 @@
 // on the client and nothing on the server ever goes looking for a session to follow.
 
 import {
-  type BytePlan,
-  type Fetched,
   type Follow,
-  followedBatch,
   followedRecords,
-  followedTexts,
-  groupedReads,
-  joinedTexts,
   type Plan,
-  type PlannedRead,
-  packedStretch,
-  plannedBatch,
   plannedRecords,
-  type Reach,
-  type RecordPlan,
   type RecordReach,
   type RecordWindow,
   type Tail,
@@ -202,8 +188,8 @@ const notesOf = (note: HTMLElement, tail: HTMLElement, more: HTMLElement): Notes
     },
   };
 };
-// One batch the box puts on screen, whichever path the file is held on: the texts to render, in
-// the order they go into the box, and what they weigh, which is what the note counts.
+// One batch the box puts on screen: the texts to render, in the order they go into the box, and
+// what they weigh, which is what the note counts.
 interface Batch {
   texts: string[];
   bytes: number;
@@ -224,9 +210,8 @@ interface Followed extends Batch {
 
 type Step<T> = { ok: true; value: T } | { ok: false; why: string; signedOut: boolean };
 
-// What the box reads against. The two paths the archive takes a transcript on differ in how a
-// place in a file is named and in what a batch has to be joined out of, and in nothing else: the
-// cursors live in here, and the box below knows only that a step came back and what it weighed.
+// What the box reads against. The cursors live in here, and the box below knows only that a step
+// came back and what it weighed.
 interface Walker {
   file: string;
   /// What the listing weighs when the page is drawn. It grows as the box follows the file.
@@ -411,105 +396,12 @@ const boxOf = ({ box, list, note, tail, more }: Parts, walker: Walker): void => 
   });
 };
 
-// A file the byte path wrote. A stretch is a span of the file on disk and a stretch boundary is
-// not a line boundary, so each batch holds a part line at the edge it was cut at, which is carried
-// to the batch beside it; the two directions hold one of those each, since they read away from
-// each other and never meet.
-const bytesWalker = (plan: BytePlan): Walker => {
-  const reads: PlannedRead[] = [];
-  plan.runs.forEach((run, index) => {
-    for (const read of run.reads) {
-      reads.push({ run: index, at: read.at, offset: read.offset, skip: read.skip, bytes: read.bytes });
-    }
-  });
-
-  let edge = reads.length;
-  let pending = reads[edge - 1]?.bytes ?? 0;
-  let remnant = "";
-  // `at` is how far the file has been read to: it starts at the end of the manifest the page was
-  // handed, which is the first byte the backward walk will never read, so following can only ever
-  // add turns the box has not shown. `after` is the stretch that cursor is the end of, and goes up
-  // with it: it is what lets a beat list one page of the end of the file rather than every object
-  // in front of it.
-  let at = plan.follow === null ? 0 : plan.follow.from;
-  let after = reads[reads.length - 1]?.at ?? "";
-  let trailing = "";
-
-  // One read, fetched off the route that opens one object. A stretch stored gzipped is one gzip
-  // member: there is no part of it to ask for, the manifest never splits a read of one, and the
-  // browser inflates what comes back, so that one is asked for whole and without a range.
-  const grab = (read: PlannedRead): Promise<Got> => {
-    const url = `${plan.path}?file=${encodeURIComponent(plan.file)}&at=${read.at}`;
-    if (packedStretch(read.at) !== null) return asked(plan.file, url, {}, read.at);
-    return asked(plan.file, url, { range: `bytes=${read.skip}-${read.skip + read.bytes - 1}` }, read.at);
-  };
-
-  const fetched = async (batch: PlannedRead[]): Promise<Step<Fetched[]>> => {
-    const held: Fetched[] = [];
-    for (const read of batch) {
-      const got = await grab(read);
-      if (!got.ok) return got;
-      held.push({ ...read, text: got.text });
-    }
-    return { ok: true, value: held };
-  };
-
-  const weighed = (batch: PlannedRead[]): number => batch.reduce((all, read) => all + read.bytes, 0);
-
-  return {
-    file: plan.file,
-    bytes: plan.readable,
-    follow: plan.follow,
-    back: async () => {
-      const planned = plannedBatch(reads, edge, pending, plan.step);
-      const got = await fetched(planned.batch);
-      if (!got.ok) return got;
-      edge = planned.edge;
-      pending = planned.pending;
-      const joined = joinedTexts(groupedReads(got.value), plan.runs, remnant);
-      remnant = joined.remnant;
-      return { ok: true, value: { texts: joined.texts, bytes: weighed(planned.batch), through: edge === 0 } };
-    },
-    forward: async () => {
-      const beat = await asked(
-        plan.file,
-        `${plan.path}?file=${encodeURIComponent(plan.file)}&from=${at}&after=${encodeURIComponent(after)}`,
-        {},
-        String(at),
-      );
-      if (!beat.ok) return beat;
-      const reach = JSON.parse(beat.text) as Reach;
-      // A batch is capped at the same step the backward walk takes, so a tab left hidden for an
-      // hour catches up over several beats rather than in one enormous read.
-      const planned = followedBatch(reach.runs, at, plan.step);
-      const got = await fetched(planned.batch);
-      if (!got.ok) return got;
-      // The part line held from the last beat belongs to the bytes just before this batch. A batch
-      // that does not start there sits across a hole, and nothing is carried over one.
-      const head = planned.batch[0];
-      if (head !== undefined && head.offset + head.skip !== at) trailing = "";
-      // The batch ends where the last read of it ends, which is the end of that stretch: the
-      // cursor and the stretch it names go up together, so the next beat's page opens there.
-      const last = planned.batch[planned.batch.length - 1];
-      if (last !== undefined) after = last.at;
-      at = planned.at;
-      const joined = followedTexts(groupedReads(got.value), trailing);
-      trailing = joined.remnant;
-      const listed = reach.runs[reach.runs.length - 1]?.to ?? at;
-      return {
-        ok: true,
-        value: { texts: joined.texts, bytes: weighed(planned.batch), running: reach.running, behind: at < listed },
-      };
-    },
-  };
-};
-
-// A file the record path wrote. A record is one whole line verbatim, so a window of them is two
-// ordinals and comes back as prose that parses on its own: there is no range to ask for, no part
-// line to carry between windows, and nothing to join. A hole is a run of ordinals no object holds;
-// the walk opens on the far side of one rather than stopping at it, and the page says how many
-// records each gap swallowed.
-const recordsWalker = (plan: RecordPlan): Walker => {
+// One file of a session. A record is one whole line verbatim, so a window of them is two ordinals
+// and comes back as prose that parses on its own: there is no range to ask for, no part line to
+// carry between windows, and nothing to join. A hole is a run of ordinals no object holds; the
+// walk opens on the far side of one rather than stopping at it, and the page says how many records
+// each gap swallowed.
+const recordsWalker = (plan: Plan): Walker => {
   const spans = plan.spans;
   const first = spans[0]?.from ?? 0;
   const end = spans[spans.length - 1];
@@ -564,8 +456,7 @@ const recordsWalker = (plan: RecordPlan): Walker => {
   };
 };
 
-const boot = (parts: Parts, plan: Plan): void =>
-  boxOf(parts, plan.held === "records" ? recordsWalker(plan) : bytesWalker(plan));
+const boot = (parts: Parts, plan: Plan): void => boxOf(parts, recordsWalker(plan));
 
 const box = document.getElementById("tx");
 const list = document.getElementById("txlist");

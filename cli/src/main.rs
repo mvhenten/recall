@@ -264,28 +264,22 @@ enum Command {
         backfill: bool,
         #[arg(
             long,
-            conflicts_with_all = ["sync", "end", "adopt", "backfill"],
-            help = "Read every session the archive holds back out of it and send it again as records"
-        )]
-        replay: bool,
-        #[arg(
-            long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "replay"],
+            conflicts_with_all = ["sync", "end", "adopt", "backfill"],
             help = "Print one session, by its name, its handle or its Claude Code session id"
         )]
         find: Option<String>,
         #[arg(
             long,
             value_name = "QUERY",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "replay", "find"],
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find"],
             help = "Find sessions on every host by what was said in them"
         )]
         search: Option<String>,
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "replay", "find", "search"],
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search"],
             help = "Write a stored session's transcript back onto this host, so claude --resume takes it"
         )]
         restore: Option<String>,
@@ -776,7 +770,7 @@ impl backfill::Service for Client {
     }
 
     fn counted(&self, session_id: &str) -> Result<std::collections::HashSet<String>> {
-        Ok(self.transcript_files(session_id)?.counted)
+        self.counted_files(session_id)
     }
 }
 
@@ -808,89 +802,6 @@ fn backfill_sessions() -> Result<ExitCode> {
     })?;
     println!("backfilled {touched} of {} past sessions", past.len());
     Ok(ExitCode::SUCCESS)
-}
-
-/// Every session the archive holds and nothing is still writing, read back out of the archive and
-/// sent again as the records it is made of. It is how a session written before this host spoke
-/// `/v2` reaches the record path, and it reads the file back through the very reader the live
-/// sender uses, so a replayed session and a live one cannot be cut into records differently.
-///
-/// A session still running is left alone: the host writing it is the one that archives it. A file
-/// the record path already holds refuses the first run of records with the ordinal it waits at,
-/// which costs one call and sends nothing. A session the byte path wrote is taken over by the
-/// replay: the records open at ordinal 0 and carry the whole file, and the service drops what the
-/// byte path indexed in the batch that writes the record mark. A file that fails is reported and
-/// passed over rather than stopping the run.
-fn replay_sessions(client: &Client) -> Result<ExitCode> {
-    let live: std::collections::HashSet<String> = client
-        .sessions()?
-        .into_iter()
-        .map(|session| session.session_id)
-        .collect();
-    let cold: Vec<String> = {
-        let mut held: Vec<String> = client
-            .session_history_ids()?
-            .into_iter()
-            .filter(|session_id| !live.contains(session_id))
-            .collect();
-        held.sort();
-        held
-    };
-    if cold.is_empty() {
-        println!("no session needs replaying");
-        return Ok(ExitCode::SUCCESS);
-    }
-    let mut replayed = 0;
-    let mut skipped = 0;
-    for session_id in &cold {
-        let held = match client.transcript_files(session_id) {
-            Ok(held) => held,
-            Err(error) => {
-                skipped += 1;
-                eprintln!("recall: skipped {session_id}: {error:#}");
-                continue;
-            }
-        };
-        for file in &held.files {
-            match replay_file(client, session_id, file.file()) {
-                Ok(sent) => {
-                    replayed += 1;
-                    println!(
-                        "replayed {} of {session_id}: {} records sent, {} lines dropped, waiting at {}",
-                        file.file(),
-                        sent.records,
-                        sent.dropped,
-                        sent.next
-                    );
-                }
-                Err(error) => {
-                    skipped += 1;
-                    eprintln!("recall: skipped {} of {session_id}: {error:#}", file.file());
-                }
-            }
-        }
-    }
-    println!(
-        "replayed {replayed} files of {} sessions, skipped {skipped}",
-        cold.len()
-    );
-    Ok(ExitCode::SUCCESS)
-}
-
-/// One archived file, read back as it is served and sent again as records. The session wrote it
-/// long ago, so the end of the file is the end for good, and a replay asked for once runs the
-/// whole file rather than leaving a remainder for a beat that is never coming.
-fn replay_file(client: &Client, session_id: &str, file: &str) -> Result<transcripts::Sent> {
-    let body = client.transcript_body(session_id, file)?;
-    let mut reader = transcripts::Reader::new(std::io::BufReader::new(body), transcripts::holds_of(file), Pass::Final);
-    transcripts::send_from(
-        client,
-        session_id,
-        file,
-        &mut reader,
-        transcripts::Place::nothing(),
-        usize::MAX,
-    )
 }
 
 /// Says which session a name settled on when it named more than one. The service answers with the
@@ -1065,7 +976,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             end,
             adopt,
             backfill,
-            replay,
             find,
             search,
             restore,
@@ -1083,9 +993,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if backfill {
                 return backfill_sessions();
-            }
-            if replay {
-                return replay_sessions(&client()?);
             }
             if let Some(target) = find {
                 return find_session(&client()?, &target, cli.json);

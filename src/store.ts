@@ -80,7 +80,6 @@ import {
   usageEvents,
 } from "./schema/tenant";
 import type { ShareMode, ShareRecord } from "./shares";
-import { MAIN_FILE } from "./transcripts";
 import type { Speaker } from "./turns";
 
 // A list of values goes in as one JSON parameter and is unpacked by `json_each`, because SQLite
@@ -1295,22 +1294,6 @@ export const recordUsage = async (
   });
 };
 
-// How far one session's archive runs and how far the index read of it before the byte path was
-// retired. Nothing writes `archived` any more; it is read to tell a session the byte path wrote
-// from one that never touched it, which is what a replay takes over.
-export interface IndexMark {
-  archived: number;
-  indexed: number;
-  chunks: number;
-}
-
-export const indexMark = async (db: TenantDb, userId: string, sessionId: string): Promise<IndexMark | null> =>
-  db
-    .select({ archived: sessionIndex.archived, indexed: sessionIndex.bytes, chunks: sessionIndex.chunks })
-    .from(sessionIndex)
-    .where(and(eq(sessionIndex.userId, userId), eq(sessionIndex.sessionId, sessionId)))
-    .get() ?? null;
-
 export interface IndexedChunk {
   speaker: Speaker;
   text: string;
@@ -2418,23 +2401,6 @@ export const recordReach = async (db: TenantDb, userId: string, sessionId: strin
   return row === undefined ? 0 : row.nextOrdinal;
 };
 
-// Whether a session's own transcript is on the record mark. A session with a row for `main` indexes
-// itself in the request that appends to it, so a replay reading one knows the prose is already in
-// the index and takes nothing over. The mark is read for `main` alone: a delegated file derives
-// nothing either way, and a row for one of those would say the session had crossed when it had not.
-export const onRecordMark = async (db: TenantDb, userId: string, sessionId: string): Promise<boolean> =>
-  db
-    .select({ file: sessionRecords.file })
-    .from(sessionRecords)
-    .where(
-      and(
-        eq(sessionRecords.userId, userId),
-        eq(sessionRecords.sessionId, sessionId),
-        eq(sessionRecords.file, MAIN_FILE),
-      ),
-    )
-    .get() !== undefined;
-
 export const openChunks = async (
   db: TenantDb,
   userId: string,
@@ -2461,9 +2427,7 @@ export const openChunks = async (
   });
 };
 
-// How many chunks a session already holds, which is the ordinal the next one takes. The record
-// path shares the counter with the byte path, so a session that was indexed either way appends to
-// what is there rather than writing over it.
+// How many chunks a session already holds, which is the ordinal the next one takes.
 export const chunkReach = async (db: TenantDb, userId: string, sessionId: string): Promise<number> => {
   const row = db
     .select({ chunks: sessionIndex.chunks })
@@ -2473,10 +2437,9 @@ export const chunkReach = async (db: TenantDb, userId: string, sessionId: string
   return row === undefined ? 0 : row.chunks;
 };
 
-// The counter moved on, which only ever climbs: two paths index one session and a reach that went
-// backwards would have the next pass write over prose that is already indexed. The row is opened
-// at nothing but the reach where the session has none, since the mark the byte path reads is the
-// archive's and not this.
+// The counter moved on, which only ever climbs: a reach that went backwards would have the next
+// pass write over prose that is already indexed. The row is opened at nothing but the reach where
+// the session has none.
 //
 // `guard` is what the write is weighed against — the mark a record append read, `undefined` where
 // there is nothing to lose the row to.
@@ -2502,10 +2465,10 @@ export interface RecordCommit {
   chunkFrom: number;
   chunks: IndexedChunk[];
   open: readonly OpenChunk[];
-  /// Whether this append takes a session the byte path wrote over from it. A replay opens at
-  /// ordinal 0 and carries the whole file after it, so what the byte path indexed is prose these
-  /// records index again: its mark and its chunks go in the batch below, in front of the chunks
-  /// that replace them.
+  /// Whether this commit is the first the session's own file ever carried over an index that
+  /// already holds chunks. Only a session indexed before the record path took over can be in that
+  /// state, and the prose those chunks hold is prose this commit indexes again from ordinal 0, so
+  /// they go in the batch below, in front of the chunks that replace them.
   takeover: boolean;
 }
 
@@ -2531,19 +2494,22 @@ const markStands = (commit: RecordCommit): SQL =>
 export const commitRecords = async (db: TenantDb, commit: RecordCommit): Promise<boolean> => {
   const { userId, sessionId, file, chunkFrom, chunks, open, next, takeover } = commit;
   return db.transaction((tx) => {
-    // A takeover first, so everything below it is written over a session the byte path no longer
-    // holds anything of. The two statements and the mark at the foot of the batch land together,
-    // which is what leaves no instant where one session is on both paths.
+    // The takeover first, so everything below it is written over an index holding nothing of the
+    // session. It lands in the same batch as the mark at the foot, which is what leaves no instant
+    // where the session is half indexed by each.
+    //
+    // The counter goes back to nothing beside the rows. Nothing reads a chunk ordinal — it is the
+    // third column of the unique key and no more — so leaving it would break nothing visible, and
+    // `MAX(old, new)` would simply open the next append past a gap. It is reset because the counter
+    // is how many chunks the session holds, and a counter that counted rows this batch deleted is
+    // not that.
     if (takeover) {
       tx.run(sql`DELETE FROM ${sessionChunks}
         WHERE ${sessionChunks.userId} = ${userId} AND ${sessionChunks.sessionId} = ${sessionId}
           AND ${markStands(commit)}`);
       tx.insert(sessionIndex)
         .select(sql`SELECT ${userId}, ${sessionId}, 0, 0, 0 WHERE ${markStands(commit)}`)
-        .onConflictDoUpdate({
-          target: [sessionIndex.userId, sessionIndex.sessionId],
-          set: { archived: 0, bytes: 0, chunks: 0 },
-        })
+        .onConflictDoUpdate({ target: [sessionIndex.userId, sessionIndex.sessionId], set: { chunks: 0 } })
         .run();
     }
     chunks.forEach((chunk, index) => {

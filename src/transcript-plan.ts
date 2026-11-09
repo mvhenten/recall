@@ -1,161 +1,36 @@
-// How a reader walks a transcript backwards. The page carries a manifest — every stretch of the
-// chosen file, where it sits and how long it is — and these three steps turn it into one batch of
-// ranged reads, the reads gathered back into adjacent text, and the whole lines that text holds.
+// How a reader walks a transcript backwards. The page carries a manifest — every object of the
+// chosen file, the ordinal it opens at and how many records it holds — and these steps turn it
+// into the window to fetch next and what that window weighs.
 //
-// Two numbers say where the walk has got to: `edge` is the stretch just older than the oldest one
-// loaded, and `pending` is how much of that stretch is still unread. A stretch boundary is not a
-// line boundary, so the head of each batch is a part line; it is held back as the remnant and
-// joined to the batch loaded after it, which holds the rest of that line. A run boundary is a hole
-// in the archive, and nothing is joined across one.
+// One number says where the walk has got to: `edge` is the ordinal just older than the oldest
+// record loaded. A record is one whole line verbatim, so a window of them parses on its own —
+// there is no range to ask for, no part line to carry between windows and nothing to join. A hole
+// is a run of ordinals no object holds, and the walk opens on the far side of one rather than
+// stopping at it.
 //
-// A session still being written is followed the other way round: one cursor says how far the file
-// has been read to, the stretches past it are read forward, and the part line at the end of a
-// batch is the remnant the next batch completes.
+// A session still being written is followed the other way round: one cursor says how many records
+// of the file have been read, and the objects past it are read forward.
 //
 // Nothing here touches a document or a network, so the whole of the arithmetic a wrong window
-// hides in is read and exercised on its own. The name a stretch is stored under lives here too:
-// the manifest is a list of them, and the browser and the archive have to read one the same way.
+// hides in is read and exercised on its own.
 
-const OFFSET_DIGITS = 16;
-
-const padded = (place: number): string => String(place).padStart(OFFSET_DIGITS, "0");
-
-const STRETCH_NAME = new RegExp(
-  `^([0-9]{${OFFSET_DIGITS}})(?:\\.([0-9]{${OFFSET_DIGITS}})(?:\\.([0-9]{${OFFSET_DIGITS}}))?)?$`,
-);
-
-// What a stretch is stored under, past the file's prefix: where it begins in the file and where it
-// ends there.
-export const stretchName = (from: number, through: number): string => `${padded(from)}.${padded(through)}`;
-
-// What a stretch stored gzipped is stored under: the span of the file it accounts for, and how many
-// bytes the object inflates to. Nothing reads that length off a gzip member without inflating it,
-// and where a stretch sits in the archive is the lengths of the stretches in front of it, so a
-// reader that had to find it out would open every object of the file to place the last one. A
-// listing names every stretch for free, so the name carries it and the placing stays one listing.
-export const compressedStretchName = (from: number, through: number, inflates: number): string =>
-  `${stretchName(from, through)}.${padded(inflates)}`;
-
-// What a host from before redaction stores a stretch under: the one place it reached in the file
-// and in the archive alike.
-export const legacyStretchName = (place: number): string => padded(place);
-
-// Which of the three forms one stretch's name is in, and nothing at all where the name is not one
-// the archive wrote. A `place` is what a host from before redaction stored a stretch under: one
-// number meaning a place in the file and in the archive at once, with the stretch running to the
-// object's own size in both. A `span` names where in the file the stretch begins and ends over an
-// object holding those bytes as they stand. A `packed` names the same span over one gzip member,
-// and says how many bytes it inflates to as well.
-export type NamedStretch =
-  | { form: "place"; from: number }
-  | { form: "span"; from: number; through: number }
-  | { form: "packed"; from: number; through: number; inflates: number };
-
-export const namedStretch = (name: string): NamedStretch | null => {
-  const found = STRETCH_NAME.exec(name);
-  const opens = found?.[1];
-  if (opens === undefined) return null;
-  const from = Number(opens);
-  const ends = found?.[2];
-  if (ends === undefined) return { form: "place", from };
-  const through = Number(ends);
-  const inflates = found?.[3];
-  if (inflates === undefined) return { form: "span", from, through };
-  return { form: "packed", from, through, inflates: Number(inflates) };
-};
-
-// Whether one name is a stretch's, which is what says a key is one the archive wrote.
-export const isStretchName = (name: string): boolean => namedStretch(name) !== null;
-
-export type PackedStretch = Extract<NamedStretch, { form: "packed" }>;
-
-// One name read as a stretch stored gzipped, and nothing at all for either of the other two forms.
-// It is the whole of how a reader tells them apart: a gzip member has no inner range, so it is read
-// whole and inflated where a stretch stored as it stands is ranged inside.
-export const packedStretch = (name: string): PackedStretch | null => {
-  const named = namedStretch(name);
-  return named !== null && named.form === "packed" ? named : null;
-};
-
-// One ranged read of one stretch: which object to open, where that object's first byte falls in
-// the archive, how much of its head to pass over, and how many bytes to take. `at` names the
-// object and `offset` places it, and the two carry the same number only for a stretch stored
-// before a redacted stretch could run to another length than the file it was read from. `skip` is
-// zero for every stretch an archive wrote in order; it is other than zero only where a stretch
-// overlaps the one before it, and then it is what keeps the bytes they share out of the file twice.
-// A read of a compressed stretch is the whole of it: those overlap nothing and are never split.
-export interface Read {
-  at: string;
-  offset: number;
-  skip: number;
-  bytes: number;
-}
-
-// One span of a file every byte of which sits in some object. Two stretches that meet exactly are
-// one run; a stretch stored past the end of what the archive accounts for opens another, since the
-// bytes between them are in no object and the lines either side of the gap do not join up. Only a
-// stretch keyed by one offset can land there: one keyed by both its ends is taken where the archive
-// reaches exactly the place in the file it begins at, so a file keyed that way is one run.
-export interface Run {
-  from: number;
-  to: number;
-  reads: Read[];
-}
-
-// How many ranged reads a page is willing to name. The manifest is written into every view of the
-// page, at some hundred bytes a read — a read names the stretch it opens, and a name runs to fifty
-// characters — and a session archived in small stretches holds tens of thousands of them; past this
-// the oldest are left off, rather than shipping a megabyte of manifest to read a transcript nobody
+// How many objects a page is willing to name. The manifest is written into every view of the
+// page, and a session appending a record at a time holds one object per record; past this the
+// oldest are left off, rather than shipping a megabyte of manifest to read a transcript nobody
 // scrolls that far back through.
 export const MAX_PLANNED_READS = 500;
 
-export interface Listing {
-  runs: Run[];
-  /// Where the listing begins, and zero when it names the file from its first byte. A gap in
-  /// front of the first run is a hole in the archive only when nothing was left off.
-  from: number;
-  /// How many of the file's bytes the listing can actually read, which is every byte of its runs
-  /// and none of the holes between them. It is a count and never a place in the file: a reader
-  /// counts up to it, so a holed file reads as finished when it is finished rather than stopping
-  /// short for ever.
-  readable: number;
-}
-
-const readableIn = (runs: Run[]): number => runs.reduce((all, run) => all + run.to - run.from, 0);
-
-// The newest reads of a file, up to the ceiling, and where the listing begins.
-export const listedRuns = (runs: Run[]): Listing => {
-  const total = runs.reduce((all, run) => all + run.reads.length, 0);
-  if (total <= MAX_PLANNED_READS) return { runs, from: 0, readable: readableIn(runs) };
-  let drop = total - MAX_PLANNED_READS;
-  const kept: Run[] = [];
-  for (const run of runs) {
-    if (drop >= run.reads.length) {
-      drop -= run.reads.length;
-      continue;
-    }
-    const reads = run.reads.slice(drop);
-    drop = 0;
-    const head = reads[0];
-    if (head === undefined) continue;
-    kept.push({ from: head.offset + head.skip, to: run.to, reads });
-  }
-  return { runs: kept, from: kept[0]?.from ?? 0, readable: readableIn(kept) };
-};
-
 // Where the box starts following a file still being written, and how often it beats. `from` is
-// the end of the manifest the page was handed, in whatever places that manifest counts: a place
-// in the archive for a file held as bytes, which is never a place in the file — the two part
-// company the moment a stretch redacts to another length than its span — and an ordinal for a
-// file held as records, which is a place in both.
+// the end of the manifest the page was handed, counted in ordinals: a record is a line of the
+// file, which redaction cannot move, so an ordinal is a count and a place at once.
 export interface Follow {
   from: number;
   every: number;
 }
 
-// One object of a file held as records, as the window of the file it answers for: the ordinal its
-// first record carries, how many it holds, and what those weigh in the transcript they join back
-// to, counting the break that closes the last of them.
+// One object of a file, as the window of the file it answers for: the ordinal its first record
+// carries, how many it holds, and what those weigh in the transcript they join back to, counting
+// the break that closes the last of them.
 //
 // A record is addressed by its ordinal and an object is the unit the archive hands back, so these
 // are what a window of the file is planned against: every window opens and ends on an object
@@ -166,41 +41,21 @@ export interface RecordSpan {
   bytes: number;
 }
 
-interface Box {
+// What the page hands the browser: the route a window of the file is read off, the manifest the
+// walk is planned against, and where to pick a file still being written up from.
+export interface Plan {
   path: string;
   file: string;
   step: number;
   follow: Follow | null;
-}
-
-// What the page hands the browser: the route a window of the file is read off, the manifest the
-// walk is planned against, and where to pick a file still being written up from. The two paths the
-// archive takes a transcript on are read apart, because a stretch names bytes of the file on disk
-// and a record names a line of it; `held` is what says which manifest the box is holding.
-export interface BytePlan extends Box {
-  held: "bytes";
-  readable: number;
-  runs: Run[];
-}
-
-export interface RecordPlan extends Box {
-  held: "records";
   /// What the listed records weigh, which is a length of the archive and no place in the file.
   bytes: number;
   spans: RecordSpan[];
 }
 
-export type Plan = BytePlan | RecordPlan;
-
-// What a beat is answered with: whether anyone is still running the session, and how the end of
-// its file lays out around and past where the reader has read.
-export interface Reach {
-  running: boolean;
-  runs: Run[];
-}
-
-// What a beat over a file held as records is answered with: the objects holding records the
-// reader has not read, which is what the window it asks for next is planned against.
+// What a beat is answered with: whether anyone is still running the session, and the objects
+// holding records the reader has not read, which is what the window it asks for next is planned
+// against.
 export interface RecordReach {
   running: boolean;
   spans: RecordSpan[];
@@ -217,9 +72,9 @@ export interface SpanListing {
   bytes: number;
 }
 
-// The newest spans of a file, up to the same ceiling the byte path's reads are held to. A session
-// appending a record at a time holds one object per record, and a page carrying every one of them
-// would ship a manifest nobody scrolls far enough back to spend.
+// The newest spans of a file, up to the ceiling. A session appending a record at a time holds one
+// object per record, and a page carrying every one of them would ship a manifest nobody scrolls
+// far enough back to spend.
 export const listedSpans = (spans: RecordSpan[]): SpanListing => {
   const held = spans.length > MAX_PLANNED_READS;
   const kept = held ? spans.slice(spans.length - MAX_PLANNED_READS) : spans;
@@ -231,8 +86,8 @@ export const listedSpans = (spans: RecordSpan[]): SpanListing => {
   };
 };
 
-// One window of a file held as records: the ordinal it opens at, the one past its last record,
-// and what the records in it weigh. A window never spans a hole — the objects covering one have to
+// One window of a file: the ordinal it opens at, the one past its last record, and what the
+// records in it weigh. A window never spans a hole — the objects covering one have to
 // tile it exactly for the archive to answer it at all — so both ends sit in the same run of
 // records, and a walk that has a hole in front of it steps over it and opens the far side.
 export interface RecordWindow {
@@ -315,146 +170,6 @@ export const gapsInSpans = (listing: SpanListing): SpanGaps => {
   return { records, places };
 };
 
-export interface Gaps {
-  bytes: number;
-  places: number;
-}
-
-// The bytes of the listed span that sit in no object at all, and how many runs of them there are.
-// The span begins where the listing begins, so a file the archive only caught the end of counts
-// the bytes in front of its first stretch, and a listing held back at the ceiling does not count
-// what it deliberately left off.
-export const gapsIn = (listing: Listing): Gaps => {
-  let bytes = 0;
-  let places = 0;
-  let at = listing.from;
-  for (const run of listing.runs) {
-    if (run.from > at) {
-      bytes += run.from - at;
-      places += 1;
-    }
-    at = run.to;
-  }
-  return { bytes, places };
-};
-
-export interface PlannedRead extends Read {
-  /// Which run of the file this read sits in. Nothing is joined across a run boundary.
-  run: number;
-}
-
-export interface PlannedBatch {
-  /// The reads to fetch, oldest first.
-  batch: PlannedRead[];
-  edge: number;
-  pending: number;
-}
-
-// The next batch to fetch and where the walk stands once every read of it has landed. The caller's
-// own cursor is left alone: a batch that fails part way through leaves the reader exactly where it
-// was, and asks for the same bytes again.
-//
-// A compressed stretch is taken whole however little budget is left: it is one gzip member, so
-// there is no part of it to ask for, and splitting one would fetch and inflate the same object once
-// per piece. The budget is spent past rather than inside it, which costs the walk one stretch of
-// overshoot and saves it every read but the first.
-export const plannedBatch = (reads: PlannedRead[], edge: number, pending: number, step: number): PlannedBatch => {
-  const batch: PlannedRead[] = [];
-  let budget = step;
-  let at = edge;
-  let left = pending;
-  while (budget > 0 && left > 0) {
-    const read = reads[at - 1];
-    if (read === undefined) break;
-    const take = packedStretch(read.at) === null ? Math.min(left, budget) : left;
-    batch.unshift({ run: read.run, at: read.at, offset: read.offset, skip: read.skip + left - take, bytes: take });
-    budget -= take;
-    left -= take;
-    if (left === 0) {
-      at -= 1;
-      left = reads[at - 1]?.bytes ?? 0;
-    }
-  }
-  return { batch, edge: at, pending: left };
-};
-
-export interface Fetched extends PlannedRead {
-  text: string;
-}
-
-export interface Group {
-  run: number;
-  /// Where in the file this group's text begins.
-  at: number;
-  text: string;
-}
-
-// The batch gathered into one text per run. Two reads of one run are adjacent bytes of the file,
-// and two reads either side of a run boundary are not.
-export const groupedReads = (fetched: Fetched[]): Group[] => {
-  const groups: Group[] = [];
-  for (const read of fetched) {
-    const last = groups[groups.length - 1];
-    if (last !== undefined && last.run === read.run) {
-      last.text += read.text;
-      continue;
-    }
-    groups.push({ run: read.run, at: read.offset + read.skip, text: read.text });
-  }
-  return groups;
-};
-
-export interface Joined {
-  /// The whole lines each group holds, in the order they go into the box.
-  texts: string[];
-  remnant: string;
-}
-
-export interface FollowedBatch {
-  /// The reads to fetch, oldest first.
-  batch: PlannedRead[];
-  /// Where the file has been read to once every read of the batch has landed.
-  at: number;
-}
-
-// The next batch of a file a session is still writing, reading forward from where the reader has
-// got to. Every byte already read is passed over, so nothing on screen is rendered twice, and a
-// read is taken whole or not at all, so the cursor lands on a stretch boundary and the listing
-// that names the next batch starts there with no part-read stretch behind it.
-export const followedBatch = (runs: Run[], from: number, step: number): FollowedBatch => {
-  const batch: PlannedRead[] = [];
-  let at = from;
-  let budget = step;
-  for (const [index, run] of runs.entries()) {
-    for (const read of run.reads) {
-      const ends = read.offset + read.skip + read.bytes;
-      if (ends <= at) continue;
-      if (budget <= 0) return { batch, at };
-      const begins = Math.max(at, read.offset + read.skip);
-      batch.push({ run: index, at: read.at, offset: read.offset, skip: begins - read.offset, bytes: ends - begins });
-      budget -= ends - begins;
-      at = ends;
-    }
-  }
-  return { batch, at };
-};
-
-// The groups turned into text that parses, reading forward, newest group last. A batch ends
-// wherever the archive has got to and not on a line end, so the last line of a group is a part
-// line: it is held back and joined to the group fetched after it. Two groups of one batch sit
-// either side of a hole, so nothing is carried from the one to the other.
-export const followedTexts = (groups: Group[], remnant: string): Joined => {
-  const texts: string[] = [];
-  let held = remnant;
-  for (const [index, group] of groups.entries()) {
-    const text = (index === 0 ? held : "") + group.text;
-    const cut = text.lastIndexOf("\n");
-    held = cut < 0 ? text : text.slice(cut + 1);
-    texts.push(cut < 0 ? "" : text.slice(0, cut + 1));
-  }
-  return { texts, remnant: held };
-};
-
 // How far the walk has got, and how much of it the reader can see. `shown` is what keeps the note
 // honest: a walk that read every byte and rendered no turn is the one answer the box must never
 // give as success, since an empty box under "the whole of it is here" leaves the reader unable to
@@ -512,26 +227,4 @@ export const walkNote = (walk: Walk): string => {
     return `${read} read, and the last ${kb(walk.dry)} of it holds no prose at all. Load earlier to keep reading.`;
   }
   return `${read} read. Scroll up for more.`;
-};
-
-// The groups turned into text that parses, reading backwards, newest group first. A batch starts
-// wherever its budget ran out and not on a line end, so the head of a group is a part line: it is
-// held back and joined to the group fetched after it. A group that begins where its run begins has
-// nothing in front of it, so nothing is held back there and nothing is carried across the hole
-// beyond it.
-export const joinedTexts = (groups: Group[], runs: Run[], remnant: string): Joined => {
-  const texts: string[] = [];
-  let held = remnant;
-  for (const group of [...groups].reverse()) {
-    const run = runs[group.run];
-    let text = group.text + held;
-    held = "";
-    if (run !== undefined && group.at > run.from) {
-      const cut = text.indexOf("\n");
-      held = cut < 0 ? text : text.slice(0, cut + 1);
-      text = cut < 0 ? "" : text.slice(cut + 1);
-    }
-    texts.push(text);
-  }
-  return { texts, remnant: held };
 };

@@ -18,7 +18,6 @@
     "maxBytes": 101,
     "extraChars": "._-"
   },
-  "maxStretchBytes": 1048576,
   "maxAppendBytes": 5242880,
   "headBytes": 8192,
   "idleAfterMs": 300000,
