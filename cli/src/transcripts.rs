@@ -165,7 +165,7 @@ fn named(stem: &str, holds: Holds) -> Option<String> {
     Some(file)
 }
 
-/// What one file of a session holds, read off the name the archive gave it. It is how a replay
+/// What one file of a session holds, read off the name the archive gave it. It is how a restore
 /// tells a transcript from a tool output when all it has is the archive's listing.
 pub fn holds_of(file: &str) -> Holds {
     if file.starts_with(TOOL_RESULT) {
@@ -1457,17 +1457,16 @@ mod tests {
         assert_eq!(service.body("main"), text, "and the backlog reached the archive whole");
     }
 
-    /// A file read back out of the archive and sent again, which is what `recall sessions
-    /// --replay` does. It goes through the very reader the live sender uses, so the only thing
-    /// that can be proved here is the thing that matters: where a replay stops is a function of
-    /// the file and nothing else.
-    fn replay(service: &Fake, file: &str, text: &str) -> Sent {
+    /// A whole file sent in one pass, which is what a backfill does. It goes through the very
+    /// reader the live sender uses, so the only thing that can be proved here is the thing that
+    /// matters: where the pass stops is a function of the file and nothing else.
+    fn whole_file(service: &Fake, file: &str, text: &str) -> Sent {
         let mut reader = Reader::new(text.as_bytes(), holds_of(file), Pass::Final);
         send_from(service, "s-1", file, &mut reader, Place::nothing(), usize::MAX).unwrap()
     }
 
     #[test]
-    fn a_replay_reaches_the_same_record_whether_it_opens_at_nothing_or_part_way_through() {
+    fn a_whole_file_reaches_the_same_record_whether_it_opens_at_nothing_or_part_way_through() {
         let text = turns(2_500, "replayed");
         let whole = Fake::default();
         let resumed = Fake::default();
@@ -1475,14 +1474,11 @@ mod tests {
         resumed.append("s-1", MAIN, 0, &halfway[..1_000], true).unwrap();
         resumed.append("s-1", MAIN, 1_000, &halfway[1_000..], true).unwrap();
 
-        let first = replay(&whole, MAIN, &text);
-        let rest = replay(&resumed, MAIN, &text);
+        let first = whole_file(&whole, MAIN, &text);
+        let rest = whole_file(&resumed, MAIN, &text);
 
         assert_eq!(first.next, 2_500);
-        assert_eq!(
-            rest.next, first.next,
-            "a replay resumed mid-way reaches the same record"
-        );
+        assert_eq!(rest.next, first.next, "a pass resumed mid-way reaches the same record");
         assert_eq!(rest.records, 1_300, "and sends only the records the archive had not");
         assert_eq!(
             whole.body(MAIN),
@@ -1490,25 +1486,25 @@ mod tests {
             "and the two files read back alike"
         );
 
-        let again = replay(&whole, MAIN, &text);
-        assert_eq!(again.records, 0, "a second replay of the same file sends nothing");
+        let again = whole_file(&whole, MAIN, &text);
+        assert_eq!(again.records, 0, "a second pass over the same file sends nothing");
         assert_eq!(again.next, 2_500);
         assert_eq!(whole.body(MAIN), text);
     }
 
     #[test]
-    fn a_replay_of_a_persisted_output_reads_back_as_the_file_it_was() {
+    fn a_persisted_output_reads_back_as_the_file_it_was() {
         let service = Fake::default();
         let text = "first\n\n\nthe blank lines belong to the record that follows them\n\nlast";
 
-        let sent = replay(&service, "tool-results.b374nf1qv", text);
+        let sent = whole_file(&service, "tool-results.b374nf1qv", text);
 
         assert_eq!(service.body("tool-results.b374nf1qv"), text);
         assert_eq!(sent.records, 3);
         assert_eq!(
-            replay(&service, "tool-results.b374nf1qv", text).records,
+            whole_file(&service, "tool-results.b374nf1qv", text).records,
             0,
-            "and a second replay of it sends nothing"
+            "and a second pass over it sends nothing"
         );
     }
 
@@ -1553,7 +1549,7 @@ mod tests {
         let service = Fake::default();
         let text = format!("{BINARY_RECORD}not really base64\nplain\n");
 
-        replay(&service, "tool-results.b374nf1qv", &text);
+        whole_file(&service, "tool-results.b374nf1qv", &text);
 
         let records = service.records("tool-results.b374nf1qv");
         assert_eq!(records.len(), 2);

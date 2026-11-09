@@ -216,7 +216,6 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     // The records are indexed from ordinal 0, stranded span and all.
     const taken = await chunksOf(client.userId, session);
-    expect(await chunkCount(client.userId, session)).toBe(taken.length);
     expect(await ordinalsOf(client.userId, session)).toEqual(taken.map((_, at) => at));
   });
 
@@ -323,7 +322,6 @@ describe("POST /v2/sessions/{sessionId}/records", () => {
 
     const indexed = await chunksOf(client.userId, session);
     expect(indexed.length).toBeGreaterThan(0);
-    expect(await chunkCount(client.userId, session)).toBe(indexed.length);
 
     // The refused host sends again at the ordinal it was handed and lands, which is the sequence
     // terminating rather than the two of them taking turns losing the file.

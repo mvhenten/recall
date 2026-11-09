@@ -614,7 +614,7 @@ interface DashboardAsk {
   tab: Tab | null;
   segments: string[];
   rawSessionId: string;
-  reading: boolean;
+  transcript: boolean;
   shareName: string | null;
   saving: boolean;
   posting: boolean;
@@ -632,7 +632,7 @@ const dashboardAsk = (request: Request, url: URL): DashboardAsk => {
     tab,
     segments,
     rawSessionId: segments[0] ?? "",
-    reading: segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT,
+    transcript: segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT,
     shareName,
     saving: posted && tab?.path === LABELS_TAB.path,
     posting: posted && tab?.path === BOARD_TAB.path,
@@ -2597,12 +2597,12 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const db = env.DB;
     const lost = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Back to the dashboard");
-    const { tab, segments, rawSessionId, reading, shareName, saving } = dashboardAsk(request, url);
+    const { tab, segments, rawSessionId, transcript, shareName, saving } = dashboardAsk(request, url);
     if (saving) return saveLabels(request, url, db, userId, lost);
     // A read of the tail renders no page, so it does not pay for the tally a page carries in its
     // header. It reads this tenant's rows for how far the file now reaches, which is what keeps it
     // here while the prose of a named window is answered in the Worker off the archive alone.
-    if (reading) return transcriptTail(url, env, userId, rawSessionId);
+    if (transcript) return transcriptTail(url, env, userId, rawSessionId);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (shareName !== null) {
@@ -3138,7 +3138,7 @@ export const createApp = (deps: Deps): App => {
       dashboardNotice(status, title, text, "Back to the dashboard");
     const signIn = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Sign in again");
-    const { saving, posting, sending, sharing, reading, rawSessionId } = dashboardAsk(request, url);
+    const { saving, posting, sending, sharing, transcript, rawSessionId } = dashboardAsk(request, url);
     if (request.method !== "GET" && !saving && !posting && !sending && !sharing) {
       return lost(
         405,
@@ -3153,7 +3153,10 @@ export const createApp = (deps: Deps): App => {
     // The prose of one named window comes off the archive and reads no row at all, so it is
     // answered here rather than one round trip into the object apiece. `since` asks how far the
     // file now reaches, which is a row this tenant holds, so that one goes on to the object.
-    if (reading && !url.searchParams.has("since")) {
+    // `from` is the byte path's cursor, which no page writes any more; a tab left open across the
+    // deploy still sends it, and it goes on to the object for the same refusal every other unknown
+    // beat gets rather than a 400 about a window it never asked for.
+    if (transcript && !url.searchParams.has("from") && !url.searchParams.has("since")) {
       return transcriptRecords(url, env.TRANSCRIPTS, userId, rawSessionId);
     }
     return tenantOf(env, userId).dashboard(request, userId, email, handed());
