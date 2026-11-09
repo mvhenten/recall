@@ -70,13 +70,13 @@ const { endpoint, token } = recallConfig(process.env, text);
 if (endpoint === "") die(`RECALL_ENDPOINT names no deployment, in the environment or in ${path}\n${usage}`);
 if (token === "") die(`this host is not signed in to ${endpoint}; run recall login\n${usage}`);
 
-const response = await fetch(`${endpoint}/v1/artifacts/copy`, {
+const response = await fetch(`${endpoint}/v2/artifacts/copy`, {
   method: "POST",
   headers: { authorization: `Bearer ${token}` },
   signal: AbortSignal.timeout(600_000),
 });
 const body = await response.text();
-if (!response.ok) die(`POST ${endpoint}/v1/artifacts/copy returned ${response.status}: ${body}`);
+if (!response.ok) die(`POST ${endpoint}/v2/artifacts/copy returned ${response.status}: ${body}`);
 
 const report = JSON.parse(body);
 const { userId, artifacts, revisions, names, checks } = report;

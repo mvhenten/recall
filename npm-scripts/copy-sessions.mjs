@@ -89,7 +89,7 @@ const some = (list) => (list.length === 0 ? "none" : list.join(", "));
 // — it holds the rows it wrote after the cutover beside the copied ones. A run that opens without
 // the flag writes them once more, which is what finishes a call that died in the middle.
 const call = async (after, metadataComplete) => {
-  const response = await fetch(`${endpoint}/v1/sessions/copy`, {
+  const response = await fetch(`${endpoint}/v2/sessions/copy`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ after, metadataComplete }),
@@ -98,7 +98,7 @@ const call = async (after, metadataComplete) => {
   const body = await response.text();
   if (!response.ok) {
     die(
-      `POST ${endpoint}/v1/sessions/copy returned ${response.status}: ${body}\n` +
+      `POST ${endpoint}/v2/sessions/copy returned ${response.status}: ${body}\n` +
         `Nothing in D1 was changed. Run again with --after=${after} to carry on from where this call opened.`,
     );
   }

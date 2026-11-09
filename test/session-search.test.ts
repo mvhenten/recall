@@ -1,8 +1,7 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { CHUNK_RECENT } from "../src/app";
 import type { PastSession, SessionHit } from "../src/model";
-import { harness, UNEMBEDDABLE } from "./harness";
+import { harness } from "./harness";
 
 const line = (entry: Record<string, unknown>): string => `${JSON.stringify(entry)}\n`;
 
@@ -20,6 +19,9 @@ const about = (subject: string): string =>
   ].join("");
 
 const bytes = (text: string): number => new TextEncoder().encode(text).byteLength;
+
+// The lines of a transcript as the records an append carries, which is how prose reaches the index.
+const recordsOf = (text: string): string[] => text.split("\n").filter((line) => line !== "");
 
 // A word made of letters alone, since the test embedder is blind to any token holding a digit.
 const coined = (at: number): string => {
@@ -44,43 +46,6 @@ const filler = (turns: number): string => {
   return written.join("");
 };
 
-// A run of turns about one subject, long enough that several of them run past one bite of the
-// indexer. Every turn carries its own number, so the chunks can be read back for the turns a bite
-// seam falls between; the number holds a digit, which the harness's embedder is blind to, so what a
-// search sees of this prose is the subject alone.
-const run = (from: number, turns: number, subject: string): string => {
-  const written: string[] = [];
-  for (let turn = from; turn < from + turns; turn += 1) {
-    const stamp = new Date(1_700_000_000_000 + turn * 1_000).toISOString();
-    written.push(
-      line({
-        type: "user",
-        timestamp: stamp,
-        origin: { kind: "human" },
-        message: {
-          content: `t${turn}x ${subject}: ${`what ${subject} does, and why it does it that way. `.repeat(20)}`,
-        },
-      }),
-      line({
-        type: "assistant",
-        timestamp: stamp,
-        message: {
-          model: "claude-opus-5",
-          content: [
-            { type: "text", text: `t${turn}x ${subject} works like this: ${`${subject} does its job. `.repeat(20)}` },
-          ],
-        },
-      }),
-    );
-  }
-  return written.join("");
-};
-
-const turnsIn = (chunks: string[]): number[] =>
-  [...new Set([...chunks.join("\n").matchAll(/\bt(\d+)x\b/g)].map((found) => Number(found[1])))].sort(
-    (left, right) => left - right,
-  );
-
 const sessionOf = async (response: Response): Promise<PastSession> => {
   expect(response.status).toBe(200);
   const body = (await response.json()) as { session: PastSession };
@@ -99,8 +64,7 @@ describe("finding a stored session", () => {
     const client = await h.user("finder");
     const id = "11112222-3333-4444-5555-666677778888";
     await client.sync(id);
-    await client.archive(id, "main", 0, named("kisuvpalas") + about("the signing key"));
-    await h.deliver();
+    await client.v2.records(id, "main", 0, recordsOf(named("kisuvpalas") + about("the signing key")));
 
     const session = await sessionOf(await client.session("kisuvpalas"));
 
@@ -119,11 +83,10 @@ describe("finding a stored session", () => {
   it("takes the most recent of the sessions a name answers for, and says how many there were", async () => {
     const h = await harness();
     const client = await h.user("twin");
-    await client.sync("s-older", { lastActivityAt: h.now() + 1_000 });
-    await client.archive("s-older", "main", 0, named("lobivdigob") + about("the first run"));
-    await client.sync("s-newer", { lastActivityAt: h.now() + 90_000 });
-    await client.archive("s-newer", "main", 0, named("lobivdigob") + about("the second run"));
-    await h.deliver();
+    await client.sync("s-older", { lastActivityAt: new Date(h.now() + 1_000).toISOString() });
+    await client.v2.records("s-older", "main", 0, recordsOf(named("lobivdigob") + about("the first run")));
+    await client.sync("s-newer", { lastActivityAt: new Date(h.now() + 90_000).toISOString() });
+    await client.v2.records("s-newer", "main", 0, recordsOf(named("lobivdigob") + about("the second run")));
 
     const found = (await (await client.session("lobivdigob")).json()) as { session: PastSession; matches: number };
 
@@ -138,8 +101,7 @@ describe("finding a stored session", () => {
     const owner = await h.user("keeper");
     const stranger = await h.user("passerby");
     await owner.sync("s-private");
-    await owner.archive("s-private", "main", 0, named("vatoglojaf") + about("nothing to see"));
-    await h.deliver();
+    await owner.v2.records("s-private", "main", 0, recordsOf(named("vatoglojaf") + about("nothing to see")));
 
     expect((await stranger.session("vatoglojaf")).status).toBe(404);
     expect((await stranger.session("s-private")).status).toBe(404);
@@ -151,10 +113,16 @@ describe("searching sessions by meaning", () => {
     const h = await harness();
     const client = await h.user("searcher");
     await client.sync("s-archive", { host: "tower" });
-    await client.archive("s-archive", "main", 0, named("pihokkokuk") + about("the transcript archive offset"));
+    await client.v2.records(
+      "s-archive",
+      "main",
+      0,
+      recordsOf(named("pihokkokuk") + about("the transcript archive offset")),
+    );
     await client.sync("s-pipeline", { host: "laptop" });
-    await client.archive("s-pipeline", "main", 0, named("latimmakom") + about("the release pipeline"));
-    await h.deliver();
+    await client.v2.records("s-pipeline", "main", 0, recordsOf(named("latimmakom") + about("the release pipeline")));
+    await client.v2.end("s-archive");
+    await client.v2.end("s-pipeline");
 
     const found = await hitsOf(await client.searchSessions("where does the transcript archive keep its offset"));
 
@@ -169,10 +137,11 @@ describe("searching sessions by meaning", () => {
     const mine = await h.user("mine");
     const theirs = await h.user("theirs");
     await mine.sync("s-mine");
-    await mine.archive("s-mine", "main", 0, named("gapulbadag") + about("the signing key rotation"));
+    await mine.v2.records("s-mine", "main", 0, recordsOf(named("gapulbadag") + about("the signing key rotation")));
     await theirs.sync("s-theirs");
-    await theirs.archive("s-theirs", "main", 0, named("minuksijaj") + about("the signing key rotation"));
-    await h.deliver();
+    await theirs.v2.records("s-theirs", "main", 0, recordsOf(named("minuksijaj") + about("the signing key rotation")));
+    await mine.v2.end("s-mine");
+    await theirs.v2.end("s-theirs");
 
     const found = await hitsOf(await mine.searchSessions("signing key rotation"));
 
@@ -194,13 +163,15 @@ describe("searching sessions by meaning", () => {
     ] as const;
     for (const [sessionId, subject] of subjects) {
       await client.sync(sessionId);
-      await client.archive(sessionId, "main", 0, about(subject));
+      await client.v2.records(sessionId, "main", 0, recordsOf(about(subject)));
+      await client.v2.end(sessionId);
     }
-    await h.deliver();
     await client.sync("s-filler");
-    await client.archive("s-filler", "main", 0, filler(CHUNK_RECENT + 100));
-    await h.deliver();
-    await h.deliver();
+    const written = recordsOf(filler(CHUNK_RECENT + 100));
+    for (let at = 0; at < written.length; at += 500) {
+      await client.v2.records("s-filler", "main", at, written.slice(at, at + 500));
+    }
+    await client.v2.end("s-filler");
     expect((await h.chunks(userId, "s-filler")).length).toBeGreaterThan(CHUNK_RECENT);
 
     for (const [sessionId, subject, query] of subjects) {
@@ -208,137 +179,6 @@ describe("searching sessions by meaning", () => {
       expect([query, found[0]?.session.sessionId]).toEqual([query, sessionId]);
       expect(found[0]?.excerpt.text).toContain(subject);
     }
-  });
-});
-
-describe("indexing off the storage event", () => {
-  // Indexing picks a session up where it left it, so a session that goes on writing is caught up
-  // a stretch at a time rather than read from the start again — and an event delivered a second
-  // time, which the queue promises will happen, indexes nothing twice.
-  it("indexes what has arrived since the last pass, and nothing twice", async () => {
-    const h = await harness();
-    const userId = `indexer-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
-    await client.sync("s-long");
-    const first = named("rogiffavof") + about("the offset table");
-    await client.archive("s-long", "main", 0, first);
-    await h.deliver();
-    const indexed = await h.chunks(userId, "s-long");
-    expect(indexed.length).toBeGreaterThan(0);
-
-    await client.archive("s-long", "main", bytes(first), about("the labels tab"));
-    await h.deliver();
-
-    const grown = await h.chunks(userId, "s-long");
-    expect(grown.slice(0, indexed.length)).toEqual(indexed);
-    expect(grown.length).toBeGreaterThan(indexed.length);
-    await h.deliver();
-    expect(await h.chunks(userId, "s-long")).toEqual(grown);
-    expect((await hitsOf(await client.searchSessions("the labels tab")))[0]?.session.sessionId).toBe("s-long");
-  });
-
-  // What `recall sessions --backfill` hands the indexer: a session hundreds of bites behind its
-  // archive. One bite is all one invocation takes, so the session is caught up over as many
-  // invocations, and while it is still behind its messages go back for redelivery rather than
-  // acking — an acked message with nothing else asking what is behind would leave the rest of the
-  // transcript unindexed for good. The chunks are read back after every delivery because a bite
-  // seam is where prose would be dropped or indexed twice: each delivery appends to what the one
-  // before it wrote and rewrites none of it.
-  it("takes one bite of a session far behind per delivery, and sends its messages back until it is level", async () => {
-    const h = await harness();
-    const userId = `behind-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
-    await client.sync("s-behind");
-    const head = named("rogiffavof") + run(0, 430, "the offset table");
-    const middle = run(430, 430, "the labels tab");
-    const tail = run(860, 430, "the signing key");
-    await client.archive("s-behind", "main", 0, head);
-    await client.archive("s-behind", "main", bytes(head), middle);
-    await client.archive("s-behind", "main", bytes(head) + bytes(middle), tail);
-    const archived = bytes(head) + bytes(middle) + bytes(tail);
-
-    await h.deliver();
-
-    const afterOne = await h.chunks(userId, "s-behind");
-    expect(h.retried()).toBe(3);
-    expect(afterOne.length).toBeGreaterThan(0);
-    expect((await h.indexMark(userId, "s-behind"))?.bytes).toBeLessThan(archived);
-
-    await h.deliver();
-
-    const afterTwo = await h.chunks(userId, "s-behind");
-    expect(h.retried()).toBe(3);
-    expect(afterTwo.slice(0, afterOne.length)).toEqual(afterOne);
-    expect(afterTwo.length).toBeGreaterThan(afterOne.length);
-
-    await h.deliver();
-
-    const afterThree = await h.chunks(userId, "s-behind");
-    expect(h.retried()).toBe(0);
-    expect(afterThree.slice(0, afterTwo.length)).toEqual(afterTwo);
-    const mark = await h.indexMark(userId, "s-behind");
-    expect(mark?.bytes).toBe(archived);
-    expect(mark?.chunks).toBe(afterThree.length);
-    expect(turnsIn(afterThree)).toEqual([...Array(1_290).keys()]);
-    expect((await hitsOf(await client.searchSessions("the signing key")))[0]?.session.sessionId).toBe("s-behind");
-  });
-
-  // The failure that would otherwise take the index down for every account at once. One delivery
-  // carries the stretches of several sessions, so a transcript the indexer cannot get through
-  // would fail the delivery and hold back everything in it; each session is caught on its own
-  // instead, keeps its own mark where it was, and sends its own messages back for redelivery.
-  // Nothing else asks what is behind, so a session that acked a failure would never be indexed.
-  it("sends back the messages of a session it cannot get through, and indexes the rest", async () => {
-    const h = await harness();
-    const userId = `wounded-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
-    await client.sync("s-aaa-poisoned");
-    await client.archive("s-aaa-poisoned", "main", 0, named("rogiffavof") + about(`${UNEMBEDDABLE} wreckage`));
-    await client.sync("s-zzz-healthy");
-    await client.archive("s-zzz-healthy", "main", 0, named("minuksijaj") + about("the labels tab"));
-
-    await h.deliver();
-
-    expect(await h.chunks(userId, "s-zzz-healthy")).not.toEqual([]);
-    expect(await h.chunks(userId, "s-aaa-poisoned")).toEqual([]);
-    const poisoned = await h.indexMark(userId, "s-aaa-poisoned");
-    expect(poisoned?.bytes).toBe(0);
-    expect(poisoned?.archived).toBeGreaterThan(0);
-    expect(h.retried()).toBe(1);
-    await h.deliver();
-    expect(await h.chunks(userId, "s-zzz-healthy")).not.toEqual([]);
-    expect(await h.chunks(userId, "s-aaa-poisoned")).toEqual([]);
-  });
-
-  // An object the archive lost. Its bytes exist nowhere and never will, and the row the appends
-  // wrote counts them, so the mark the indexer leaves stands short of it for good. The pass that
-  // finds nothing past where it has read stops rather than asking for those bytes on every event.
-  it("steps over a stretch the archive lost rather than stalling on it", async () => {
-    const h = await harness();
-    const userId = `holed-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
-    await client.sync("s-holed");
-    const head = named("nufogruzup") + about("the offset table");
-    const lost = about("a stretch that never landed");
-    const tail = about("the labels tab");
-    await client.archive("s-holed", "main", 0, head);
-    await client.archive("s-holed", "main", bytes(head), lost);
-    await client.archive("s-holed", "main", bytes(head) + bytes(lost), tail);
-    const keys = await env.TRANSCRIPTS.list({ prefix: `${userId}/s-holed/main/` });
-    await env.TRANSCRIPTS.delete(keys.objects[1]?.key ?? "");
-
-    await h.deliver();
-
-    const mark = await h.indexMark(userId, "s-holed");
-    expect(mark?.bytes).toBe(bytes(head) + bytes(tail));
-    expect(mark?.archived).toBe(bytes(head) + bytes(lost) + bytes(tail));
-    const chunks = await h.chunks(userId, "s-holed");
-    await h.deliver();
-    expect(await h.chunks(userId, "s-holed")).toEqual(chunks);
-    expect(chunks.some((text) => text.includes("the offset table"))).toBe(true);
-    expect(chunks.some((text) => text.includes("the labels tab"))).toBe(true);
-    expect(chunks.some((text) => text.includes("never landed"))).toBe(false);
-    expect((await hitsOf(await client.searchSessions("the labels tab")))[0]?.session.sessionId).toBe("s-holed");
   });
 });
 

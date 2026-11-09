@@ -7,7 +7,7 @@ import { artifactRevisions, artifacts } from "./schema/tenant";
 import { claimArtifactName } from "./store";
 
 // The one-shot copy of an account's artifact metadata out of D1 and into that account's own
-// object, driven by `POST /v1/artifacts/copy` and by nothing else. It is not a request path: no
+// object, driven by `POST /v2/artifacts/copy` and by nothing else. It is not a request path: no
 // read or write of an artifact reaches anything here, and the route exists so that an operator
 // can run the copy once against a running deployment.
 //

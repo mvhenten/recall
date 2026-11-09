@@ -37,7 +37,7 @@ const owner = async (h: Harness): Promise<Owner> => {
 // A send from the dashboard reaches a session the same way one from another host does: through a
 // socket the host has open. News answers nothing back, so this only has to be attached.
 const attach = async (h: Harness, token: string): Promise<WebSocket> => {
-  const response = await h.send("/v1/messages/listen", {
+  const response = await h.send("/v2/messages/listen", {
     headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
   expect(response.status).toBe(101);
@@ -189,7 +189,7 @@ const send = async (h: Harness, path: string, assertion: string, body: string): 
 };
 
 const deviceId = async (client: Client): Promise<string> => {
-  const response = await client.request("GET", "/v1/devices");
+  const response = await client.request("GET", "/v2/devices");
   expect(response.status).toBe(200);
   const listed: { devices: { deviceId: string }[] } = await response.json();
   const device = listed.devices[0];
@@ -458,7 +458,6 @@ describe("following a transcript as it is written", () => {
     const head = transcriptOf(3);
     const grew = transcriptOf(2);
     const at = await archivedBody(h, you.laptop, "beef0010", head);
-    await h.deliver();
     const plan = planOf(await read(h, "/dashboard/sessions/beef0010", you.assertion));
     expect(plan.follow).toEqual({ from: head.length, every: TRANSCRIPT_FOLLOW_MS });
 
@@ -468,7 +467,6 @@ describe("following a transcript as it is written", () => {
     expect(await first.json()).toEqual({ running: true, runs: [] });
 
     await archivedBody(h, you.laptop, "beef0010", grew, at);
-    await h.deliver();
     const moved: Reach = await (await beatOf(h, plan, at, you.assertion)).json();
 
     expect(moved.running).toBe(true);
@@ -486,7 +484,6 @@ describe("following a transcript as it is written", () => {
       starts.push(at);
       at = await archivedBody(h, you.laptop, "beef0011", transcriptOf(2), at);
     }
-    await h.deliver();
     const plan = planOf(await read(h, "/dashboard/sessions/beef0011", you.assertion));
 
     const behind: Reach = await (await beatOf(h, plan, starts[1] ?? 0, you.assertion)).json();
@@ -518,7 +515,6 @@ describe("following a transcript as it is written", () => {
     const h = await harness();
     const you = await owner(h);
     const at = await archivedBody(h, you.laptop, "beef0012", transcriptOf(3));
-    await h.deliver();
     const plan = planOf(await read(h, "/dashboard/sessions/beef0012", you.assertion));
     h.tick(SESSION_TTL_MS + 1);
 
@@ -535,7 +531,6 @@ describe("following a transcript as it is written", () => {
     const you = await owner(h);
     await archivedBody(h, you.laptop, "beef0013", transcriptOf(3));
     expect((await you.laptop.archive("beef0013", "task-7", 0, transcriptOf(2))).status).toBe(200);
-    await h.deliver();
     const plan = planOf(await read(h, "/dashboard/sessions/beef0013?file=task-7", you.assertion));
     const main = { ...plan, file: "main" };
 
@@ -617,7 +612,6 @@ describe("a session page over a transcript held as records", () => {
     const h = await harness();
     const you = await owner(h);
     await archivedBody(h, you.laptop, "cafe0101", `${entry(0)}\n${entry(1)}\n`);
-    await h.deliver();
     const written = [entry(0), entry(1), entry(2)];
     await recordedBody(h, you.laptop, "cafe0101", written);
 
@@ -634,7 +628,6 @@ describe("a session page over a transcript held as records", () => {
     await recordedBody(h, you.laptop, "cafe0105", written);
     const delegated = transcriptOf(2);
     expect((await you.laptop.archive("cafe0105", "task-7", 0, delegated)).status).toBe(200);
-    await h.deliver();
 
     const path = "/dashboard/sessions/cafe0105";
     const html = await read(h, path, you.assertion);
@@ -654,7 +647,6 @@ describe("a session page over a transcript held as records", () => {
     const you = await owner(h);
     const body = transcriptOf(2);
     await archivedBody(h, you.laptop, "cafe0106", body);
-    await h.deliver();
     await h.strayRecord(you.userId, "cafe0106", "main/not-an-ordinal");
 
     const html = await read(h, "/dashboard/sessions/cafe0106", you.assertion);

@@ -8,7 +8,7 @@ const ORIGIN = "https://recall.test";
 const BOARD_PATH = "/dashboard/board";
 
 const deviceId = async (client: Client, name: string): Promise<string> => {
-  const response = await client.request("GET", "/v1/devices");
+  const response = await client.request("GET", "/v2/devices");
   const listed: { devices: { deviceId: string; name: string }[] } = await response.json();
   const device = listed.devices.find((candidate) => candidate.name === name);
   if (!device) throw new Error(`no device named ${name}`);
@@ -16,20 +16,20 @@ const deviceId = async (client: Client, name: string): Promise<string> => {
 };
 
 const postToFleet = async (client: Client, body: string): Promise<BoardMessage> => {
-  const response = await client.request("POST", "/v1/board", { scope: "fleet", body });
+  const response = await client.request("POST", "/v2/board", { address: { scope: "fleet" }, body });
   expect(response.status).toBe(201);
   return await response.json();
 };
 
 const pickUp = async (client: Client, sessionId: string): Promise<BoardMessage[]> => {
-  const response = await client.request("POST", "/v1/board/pickup", { sessionId });
+  const response = await client.request("POST", "/v2/board/pickup", { sessionId });
   expect(response.status).toBe(200);
   const picked: { messages: BoardMessage[] } = await response.json();
   return picked.messages;
 };
 
 const readBoard = async (client: Client): Promise<BoardEntry[]> => {
-  const response = await client.request("GET", "/v1/board");
+  const response = await client.request("GET", "/v2/board");
   expect(response.status).toBe(200);
   const page: { entries: BoardEntry[] } = await response.json();
   return page.entries;
@@ -68,9 +68,8 @@ describe("the board", () => {
     const userId = `user-${crypto.randomUUID()}`;
     const { laptop, desktop } = await account(h, userId);
     const desktopId = await deviceId(laptop, "desktop");
-    const posted = await laptop.request("POST", "/v1/board", {
-      scope: "host",
-      deviceId: desktopId,
+    const posted = await laptop.request("POST", "/v2/board", {
+      address: { scope: "host", target: desktopId },
       body: "pull main",
     });
     expect(posted.status).toBe(201);
@@ -89,9 +88,8 @@ describe("the board", () => {
     const userId = `user-${crypto.randomUUID()}`;
     const { laptop, desktop } = await account(h, userId);
     expect((await laptop.sync("9f8a1b2c")).status).toBe(204);
-    const posted = await laptop.request("POST", "/v1/board", {
-      scope: "session",
-      sessionId: "9f8a1b2c",
+    const posted = await laptop.request("POST", "/v2/board", {
+      address: { scope: "session", target: "9f8a1b2c" },
       body: "for the laptop session only",
     });
     expect(posted.status).toBe(201);
@@ -173,9 +171,9 @@ describe("the board", () => {
     const bob = await h.user("bob");
     await postToFleet(laptop, "ours alone");
 
-    expect((await bob.request("POST", "/v1/board", { scope: "host", deviceId: desktopId, body: "x" })).status).toBe(
-      404,
-    );
+    expect(
+      (await bob.request("POST", "/v2/board", { address: { scope: "host", target: desktopId }, body: "x" })).status,
+    ).toBe(404);
     expect(await pickUp(bob, "9f8a1b2c")).toEqual([]);
     expect(await readBoard(bob)).toEqual([]);
   });

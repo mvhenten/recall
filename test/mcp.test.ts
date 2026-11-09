@@ -347,7 +347,7 @@ describe("the connector's tools", () => {
     const client = h.clientWithToken(token);
     const sent = (await mcp.json("recall_send", { to: "laptop", message: "ship it" })) as { toDeviceId: string };
 
-    const devices = await client.request("GET", "/v1/devices");
+    const devices = await client.request("GET", "/v2/devices");
     const listed = (await devices.json()) as { devices: Array<{ deviceId: string; name: string }> };
     expect(listed.devices.map((device) => device.name)).toEqual(["laptop"]);
     expect(sent.toDeviceId).toBe(listed.devices[0]?.deviceId);

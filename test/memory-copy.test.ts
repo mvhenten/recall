@@ -81,16 +81,16 @@ const tenantRanking = async (userId: string, query: string): Promise<string[]> =
   (await tenantRows<{ id: string }>(userId, RANKING, userId, query)).map((row) => row.id);
 
 const copy = async (client: Client): Promise<MemoryCopyReport> => {
-  const response = await client.request("POST", "/v1/memories/copy");
+  const response = await client.request("POST", "/v2/memories/copy");
   expect(response.status).toBe(200);
   return response.json();
 };
 
 const listed = async (client: Client): Promise<string[]> => {
-  const response = await client.request("GET", "/v1/memories?limit=50");
+  const response = await client.request("GET", "/v2/memories?limit=50");
   expect(response.status).toBe(200);
-  const page: { memories: Memory[] } = await response.json();
-  return page.memories.map((memory) => memory.name).sort();
+  const page: { memories: Array<{ memoryName: string }> } = await response.json();
+  return page.memories.map((memory) => memory.memoryName).sort();
 };
 
 const owner = async (h: Harness): Promise<{ client: Client; email: string }> => {

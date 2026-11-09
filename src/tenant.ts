@@ -57,10 +57,6 @@ export class Tenant extends DurableObject<Env> {
     return this.half(call).tool(made, this.store(), caller);
   }
 
-  index(userId: string, sessionId: string, call: TenantCall): Promise<boolean> {
-    return this.half(call).index(this.store(), userId, sessionId);
-  }
-
   // The artifact rows, which the Worker reads rather than the object's own halves. The collection
   // streams a publish straight into R2 and serves an artifact's bytes back out of it, and routing
   // that through here would carry sixty-four megabytes Worker to object to storage for nothing;

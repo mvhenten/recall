@@ -10,7 +10,7 @@ import { memories, memoryTags } from "./schema/tenant";
 import { type TextCandidate, textCandidates, type VectorCandidate, vectorCandidates } from "./store";
 
 // The one-shot copy of an account's memories out of D1 and into that account's own object, driven
-// by `POST /v1/memories/copy` and by nothing else. It is not a request path: no read or write of a
+// by `POST /v2/memories/copy` and by nothing else. It is not a request path: no read or write of a
 // memory reaches anything here, and the route exists so that an operator can run the copy once
 // against a running deployment.
 //

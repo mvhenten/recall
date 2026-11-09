@@ -107,7 +107,7 @@ const tenantChunks = (userId: string): Promise<D1Chunk[]> =>
   );
 
 const copyFrom = async (client: Client, after: number, metadataComplete = false): Promise<SessionCopyReport> => {
-  const response = await client.request("POST", "/v1/sessions/copy", { after, metadataComplete });
+  const response = await client.request("POST", "/v2/sessions/copy", { after, metadataComplete });
   expect(response.status).toBe(200);
   const report: SessionCopyReport = await response.json();
   // Every corpus a test writes is well inside one call's budget, so a run that did not reach the
@@ -220,7 +220,7 @@ describe("copying the sessions an account held before they moved", () => {
     expect(kept).toEqual([{ counted: 1, open: 1, posted: 1, taken: 1, labelled: 1 }]);
 
     expect((await client.session(live)).status).toBe(200);
-    const history = await client.request("GET", "/v1/sessions?scope=history");
+    const history = await client.request("GET", "/v2/history");
     const page: { sessionIds: string[] } = await history.json();
     expect(page.sessionIds.sort()).toEqual([live, over].sort());
 

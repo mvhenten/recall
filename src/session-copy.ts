@@ -43,7 +43,7 @@ import {
 import { jsonEach, raiseChunkReach } from "./store";
 
 // The one-shot copy of an account's sessions out of D1 and into that account's own object, driven
-// by `POST /v1/sessions/copy` and by nothing else. It is not a request path: no read or write of a
+// by `POST /v2/sessions/copy` and by nothing else. It is not a request path: no read or write of a
 // session reaches anything here, and the route exists so that an operator can run the copy against
 // a running deployment.
 //

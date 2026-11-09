@@ -90,13 +90,13 @@ const tenantRanking = async (userId: string, query: string): Promise<number[]> =
   (await tenantRows<{ seq: number }>(userId, RANKING, userId, query)).map((row) => row.seq);
 
 const copy = async (client: Client): Promise<ArtifactCopyReport> => {
-  const response = await client.request("POST", "/v1/artifacts/copy");
+  const response = await client.request("POST", "/v2/artifacts/copy");
   expect(response.status).toBe(200);
   return response.json();
 };
 
 const listed = async (client: Client): Promise<string[]> => {
-  const response = await client.request("GET", "/v1/artifacts?limit=50");
+  const response = await client.request("GET", "/v2/artifacts?limit=50");
   expect(response.status).toBe(200);
   const page: { artifacts: ArtifactView[] } = await response.json();
   return page.artifacts.map((one) => one.name).sort();
@@ -228,7 +228,7 @@ describe("copying the artifacts an account published before they moved", () => {
       name,
     );
     expect(rows).toEqual([{ rev_next: 7 }]);
-    const held = await client.request("GET", `/v1/artifacts/${name}`);
+    const held = await client.request("GET", `/v2/artifacts/${name}`);
     const { artifact }: { artifact: ArtifactView } = await held.json();
     expect(artifact.title).toBe(name);
   });

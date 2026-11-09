@@ -32,27 +32,12 @@
 // stored as it stands, which is everything the archive holds from before this and every stretch a
 // host that has yet to learn to compress one sends; both forms are read and neither is rewritten.
 //
-// The key says everything about one object: who, which session, which file and where in it. An
-// append weighs its stretch against one listing of the file's prefix, and the one number worth
-// keeping off that listing — how many bytes of the session's own transcript the archive holds — is
-// written down beside the object rather than counted a second time by the consumer the storage
-// event wakes. Counting it there would have cost a listing of the whole prefix per stretch, which
-// is the length of the session; the price is a second write on the append path, and a row left
-// standing ahead of the objects where one of them is lost outright. Nothing derived is ever asked
-// a question the objects can answer, so every reading that must not lag lists them.
+// The key says everything about one object: who, which session, which file and where in it.
+// Nothing writes one any more — a host sends records, and the record path is where prose enters
+// the archive. What is here reads the files that path never wrote, which a replay converts and
+// which the session page and the transcript endpoint serve until it has.
 
-import { sql } from "drizzle-orm";
-import type { TenantDb } from "./db";
-import { sessionIndex } from "./schema/tenant";
-import {
-  compressedStretchName,
-  isStretchName,
-  legacyStretchName,
-  type NamedStretch,
-  namedStretch,
-  type Run,
-  stretchName,
-} from "./transcript-plan";
+import { isStretchName, legacyStretchName, type NamedStretch, namedStretch, type Run } from "./transcript-plan";
 
 // The largest stretch one call may carry. A transcript of any size lands as a run of these.
 export const MAX_STRETCH_BYTES = 1_048_576;
@@ -321,70 +306,6 @@ export const readTranscript = async (
   return { body, gzip };
 };
 
-export interface Bite {
-  text: string;
-  /// Where in the archive this bite ends, as a position in it and never a count of bytes read.
-  /// The two part company over a hole, and a mark that could mean either would have a reader
-  /// index prose it already held or skip prose it never did.
-  through: number;
-}
-
-// One bite of a file's archive, from `from` and at most `limit` bytes, for a reader that will come
-// back for the rest. `through` always moves while stretches are left: a reader that takes it as
-// its mark cannot be handed the same bite twice, whatever the archive holds.
-//
-// A hole is a run of bytes no object covers, which is what a stretch stored past the end of what
-// the archive accounts for leaves behind. A two-segment name lands only where the archive reaches
-// exactly the place in the file the stretch begins at, so a file keyed in that form holds no hole
-// and the step below is reached only by the one-segment form, where a key named a place nothing had
-// reached. Those bytes exist nowhere, so the read steps over the hole to the next stretch rather
-// than reading across it as though the file ran on.
-//
-// This is the one reading of the archive that inflates a stretch in the service. It is the indexer,
-// which wants a window of the prose in the middle of an object and no gzip member can be opened
-// there; every other reader is handed the member and inflates it itself. The append inflates one
-// too, to take the length its name carries, and keeps no byte of what comes out.
-export const readStretch = async (
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-  from: number,
-  to: number,
-  limit: number,
-): Promise<Bite> => {
-  const parts = await stretches(bucket, userId, sessionId, file);
-  const read: Uint8Array[] = [];
-  let at = from;
-  let held = 0;
-  while (at < to && held < limit) {
-    const covering = parts.find((part) => part.archive.from <= at && part.archive.to > at);
-    const part = covering ?? parts.find((part) => part.archive.from > at);
-    if (part === undefined) break;
-    at = Math.max(at, part.archive.from);
-    const offset = at - part.archive.from;
-    const length = Math.min(part.archive.to - at, limit - held, to - at);
-    if (length <= 0) break;
-    const body = await stretchBytes(bucket, userId, sessionId, file, part, offset, length);
-    read.push(body);
-    held += body.byteLength;
-    at += body.byteLength;
-  }
-  const bytes = new Uint8Array(held);
-  let written = 0;
-  for (const body of read) {
-    bytes.set(body, written);
-    written += body.byteLength;
-  }
-  const line = bytes.lastIndexOf(10) + 1;
-  // Level with the archive, so there is no later stretch to finish a line that ends short; the
-  // mark takes the whole bite. Stopped early, so the last line may yet be completed by bytes that
-  // have not arrived, and the mark holds back to the last one that is whole — unless the bite
-  // holds no line end at all, which is one entry longer than a bite and never worth waiting for.
-  const through = at >= to ? to : from + (line > 0 ? line : held);
-  return { text: new TextDecoder().decode(bytes.subarray(0, at >= to ? held : line || held)), through };
-};
-
 export interface ArchivedFile extends Extent {
   file: string;
   bytes: number;
@@ -554,164 +475,6 @@ export const openStretch = (
   range?: R2Range,
 ): Promise<R2ObjectBody | null> =>
   bucket.get(keyOf(userId, sessionId, file, name), range === undefined ? undefined : { range });
-
-// One stretch as it is stored: the bytes of the object, and — where those are gzipped — how many
-// bytes of the file they inflate to. Nothing reads that length off a gzip member, so the name
-// carries it, and every reading of where the stretch sits in the archive rests on that number
-// rather than on the object's own size.
-export type StretchBody =
-  | { kind: "plain"; bytes: ArrayBuffer }
-  | { kind: "gzip"; bytes: ArrayBuffer; inflates: number };
-
-const holdsOf = (body: StretchBody): number => (body.kind === "gzip" ? body.inflates : body.bytes.byteLength);
-
-const nameOf = (from: number, through: number, body: StretchBody): string =>
-  body.kind === "gzip" ? compressedStretchName(from, through, body.inflates) : stretchName(from, through);
-
-const GZIP_MAGIC = 0x1f8b;
-
-// How many bytes one gzip member inflates to, counted by inflating it. The length the format
-// trails is no answer: it belongs to the last member of the body, so a body holding two of them
-// would be stored under a name claiming part of what it holds, and every later read of that object
-// would break for good. Nothing of the inflated bytes is kept — the member is what the archive
-// stores — and a body inflating past what one stretch may hold is stopped here, as is one holding a
-// second member, which the stream refuses outright.
-const inflatedLength = async (body: ArrayBuffer): Promise<number> => {
-  const reader = new Blob([body]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
-  let held = 0;
-  for (;;) {
-    const taken = await reader.read();
-    if (taken.done) return held;
-    held += taken.value.byteLength;
-    if (held > MAX_STRETCH_BYTES) {
-      await reader.cancel();
-      throw new Error(`a gzipped transcript stretch must inflate to at most ${MAX_STRETCH_BYTES} bytes`);
-    }
-  }
-};
-
-// One appended body as the archive stores it. A gzip member goes up as it stands, so a reader is
-// handed the member and inflates it, and the one number every placing of a stretch in the archive
-// rests on is taken here and written into the name. A transcript stretch is prose and JSON and
-// never opens with the two bytes gzip does, so the two forms tell themselves apart: a host that has
-// yet to learn to compress one sends the bytes of the file and they are stored as they stand.
-export const storedStretch = async (body: ArrayBuffer): Promise<StretchBody> => {
-  if (body.byteLength < 2 || new DataView(body).getUint16(0) !== GZIP_MAGIC) {
-    return { kind: "plain", bytes: body };
-  }
-  return { kind: "gzip", bytes: body, inflates: await inflatedLength(body) };
-};
-
-// The one write an append from a host before redaction makes, and it lands only where nothing is
-// yet. Where the stretch begins in the archive is that caller's to say and the key carries it, so
-// nothing is read first and nothing is claimed; a second writer reaching the same place is
-// answered `false` and told how far the archive runs rather than writing over the first.
-//
-// A gzipped body is stored as the encoding it is, so a reader is handed the member and inflates it
-// rather than being handed bytes the service inflated for it.
-export const putStretch = async (
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-  name: string,
-  body: StretchBody,
-): Promise<boolean> => {
-  const written = await bucket.put(keyOf(userId, sessionId, file, name), body.bytes, {
-    httpMetadata: {
-      contentType: "application/x-ndjson",
-      ...(body.kind === "gzip" ? { contentEncoding: "gzip" } : {}),
-    },
-    onlyIf: { etagDoesNotMatch: "*" },
-  });
-  return written !== null;
-};
-
-export type Appended =
-  | {
-      kind: "written";
-      through: number;
-      /// How many bytes of the file the archive holds once this stretch is in it, which is the
-      /// count it held before plus what the stretch just stored accounts for. The reach the stretch
-      /// was weighed against came off the same listing, so this costs no second one.
-      archived: number;
-      /// How many bytes of the file the archive held in front of this stretch, off that same
-      /// listing. It is where a session this store has never indexed is marked as read to.
-      held: number;
-    }
-  | ({ kind: "refused" } & Extent);
-
-// One stretch of a file, taken only where the archive reaches exactly the place in the file the
-// stretch begins at. Two writers read one file at different instants — a listener's beat and a
-// session ending — and hold stretches that begin together and end apart. The key names both ends,
-// so those two would land beside each other and the archive would account for the span they share
-// twice; and nothing can be trimmed off the head of the second, since what it holds is the file
-// redacted and no count of those bytes answers for a place in the file.
-//
-// So how far the archive reaches is read first, and that is what a stretch is weighed against. It
-// costs a listing of the file's prefix, which is the price of an archive that accounts for every
-// byte of a file exactly once however many writers reach it. The loser is answered the reach,
-// which is where its next stretch begins. Two appends whose listings both land before either write
-// leave one stretch read and the other passed over, and the next append from the writer that was
-// passed over is refused and told the reach, so the file comes back to one writer within a beat.
-//
-// The one listing answers both questions the append has: how far into the file the archive reaches,
-// which is what the stretch is weighed against, and how many bytes of the file it holds, which is
-// what the index and a following box are weighed against. The second is written down here rather
-// than counted again by the consumer the storage event wakes.
-export const appendStretch = async (
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-  from: number,
-  through: number,
-  body: StretchBody,
-): Promise<Appended> => {
-  const parts = await stretches(bucket, userId, sessionId, file);
-  const reach = extentOf(parts);
-  if (reach.through !== from) return { kind: "refused", ...reach };
-  const runs = runsOf(parts);
-  // A key already there names this same span of the same file and says it accounts for the same
-  // number of bytes, so the stretch is accounted for whichever writer put it there and the first to
-  // land is the one kept. The count below comes off the name rather than off the body, so two
-  // writers whose gzip left them bodies of different lengths still leave the same count behind.
-  await putStretch(bucket, userId, sessionId, file, nameOf(from, through, body), body);
-  const held = runs[runs.length - 1]?.to ?? 0;
-  return { kind: "written", through, archived: held + holdsOf(body), held };
-};
-
-// The one thing worth keeping off the objects: how many bytes of a session's own transcript the
-// archive holds. The indexer reads it on every pass and must not pay for a listing, and the append
-// that moved it already paid for the listing that says it. It is folded in with MAX, so a write
-// that lands behind one for a later stretch leaves the row where the objects already put it.
-//
-// A delegated turn derives nothing — the index never reads one — so its stretch writes no row at
-// all. The archive answers for those files by listing them, which is the only reading that can
-// answer without lagging.
-//
-// The row a session is first seen by opens marked as read to where the archive already stood, not
-// to zero, so what this store has never indexed is not a gap it reads the whole of. A session the
-// store moved to while its host was running holds a file megabytes long, and a mark opening at
-// zero would have the consumer read and embed every byte of it again, one message of its queue at
-// a time. Opening it level leaves the first stretch the only gap there is, and the archive behind
-// it is reached by a replay and nothing else. A session already carrying a row is left where its
-// own passes put it, since the seed is the insert alone.
-export const cacheArchived = async (
-  db: TenantDb,
-  userId: string,
-  sessionId: string,
-  archived: number,
-  held: number,
-): Promise<void> => {
-  db.insert(sessionIndex)
-    .values({ userId, sessionId, archived, bytes: held, chunks: 0 })
-    .onConflictDoUpdate({
-      target: [sessionIndex.userId, sessionIndex.sessionId],
-      set: { archived: sql`MAX(${sessionIndex.archived}, excluded.archived)` },
-    })
-    .run();
-};
 
 // How far into each of a session's files the archive reaches, counted off the objects and nothing
 // else. Every caller that acts on the answer reads it here — a host working out where to send the

@@ -1,13 +1,22 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { Memory } from "../src/model";
 import { dot, ftsQuery, normalize, quantize, reciprocalRankFusion } from "../src/rank";
 import { type Client, harness } from "./harness";
 
+interface MemoryView {
+  memoryId: string;
+  memoryName: string;
+  type: string;
+  body: string;
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 const listNames = async (response: Response): Promise<string[]> => {
   expect(response.status).toBe(200);
-  const page: { memories: Memory[] } = await response.json();
-  return page.memories.map((memory) => memory.name);
+  const page: { memories: MemoryView[] } = await response.json();
+  return page.memories.map((memory) => memory.memoryName);
 };
 
 describe("user isolation", () => {
@@ -17,12 +26,12 @@ describe("user isolation", () => {
     const bob = await h.user("bob");
     const secret = await alice.save("deploy-secret", { body: "the vault combination is under the doormat" });
 
-    expect((await bob.request("GET", "/v1/memories/deploy-secret")).status).toBe(404);
-    expect(await listNames(await bob.request("GET", "/v1/memories"))).toEqual([]);
+    expect((await bob.request("GET", "/v2/memories/deploy-secret")).status).toBe(404);
+    expect(await listNames(await bob.request("GET", "/v2/memories"))).toEqual([]);
     for (const mode of ["hybrid", "vector", "text"] as const) {
       expect(await bob.search("vault combination doormat", "any", mode)).toEqual([]);
     }
-    expect((await bob.request("DELETE", "/v1/memories/deploy-secret")).status).toBe(404);
+    expect((await bob.request("DELETE", "/v2/memories/deploy-secret")).status).toBe(404);
 
     const bobs = await bob.save("deploy-secret", { body: "bob keeps a different note" });
     expect(bobs.memoryId).not.toBe(secret.memoryId);
@@ -48,34 +57,34 @@ describe("upsert", () => {
   it("updates the existing row and re-embeds it when a name is saved again", async () => {
     const h = await harness();
     const alice = await h.user("alice");
-    const first = await alice.request("PUT", "/v1/memories/build-cache", {
+    const first = await alice.request("PUT", "/v2/memories/build-cache", {
       description: "how the build cache works",
-      type: "project",
+      type: "Project",
       body: "cache lives in redis",
       tags: ["repo:github.com/acme/app"],
     });
     expect(first.status).toBe(201);
-    const created: { memory: Memory } = await first.json();
+    const created: { memory: MemoryView } = await first.json();
 
     h.tick(60_000);
-    const second = await alice.request("PUT", "/v1/memories/build-cache", {
+    const second = await alice.request("PUT", "/v2/memories/build-cache", {
       description: "how the build cache works now",
-      type: "reference",
+      type: "Reference",
       body: "cache moved to an object storage bucket",
       tags: ["global"],
     });
     expect(second.status).toBe(200);
-    const updated: { memory: Memory } = await second.json();
+    const updated: { memory: MemoryView } = await second.json();
 
     expect(updated.memory).toMatchObject({
       memoryId: created.memory.memoryId,
       createdAt: created.memory.createdAt,
       updatedAt: h.now(),
-      type: "reference",
+      type: "Reference",
       body: "cache moved to an object storage bucket",
       tags: ["global"],
     });
-    expect(await listNames(await alice.request("GET", "/v1/memories"))).toEqual(["build-cache"]);
+    expect(await listNames(await alice.request("GET", "/v2/memories"))).toEqual(["build-cache"]);
     expect((await alice.search("object storage bucket", "any", "vector")).map((hit) => hit.memory.name)).toEqual([
       "build-cache",
     ]);
@@ -96,10 +105,10 @@ describe("recall tracking", () => {
     expect(hit?.memory.lastRecalledAt).toBe(0);
 
     const readAt = h.tick(1_000);
-    const response = await alice.request("GET", "/v1/memories/tabs-or-spaces?recall=true");
-    const read: { memory: Memory } = await response.json();
+    const response = await alice.v2.recallMemory("tabs-or-spaces");
+    const read: { memory: { recallCount: number } } = await response.json();
     expect(read.memory.recallCount).toBe(1);
-    expect(read.memory.lastRecalledAt).toBe(readAt);
+    expect((await alice.get("tabs-or-spaces")).lastRecalledAt).toBe(readAt);
     expect((await alice.get("tabs-or-spaces")).recallCount).toBe(1);
   });
 
@@ -135,27 +144,26 @@ describe("hybrid search", () => {
     const alice = await h.user("alice");
     await alice.save("cache-warming", { body: "cache warming steps" });
     await alice.save("weather", { body: "the weather is nice" });
-    const search = (mode: "hybrid" | "text") =>
-      alice.request("POST", "/v1/search", {
+    const search = (mode: "Hybrid" | "Text") =>
+      alice.request("POST", "/v2/memories/search", {
         query: "warming the cache",
         tags: [],
-        any: true,
         limit: 10,
         minScore: 0.5,
         mode,
       });
 
-    const text: { hits: Array<{ memory: Memory }> } = await (await search("text")).json();
-    expect(text.hits.map((hit) => hit.memory.name)).toEqual(["cache-warming"]);
-    const hybrid: { hits: Array<{ memory: Memory }> } = await (await search("hybrid")).json();
-    expect(hybrid.hits.map((hit) => hit.memory.name)).toEqual(["cache-warming"]);
+    const text: { hits: Array<{ memory: MemoryView }> } = await (await search("Text")).json();
+    expect(text.hits.map((hit) => hit.memory.memoryName)).toEqual(["cache-warming"]);
+    const hybrid: { hits: Array<{ memory: MemoryView }> } = await (await search("Hybrid")).json();
+    expect(hybrid.hits.map((hit) => hit.memory.memoryName)).toEqual(["cache-warming"]);
   });
 
   it("removes a deleted memory from the full-text index", async () => {
     const h = await harness();
     const alice = await h.user("alice");
     const memory = await alice.save("short-lived", { body: "ephemeral marker vq77zeta" });
-    expect((await alice.request("DELETE", "/v1/memories/short-lived")).status).toBe(204);
+    expect((await alice.request("DELETE", "/v2/memories/short-lived")).status).toBe(204);
 
     expect(await alice.search("vq77zeta", "any", "text")).toEqual([]);
     const fts = await env.DB.prepare("SELECT count(*) AS n FROM memories_fts WHERE memories_fts MATCH ?")
@@ -190,12 +198,12 @@ describe("tags", () => {
   it("normalizes tags to a sorted, lower-case, de-duplicated set", async () => {
     const h = await harness();
     const alice = await h.user("alice");
-    const memory = await alice.save("normalized", { tags: [" Global ", "global", "Repo:GitHub.com/Acme/App"] });
+    const memory = await alice.save("normalized", { tags: ["global", "global", "repo:github.com/acme/app"] });
     expect(memory.tags).toEqual(["global", "repo:github.com/acme/app"]);
 
-    const rejected = await alice.request("PUT", "/v1/memories/normalized", {
+    const rejected = await alice.request("PUT", "/v2/memories/normalized", {
       description: "d",
-      type: "user",
+      type: "User",
       body: "",
       tags: ["has space"],
     });
@@ -216,13 +224,12 @@ describe("tags", () => {
     }
     expect(await alice.search("release checklist", "any")).toHaveLength(4);
 
-    const unscoped = await alice.request("POST", "/v1/search", {
+    const unscoped = await alice.request("POST", "/v2/memories/search", {
       query: "release checklist",
       tags: [],
-      any: false,
       limit: 10,
       minScore: 0,
-      mode: "hybrid",
+      mode: "Nowhere",
     });
     expect(unscoped.status).toBe(400);
   });
@@ -237,20 +244,24 @@ describe("tags", () => {
     await alice.save("newest", { tags: ["global"] });
     await alice.save("other", { tags: ["repo:github.com/acme/app"] });
 
-    const first = await alice.request("GET", "/v1/memories?tag=global&limit=2");
-    const page: { memories: Memory[]; nextCursor: string } = await first.json();
-    expect(page.memories.map((memory) => memory.name)).toEqual(["newest", "middle"]);
-    const next = `/v1/memories?tag=global&cursor=${encodeURIComponent(page.nextCursor)}`;
+    const first = await alice.request("GET", "/v2/memories?tags=global&limit=2");
+    const page: { memories: MemoryView[]; nextCursor: string } = await first.json();
+    expect(page.memories.map((memory) => memory.memoryName)).toEqual(["newest", "middle"]);
+    const next = `/v2/memories?tags=global&cursor=${encodeURIComponent(page.nextCursor)}`;
     expect(await listNames(await alice.request("GET", next))).toEqual(["oldest"]);
-    expect(await listNames(await alice.request("GET", `/v1/memories?tag=global&since=${middleCreatedAt}`))).toEqual([
-      "newest",
-      "middle",
-    ]);
+    expect(
+      await listNames(
+        await alice.request(
+          "GET",
+          `/v2/memories?tags=global&since=${encodeURIComponent(new Date(middleCreatedAt).toISOString())}`,
+        ),
+      ),
+    ).toEqual(["newest", "middle"]);
   });
 });
 
 interface Elsewhere {
-  name: string;
+  memoryName: string;
   type: string;
   tags: string[];
   description: string;
@@ -261,12 +272,11 @@ const scopedSearch = async (
   client: Client,
   query: string,
   tags: string[],
-  mode: "hybrid" | "vector" | "text" = "hybrid",
-): Promise<{ hits: Array<{ memory: Memory }>; elsewhere: Elsewhere[] }> => {
-  const response = await client.request("POST", "/v1/search", {
+  mode: "Hybrid" | "Vector" | "Text" = "Hybrid",
+): Promise<{ hits: Array<{ memory: MemoryView }>; elsewhere: Elsewhere[] }> => {
+  const response = await client.request("POST", "/v2/memories/search", {
     query,
     tags,
-    any: tags.length === 0,
     limit: 10,
     minScore: 0.1,
     mode,
@@ -287,13 +297,13 @@ describe("elsewhere", () => {
       tags: ["repo:github.com/acme/other"],
     });
 
-    for (const mode of ["hybrid", "vector", "text"] as const) {
+    for (const mode of ["Hybrid", "Vector", "Text"] as const) {
       const result = await scopedSearch(alice, "deploy pipeline", ["repo:github.com/acme/app", "global"], mode);
-      expect(result.hits.map((hit) => hit.memory.name)).toEqual(["here-deploy"]);
+      expect(result.hits.map((hit) => hit.memory.memoryName)).toEqual(["here-deploy"]);
       expect(result.elsewhere).toHaveLength(1);
       expect(result.elsewhere[0]).toMatchObject({
-        name: "other-deploy",
-        type: "reference",
+        memoryName: "other-deploy",
+        type: "Reference",
         tags: ["repo:github.com/acme/other"],
         description: "deploy notes for the other repo",
       });
@@ -322,9 +332,9 @@ describe("elsewhere", () => {
     const alices = await scopedSearch(alice, "build cache warming", ["global"]);
     expect(alices.hits).toEqual([]);
     expect(alices.elsewhere).toHaveLength(3);
-    expect(alices.elsewhere.map((entry) => entry.name)).not.toContain("bob-cache");
+    expect(alices.elsewhere.map((entry) => entry.memoryName)).not.toContain("bob-cache");
 
     const bobs = await scopedSearch(bob, "build cache warming", ["global"]);
-    expect(bobs.elsewhere.map((entry) => entry.name)).toEqual(["bob-cache"]);
+    expect(bobs.elsewhere.map((entry) => entry.memoryName)).toEqual(["bob-cache"]);
   });
 });

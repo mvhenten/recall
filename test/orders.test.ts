@@ -42,7 +42,7 @@ const saysNothing: Answer = () => null;
 const mailboxOf = (userId: string): DurableObjectStub<Mailbox> => env.MAILBOX.get(env.MAILBOX.idFromName(userId));
 
 const deviceId = async (client: Client, name: string): Promise<string> => {
-  const response = await client.request("GET", "/v1/devices");
+  const response = await client.request("GET", "/v2/devices");
   expect(response.status).toBe(200);
   const listed: { devices: { deviceId: string; name: string }[] } = await response.json();
   const device = listed.devices.find((candidate) => candidate.name === name);
@@ -62,7 +62,7 @@ const bus = async () => {
 // The upgrade declares that this daemon reads the kind of a message, which is what the mailbox
 // hands an order to.
 const listen = async (h: Harness, token: string, answer: Answer): Promise<Listener> => {
-  const response = await h.send("/v1/messages/listen", {
+  const response = await h.send("/v2/messages/listen", {
     headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
   expect(response.status).toBe(101);
@@ -92,7 +92,7 @@ interface Released {
 }
 
 const released = async (h: Harness, token: string): Promise<Released> => {
-  const response = await h.send("/v1/messages/listen", {
+  const response = await h.send("/v2/messages/listen", {
     headers: { authorization: `Bearer ${token}`, upgrade: "websocket" },
   });
   expect(response.status).toBe(101);
@@ -116,7 +116,12 @@ const released = async (h: Harness, token: string): Promise<Released> => {
 };
 
 const order = (client: Client, toDeviceId: string, body: string): Promise<Response> =>
-  client.request("POST", "/v1/messages", { kind: "order", toDeviceId, body });
+  client.request("POST", "/v2/messages", {
+    kind: "order",
+    address: { scope: "host", target: toDeviceId },
+    fromSessionId: "",
+    body,
+  });
 
 const outcome = async (response: Response): Promise<Sent> => {
   expect(response.status).toBe(201);
@@ -203,12 +208,22 @@ describe("orders", () => {
 
     const old = await released(h, desktopToken);
     const green = await outcome(
-      await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "the build is green" }),
+      await laptop.request("POST", "/v2/messages", {
+        kind: "news",
+        address: { scope: "host", target: desktopId },
+        fromSessionId: "",
+        body: "the build is green",
+      }),
     );
     await eventually(() => old.read.length === 1, "the news a released daemon still reads");
     const second = await outcome(await order(laptop, desktopId, "restart the worker"));
     const red = await outcome(
-      await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId, body: "main is red" }),
+      await laptop.request("POST", "/v2/messages", {
+        kind: "news",
+        address: { scope: "host", target: desktopId },
+        fromSessionId: "",
+        body: "main is red",
+      }),
     );
     await eventually(() => old.read.length === 2, "the news that follows the ack it wrote back");
 

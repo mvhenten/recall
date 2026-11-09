@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chunkTurns, MAX_CHUNK_CHARS } from "../src/chunks";
+import { type Chunk, chunkTurnsCarrying, closeChunks, MAX_CHUNK_CHARS } from "../src/chunks";
 import { agentName, readTurns } from "../src/turns";
 
 const line = (entry: Record<string, unknown>): string => JSON.stringify(entry);
@@ -97,6 +97,10 @@ describe("reading a transcript", () => {
 
 describe("chunking a session", () => {
   const turn = (speaker: "user" | "model", text: string, at: number) => ({ speaker, text, at });
+  const chunkTurns = (turns: ReturnType<typeof turn>[]): Chunk[] => {
+    const { closed, open } = chunkTurnsCarrying(turns, []);
+    return [...closed, ...closeChunks(open)];
+  };
 
   it("keeps each speaker in chunks of its own", () => {
     const chunks = chunkTurns([

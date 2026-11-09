@@ -1303,53 +1303,6 @@ export interface IndexedChunk {
   embedding: Uint8Array;
 }
 
-// A session is off the record mark while it holds no row for its own transcript. Every statement
-// the two indexing paths write carries it, so a session taken over by a replay stops the other
-// path dead rather than letting the two write the same prose twice.
-const offRecord = (userId: string, sessionId: string): SQL =>
-  sql`NOT EXISTS (SELECT 1 FROM ${sessionRecords}
-    WHERE ${sessionRecords.userId} = ${userId} AND ${sessionRecords.sessionId} = ${sessionId}
-      AND ${sessionRecords.file} = ${MAIN_FILE})`;
-
-// What one indexing pass produced, written in one batch with the mark that says how far it read.
-// The chunks are appended under ordinals that only climb, so a session indexed again after it was
-// resumed adds to what is there and nothing already indexed is rewritten or lost.
-//
-// It all lands in one batch, and every statement of it lands only while the session is off the
-// record mark. A session taken over by a replay goes on the mark in the batch that drops the
-// chunks this path wrote, so a pass that read its bite before the takeover and writes after it
-// writes nothing at all: there is no ordering of the two that leaves one session holding chunks
-// from both paths.
-export const writeChunks = async (
-  db: TenantDb,
-  userId: string,
-  sessionId: string,
-  from: number,
-  chunks: IndexedChunk[],
-  reached: number,
-): Promise<void> => {
-  db.transaction((tx) => {
-    chunks.forEach((chunk, index) => {
-      tx.insert(sessionChunks)
-        .select(
-          sql`SELECT NULL, ${userId}, ${sessionId}, ${from + index}, ${chunk.speaker}, ${chunk.text},
-            ${blobOf(chunk.embedding)}, ${chunk.at}
-          WHERE ${offRecord(userId, sessionId)}`,
-        )
-        .onConflictDoNothing({ target: [sessionChunks.userId, sessionChunks.sessionId, sessionChunks.ordinal] })
-        .run();
-    });
-    // The reach climbs and never drops back to what this pass read. Another writer may have moved
-    // it between the read and here — a record append, or the one-shot copy out of D1 shifting a
-    // session's copied chunks above the ordinals this object already holds — and a reach set back
-    // under theirs would have the next pass write over prose that is already indexed.
-    tx.update(sessionIndex)
-      .set({ bytes: reached, chunks: sql`MAX(chunks, ${from + chunks.length})` })
-      .where(and(eq(sessionIndex.userId, userId), eq(sessionIndex.sessionId, sessionId), offRecord(userId, sessionId)))
-      .run();
-  });
-};
-
 export interface ChunkCandidate {
   chunkSeq: number;
   sessionId: string;
