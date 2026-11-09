@@ -30,6 +30,7 @@ import {
   LIST_PARAMS,
   type ListInput,
   type Live,
+  MAIN_FILE,
   MAX_SESSION_TEXT_CHARS,
   type Memory,
   type MemoryCounts,
@@ -55,20 +56,8 @@ import {
 } from "./model";
 import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE, sizeText, TOKENS } from "./page";
 import { MAX_EMAIL_SHARES, SHARE_DAYS, type ShareView, shareTimeLeft } from "./shares";
-import {
-  type Follow,
-  gapsIn,
-  gapsInSpans,
-  listedRuns,
-  listedSpans,
-  type Plan,
-  type RecordSpan,
-  type Run,
-  type Listing as RunListing,
-  type SpanListing,
-} from "./transcript-plan";
+import { type Follow, gapsInSpans, listedSpans, type Plan, type RecordSpan, type SpanListing } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
-import { MAIN_FILE } from "./transcripts";
 
 export interface Tab {
   path: string;
@@ -1439,16 +1428,10 @@ export const TRANSCRIPT_FOLLOW_MS = 10_000;
 
 // What the page knows about one transcript file. A session with nothing archived and a session
 // asked for a file it never wrote are different answers, and the page says which rather than
-// handing the browser a manifest of no stretches.
-//
-// The archive takes a transcript on two paths and the page reads whichever holds the file. A file
-// the records hold is answered off them — that is what `/v2` writes, and a session born there has
-// nothing under the byte path's prefix at all — and the byte path answers for the rest, which is
-// what `/v1` left behind.
+// handing the browser a manifest of no objects.
 export type TranscriptPlan =
   | { kind: "none" }
   | { kind: "missing"; file: string; files: string[] }
-  | { kind: "read"; file: string; files: string[]; bytes: number; runs: Run[] }
   | { kind: "records"; file: string; files: string[]; records: number; spans: RecordSpan[] };
 
 // What the send box has to say for itself after a post, and nothing when it has nothing.
@@ -1574,34 +1557,16 @@ export const transcriptScript = (): Response =>
 // that can open it keeps the JSON valid and the element whole.
 const planJson = (plan: unknown): string => JSON.stringify(plan).replaceAll("<", "\\u003c");
 
-// A hole is a run of bytes the archive never got, which is what a stretch written past the end of
-// the file leaves behind — including one in front of the first stretch, where a file whose
-// archiving began late has no beginning at all. The entry that straddles a hole cannot be read,
-// and saying so is what keeps a reader from taking the entries either side of it for the whole
-// conversation.
-const holeNote = (listing: RunListing): string => {
-  const { bytes, places } = gapsIn(listing);
-  if (bytes === 0) return "";
-  return `<p class="callout">The archive never got ${bytes} bytes of this file, in ${places} ${places === 1 ? "place" : "places"}. Whatever entry each gap falls inside is not shown.</p>`;
-};
-
 // What a manifest held back says for itself. The reader is told the box stops short of the start
 // of the file rather than being left to read the oldest turn it shows as the first one there was.
-const trimNote = (listing: RunListing, bytes: number): string =>
-  listing.from === 0
-    ? ""
-    : `<p class="callout">This file runs to ${sizeText(bytes)}. The last ${sizeText(bytes - listing.from)} of it is listed here; the stretches before that are not, so the box stops short of the start of the session.</p>`;
-
-// What a manifest of records held back says for itself, which is the same thing in the places
-// records are counted in: a record is a line of the file and never a byte of it, so what the box
-// stops short of is said in records.
+// It is said in records: a record is a line of the file and never a byte of it.
 const spanTrimNote = (listing: SpanListing, records: number): string =>
   listing.from === 0
     ? ""
     : `<p class="callout">This file holds ${records} records. The last ${listing.readable} of them are listed here; the records before that are not, so the box stops short of the start of the session.</p>`;
 
-// A hole in a file held as records is a run of ordinals no object holds, which is what an append
-// the archive never got leaves behind. The walk reads the records either side of it, and saying
+// A hole is a run of ordinals no object holds, which is what an append the archive never got
+// leaves behind. The walk reads the records either side of it, and saying
 // how many are missing is what keeps a reader from taking the entries around the gap for one
 // unbroken conversation.
 const spanHoleNote = (listing: SpanListing): string => {
@@ -1619,8 +1584,8 @@ const spanHoleNote = (listing: SpanListing): string => {
 const followOf = (view: SessionView, file: string, from: number): Follow | null =>
   view.deviceId !== null && file === MAIN_FILE ? { from, every: TRANSCRIPT_FOLLOW_MS } : null;
 
-// The box itself, which is the same document whichever path holds the file: a scroller the
-// browser fills, the two notes it talks through, and the manifest it plans its reads against.
+// The box itself: a scroller the browser fills, the two notes it talks through, and the manifest
+// it plans its reads against.
 const transcriptBox = (file: string, plan: Plan, notes: string): string =>
   `${notes}
 <div class="scroller" id="tx" tabindex="0" aria-label="Transcript">
@@ -1636,35 +1601,13 @@ const transcriptCard = (view: SessionView): string => {
   const held = view.transcript;
   const id = view.session.sessionId;
   const path = `${sessionPath(id)}/${TRANSCRIPT_SEGMENT}`;
-  if (held.kind === "records") {
-    const listing = listedSpans(held.spans);
-    const last = listing.spans[listing.spans.length - 1];
-    const plan: Plan = {
-      held: "records",
-      path,
-      file: held.file,
-      bytes: listing.bytes,
-      step: TRANSCRIPT_STEP_BYTES,
-      spans: listing.spans,
-      follow: followOf(view, held.file, last === undefined ? 0 : last.from + last.held),
-    };
-    return insightCard(
-      "Transcript",
-      `${held.file} · ${sizeText(listing.bytes)}`,
-      transcriptBox(
-        held.file,
-        plan,
-        `${fileChips(id, held.files, held.file)}${spanTrimNote(listing, held.records)}${spanHoleNote(listing)}`,
-      ),
-    );
-  }
   if (held.kind === "none") {
     return insightCard(
       "Transcript",
       "nothing archived",
       emptyState(
         "No transcript is archived for this session.",
-        "A host archives a session's transcript as it runs, and the stretches land here within a minute of the prose.",
+        "A host archives a session's transcript as it runs, and the records land here within a minute of the prose.",
       ),
     );
   }
@@ -1675,23 +1618,23 @@ const transcriptCard = (view: SessionView): string => {
       `${fileChips(id, held.files, held.file)}${emptyState(`This session has no ${held.file} on record.`, "Pick one of the files it did archive.")}`,
     );
   }
-  const listing = listedRuns(held.runs);
+  const listing = listedSpans(held.spans);
+  const last = listing.spans[listing.spans.length - 1];
   const plan: Plan = {
-    held: "bytes",
     path,
     file: held.file,
-    readable: listing.readable,
+    bytes: listing.bytes,
     step: TRANSCRIPT_STEP_BYTES,
-    runs: listing.runs,
-    follow: followOf(view, held.file, held.bytes),
+    spans: listing.spans,
+    follow: followOf(view, held.file, last === undefined ? 0 : last.from + last.held),
   };
   return insightCard(
     "Transcript",
-    `${held.file} · ${sizeText(held.bytes)}`,
+    `${held.file} · ${sizeText(listing.bytes)}`,
     transcriptBox(
       held.file,
       plan,
-      `${fileChips(id, held.files, held.file)}${trimNote(listing, held.bytes)}${holeNote(listing)}`,
+      `${fileChips(id, held.files, held.file)}${spanTrimNote(listing, held.records)}${spanHoleNote(listing)}`,
     ),
   );
 };

@@ -112,10 +112,10 @@ import {
   type InjectInput,
   isRecord,
   type Live,
+  MAIN_FILE,
   type MemoryHit,
   type MemoryType,
   type Parsed,
-  parseByteRange,
   parseHistory,
   parseLabels,
   parseList,
@@ -125,9 +125,6 @@ import {
   parseSearch,
   parseSessionId,
   parseSessionSearch,
-  parseStretchCursor,
-  parseStretchName,
-  parseStretchOffset,
   parseTranscriptFile,
   type SaveInput,
   SEARCH_RESULTS,
@@ -159,6 +156,7 @@ import {
   MAX_RECORDS_BYTES,
   MAX_RECORDS_PER_APPEND,
   putRecords,
+  type RecordedFile,
   readRecordAppend,
   readRecords,
   readRecordsBetween,
@@ -221,7 +219,6 @@ import {
   getMemory,
   historyCursorDirection,
   type IndexedChunk,
-  indexMark,
   labelTargets,
   listBoard,
   listMemories,
@@ -233,7 +230,6 @@ import {
   memoryCounts,
   memoryCursorDirection,
   nameSession,
-  onRecordMark,
   openChunks,
   postBoardMessage,
   putSession,
@@ -282,16 +278,7 @@ import {
   TOOLS,
   toolArguments,
 } from "./tools";
-import { packedStretch, type Reach, type RecordReach } from "./transcript-plan";
-import {
-  archivedFiles,
-  archivedSince,
-  archivedTranscript,
-  type HeldFile,
-  MAIN_FILE,
-  openStretch,
-  readTranscript,
-} from "./transcripts";
+import type { RecordReach } from "./transcript-plan";
 import { agentName, readTurns } from "./turns";
 import {
   deviceView,
@@ -435,21 +422,6 @@ const json = (body: unknown, status = 200, headers?: HeadersInit): Response => R
 const error = (status: number, message: string): Response => json({ error: message }, status);
 
 const readJson = (request: Request): Promise<unknown> => request.json().catch(() => null);
-
-// Whether a reader of the archive takes the gzip members a stretch is stored as. Every browser does
-// and so does the host's own client, which is the whole of why nothing is inflated here for them;
-// one that does not is answered the bytes of the file. A client that names the coding only to
-// refuse it — `gzip;q=0` — is one of those, and is answered what it asked for rather than what it
-// named.
-const takesGzip = (request: Request): boolean => {
-  for (const coding of (request.headers.get("accept-encoding") ?? "").split(",")) {
-    const [named, ...params] = coding.split(";").map((part) => part.trim().toLowerCase());
-    if (named !== "gzip") continue;
-    const quality = params.find((param) => param.startsWith("q="));
-    return quality === undefined || Number(quality.slice(2)) > 0;
-  }
-  return false;
-};
 
 const embeddingText = (name: string, description: string, body: string): string => `${name}\n${description}\n\n${body}`;
 
@@ -642,7 +614,7 @@ interface DashboardAsk {
   tab: Tab | null;
   segments: string[];
   rawSessionId: string;
-  bytes: boolean;
+  reading: boolean;
   shareName: string | null;
   saving: boolean;
   posting: boolean;
@@ -660,7 +632,7 @@ const dashboardAsk = (request: Request, url: URL): DashboardAsk => {
     tab,
     segments,
     rawSessionId: segments[0] ?? "",
-    bytes: segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT,
+    reading: segments.length === 2 && segments[1] === TRANSCRIPT_SEGMENT,
     shareName,
     saving: posted && tab?.path === LABELS_TAB.path,
     posting: posted && tab?.path === BOARD_TAB.path,
@@ -669,90 +641,16 @@ const dashboardAsk = (request: Request, url: URL): DashboardAsk => {
   };
 };
 
-// One stretch stored gzipped, handed over as it stands. A gzip member has no inner range, so the
-// manifest never splits a read of one and the whole object is the answer: the browser inflates it,
-// which leaves this reading no byte of the archive to touch and puts under a third of them on the
-// wire. This route sits behind the Access assertion, so every reader of it is a browser and every
-// browser takes gzip — `fetch` cannot drop the header — and the member goes over as it is.
-const compressedStretch = async (
-  request: Request,
-  bucket: R2Bucket,
-  userId: string,
-  sessionId: string,
-  file: string,
-  name: string,
-  inflates: number,
-): Promise<Response> => {
-  if (request.headers.get("range") !== null) {
-    return error(416, `the stretch at ${name} is one gzip member, so it is read whole, as ${inflates} bytes`);
-  }
-  const object = await openStretch(bucket, userId, sessionId, file, name);
-  if (object === null) {
-    return error(404, `the archive holds no stretch of ${file} at ${name} of session ${sessionId}`);
-  }
-  return new Response(object.body, {
-    headers: {
-      "content-type": "application/x-ndjson",
-      "cache-control": "no-store",
-      "content-encoding": "gzip",
-    },
-  });
-};
-
-// The bytes of one stretch, streamed as they come off the archive. The key is built from the user
-// the Access assertion resolved to, so a caller reaches nothing outside its own prefix, and the
-// range is the browser's to choose: this reads no listing, joins no stretches and parses nothing,
-// which is the whole of why the window the reader sees is the browser's own business.
+// One window of a file, streamed as the bytes of the file it accounts for. The window is two
+// ordinals and no byte range: a record is a line of the file verbatim, redaction leaves it at
+// another length than the host read, and where it sits in the file on disk is something the
+// archive never knew. The objects covering the window have to tile it exactly; where they do not,
+// this says the archive holds no such run rather than answering short of it.
 //
-// It is answered in the Worker because it reads the archive and nothing else. A reader scrolling a
-// long transcript sends thousands of these, and routing each through the tenant object would buy
-// nothing it does not already have.
-const transcriptBytes = async (
-  request: Request,
-  url: URL,
-  bucket: R2Bucket,
-  userId: string,
-  rawSessionId: string,
-): Promise<Response> => {
-  const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
-  if (!session.ok) return error(400, session.error);
-  const file = parseTranscriptFile(url.searchParams.get("file"));
-  if (!file.ok) return error(400, file.error);
-  const at = parseStretchName(url.searchParams.get("at"));
-  if (!at.ok) return error(400, at.error);
-  const packed = packedStretch(at.value);
-  if (packed !== null) {
-    return compressedStretch(request, bucket, userId, session.value, file.value, at.value, packed.inflates);
-  }
-  const asked = parseByteRange(request.headers.get("range"));
-  if (!asked.ok) return error(416, asked.error);
-  const { offset, length } = asked.value;
-  const object = await openStretch(bucket, userId, session.value, file.value, at.value, { offset, length });
-  if (object === null) {
-    return error(404, `the archive holds no stretch of ${file.value} at ${at.value} of session ${session.value}`);
-  }
-  if (offset + length > object.size) {
-    return error(416, `the stretch at ${at.value} holds ${object.size} bytes`);
-  }
-  return new Response(object.body, {
-    status: 206,
-    headers: {
-      "content-type": "application/x-ndjson",
-      "cache-control": "no-store",
-      "content-range": `bytes ${offset}-${offset + length - 1}/${object.size}`,
-    },
-  });
-};
-
-// One window of a file the record path holds, streamed as the bytes of the file it accounts for.
-// The window is two ordinals and no byte range: a record is a line of the file verbatim,
-// redaction leaves it at another length than the host read, and where it sits in the file on disk
-// is something the archive never knew. The objects covering the window have to tile it exactly;
-// where they do not, this says the archive holds no such run rather than answering short of it.
-//
-// Like the bytes of a stretch, it is answered in the Worker: it reads the archive and nothing
-// else, and the key is built from the user the Access assertion resolved to, so a caller reaches
-// nothing outside its own prefix.
+// It is answered in the Worker because it reads the archive and nothing else, and the key is built
+// from the user the Access assertion resolved to, so a caller reaches nothing outside its own
+// prefix. A reader scrolling a long transcript sends thousands of these, and routing each through
+// the tenant object would buy nothing it does not already have.
 const transcriptRecords = async (
   url: URL,
   bucket: R2Bucket,
@@ -1365,13 +1263,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // What the page tells the browser about a session's transcript: which files it holds, and where
   // every window of the chosen one sits. It is listings and no reads — the browser fetches the
   // prose it wants itself, off the manifest named here.
-  //
-  // The two paths the archive takes a transcript on are weighed the way `/v2` weighs them. The
-  // record path is what `/v2` writes, so a file the records hold is answered off them, and the
-  // byte path answers for the rest, which is what `/v1` left behind. A session converted by a
-  // replay keeps the byte objects of the file it was converted from — nothing deletes them — so
-  // reading the bytes of a file the records also hold would show the transcript as it stood
-  // before the conversion and silently drop everything appended since.
   const transcriptPlan = async (
     env: TenantEnv,
     userId: string,
@@ -1382,57 +1273,27 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const chosen = wanted === null ? { ok: true as const, value: MAIN_FILE } : parseTranscriptFile(wanted);
     if (!chosen.ok) return dashboardNotice(400, "File refused", `${chosen.error}.`, "Back to the dashboard");
     const file = chosen.value;
-    const [recorded, held] = await Promise.all([
-      recordedTranscript(env.TRANSCRIPTS, userId, sessionId, file),
-      archivedTranscript(env.TRANSCRIPTS, userId, sessionId),
-    ]);
-    const byRecords = new Set(recorded.files.map((recording) => recording.file));
-    const files = [...new Set([...byRecords, ...held.map((archived) => archived.file)])].sort((left, right) =>
-      left.localeCompare(right),
-    );
+    const recorded = await recordedTranscript(env.TRANSCRIPTS, userId, sessionId, file);
+    const files = recorded.files.map((recording) => recording.file).sort((left, right) => left.localeCompare(right));
     if (files.length === 0) return { kind: "none" };
     const recording = recorded.files.find((one) => one.file === file);
-    if (recording !== undefined) {
-      return { kind: "records", file, files, records: recording.records, spans: recorded.spans };
-    }
-    const archive = held.find((archived) => archived.file === file);
-    if (archive === undefined || archive.bytes === 0) return { kind: "missing", file, files };
-    return { kind: "read", file, files, bytes: archive.bytes, runs: archive.runs };
+    if (recording === undefined) return { kind: "missing", file, files };
+    return { kind: "records", file, files, records: recording.records, spans: recorded.spans };
   };
 
-  // Whether anyone is still running the session, and the stretches of its file around and past
-  // where the reader has read. Nothing writes the byte archive any more, so a file held as bytes
-  // cannot grow and the listing is the whole of the answer: a beat over one costs the page below
-  // and never a row read first to find out whether to pay for it.
-  //
-  // The cursor is where the reader has read to and the stretch it read to the end of, and the two
-  // come off the manifest the archive itself wrote: a read is taken whole, so `from` is always the
-  // end of the stretch `after` names. That pair is what bounds the listing a beat pays for — the
-  // page opens past `after` and its first object sits at `from` — so a beat over a session of ten
-  // thousand stretches costs what one over a session of ten costs. The reader reads forward from
-  // `from` across whatever comes back.
-  //
-  // Only the session's own file is followed. Every other file is a delegated turn, which derives
-  // nothing and so keeps no extent, and a listing is the only reading that could answer for one.
-  // The same question of a file the record path holds: how its records lay out past where the
-  // reader has read, and whether anyone is still running the session. The mark the index commits
-  // with every append says how far the records reach without opening the archive at all, so a
-  // beat that finds nothing new lists nothing. Like the byte path's extent it is trusted to say a
-  // file has grown and never to say it has not: a writer that stored records and lost the file
-  // before committing leaves the mark behind the objects, and the next append carries it past
-  // them.
+  // How a file's records lay out past where the reader has read, and whether anyone is still
+  // running the session. The mark the index commits with every append says how far the records
+  // reach without opening the archive at all, so a beat that finds nothing new lists nothing. It
+  // is trusted to say a file has grown and never to say it has not: a writer that stored records
+  // and lost the file before committing leaves the mark behind the objects, and the next append
+  // carries it past them.
   //
   // The objects are listed only where the mark says records landed, because a window the reader
   // asks for opens and ends on an object boundary and nowhere else, and nothing but the listing
   // says where those fall. That listing is one page of the file from the reader's own cursor on,
   // so a beat over a session of twelve thousand appends costs what one over a session of ten
   // costs.
-  const transcriptRecordTail = async (
-    url: URL,
-    env: TenantEnv,
-    userId: string,
-    rawSessionId: string,
-  ): Promise<Response> => {
+  const transcriptTail = async (url: URL, env: TenantEnv, userId: string, rawSessionId: string): Promise<Response> => {
     const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
     if (!session.ok) return error(400, session.error);
     const file = parseTranscriptFile(url.searchParams.get("file"));
@@ -1448,25 +1309,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         ? await recordSpansSince(env.TRANSCRIPTS, userId, session.value, file.value, since.value)
         : [];
     const reach: RecordReach = { running: device !== null, spans };
-    return json(reach, 200, { "cache-control": "no-store" });
-  };
-
-  const transcriptTail = async (url: URL, env: TenantEnv, userId: string, rawSessionId: string): Promise<Response> => {
-    if (url.searchParams.has("since")) return transcriptRecordTail(url, env, userId, rawSessionId);
-    const session = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!session.ok) return error(400, session.error);
-    const file = parseTranscriptFile(url.searchParams.get("file"));
-    if (!file.ok) return error(400, file.error);
-    if (file.value !== MAIN_FILE) return error(400, `only ${MAIN_FILE} is followed as it is written`);
-    const from = parseStretchOffset(url.searchParams.get("from"));
-    if (!from.ok) return error(400, from.error);
-    const after = parseStretchCursor(url.searchParams.get("after"));
-    if (!after.ok) return error(400, after.error);
-    const [device, runs] = await Promise.all([
-      liveSessionDevice(env.DB, userId, session.value, deps.now()),
-      archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value),
-    ]);
-    const reach: Reach = { running: device !== null, runs };
     return json(reach, 200, { "cache-control": "no-store" });
   };
 
@@ -2446,20 +2288,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ sessions: listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)) });
   };
 
-  // Every file of a session the archive holds, whichever path wrote it. The record path is the one
-  // `/v2` writes with and the byte path is what `/v1` left behind, so a file the records hold is
-  // answered off them and the byte path answers for the rest.
-  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<HeldFile[]> => {
-    const [recorded, archived] = await Promise.all([
-      recordFiles(bucket, userId, sessionId),
-      archivedFiles(bucket, userId, sessionId),
-    ]);
-    const held = new Set(recorded.map((file) => file.file));
-    const byBytes = archived
-      .filter((file) => !held.has(file.file))
-      .map(({ file, bytes, through, named }): HeldFile => ({ held: "bytes", file, bytes, through, named }));
-    return [...recorded, ...byBytes].sort((left, right) => left.file.localeCompare(right.file));
-  };
+  // Every file of a session the archive holds, which is the files the records hold and nothing
+  // else.
+  const v2FilesOf = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<RecordedFile[]> =>
+    (await recordFiles(bucket, userId, sessionId)).sort((left, right) => left.file.localeCompare(right.file));
 
   const v2Session = async (bucket: R2Bucket, db: TenantDb, caller: Caller, target: string): Promise<Response> => {
     const found = await findSession(db, caller.userId, target, deps.now());
@@ -2502,21 +2334,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
     const file = parseTranscriptFile(url.searchParams.get("file"));
     if (!file.ok) return error(400, file.error);
-    const ndjson = (body: ReadableStream<Uint8Array>, gzip: boolean): Response =>
-      new Response(body, {
-        headers: {
-          "content-type": "application/x-ndjson",
-          "cache-control": "no-store",
-          ...(gzip ? { "content-encoding": "gzip" } : {}),
-        },
-      });
-    // The records first: they are what `/v2` writes, and a session that only ever posted them has
-    // nothing under the byte path's prefix at all.
     const recorded = await readRecords(bucket, caller.userId, sessionId, file.value);
-    if (recorded !== null) return ndjson(recorded, false);
-    const archived = await readTranscript(bucket, caller.userId, sessionId, file.value, takesGzip(request));
-    if (archived === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
-    return ndjson(archived.body, archived.gzip);
+    if (recorded === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
+    return new Response(recorded, {
+      headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
+    });
   };
 
   const v2Usage = async (request: Request, db: TenantDb, caller: Caller, sessionId: string): Promise<Response> => {
@@ -2580,18 +2402,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       const taken: V2RecordsAccepted = { file: file.value, next };
       return json(taken);
     };
-    // One session, one path into the index. A session the byte path already wrote is taken over
-    // whole or not at all: the record mark is written, the byte mark cleared and the chunks the
-    // byte path wrote dropped, all in the batch that carries this append — so the two never index
-    // the same prose and the chunk counter they share is held by one of them.
-    //
-    // Nothing here weighs where the append opens. A session on the byte path holds no record mark,
-    // so the fold below reads the file from ordinal 0 whatever `from` says, which is the whole of
-    // what a takeover needs; an append landing in the middle of a file the records do not reach is
-    // refused by the ordinal check for the ordinary reason and told to send from 0.
-    const mark = await indexMark(db, userId, sessionId);
-    const crossing = file.value === MAIN_FILE && mark !== null && mark.archived > 0;
-    const takeover = crossing && !(await onRecordMark(db, userId, sessionId));
     // The mark says where the file is waiting, and the objects are the arbiter: the two part
     // company only where a writer stored records and did not live to write the mark. The objects
     // also carry the one thing the mark cannot, which is whether a break closed the record in
@@ -2622,8 +2432,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       return refuse(await recordsReach(bucket, userId, sessionId, file.value));
     }
     const next = from + records.length;
-    // Only the session's own file reaches the index, exactly as the byte path's consumer reads
-    // only `main`. A delegated turn is the model talking to itself and derives nothing.
+    // Only the session's own file reaches the index. A delegated turn is the model talking to
+    // itself and derives nothing.
     if (file.value !== MAIN_FILE) {
       const commit = {
         userId,
@@ -2634,7 +2444,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         chunkFrom: 0,
         chunks: [],
         open: [],
-        takeover: false,
       };
       if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
       return accepted(next);
@@ -2648,9 +2457,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const text = [...behind, ...records].join("\n");
     const carried = await openChunks(db, userId, sessionId, file.value);
     const { closed: shut, open } = chunkTurnsCarrying(readTurns(text, file.value), carried);
-    // A takeover indexes the session from nothing, so its chunks open at ordinal 0 and the byte
-    // path's are dropped under them in the same batch.
-    const chunkFrom = takeover ? 0 : await chunkReach(db, userId, sessionId);
+    const chunkFrom = await chunkReach(db, userId, sessionId);
     const indexed = await embedChunks(shut);
     // The mark the work above was read against, still standing. A host knows its next `from`
     // without asking and pipelines two appends, and the second read the chunks and the open chunk
@@ -2664,7 +2471,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       chunkFrom,
       chunks: indexed,
       open,
-      takeover,
     };
     if (!(await commitRecords(db, commit))) return refuse(await recordReach(db, userId, sessionId, file.value));
     // The span this append indexed opens the session wherever the mark stood at nothing, which is
@@ -2707,7 +2513,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       chunkFrom,
       chunks: indexed,
       open: [],
-      takeover: false,
     });
   };
 
@@ -2792,12 +2597,12 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const db = env.DB;
     const lost = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Back to the dashboard");
-    const { tab, segments, rawSessionId, bytes, shareName, saving } = dashboardAsk(request, url);
+    const { tab, segments, rawSessionId, reading, shareName, saving } = dashboardAsk(request, url);
     if (saving) return saveLabels(request, url, db, userId, lost);
     // A read of the tail renders no page, so it does not pay for the tally a page carries in its
     // header. It reads this tenant's rows for how far the file now reaches, which is what keeps it
     // here while the prose of a named window is answered in the Worker off the archive alone.
-    if (bytes) return transcriptTail(url, env, userId, rawSessionId);
+    if (reading) return transcriptTail(url, env, userId, rawSessionId);
     const now = deps.now();
     const live = await liveTally(db, userId, now);
     if (shareName !== null) {
@@ -3333,7 +3138,7 @@ export const createApp = (deps: Deps): App => {
       dashboardNotice(status, title, text, "Back to the dashboard");
     const signIn = (status: number, title: string, text: string): Response =>
       dashboardNotice(status, title, text, "Sign in again");
-    const { saving, posting, sending, sharing, bytes, rawSessionId } = dashboardAsk(request, url);
+    const { saving, posting, sending, sharing, reading, rawSessionId } = dashboardAsk(request, url);
     if (request.method !== "GET" && !saving && !posting && !sending && !sharing) {
       return lost(
         405,
@@ -3346,15 +3151,10 @@ export const createApp = (deps: Deps): App => {
     const userId = await invited(env.DB, email, signIn);
     if (userId instanceof Response) return userId;
     // The prose of one named window comes off the archive and reads no row at all, so it is
-    // answered here rather than one round trip into the object apiece — the bytes of a stretch
-    // for a file the byte path holds, the records of an ordinal window for one the record path
-    // holds. `from` and `since` ask how far the file now reaches, which is a row this tenant
-    // holds, so those go on to the object.
-    if (bytes && !url.searchParams.has("from") && !url.searchParams.has("since")) {
-      if (url.searchParams.has("records")) {
-        return transcriptRecords(url, env.TRANSCRIPTS, userId, rawSessionId);
-      }
-      return transcriptBytes(request, url, env.TRANSCRIPTS, userId, rawSessionId);
+    // answered here rather than one round trip into the object apiece. `since` asks how far the
+    // file now reaches, which is a row this tenant holds, so that one goes on to the object.
+    if (reading && !url.searchParams.has("since")) {
+      return transcriptRecords(url, env.TRANSCRIPTS, userId, rawSessionId);
     }
     return tenantOf(env, userId).dashboard(request, userId, email, handed());
   };

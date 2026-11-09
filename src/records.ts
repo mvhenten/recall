@@ -1,7 +1,6 @@
-// A session's transcript as the records it is written in, which is the other way the archive takes
-// one. The byte path keys an object by where its stretch sits in the file and leaves the reader to
-// work out what a line is; a record is one redacted JSONL line verbatim, and its place in the file
-// is its ordinal — the position it holds in the records of that file and nothing else.
+// A session's transcript as the records it is written in, which is the one way prose enters the
+// archive. A record is one redacted JSONL line verbatim, and its place in the file is its ordinal
+// — the position it holds in the records of that file and nothing else.
 //
 // One object per append, under `records/<user id>/<session id>/<file>/<first ordinal>`. The
 // ordinal is zero-padded so a listing sorts in the order the records were written, and the count
@@ -9,12 +8,21 @@
 // object ends. Beside the count rides the one byte no ordinal accounts for: whether a line break
 // closed the last record, which is what makes a readback the file to its final byte rather than
 // one short of it.
-//
-// The `records/` prefix is what keeps the two paths apart in one bucket: a byte-path key is four
-// segments under the account's own id, and nothing that reads those reaches a record object.
 
 import type { RecordSpan } from "./transcript-plan";
-import type { RecordedFile } from "./transcripts";
+
+// One file of a session as `/v2` answers for it. `bytes` is a length of the archive and no place
+// in the file on disk — a record goes up redacted and reads back at another length than the line
+// the host wrote — so a reader weighs its own copy against `records`, which redaction cannot move.
+//
+// `held` says which path of the archive wrote the file. Only the record path does now, so the tag
+// carries one value; it stays on the wire because every released host reads the answer by it.
+export interface RecordedFile {
+  held: "records";
+  file: string;
+  bytes: number;
+  records: number;
+}
 
 // How many records one append may carry, and how many bytes of them. Both are the ceiling the
 // endpoint answers 413 against. A record is one line and cannot be split, so the byte ceiling is
@@ -282,11 +290,11 @@ const filesOf = (objects: readonly RecordObject[]): RecordedFile[] => {
 const spansOf = (objects: readonly RecordObject[]): RecordSpan[] =>
   objects.map((object) => ({ from: object.from, held: object.held, bytes: object.bytes + (object.closes ? 1 : 0) }));
 
-// The files of a session the record path holds, and what each weighs. Nothing here is a span of a
-// file on disk the way a byte-path stretch is — a record is a whole line verbatim, and redaction
-// leaves a line at another length than the one the host read — so `bytes` is a length of the
-// archive and no place in the file the host holds. How many records of the file the archive has is
-// the one count that is a place in both, and a restore weighs a local file against that.
+// The files of a session the archive holds, and what each weighs. Nothing here is a span of a file
+// on disk — a record is a whole line verbatim, and redaction leaves a line at another length than
+// the one the host read — so `bytes` is a length of the archive and no place in the file the host
+// holds. How many records of the file the archive has is the one count that is a place in both,
+// and a restore weighs a local file against that.
 export const recordFiles = async (bucket: R2Bucket, userId: string, sessionId: string): Promise<RecordedFile[]> =>
   filesOf(await listRecords(bucket, userId, sessionId, null, "skip", WHOLE_FILE));
 

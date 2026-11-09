@@ -22,8 +22,7 @@
     "deploy": "node npm-scripts/deploy.mjs",
     "presetup": "npm run build:browser",
     "setup": "node npm-scripts/setup.mjs",
-    "release": "node npm-scripts/release.mjs",
-    "recompress-archive": "node npm-scripts/recompress-archive.mjs"
+    "release": "node npm-scripts/release.mjs"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.4",

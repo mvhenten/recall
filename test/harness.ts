@@ -9,8 +9,6 @@ import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
 import { putRecords, RECORDS_PREFIX } from "../src/records";
 import { SHARE_EMAIL_PREFIX, SHARE_LINK_PREFIX } from "../src/shares";
-import { compressedStretchName, legacyStretchName, stretchName } from "../src/transcript-plan";
-import { archivedFiles } from "../src/transcripts";
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const ORIGIN = "https://recall.test";
@@ -121,24 +119,8 @@ export interface Client {
   search(query: string, scope: string[] | "any", mode?: Mode): Promise<Hit[]>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
-  /// One stretch of a file no secret was taken out of, so the span of the file it accounts for is
-  /// its own length. Nothing writes the byte archive over the API any more, so this lands the
-  /// object and the reach the archive is read against directly, and there is no answer to weigh.
-  archive(sessionId: string, file: string, from: number, body: string | Uint8Array): Promise<void>;
-  /// One stretch that accounts for a span of the file its own bytes do not run to, which is every
-  /// stretch a secret was taken out of.
-  archiveSpan(sessionId: string, file: string, from: number, through: number, body: string | Uint8Array): Promise<void>;
-  /// One stretch as every host sent one: the span of the file it accounts for, and the bytes
-  /// gzipped.
-  archiveGzip(sessionId: string, file: string, from: number, through: number, body: string | Uint8Array): Promise<void>;
-  /// One stretch as a host from before redaction wrote one: one offset, meaning a place in the
-  /// archive and in the file at once.
-  archiveLegacy(sessionId: string, file: string, offset: number, body: string | Uint8Array): Promise<void>;
   transcript(sessionId: string): Promise<Response>;
   readTranscript(sessionId: string, file: string): Promise<Response>;
-  /// One file read back by a reader that takes the gzip members the archive stores, which is every
-  /// browser and the host's own client.
-  readTranscriptGzip(sessionId: string, file: string): Promise<Response>;
   session(target: string): Promise<Response>;
   searchSessions(query: string, limit?: number): Promise<Response>;
 }
@@ -182,21 +164,6 @@ export const tenantRows = <T>(userId: string, query: string, ...binds: SqlStorag
   // The row shape is the caller's assertion, the way `.all<Row>()` is on D1.
   inTenant(userId, (sql) => sql.exec<Record<string, SqlStorageValue>>(query, ...binds).toArray() as T[]);
 
-// How far into the file the archive reaches, which the append that wrote the byte path kept
-// beside the objects. A test laying a stretch down lays this with it, since every reader of the
-// archive is weighed against it.
-const reach = async (userId: string, sessionId: string, archived: number): Promise<void> => {
-  await inTenant(userId, (sql) => {
-    sql.exec(
-      `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?, ?, ?, 0, 0)
-        ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
-      userId,
-      sessionId,
-      archived,
-    );
-  });
-};
-
 // An instant a test names as the epoch milliseconds `/v1` took, in the offset-carrying form `/v2`
 // takes. A number that is no instant is left alone, since what it is refused for is the point.
 const dated = (fields: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> => {
@@ -206,28 +173,6 @@ const dated = (fields: Record<string, unknown>, keys: readonly string[]): Record
     if (typeof value === "number" && value > 0) written[key] = new Date(value).toISOString();
   }
   return written;
-};
-
-const MAIN = "main";
-
-const held = (body: string | Uint8Array): number =>
-  typeof body === "string" ? new TextEncoder().encode(body).byteLength : body.byteLength;
-
-const bytesOf = (body: string | Uint8Array): Uint8Array =>
-  typeof body === "string" ? new TextEncoder().encode(body) : body;
-
-// One body as a host sends it and as a reader of the archive reads it back. The members are read
-// with the same stream the browser inflates them with, so a test asserting on a transcript is
-// asserting on the bytes a reader of the dashboard sees.
-export const gzipped = async (body: string | Uint8Array): Promise<Uint8Array> =>
-  new Uint8Array(
-    await new Response(new Blob([bytesOf(body)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer(),
-  );
-
-export const inflated = async (response: Response): Promise<string> => {
-  const body = response.body;
-  if (body === null) throw new Error("the response carries no body to inflate");
-  return new Response(body.pipeThrough(new DecompressionStream("gzip"))).text();
 };
 
 const SESSION_DOCUMENT: Record<string, unknown> = {
@@ -592,24 +537,6 @@ export const harness = async ({
         lastRecalledAt: row?.last_recalled_at ?? 0,
       };
     };
-    // One stretch laid into the byte archive. The API that took these is gone and the archive they
-    // are in is read-only, so a test of what reads it back lays the object and the reach down the
-    // way the append that is gone did.
-    const putArchived = async (
-      sessionId: string,
-      file: string,
-      name: string,
-      body: string | Uint8Array,
-      gzip: boolean,
-    ): Promise<void> => {
-      const account = await accountId();
-      await env.TRANSCRIPTS.put(`${account}/${sessionId}/${file}/${name}`, body, {
-        httpMetadata: { contentType: "application/x-ndjson", ...(gzip ? { contentEncoding: "gzip" } : {}) },
-      });
-      if (file !== MAIN) return;
-      const held = (await archivedFiles(env.TRANSCRIPTS, account, sessionId)).find((one) => one.file === MAIN);
-      await reach(account, sessionId, held?.bytes ?? 0);
-    };
     return {
       v2,
       userId,
@@ -638,29 +565,11 @@ export const harness = async ({
       usage(sessionId, fields = {}) {
         return v2.usage(sessionId, dated(fields, ["at"]));
       },
-      archive(sessionId, file, from, body) {
-        return this.archiveSpan(sessionId, file, from, from + held(body), body);
-      },
-      archiveSpan(sessionId, file, from, through, body) {
-        return putArchived(sessionId, file, stretchName(from, through), body, false);
-      },
-      async archiveGzip(sessionId, file, from, through, body) {
-        const member = await gzipped(body);
-        return putArchived(sessionId, file, compressedStretchName(from, through, held(body)), member, true);
-      },
-      archiveLegacy(sessionId, file, offset, body) {
-        return putArchived(sessionId, file, legacyStretchName(offset), body, false);
-      },
       transcript(sessionId) {
         return v2.files(sessionId);
       },
       readTranscript(sessionId, file) {
         return v2.transcript(sessionId, file);
-      },
-      readTranscriptGzip(sessionId, file) {
-        return send(`/v2/sessions/${encodeURIComponent(sessionId)}/transcript?file=${encodeURIComponent(file)}`, {
-          headers: { ...headers, "accept-encoding": "gzip, br" },
-        });
       },
       session(target) {
         return v2.session(target);
@@ -785,16 +694,6 @@ export const harness = async ({
     // half-finished migration leaves behind.
     strayRecord: (userId: string, sessionId: string, name: string): Promise<unknown> =>
       env.TRANSCRIPTS.put(`${RECORDS_PREFIX}/${userId}/${sessionId}/${name}`, "no record object"),
-    indexMark: (userId: string, sessionId: string): Promise<Record<string, number> | null> =>
-      inTenant(userId, (sql) =>
-        sql
-          .exec<Record<string, number>>(
-            "SELECT archived, bytes, chunks FROM session_index WHERE user_id = ? AND session_id = ?",
-            userId,
-            sessionId,
-          )
-          .toArray(),
-      ).then((rows) => rows[0] ?? null),
     chunks: (userId: string, sessionId: string): Promise<string[]> =>
       inTenant(userId, (sql) =>
         sql
