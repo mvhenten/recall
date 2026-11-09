@@ -10,18 +10,20 @@ import type { z } from "zod";
 import {
   AppendRecordsSchema,
   type DeviceSchema,
+  type InjectedMemorySchema,
+  InjectMemoriesSchema,
   ListMemoriesSchema,
   type MemoryHitSchema,
   MemoryPathSchema,
   type MemorySchema,
   type MemoryTypeSchema,
-  type NearbyMemorySchema,
   type PastSessionSchema,
   type RecordsAcceptedSchema,
   type RecordsConflictSchema,
   SaveMemorySchema,
   SearchMemoriesSchema,
   type SearchModeSchema,
+  type SearchResultsSchema,
   SendMessageSchema,
   type SessionHitSchema,
   type SessionModeSchema,
@@ -34,6 +36,7 @@ import type { SendInput } from "./mailbox";
 import {
   DEFAULT_PAGE_ROWS,
   fail,
+  type InjectInput,
   type ListInput,
   type Memory,
   type MemoryHit,
@@ -43,6 +46,7 @@ import {
   type PastSession,
   type SaveInput,
   type SearchInput,
+  type SearchResults,
   type Session,
   type SessionHit,
   type SessionInput,
@@ -63,7 +67,8 @@ export type V2SendInput = z.infer<typeof SendMessageSchema>;
 export type V2AppendRecords = z.infer<typeof AppendRecordsSchema>;
 export type V2Memory = z.infer<typeof MemorySchema>;
 export type V2MemoryHit = z.infer<typeof MemoryHitSchema>;
-export type V2NearbyMemory = z.infer<typeof NearbyMemorySchema>;
+export type V2SearchResults = z.infer<typeof SearchResultsSchema>;
+export type V2InjectedMemory = z.infer<typeof InjectedMemorySchema>;
 
 // The three things a session's mode can be. `/v1` said "the host could not tell" with an empty
 // string, which reads as a missing field rather than as an answer.
@@ -189,14 +194,27 @@ export const memoryView = (memory: Memory): V2Memory => ({
   recallCount: memory.recallCount,
 });
 
-export const memoryHitView = (hit: MemoryHit): V2MemoryHit => ({ memory: memoryView(hit.memory), score: hit.score });
+export const memoryHitView = (hit: MemoryHit): V2MemoryHit => ({
+  memory: memoryView(hit.memory),
+  score: hit.score,
+  inScope: hit.inScope,
+});
 
-export const nearbyMemoryView = (hit: MemoryHit): V2NearbyMemory => ({
+export const searchResultsView = (found: SearchResults): V2SearchResults => ({
+  count: found.count,
+  results: found.results.map(memoryHitView),
+  scopes: found.scopes,
+});
+
+// A memory worth putting in front of a prompt, without its body. The hook prints a line per
+// memory and the agent reads the ones it wants in full, so the body would be spend for nothing.
+export const injectedMemoryView = (hit: MemoryHit): V2InjectedMemory => ({
   score: hit.score,
   memoryName: hit.memory.name,
   type: MEMORY_TYPE_OUT[hit.memory.type],
   tags: hit.memory.tags,
   description: hit.memory.description,
+  inScope: hit.inScope,
 });
 
 // What a zod refusal reads as. The issues are joined in the order the schema raised them, so the
@@ -309,7 +327,8 @@ export const parseSaveMemory = (body: unknown): Parsed<SaveInput> => {
 };
 
 // No `any`. `/v1` took a boolean that had to disagree with the tag list, so the two fields were
-// cross-validated by hand and either one alone was a refusal. An empty tag list means every memory.
+// cross-validated by hand and either one alone was a refusal. Breadth is the default now: an empty
+// `scope` searches every memory, and `preferScope` ranks rather than narrows.
 export const parseSearchMemories = (body: unknown): Parsed<SearchInput> => {
   const read = validated(SearchMemoriesSchema, body);
   if (!read.ok) return read;
@@ -318,10 +337,26 @@ export const parseSearchMemories = (body: unknown): Parsed<SearchInput> => {
     ok: true,
     value: {
       query: input.query,
-      tags: tagSet(input.tags),
+      scope: tagSet(input.scope),
+      preferScope: tagSet(input.preferScope),
       limit: input.limit,
       minScore: input.minScore,
       mode: SEARCH_MODE_IN[input.mode],
+    },
+  };
+};
+
+export const parseInjectMemories = (body: unknown): Parsed<InjectInput> => {
+  const read = validated(InjectMemoriesSchema, body);
+  if (!read.ok) return read;
+  const input = read.value;
+  return {
+    ok: true,
+    value: {
+      query: input.query,
+      preferScope: tagSet(input.preferScope),
+      limit: input.limit,
+      minScore: input.minScore,
     },
   };
 };

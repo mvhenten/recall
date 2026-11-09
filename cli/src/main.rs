@@ -19,7 +19,7 @@ mod ws;
 
 use anyhow::{Context, Result, bail};
 use api::{Client, Memory, SaveBody};
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use jiff::Timestamp;
 use settings::{Mode, Settings};
 use std::io::{IsTerminal, Read};
@@ -55,18 +55,6 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Args)]
-struct TagFilter {
-    #[arg(
-        long = "tag",
-        value_name = "TAG",
-        help = "Match this tag instead of the repo tag and global (repeatable)"
-    )]
-    tags: Vec<String>,
-    #[arg(long, conflicts_with = "tags", help = "Match every memory, whatever its tags")]
-    any: bool,
-}
-
 #[derive(Subcommand)]
 enum Command {
     #[command(about = "Save a memory from a markdown file with frontmatter, or from stdin")]
@@ -88,8 +76,12 @@ enum Command {
     Get { name: String },
     #[command(about = "List memories, newest created first")]
     List {
-        #[command(flatten)]
-        filter: TagFilter,
+        #[arg(
+            long = "tag",
+            value_name = "TAG",
+            help = "Only memories carrying this tag (repeatable); every memory when omitted"
+        )]
+        tags: Vec<String>,
         #[arg(long, help = "Only memories created at or after this ISO 8601 time or epoch ms")]
         since: Option<String>,
         #[arg(long, default_value_t = 20)]
@@ -97,13 +89,18 @@ enum Command {
         #[arg(long, default_value = "", help = "nextCursor from a previous --json page")]
         cursor: String,
     },
-    #[command(about = "Search memories by meaning")]
+    #[command(about = "Search every memory by meaning; memories from here rank first")]
     Search {
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
-        #[command(flatten)]
-        filter: TagFilter,
-        #[arg(long, default_value_t = 5)]
+        #[arg(
+            long,
+            value_name = "SCOPE",
+            value_delimiter = ',',
+            help = "Narrow the search to these tags, comma separated"
+        )]
+        scope: Vec<String>,
+        #[arg(long, default_value_t = 25)]
         limit: u32,
         #[arg(
             long,
@@ -114,6 +111,15 @@ enum Command {
         min_score: f64,
         #[arg(long, default_value = "hybrid", value_parser = ["hybrid", "vector", "text"])]
         mode: String,
+    },
+    #[command(about = "The memories worth putting in front of a prompt, as JSON for the prompt hook")]
+    Inject {
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long, default_value_t = 5)]
+        limit: u32,
+        #[arg(long, default_value_t = 0.65, allow_negative_numbers = true)]
+        min_score: f64,
     },
     #[command(about = "Change a memory; opens $EDITOR when no field flag is given")]
     Edit {
@@ -555,24 +561,14 @@ fn current_repo_tag() -> Option<String> {
     repo::repo_tag(&dir)
 }
 
-fn default_tags() -> Vec<String> {
-    match current_repo_tag() {
-        Some(tag) => vec![tag, repo::GLOBAL_TAG.to_string()],
-        None => {
-            eprintln!("recall: no git repository with a remote here; searching only memories tagged global");
-            vec![repo::GLOBAL_TAG.to_string()]
-        }
-    }
-}
-
-fn filter_tags(filter: &TagFilter) -> Vec<String> {
-    if filter.any {
-        return Vec::new();
-    }
-    if !filter.tags.is_empty() {
-        return filter.tags.clone();
-    }
-    default_tags()
+/// Where the caller is, which ranks rather than narrows: the repo tag of the working copy and
+/// global. A search covers every memory whatever this says, so a host sitting in no repository
+/// simply ranks by score and says nothing about it.
+fn ambient_scope() -> Vec<String> {
+    current_repo_tag()
+        .into_iter()
+        .chain([repo::GLOBAL_TAG.to_string()])
+        .collect()
 }
 
 fn read_input(file: Option<&PathBuf>) -> Result<String> {
@@ -1261,7 +1257,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::List {
-            filter,
+            tags,
             since,
             limit,
             cursor,
@@ -1271,7 +1267,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .with_context(|| format!("--since {value} is neither epoch ms nor ISO 8601"))?,
                 None => 0,
             };
-            let page = client()?.list(&filter_tags(&filter), since, &cursor, limit)?;
+            let page = client()?.list(&tags, since, &cursor, limit)?;
             if cli.json {
                 print_json(&page)?;
             } else {
@@ -1283,16 +1279,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Search {
             query,
-            filter,
+            scope,
             limit,
             min_score,
             mode,
         } => {
             let query = query.join(" ");
-            let tags = filter_tags(&filter);
+            let prefer = ambient_scope();
             let result = client()?.search(&api::SearchRequest {
                 query: &query,
-                tags: &tags,
+                scope: &scope,
+                prefer_scope: &prefer,
                 limit,
                 min_score,
                 mode: &mode,
@@ -1300,11 +1297,29 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if cli.json {
                 print_json(&result)?;
             } else {
-                if result.hits.is_empty() {
+                if result.results.is_empty() {
                     println!("no memories matched");
                 }
-                print!("{}", markdown::render_hits(&result.hits));
-                print!("{}", markdown::render_elsewhere(&result.elsewhere));
+                print!("{}", markdown::render_hits(&result.results));
+                print!("{}", markdown::render_scopes(result.count, &result.scopes));
+            }
+        }
+        Command::Inject {
+            query,
+            limit,
+            min_score,
+        } => {
+            let prefer = ambient_scope();
+            let result = client()?.inject(&api::InjectRequest {
+                query: &query.join(" "),
+                prefer_scope: &prefer,
+                limit,
+                min_score,
+            })?;
+            if cli.json {
+                print_json(&result)?;
+            } else {
+                print!("{}", markdown::render_injected(&result.hits));
             }
         }
         Command::Edit {

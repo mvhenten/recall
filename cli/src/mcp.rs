@@ -8,6 +8,11 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// How many memories a connector's search answers with. A result carries the whole memory, body
+/// and all, so this is spent straight out of the agent's context window; the count and the scopes
+/// beside it are what a search that matched more than this narrows with.
+const SEARCH_LIMIT: u32 = 5;
+
 const SEND_TOOL: &str = "recall_send";
 const ORDER_TOOL: &str = "recall_order";
 
@@ -58,10 +63,8 @@ pub struct SearchParams {
     pub query: String,
     /// hybrid (default) ranks by meaning and words; text matches exact identifiers; vector by meaning only.
     pub mode: Option<SearchMode>,
-    /// Search these tags instead of the current repo tag plus global.
-    pub tags: Option<Vec<String>>,
-    /// Search every memory, whatever its tags.
-    pub any: Option<bool>,
+    /// Narrow the search to these tags. Omit to search every memory.
+    pub scope: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -231,18 +234,10 @@ pub struct Edited {
     pub tags: Vec<String>,
 }
 
-fn default_scope(repo_tag: Option<String>) -> Vec<String> {
+/// Where the caller is, which ranks a search rather than narrowing it: the repo the connector was
+/// told about, and global.
+pub fn default_scope(repo_tag: Option<String>) -> Vec<String> {
     repo_tag.into_iter().chain([repo::GLOBAL_TAG.to_string()]).collect()
-}
-
-pub fn scope_tags(tags: Option<Vec<String>>, any: bool, repo_tag: Option<String>) -> Result<Vec<String>> {
-    let tags = tags.unwrap_or_default();
-    match (any, tags.is_empty()) {
-        (true, false) => bail!("pass tags or any, not both"),
-        (true, true) => Ok(Vec::new()),
-        (false, false) => Ok(tags),
-        (false, true) => Ok(default_scope(repo_tag)),
-    }
 }
 
 pub fn save_tags(
@@ -360,17 +355,18 @@ impl Recall {
 
     #[tool(
         name = "recall_search",
-        description = "Search the user's memories. Covers the current repo and global memories unless tags or any is given. Returns {hits, elsewhere}: hits are full memories with a score; elsewhere lists the best matches outside the searched tags by name, so recall_get them if relevant."
+        description = "Search every memory the user holds. Returns {count, results, scopes}: count is every match, results the five best ranked with memories from the current repo first, and scopes the tags those matches carry with a count each. A count in the hundreds means narrowing with one of the scopes rather than paging."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> Result<String, String> {
         blocking(move || {
-            let any = params.any.unwrap_or(false);
-            let tags = scope_tags(params.tags, any, repo_tag())?;
+            let scope = params.scope.unwrap_or_default();
+            let prefer = default_scope(repo_tag());
             let mode = params.mode.unwrap_or(SearchMode::Hybrid);
             let result = client()?.search(&api::SearchRequest {
                 query: &params.query,
-                tags: &tags,
-                limit: 5,
+                scope: &scope,
+                prefer_scope: &prefer,
+                limit: SEARCH_LIMIT,
                 min_score: 0.55,
                 mode: mode.as_str(),
             })?;
@@ -390,7 +386,7 @@ impl Recall {
 
     #[tool(
         name = "recall_list",
-        description = "List memories, newest created first. Covers the current repo and global memories unless tags is given. Use recall_search to find memories by topic."
+        description = "List memories, newest created first. Covers every memory unless tags is given. Use recall_search to find memories by topic."
     )]
     async fn list(&self, Parameters(params): Parameters<ListParams>) -> Result<String, String> {
         blocking(move || {
@@ -399,8 +395,7 @@ impl Recall {
                     .ok_or_else(|| anyhow::anyhow!("since {value} is neither epoch ms nor ISO 8601"))?,
                 None => 0,
             };
-            let tags = scope_tags(params.tags, false, repo_tag())?;
-            let page = client()?.list(&tags, since, "", params.limit.unwrap_or(20))?;
+            let page = client()?.list(&params.tags.unwrap_or_default(), since, "", params.limit.unwrap_or(20))?;
             to_json(&page.memories)
         })
         .await
@@ -743,20 +738,10 @@ mod tests {
     }
 
     #[test]
-    fn scope_defaults_to_repo_and_global() {
+    fn the_ambient_scope_is_the_repo_and_global() {
         let repo = Some("repo:github.com/acme/widget".to_string());
-        assert_eq!(
-            scope_tags(None, false, repo.clone()).unwrap(),
-            ["repo:github.com/acme/widget", "global"]
-        );
-        assert_eq!(scope_tags(None, false, None).unwrap(), ["global"]);
-        assert_eq!(scope_tags(Some(vec![]), false, None).unwrap(), ["global"]);
-        assert_eq!(
-            scope_tags(Some(vec!["style".into()]), false, repo.clone()).unwrap(),
-            ["style"]
-        );
-        assert!(scope_tags(None, true, repo.clone()).unwrap().is_empty());
-        assert!(scope_tags(Some(vec!["style".into()]), true, repo).is_err());
+        assert_eq!(default_scope(repo), ["repo:github.com/acme/widget", "global"]);
+        assert_eq!(default_scope(None), ["global"]);
     }
 
     #[test]

@@ -14,7 +14,6 @@ import {
   saveMemory,
   searchArtifacts,
   searchSessionHistory,
-  TEXT_CANDIDATES,
   textCandidates,
   vectorCandidates,
 } from "../src/store";
@@ -126,8 +125,7 @@ const MEMORIES: ReadonlyArray<readonly [string, string, string, string]> = [
 const MEMORY_RANKING = `SELECT m.memory_id FROM memories_fts f
    JOIN memories m ON m.memory_seq = f.rowid
    WHERE memories_fts MATCH ?2 AND m.user_id = ?1
-   ORDER BY (SELECT count(*) FROM memory_tags t WHERE t.memory_id = m.memory_id AND t.tag = ?3) DESC,
-     bm25(memories_fts, 5.0, 2.0, 1.0) LIMIT 50`;
+   ORDER BY bm25(memories_fts, 5.0, 2.0, 1.0)`;
 
 const MEMORY_QUERIES = ["rank", "scan", "archive", "board OR migration", "vector AND scan"];
 
@@ -256,17 +254,15 @@ describe("the tenant store", () => {
     }
   });
 
-  it("ranks a memory search by tag scope first and then the way bm25 weights it", async () => {
+  it("ranks a memory search the way bm25 weights it", async () => {
     const userId = await withMemories();
     for (const query of MEMORY_QUERIES) {
-      const ranked = (await tenantRows<{ memory_id: string }>(userId, MEMORY_RANKING, userId, query, "search")).map(
+      const ranked = (await tenantRows<{ memory_id: string }>(userId, MEMORY_RANKING, userId, query)).map(
         (row) => row.memory_id,
       );
       expect(ranked, query).not.toEqual([]);
-      const found = await inStore(userId, (db) => textCandidates(db, userId, ["search"], [], query, TEXT_CANDIDATES));
-      expect(found.map((candidate) => candidate.memoryId)).toEqual(ranked);
-      const scope = found.map((candidate) => candidate.inScope);
-      expect(scope).toEqual([...scope].sort((left, right) => Number(right) - Number(left)));
+      const found = await inStore(userId, (db) => textCandidates(db, userId, [], [], query));
+      expect(found).toEqual(ranked);
     }
   });
 

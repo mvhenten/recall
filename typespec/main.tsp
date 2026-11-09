@@ -20,7 +20,8 @@ const maxMemoryBody = 100000;
 const maxMemoryTags = 50;
 const maxMemoryTag = 200;
 const maxMemoryQuery = 2000;
-const maxMemoryHits = 50;
+const maxSearchResults = 25;
+const maxInjectHits = 10;
 const maxListRows = 100;
 
 @doc("""
@@ -312,16 +313,26 @@ model ListMemories {
   cursor: string;
 }
 
+@doc("""
+  What a deliberate search asks for. Breadth is the default: an empty `scope` searches every
+  memory this account holds. `preferScope` is a sort key and never a filter, so a memory from
+  another repo that answers the query well is ranked below the ones from here rather than dropped.
+  """)
 model SearchMemories {
   @minLength(1)
   @maxLength(maxMemoryQuery)
   query: string;
 
+  @doc("Narrows the search to memories carrying one of these tags. An empty list searches every memory.")
   @maxItems(maxMemoryTags)
-  tags: MemoryTag[];
+  scope: MemoryTag[];
+
+  @doc("Ranks memories carrying one of these tags above the rest, score settling each group. An empty list ranks on score alone.")
+  @maxItems(maxMemoryTags)
+  preferScope: MemoryTag[];
 
   @minValue(1)
-  @maxValue(maxMemoryHits)
+  @maxValue(maxSearchResults)
   limit: int32;
 
   @minValue(-1)
@@ -334,9 +345,63 @@ model SearchMemories {
 model MemoryHit {
   memory: Memory;
   score: float64;
+
+  @doc("Whether this memory carries one of the tags `preferScope` named.")
+  inScope: boolean;
 }
 
-model NearbyMemory {
+@doc("One scope the match set holds, and how many of the matches carry it.")
+model ScopeCount {
+  scope: MemoryTag;
+
+  @minValue(1)
+  count: int32;
+}
+
+@doc("""
+  What a search answers with. `count` and `scopes` cover the whole match set; `results` is the
+  first page of it, ranked. A caller reading a `count` in the hundreds narrows with a `scope` the
+  `scopes` list named rather than paging blind.
+  """)
+model SearchResults {
+  @minValue(0)
+  count: int32;
+
+  @maxItems(maxSearchResults)
+  results: MemoryHit[];
+
+  scopes: ScopeCount[];
+}
+
+@doc("""
+  What the prompt hook asks for on every prompt. It searches every memory and never filters:
+  `preferScope` carries where the caller is, and ranks those memories above the rest.
+  """)
+model InjectMemories {
+  @minLength(1)
+  @maxLength(maxMemoryQuery)
+  query: string;
+
+  @maxItems(maxMemoryTags)
+  preferScope: MemoryTag[];
+
+  @minValue(1)
+  @maxValue(maxInjectHits)
+  limit: int32;
+
+  @doc("""
+    The cosine similarity a memory must reach to count as a match. It bounds the work and not just
+    the answer: every match has its scope read whether or not it is shown, so a floor near zero
+    reads the tags of the whole corpus to put at most ten memories in front of a prompt. `limit`
+    bounds what comes back, never what is read.
+    """)
+  @minValue(-1)
+  @maxValue(1)
+  minScore: float64;
+}
+
+@doc("One memory worth putting in front of a prompt, without its body: enough to decide whether to read it.")
+model InjectedMemory {
   score: float64;
   memoryName: MemoryName;
   type: MemoryType;
@@ -345,4 +410,5 @@ model NearbyMemory {
   tags: MemoryTag[];
 
   description: MemoryDescription;
+  inScope: boolean;
 }

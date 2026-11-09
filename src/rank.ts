@@ -55,6 +55,24 @@ export const ftsQuery = (query: string): string | null => {
   return terms.map((term) => `"${term}"`).join(" OR ");
 };
 
+export interface Scored {
+  memoryId: string;
+  score: number;
+}
+
+// One ranked list, in scope first and score settling the rest. Scope is a sort key and never a
+// partition: a memory from another scope that answers the query well is what falls below the
+// in-scope entries, so a cut takes whatever is there rather than reserving slots for it.
+export const rankByScope = (candidates: readonly Scored[], inScope: ReadonlySet<string>, limit: number): Scored[] =>
+  [...candidates]
+    .sort(
+      (left, right) =>
+        Number(inScope.has(right.memoryId)) - Number(inScope.has(left.memoryId)) ||
+        right.score - left.score ||
+        left.memoryId.localeCompare(right.memoryId),
+    )
+    .slice(0, limit);
+
 export const reciprocalRankFusion = (rankings: string[][]): Array<[string, number]> => {
   const scores = new Map<string, number>();
   for (const ranking of rankings) {

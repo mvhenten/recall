@@ -14,15 +14,16 @@ import {
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
 // its own from #[tool] macros, so the two sets are maintained separately and the wording differs
-// where this end has no repo tag to read: a search or a listing that names no tags covers global
-// here and the current repo as well there, and a project or reference save is refused here rather
-// than tagged. A tool added to one side is therefore a known gap on the other until it is added
-// there too. The tools that take a path on disk are not here at all: this end holds no working copy.
+// where this end has no repo tag to read: both search every memory, but there a search ranks the
+// current repo's first and here it ranks by score alone, and a project or reference save is
+// refused here rather than tagged. A tool added to one side is therefore a known gap on the other
+// until it is added there too. The tools that take a path on disk are not here at all: this end
+// holds no working copy.
 
 export interface SearchArgs {
   query: string;
   mode: Mode;
-  tags: string[];
+  scope: string[];
 }
 
 export interface NameArgs {
@@ -70,6 +71,8 @@ export interface ToolDefinition {
   inputSchema: ToolSchema;
 }
 
+// What a connector's search answers with, the same five the stdio server asks for. A result
+// carries the whole memory, so this is spent straight out of the agent's context window.
 export const SEARCH_LIMIT = 5;
 const LIST_LIMIT = 20;
 
@@ -94,7 +97,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_search",
     description:
-      "Search the user's memories. Covers global memories unless tags or any is given. Returns {hits, elsewhere}: hits are full memories with a score; elsewhere lists the best matches outside the searched tags by name, so recall_get them if relevant.",
+      "Search every memory the user holds. Returns {count, results, scopes}: count is every match, results the five best by score, and scopes the tags those matches carry with a count each. A count in the hundreds means narrowing with one of the scopes rather than paging.",
     inputSchema: schema(
       {
         query: text("What to look for, in plain words or an exact identifier."),
@@ -104,8 +107,7 @@ export const TOOLS: ToolDefinition[] = [
           description:
             "hybrid (default) ranks by meaning and words; text matches exact identifiers; vector by meaning only.",
         },
-        tags: strings("Search these tags instead of global."),
-        any: flag("Search every memory, whatever its tags."),
+        scope: strings("Narrow the search to these tags. Omit to search every memory."),
       },
       ["query"],
     ),
@@ -118,9 +120,9 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_list",
     description:
-      "List memories, newest created first. Covers global memories unless tags is given. Use recall_search to find memories by topic.",
+      "List memories, newest created first. Covers every memory unless tags is given. Use recall_search to find memories by topic.",
     inputSchema: schema({
-      tags: strings("List these tags instead of global."),
+      tags: strings("List only memories carrying one of these tags."),
       since: text("Only memories created at or after this ISO 8601 time, date or epoch ms."),
       limit: {
         type: "integer",
@@ -237,14 +239,6 @@ const tagList = (value: unknown, field: string): Parsed<string[]> => {
   return parsed.ok ? parsed : fail(`${field}: ${parsed.error}`);
 };
 
-// The scope a call covers when it names none: global alone, since the connector sits in no
-// repository. tags and any are the same either-or the stdio server refuses to take both of.
-export const scopeTags = (tags: string[], any: boolean): Parsed<string[]> => {
-  if (any && tags.length > 0) return fail("pass tags or any, not both");
-  if (any) return { ok: true, value: [] };
-  return { ok: true, value: tags.length > 0 ? tags : [GLOBAL_TAG] };
-};
-
 export const saveTags = (type: MemoryType, global: boolean | undefined, extra: string[]): Parsed<string[]> => {
   const scoped = global ?? (type === "user" || type === "feedback");
   if (!scoped) {
@@ -266,18 +260,16 @@ export const parseSinceArgument = (value: unknown): Parsed<number> => {
   return Number.isNaN(parsed) ? fail(`since ${value} is neither epoch ms nor ISO 8601`) : { ok: true, value: parsed };
 };
 
+// No scope means every memory. A search that quietly covered global alone answered a question
+// nobody asked, and the count and the scopes it answers with are what narrow the next call.
 export const parseSearchArgs = (args: Record<string, unknown>): Parsed<SearchArgs> => {
   const query = requiredText(args.query, "query", 2_000);
   if (!query.ok) return query;
-  const tags = tagList(args.tags, "tags");
-  if (!tags.ok) return tags;
-  const any = optionalFlag(args.any, "any");
-  if (!any.ok) return any;
-  const scope = scopeTags(tags.value, any.value ?? false);
+  const scope = tagList(args.scope, "scope");
   if (!scope.ok) return scope;
   const mode = args.mode === undefined ? "hybrid" : modes.find((known) => known === args.mode);
   if (mode === undefined) return fail(`mode must be one of ${modes.join(", ")}`);
-  return { ok: true, value: { query: query.value, mode, tags: scope.value } };
+  return { ok: true, value: { query: query.value, mode, scope: scope.value } };
 };
 
 export const parseNameArgs = (args: Record<string, unknown>): Parsed<NameArgs> => {
@@ -288,15 +280,13 @@ export const parseNameArgs = (args: Record<string, unknown>): Parsed<NameArgs> =
 export const parseListArgs = (args: Record<string, unknown>): Parsed<ListArgs> => {
   const tags = tagList(args.tags, "tags");
   if (!tags.ok) return tags;
-  const scope = scopeTags(tags.value, false);
-  if (!scope.ok) return scope;
   const since = parseSinceArgument(args.since);
   if (!since.ok) return since;
   const limit = args.limit ?? LIST_LIMIT;
   if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100) {
     return fail("limit must be a whole number from 1 to 100");
   }
-  return { ok: true, value: { tags: scope.value, since: since.value, limit } };
+  return { ok: true, value: { tags: tags.value, since: since.value, limit } };
 };
 
 export const parseSaveArgs = (args: Record<string, unknown>): Parsed<SaveArgs> => {

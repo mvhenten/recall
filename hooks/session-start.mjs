@@ -5,7 +5,7 @@ const TIMEOUT_MS = 3000;
 const INSTALL_HINT = "recall CLI not found; install it from https://github.com/mvhenten/recall#install";
 
 const CRIB = [
-  "- recall search [--any] [--tag <tag>] [--mode hybrid|vector|text] <query> | recall get <name> | recall list",
+  "- recall search [--scope a,b] [--mode hybrid|vector|text] <query> | recall get <name> | recall list [--tag <tag>]",
   "- recall save [file] [--global] | recall edit <name> | recall delete <name>; add --json for JSON",
 ];
 
@@ -31,13 +31,14 @@ const MEMORY_INSTRUCTIONS = [
   "Memories can be stale: check a remembered fact against the current code before acting on it, and fix the memory when it is wrong.",
 ];
 
-// A save from a repo working directory is tagged with that repo unless it is told otherwise, so a
-// fact that holds anywhere has to say so at the point of saving or it is filed where nothing else
-// will look for it.
+// A search covers everything and the repo tag only ranks, so nothing has to be said about reading.
+// Saving is where the scope is real: a save from a repo working directory is tagged with that
+// repo unless it is told otherwise, and a fact that holds anywhere has to say so at the point of
+// saving or it is filed where nothing else will look for it.
 function scopeLine(mode, repoTag) {
-  if (!repoTag) return "Current scope: global only.";
+  if (!repoTag) return "Searches cover every memory. No repo here, so a save is tagged global.";
   const flag = mode === "tools" ? "--global, or global: true to recall_save," : "--global";
-  return `Current repo tag: ${repoTag}. Searches also cover global, but a save from here is tagged with this repo: pass ${flag} for anything true outside it.`;
+  return `Current repo tag: ${repoTag}. Searches cover every memory and only rank this repo's first, but a save from here is tagged with this repo: pass ${flag} for anything true outside it.`;
 }
 
 function context(mode, repoTag) {

@@ -118,7 +118,7 @@ export interface Client {
   publish(name: string, html: string | Uint8Array): Promise<Response>;
   publishArtifact(name: string, input: Partial<PublishInput>): Promise<Response>;
   get(name: string): Promise<Memory>;
-  search(query: string, tags: string[] | "any", mode?: Mode): Promise<Hit[]>;
+  search(query: string, scope: string[] | "any", mode?: Mode): Promise<Hit[]>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   /// One stretch of a file no secret was taken out of, so the span of the file it accounts for is
@@ -287,7 +287,8 @@ const V2_MEMORY_DOCUMENT = (name: string): Record<string, unknown> => ({
 
 const V2_SEARCH_DOCUMENT: Record<string, unknown> = {
   query: "notes",
-  tags: [],
+  scope: [],
+  preferScope: [],
   limit: 10,
   minScore: 0.1,
   mode: "Hybrid",
@@ -667,17 +668,20 @@ export const harness = async ({
       searchSessions(query, limit = 10) {
         return v2.searchHistory(query, limit);
       },
-      async search(query, tags, mode = "hybrid") {
+      async search(query, scope, mode = "hybrid") {
         const response = await v2.searchMemories({
           query,
-          tags: tags === "any" ? [] : tags,
+          scope: scope === "any" ? [] : scope,
+          preferScope: [],
           limit: 10,
           minScore: 0.1,
           mode: SEARCH_MODE_OUT[mode],
         });
         if (response.status !== 200) throw new Error(`search: ${response.status} ${await response.text()}`);
-        const result: { hits: Array<{ memory: MemoryView; score: number }> } = await response.json();
-        return Promise.all(result.hits.map(async (hit) => ({ memory: await memoryOf(hit.memory), score: hit.score })));
+        const result: { results: Array<{ memory: MemoryView; score: number }> } = await response.json();
+        return Promise.all(
+          result.results.map(async (hit) => ({ memory: await memoryOf(hit.memory), score: hit.score })),
+        );
       },
     };
   };

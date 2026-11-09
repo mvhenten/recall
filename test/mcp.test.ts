@@ -305,9 +305,13 @@ describe("the connector's tools", () => {
     expect(listed.map((memory) => memory.name)).toEqual(["indent-style"]);
 
     const found = (await mcp.json("recall_search", { query: "indented" })) as {
-      hits: Array<{ memory: { name: string } }>;
+      count: number;
+      results: Array<{ memory: { memoryName: string } }>;
+      scopes: Array<{ scope: string; count: number }>;
     };
-    expect(found.hits.map((hit) => hit.memory.name)).toEqual(["indent-style"]);
+    expect(found.results.map((hit) => hit.memory.memoryName)).toEqual(["indent-style"]);
+    expect(found.count).toBe(1);
+    expect(found.scopes).toContainEqual({ scope: "style", count: 1 });
 
     expect(await mcp.json("recall_delete", { name: "indent-style" })).toEqual({ deleted: "indent-style" });
   });
@@ -330,15 +334,15 @@ describe("the connector's tools", () => {
     expect([...scoped.tags].sort()).toEqual(["global", "repo:github.com/acme/widget"]);
   });
 
-  it("refuses an argument the tool does not take and a tags-and-any search", async () => {
+  it("refuses an argument the tool does not take", async () => {
     const { mcp } = await signedIn();
     const extra = await mcp.tool("recall_get", { name: "x", depth: 2 }).catch((error: Error) => error.message);
     expect(extra).toBe("recall: recall_get takes no argument depth");
 
-    const both = await mcp
-      .tool("recall_search", { query: "q", tags: ["style"], any: true })
+    const gone = await mcp
+      .tool("recall_search", { query: "q", tags: ["style"] })
       .catch((error: Error) => error.message);
-    expect(both).toBe("recall: pass tags or any, not both");
+    expect(gone).toBe("recall: recall_search takes no argument tags");
   });
 
   it("sends a message to a host and never reads as one itself", async () => {
