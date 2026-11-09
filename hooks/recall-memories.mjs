@@ -7,9 +7,9 @@ import { countUsage } from "./usage.mjs";
 const TIMEOUT_MS = 4000;
 const MIN_WORDS = 3;
 
-function entry({ name, type, tags, description }) {
+function entry({ memoryName, type, tags, description }) {
   const shown = tags.filter((tag) => !tag.startsWith("source:")).join(", ");
-  return `- ${name} (${type}; ${shown}): ${description}`;
+  return `- ${memoryName} (${type}; ${shown}): ${description}`;
 }
 
 function header(repoTag) {
@@ -81,7 +81,7 @@ async function memories(input, prompt) {
       additionalContext: contextBlock(found, await repoTagOf(input.cwd)),
     },
   });
-  recordShown(input.session_id, [...shown, ...found.map(({ name }) => name)]);
+  recordShown(input.session_id, [...shown, ...found.map(({ memoryName }) => memoryName)]);
   return `hits=${found.length} elsewhere=${found.filter((hit) => !hit.inScope).length}`;
 }
 

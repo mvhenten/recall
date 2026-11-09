@@ -7,5 +7,5 @@ export function searchQuery(prompt) {
 }
 
 export function unseen(hits, shown) {
-  return hits.filter(({ name }) => !shown.has(name));
+  return hits.filter(({ memoryName }) => !shown.has(memoryName));
 }
