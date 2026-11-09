@@ -89,7 +89,7 @@ describe("the connector handshake", () => {
     });
     expect(refused.status).toBe(401);
     expect(refused.headers.get("content-type")).toBe("text/event-stream");
-    expect(await refused.text()).toContain("no credential reached /mcp");
+    expect(await refused.text()).toContain("no bearer token reached /mcp");
   });
 
   it("refuses a malformed message and an unknown method with JSON-RPC errors", async () => {

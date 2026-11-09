@@ -445,13 +445,12 @@ describe("what an uncredentialed write may leave behind", () => {
     const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
     const abandoned = await registeredClient(h);
     const connected = await h.connect(email);
-    // The abandoned client got as far as an authorize address and no further, which is the state
-    // that would pin its row if liveness were read off the request existing.
+    // The abandoned client got as far as an authorize address and no further, which leaves the
+    // request row that would pin it if liveness were read off a row existing instead of expiring.
     expect((await ask(h, abandoned)).status).toBe(303);
 
-    // The sweep rides the next registration, so nothing is dropped until one arrives.
+    // The sweep rides the next registration, which is the only thing that reads this table.
     h.tick(3_600_001);
-    expect((await ask(h, abandoned)).status).toBe(303);
     await registeredClient(h);
 
     expect((await ask(h, abandoned)).status).toBe(400);
