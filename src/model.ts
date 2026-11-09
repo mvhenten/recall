@@ -91,10 +91,10 @@ export const FRESH_WINDOW_MS = FRESH_WINDOW_DAYS * 86_400_000;
 export const DEFAULT_MIN_SCORE = 0.55;
 export const MAX_QUERY_CHARS = 2_000;
 
-// The page a search answers with, and the most memories one prompt is enriched with. Both are
-// ceilings the contract carries, so a caller asking for more is refused rather than silently cut.
+// The page a search answers with, which the contract carries: an API caller asking for more is
+// refused rather than silently cut. The dashboard's listing limit runs to a hundred and is clamped
+// to this where it searches, because there one field drives both and a person is not an API.
 export const SEARCH_RESULTS = 25;
-export const INJECT_HITS = 10;
 
 // Embedding is batched because indexing a session asks for a hundred vectors at once and one call
 // per chunk would be a hundred round trips. A memory asks for one and takes the first back.

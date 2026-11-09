@@ -20,7 +20,6 @@ const maxMemoryBody = 100000;
 const maxMemoryTags = 50;
 const maxMemoryTag = 200;
 const maxMemoryQuery = 2000;
-const maxMemoryHits = 50;
 const maxSearchResults = 25;
 const maxInjectHits = 10;
 const maxListRows = 100;

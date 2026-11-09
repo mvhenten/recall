@@ -8,6 +8,11 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// How many memories a connector's search answers with. A result carries the whole memory, body
+/// and all, so this is spent straight out of the agent's context window; the count and the scopes
+/// beside it are what a search that matched more than this narrows with.
+const SEARCH_LIMIT: u32 = 5;
+
 const SEND_TOOL: &str = "recall_send";
 const ORDER_TOOL: &str = "recall_order";
 
@@ -350,7 +355,7 @@ impl Recall {
 
     #[tool(
         name = "recall_search",
-        description = "Search every memory the user holds. Returns {count, results, scopes}: count is every match, results the first 25 ranked with memories from the current repo first, and scopes the tags those matches carry with a count each. A count in the hundreds means narrowing with one of the scopes rather than paging."
+        description = "Search every memory the user holds. Returns {count, results, scopes}: count is every match, results the five best ranked with memories from the current repo first, and scopes the tags those matches carry with a count each. A count in the hundreds means narrowing with one of the scopes rather than paging."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> Result<String, String> {
         blocking(move || {
@@ -361,7 +366,7 @@ impl Recall {
                 query: &params.query,
                 scope: &scope,
                 prefer_scope: &prefer,
-                limit: 25,
+                limit: SEARCH_LIMIT,
                 min_score: 0.55,
                 mode: mode.as_str(),
             })?;

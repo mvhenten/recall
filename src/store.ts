@@ -126,12 +126,24 @@ const MEMORY_FIELDS = {
      ORDER BY ${qualified(memoryTags.tag)}))`,
 };
 
-// Which memories carry one of these tags, as one seek per tag rather than a probe per memory. An
-// empty list narrows nothing, which is what "search everything" resolves to before it gets here.
-const tagFilter = (tags: readonly string[]): SQL =>
-  sql`(json_array_length(${JSON.stringify(tags)}) = 0 OR ${qualified(memories.memoryId)} IN (
-    SELECT ${qualified(memoryTags.memoryId)} FROM ${memoryTags}
-    WHERE ${qualified(memoryTags.tag)} IN ${jsonEach(tags)}))`;
+// Which memories carry one of these tags, as one seek per tag rather than a scan of the table.
+//
+// An empty scope narrows nothing and drops out of the `AND` entirely rather than going in as the
+// `json_array_length(?) = 0 OR …` it used to, and that is most of the cost: the planner cannot
+// see through the OR to the comparison under it, so it fell back to a plan whose price was the
+// same however narrow the scope — 423 rows for one tag where the same filter without the OR reads
+// 86. The tags then bind one placeholder each rather than going through `json_each`, which takes
+// those 86 to 84; a scope holds at most fifty tags, well inside the hundred parameters a
+// statement may bind.
+const tagFilter = (tags: readonly string[]): SQL | undefined =>
+  tags.length === 0
+    ? undefined
+    : sql`${qualified(memories.memoryId)} IN (
+        SELECT ${qualified(memoryTags.memoryId)} FROM ${memoryTags}
+        WHERE ${qualified(memoryTags.tag)} IN (${sql.join(
+          tags.map((tag) => sql`${tag}`),
+          sql`, `,
+        )}))`;
 
 const typeFilter = (types: readonly MemoryType[]): SQL =>
   sql`(json_array_length(${JSON.stringify(types)}) = 0 OR ${qualified(memories.type)} IN ${jsonEach(types)})`;
@@ -354,9 +366,15 @@ export const vectorCandidates = async (
   scope: readonly string[],
   types: readonly MemoryType[],
 ): Promise<VectorCandidate[]> => {
-  const rows = db.values<[string, unknown]>(sql`
-    SELECT ${memories.memoryId}, ${memories.embedding} FROM ${memories}
-    WHERE ${memories.userId} = ${userId} AND ${tagFilter(scope)} AND ${typeFilter(types)}`);
+  const rows = db.values<[string, unknown]>(
+    sql.join(
+      [
+        sql`SELECT ${memories.memoryId}, ${memories.embedding} FROM ${memories}`,
+        sql`WHERE ${and(eq(memories.userId, userId), tagFilter(scope), typeFilter(types))}`,
+      ],
+      sql` `,
+    ),
+  );
   return rows.map(([memoryId, embedding]) => ({ memoryId, embedding: toBytes(embedding) }));
 };
 

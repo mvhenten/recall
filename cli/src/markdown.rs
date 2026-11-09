@@ -217,17 +217,21 @@ pub fn render_every_share(artifacts: &[Artifact]) -> String {
         .collect()
 }
 
+/// One line per memory a search found, in the order it was ranked. A search answers with up to
+/// twenty-five of them, so it prints a listing and not twenty-five bodies: `recall get <name>`
+/// reads the one that looks right. A memory from outside the ambient scope says so, since that is
+/// why it sorted below the rest.
 pub fn render_hits(hits: &[Hit]) -> String {
     hits.iter()
         .map(|hit| {
             format!(
-                "## {} ({}, score {:.3})\n\n_{}_ `[{}]`\n\n{}\n\n",
+                "- **{}** ({}, score {:.3}){} {} `[{}]`\n",
                 hit.memory.name,
                 hit.memory.kind,
                 hit.score,
+                if hit.in_scope { "" } else { " elsewhere" },
                 hit.memory.description,
-                hit.memory.tags.join(", "),
-                hit.memory.body.trim_end()
+                hit.memory.tags.join(", ")
             )
         })
         .collect()

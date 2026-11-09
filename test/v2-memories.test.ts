@@ -154,12 +154,6 @@ describe("the /v2 memories", () => {
       "ranking-fusion",
     ]);
     expect(some.scopes).toContainEqual({ scope: "search", count: 2 });
-
-    // `tags` and `any` are gone rather than renamed. A body still carrying them narrows by
-    // nothing, which is the new default rather than the old pair's refusal.
-    const legacy = await client.v2.searchMemories({ query: "the", tags: ["search"], any: true, minScore: -1 });
-    const read: SearchBody = await legacy.json();
-    expect(read.count).toBe(CORPUS.length);
   });
 
   it("holds the slug, the tag charset and the body ceiling to the generated schema", async () => {

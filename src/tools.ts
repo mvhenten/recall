@@ -14,10 +14,11 @@ import {
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
 // its own from #[tool] macros, so the two sets are maintained separately and the wording differs
-// where this end has no repo tag to read: a search or a listing that names no tags covers global
-// here and the current repo as well there, and a project or reference save is refused here rather
-// than tagged. A tool added to one side is therefore a known gap on the other until it is added
-// there too. The tools that take a path on disk are not here at all: this end holds no working copy.
+// where this end has no repo tag to read: both search every memory, but there a search ranks the
+// current repo's first and here it ranks by score alone, and a project or reference save is
+// refused here rather than tagged. A tool added to one side is therefore a known gap on the other
+// until it is added there too. The tools that take a path on disk are not here at all: this end
+// holds no working copy.
 
 export interface SearchArgs {
   query: string;
@@ -70,6 +71,8 @@ export interface ToolDefinition {
   inputSchema: ToolSchema;
 }
 
+// What a connector's search answers with, the same five the stdio server asks for. A result
+// carries the whole memory, so this is spent straight out of the agent's context window.
 export const SEARCH_LIMIT = 5;
 const LIST_LIMIT = 20;
 
@@ -94,7 +97,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_search",
     description:
-      "Search every memory the user holds. Returns {count, results, scopes}: count is every match, results the first 25 ranked, and scopes the tags those matches carry with a count each. A count in the hundreds means narrowing with one of the scopes rather than paging.",
+      "Search every memory the user holds. Returns {count, results, scopes}: count is every match, results the five best by score, and scopes the tags those matches carry with a count each. A count in the hundreds means narrowing with one of the scopes rather than paging.",
     inputSchema: schema(
       {
         query: text("What to look for, in plain words or an exact identifier."),

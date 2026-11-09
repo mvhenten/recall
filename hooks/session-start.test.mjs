@@ -55,8 +55,8 @@ test("tools mode keeps naming the tools, with the CLI beside them", () => {
   assert.ok(context.includes("- recall save [file] [--global]"), context);
 });
 
-test("outside a repo the scope is global", () => {
-  assert.match(sessionStart("hook", ""), /Current scope: global only\./);
+test("outside a repo a search still covers everything and a save is global", () => {
+  assert.match(sessionStart("hook", ""), /Searches cover every memory\. No repo here, so a save is tagged global\./);
 });
 
 test("the plugin registers no mcp server", () => {

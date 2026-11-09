@@ -14,8 +14,6 @@ describe("rankByScope", () => {
     expect(ranked.map((hit) => hit.memoryId)).toEqual(["here-best", "here-worst", "far-best", "far-worst"]);
   });
 
-  // The old shape cut twice and held three slots open for memories from elsewhere, so a caller
-  // asking for two got up to five. One cut gives it two.
   it("cuts once, so a limit full of in-scope memories leaves no room for the rest", () => {
     const ranked = rankByScope(candidates, new Set(["here-best", "here-worst"]), 2);
     expect(ranked.map((hit) => hit.memoryId)).toEqual(["here-best", "here-worst"]);

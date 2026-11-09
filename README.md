@@ -138,9 +138,9 @@ Searching everything is the default. Scope is a sort key, not a partition: `reca
 
 Search is hybrid: it ranks by embedding similarity and by full-text match, then fuses the two rankings (reciprocal rank fusion, k = 60). `--mode vector` or `--mode text` uses one ranking. `--min-score` (default 0.55) is the cosine similarity a vector match must reach before fusion; hybrid scores are fusion values near 0.03, not cosines. Full-text search skips common English words such as "the" and "and", so a memory that shares only those with the query never matches, while an exact identifier still does. Search hits do not count as recalls; only a deliberate read (`recall get` or the `recall_get` tool) does, so each memory carries a recall count and the time it was last recalled.
 
-`recall --json search` prints `{count, results, scopes}`: `count` is every match, `results` the first 25 ranked, and `scopes` every tag the match set carries with a count each. A count in the hundreds is the signal to narrow with `--scope <one of them>` rather than page.
+`recall search` answers `{count, results, scopes}`: `count` is every match, `results` the first 25 ranked, and `scopes` every tag the whole match set carries with a count each, so the counts sum to `count`. A count in the hundreds is the signal to narrow with `--scope <one of them>` rather than page. The terminal prints a line per result and not 25 bodies; `recall get <name>` reads the one that looks right. The `recall_search` tool answers five, because a result carries the whole memory and that comes out of the agent's context window.
 
-`recall inject` is the prompt hook's own path: it takes a query and answers at most ten memories without their bodies, ranked the same way, in one search of the corpus, one read of the tags the survivors carry, and one read of the rows it shows.
+`recall inject` is the prompt hook's own path: it takes a query and answers at most ten memories without their bodies, ranked the same way, in one search of the corpus, one read of the tags the matches carry, and one read of the rows it shows.
 
 A memory lives in its account's own Durable Object. It was in D1 until the release that moved it; the copy that brought every corpus over has run and the D1 rows it read are left where they are.
 

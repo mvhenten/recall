@@ -19,7 +19,7 @@ mod ws;
 
 use anyhow::{Context, Result, bail};
 use api::{Client, Memory, SaveBody};
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use jiff::Timestamp;
 use settings::{Mode, Settings};
 use std::io::{IsTerminal, Read};
@@ -55,16 +55,6 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Args)]
-struct TagFilter {
-    #[arg(
-        long = "tag",
-        value_name = "TAG",
-        help = "Only memories carrying this tag (repeatable); every memory when omitted"
-    )]
-    tags: Vec<String>,
-}
-
 #[derive(Subcommand)]
 enum Command {
     #[command(about = "Save a memory from a markdown file with frontmatter, or from stdin")]
@@ -86,8 +76,12 @@ enum Command {
     Get { name: String },
     #[command(about = "List memories, newest created first")]
     List {
-        #[command(flatten)]
-        filter: TagFilter,
+        #[arg(
+            long = "tag",
+            value_name = "TAG",
+            help = "Only memories carrying this tag (repeatable); every memory when omitted"
+        )]
+        tags: Vec<String>,
         #[arg(long, help = "Only memories created at or after this ISO 8601 time or epoch ms")]
         since: Option<String>,
         #[arg(long, default_value_t = 20)]
@@ -575,10 +569,6 @@ fn ambient_scope() -> Vec<String> {
         .into_iter()
         .chain([repo::GLOBAL_TAG.to_string()])
         .collect()
-}
-
-fn filter_tags(filter: &TagFilter) -> Vec<String> {
-    filter.tags.clone()
 }
 
 fn read_input(file: Option<&PathBuf>) -> Result<String> {
@@ -1267,7 +1257,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::List {
-            filter,
+            tags,
             since,
             limit,
             cursor,
@@ -1277,7 +1267,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .with_context(|| format!("--since {value} is neither epoch ms nor ISO 8601"))?,
                 None => 0,
             };
-            let page = client()?.list(&filter_tags(&filter), since, &cursor, limit)?;
+            let page = client()?.list(&tags, since, &cursor, limit)?;
             if cli.json {
                 print_json(&page)?;
             } else {

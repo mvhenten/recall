@@ -314,8 +314,6 @@ describe("scope", () => {
     expect((await alice.get("here-deploy")).recallCount).toBe(0);
   });
 
-  // The old shape held three slots open for memories from elsewhere whatever they scored. One
-  // ranked list gives the caller the limit it asked for and nothing beyond it.
   it("cuts once, so what comes from elsewhere is only what fits below the rest", async () => {
     const h = await harness();
     const alice = await h.user("alice");

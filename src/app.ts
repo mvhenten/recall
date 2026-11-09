@@ -463,10 +463,6 @@ const GRANT_ERRORS = {
   access_denied: "the sign-in was denied in the browser",
 } as const;
 
-// How deep a search ranks before it cuts. One pass of the corpus produces the matches; this bounds
-// the set whose scope is settled and whose head is read back, so neither grows with the corpus.
-const CANDIDATE_LIMIT = 100;
-
 // A message typed into the dashboard comes from a person at a browser and from no device at all,
 // so it says so rather than borrowing one: its host and its device id both read `dashboard`, and
 // the name it carries is the Access email that signed in. Device ids are UUIDs, so no device of
@@ -2180,9 +2176,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     });
   };
 
-  // One search, cut once. The matches are capped, their scope is settled in one read of the tags
-  // they carry, and the head of the ranking is read back whole — three statements whatever the
-  // corpus holds, and the last of them reads at most as many rows as the caller asked to see.
+  // One search, cut once. Every match is scored, the tags of every match are read in one seek per
+  // memory, and the head of the ranking is read back whole: three statements whatever the corpus
+  // holds, and the last of them reads at most as many rows as the caller asked to see.
+  //
+  // The scope read covers the whole match set and not a window of it, because the two things it
+  // feeds both have to: a count per scope that does not sum to the count beside it tells a caller
+  // to narrow on a number that was never true, and a sort key resolved for only part of the list
+  // is a filter wearing a sort key's name.
   const searched = async (
     db: TenantDb,
     userId: string,
@@ -2190,35 +2191,29 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     types: MemoryType[],
   ): Promise<SearchResults> => {
     const found = await matches(db, userId, input, types);
-    const capped = found.slice(0, CANDIDATE_LIMIT);
-    const tags = await tagsOfMemories(
-      db,
-      capped.map(({ memoryId }) => memoryId),
-    );
+    const tags =
+      found.length === 0
+        ? []
+        : await tagsOfMemories(
+            db,
+            found.map(({ memoryId }) => memoryId),
+          );
     const inScope = new Set(tags.filter(([, tag]) => input.preferScope.includes(tag)).map(([memoryId]) => memoryId));
     const counts = new Map<string, number>();
     for (const [, tag] of tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
     return {
       count: found.length,
-      results: await hydrate(db, userId, rankByScope(capped, inScope, input.limit), inScope),
+      results: await hydrate(db, userId, rankByScope(found, inScope, input.limit), inScope),
       scopes: [...counts]
         .map(([scope, count]) => ({ scope, count }))
         .sort((left, right) => right.count - left.count || left.scope.localeCompare(right.scope)),
     };
   };
 
-  // What goes in front of a prompt. The same three statements as a search with the counting left
-  // off, because the hook prints what it is given and never pages.
-  const injected = async (db: TenantDb, userId: string, input: InjectInput): Promise<MemoryHit[]> => {
-    const search: SearchInput = { ...input, scope: [], mode: "vector" };
-    const capped = (await matches(db, userId, search, [])).slice(0, CANDIDATE_LIMIT);
-    const tags = await tagsOfMemories(
-      db,
-      capped.map(({ memoryId }) => memoryId),
-    );
-    const inScope = new Set(tags.filter(([, tag]) => input.preferScope.includes(tag)).map(([memoryId]) => memoryId));
-    return hydrate(db, userId, rankByScope(capped, inScope, input.limit), inScope);
-  };
+  // What goes in front of a prompt: the same search, by meaning alone, over everything, with the
+  // count and the scopes dropped because the hook prints what it is given and never pages.
+  const injected = async (db: TenantDb, userId: string, input: InjectInput): Promise<MemoryHit[]> =>
+    (await searched(db, userId, { ...input, scope: [], mode: "vector" }, [])).results;
 
   const v2MemoriesList = async (url: URL, db: TenantDb, caller: Caller): Promise<Response> => {
     const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
@@ -2322,6 +2317,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         const input = parseSearchArgs(args.value);
         if (!input.ok) return refused(input.error);
         const { query, scope, mode } = input.value;
+        // No `preferScope`: this connector runs in no working copy, so there is no scope to rank
+        // by and score alone settles the order. The stdio server has a repo tag and passes one.
         const found = await searched(
           db,
           userId,
