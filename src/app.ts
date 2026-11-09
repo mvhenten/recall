@@ -426,12 +426,12 @@ const readJson = (request: Request): Promise<unknown> => request.json().catch(()
 const embeddingText = (name: string, description: string, body: string): string => `${name}\n${description}\n\n${body}`;
 
 // Whether this is the first thing the session's own file ever commits over an index that already
-// holds chunks of it. The record path writes the mark and the chunks in one batch, so a session it
-// alone indexed cannot reach that state: a file waiting at ordinal 0 and chunks on record together
-// mean the prose was indexed by the path that came before, and the commit below reads the file
-// from ordinal 0 and indexes every word of it again. The old chunks are dropped under the new ones
-// rather than left beneath them, which is the difference between a session answering a search once
-// and answering it twice.
+// holds chunks of it. `commitRecords` writes the mark and the chunks in one transaction, so a
+// session the record path alone indexed can hold neither without the other: a file still waiting at
+// ordinal 0 with chunks on record means the prose was indexed by the path that came before. The
+// commit below reads that file from ordinal 0 and indexes every word of it again, so those chunks
+// are dropped under the ones replacing them rather than left beneath them — the difference between
+// a session answering a search once and answering it twice.
 const takesOver = (marked: number, chunks: number): boolean => marked === 0 && chunks > 0;
 
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
@@ -3168,10 +3168,7 @@ export const createApp = (deps: Deps): App => {
     // The prose of one named window comes off the archive and reads no row at all, so it is
     // answered here rather than one round trip into the object apiece. `since` asks how far the
     // file now reaches, which is a row this tenant holds, so that one goes on to the object.
-    // `from` is the byte path's cursor, which no page writes any more; a tab left open across the
-    // deploy still sends it, and it goes on to the object for the same refusal every other unknown
-    // beat gets rather than a 400 about a window it never asked for.
-    if (transcript && !url.searchParams.has("from") && !url.searchParams.has("since")) {
+    if (transcript && !url.searchParams.has("since")) {
       return transcriptRecords(url, env.TRANSCRIPTS, userId, rawSessionId);
     }
     return tenantOf(env, userId).dashboard(request, userId, email, handed());

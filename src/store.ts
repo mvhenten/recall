@@ -2497,6 +2497,12 @@ export const commitRecords = async (db: TenantDb, commit: RecordCommit): Promise
     // The takeover first, so everything below it is written over an index holding nothing of the
     // session. It lands in the same batch as the mark at the foot, which is what leaves no instant
     // where the session is half indexed by each.
+    //
+    // The counter goes back to nothing beside the rows. Nothing reads a chunk ordinal — it is the
+    // third column of the unique key and no more — so leaving it would break nothing visible, and
+    // `MAX(old, new)` would simply open the next append past a gap. It is reset because the counter
+    // is how many chunks the session holds, and a counter that counted rows this batch deleted is
+    // not that.
     if (takeover) {
       tx.run(sql`DELETE FROM ${sessionChunks}
         WHERE ${sessionChunks.userId} = ${userId} AND ${sessionChunks.sessionId} = ${sessionId}

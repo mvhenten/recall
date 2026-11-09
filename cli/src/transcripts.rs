@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn a_whole_file_reaches_the_same_record_whether_it_opens_at_nothing_or_part_way_through() {
-        let text = turns(2_500, "replayed");
+        let text = turns(2_500, "resent");
         let whole = Fake::default();
         let resumed = Fake::default();
         let halfway: Vec<String> = text.lines().take(1_200).map(str::to_string).collect();
