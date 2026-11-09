@@ -20,7 +20,7 @@ describe("hook search query", () => {
   });
 
   it("drops memories the session was already shown", () => {
-    const found = [{ name: "shown-hit" }, { name: "new-hit" }, { name: "new-elsewhere" }];
-    expect(unseen(found, new Set(["shown-hit"]))).toEqual([{ name: "new-hit" }, { name: "new-elsewhere" }]);
+    const found = [{ memoryName: "shown-hit" }, { memoryName: "new-hit" }, { memoryName: "new-elsewhere" }];
+    expect(unseen(found, new Set(["shown-hit"]))).toEqual([{ memoryName: "new-hit" }, { memoryName: "new-elsewhere" }]);
   });
 });
