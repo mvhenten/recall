@@ -63,6 +63,11 @@ async function memories(input, prompt) {
     },
   );
   if (!result.ok) {
+    // A host whose CLI predates `recall inject` has nothing to say about it. The Worker deploys on
+    // merge and hosts update whenever they next do, so this window is every prompt on every host
+    // behind, and a banner on each of them is noise about a state the person cannot act on from
+    // here. `recall search` still refuses an old binary loudly, which is where they find out.
+    if (result.error.includes("unrecognized subcommand")) return "skipped:old-cli";
     emit({ systemMessage: `recall unavailable: ${result.error}` });
     return result.timedOut ? "timeout" : `error:${firstLine(result.error)}`;
   }

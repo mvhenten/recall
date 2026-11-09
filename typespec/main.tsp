@@ -389,6 +389,12 @@ model InjectMemories {
   @maxValue(maxInjectHits)
   limit: int32;
 
+  @doc("""
+    The cosine similarity a memory must reach to count as a match. It bounds the work and not just
+    the answer: every match has its scope read whether or not it is shown, so a floor near zero
+    reads the tags of the whole corpus to put at most ten memories in front of a prompt. `limit`
+    bounds what comes back, never what is read.
+    """)
   @minValue(-1)
   @maxValue(1)
   minScore: float64;

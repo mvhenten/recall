@@ -2184,6 +2184,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // feeds both have to: a count per scope that does not sum to the count beside it tells a caller
   // to narrow on a number that was never true, and a sort key resolved for only part of the list
   // is a filter wearing a sort key's name.
+  //
+  // So the match set is what this costs, and `minScore` is what sets it. On a corpus of four
+  // hundred, ten matches read 468 rows and four hundred read 2384 — the tags of a match are read
+  // whether or not it is shown. A caller that wants the floor low wants a corpus it has already
+  // narrowed with `scope`.
   const searched = async (
     db: TenantDb,
     userId: string,
@@ -2212,6 +2217,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 
   // What goes in front of a prompt: the same search, by meaning alone, over everything, with the
   // count and the scopes dropped because the hook prints what it is given and never pages.
+  //
+  // It inherits that search's cost, and this is the path that runs on every prompt, so `minScore`
+  // is doing more work here than its name suggests: the hook's 0.65 leaves single digits of a
+  // four-hundred-memory corpus to read tags for, and a floor near zero leaves all of it. The
+  // ceiling on `limit` bounds what comes back, not what is read.
   const injected = async (db: TenantDb, userId: string, input: InjectInput): Promise<MemoryHit[]> =>
     (await searched(db, userId, { ...input, scope: [], mode: "vector" }, [])).results;
 

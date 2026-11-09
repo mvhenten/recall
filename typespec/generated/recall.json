@@ -826,7 +826,8 @@
         "minScore": {
           "type": "number",
           "minimum": -1,
-          "maximum": 1
+          "maximum": 1,
+          "description": "The cosine similarity a memory must reach to count as a match. It bounds the work and not just\nthe answer: every match has its scope read whether or not it is shown, so a floor near zero\nreads the tags of the whole corpus to put at most ten memories in front of a prompt. `limit`\nbounds what comes back, never what is read."
         }
       },
       "required": ["query", "preferScope", "limit", "minScore"],
