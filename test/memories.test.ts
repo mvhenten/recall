@@ -1,7 +1,6 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { dot, ftsQuery, normalize, quantize, reciprocalRankFusion } from "../src/rank";
-import { type Client, harness } from "./harness";
+import { type Client, harness, tenantRows } from "./harness";
 
 interface MemoryView {
   memoryId: string;
@@ -166,13 +165,17 @@ describe("hybrid search", () => {
     expect((await alice.request("DELETE", "/v2/memories/short-lived")).status).toBe(204);
 
     expect(await alice.search("vq77zeta", "any", "text")).toEqual([]);
-    const fts = await env.DB.prepare("SELECT count(*) AS n FROM memories_fts WHERE memories_fts MATCH ?")
-      .bind('"vq77zeta"')
-      .first<{ n: number }>();
+    const [fts] = await tenantRows<{ n: number }>(
+      alice.userId,
+      "SELECT count(*) AS n FROM memories_fts WHERE memories_fts MATCH ?",
+      '"vq77zeta"',
+    );
     expect(fts?.n).toBe(0);
-    const tags = await env.DB.prepare("SELECT count(*) AS n FROM memory_tags WHERE memory_id = ?")
-      .bind(memory.memoryId)
-      .first<{ n: number }>();
+    const [tags] = await tenantRows<{ n: number }>(
+      alice.userId,
+      "SELECT count(*) AS n FROM memory_tags WHERE memory_id = ?",
+      memory.memoryId,
+    );
     expect(tags?.n).toBe(0);
   });
 

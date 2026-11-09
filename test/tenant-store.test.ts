@@ -44,9 +44,9 @@ const session = {
   pid: 4242,
 };
 
-// What a history row carries that the index reads, for one fixed corpus. The same rows go into the
-// tenant object and into D1, and the ranking the reader returns is held against the ranking the
-// query itself produces over the same corpus.
+// What a history row carries that the index reads, for one fixed corpus. The ranking the shipped
+// reader returns is held against the ranking the hand-written query below produces over the same
+// rows of the same object, so what is proved is the reader's query and not the store under it.
 const CORPUS: ReadonlyArray<readonly [string, string, string, string, string]> = [
   ["s-1", "rank the chunks a search reads", "bound the vector scan", "feat(search): bound the vector scan", "cobalt"],
   ["s-2", "bound the vector scan", "rank the history rows", "fix(rank): rank the history rows", "nimbus"],
@@ -70,9 +70,9 @@ const FILTER: HistoryInput = { host: "", repo: "", cursor: "", limit: 10, sort: 
 
 const NOW = 1_700_000_120_000;
 
-// The prose one session's chunks hold, for the same corpus in both stores. `session_chunks_fts` is
-// an external-content table: it holds no copy of a chunk and its terms are the insert trigger's to
-// write, so a store that carried the table and lost the trigger ranks nothing at all.
+// The prose one session's chunks hold. `session_chunks_fts` is an external-content table: it holds
+// no copy of a chunk and its terms are the insert trigger's to write, so a store that carried the
+// table and lost the trigger ranks nothing at all.
 const CHUNKS: ReadonlyArray<readonly [number, string, string, string]> = [
   [1, "s-1", "user", "rank the chunks a search reads before it bounds the vector scan"],
   [2, "s-1", "model", "the vector scan is bounded by the chunks the search ranks"],
@@ -94,8 +94,8 @@ const CHUNK_RANKING = `SELECT c.chunk_seq FROM session_chunks_fts f
 const EMBEDDING = new ArrayBuffer(4);
 
 // What an artifact carries that the shelf's index reads. `artifacts_fts` is external-content over
-// `artifacts` and its terms are the insert trigger's to write, so the corpus goes into D1's copy
-// of the table and into the tenant object's, and the two rankings are held against each other.
+// `artifacts` and its terms are the insert trigger's to write, so the corpus is laid down by the
+// shipped writer and the ranking below is held against what the shelf's own reader returns.
 const ARTIFACTS: ReadonlyArray<readonly [string, string, string]> = [
   ["rank-the-shelf", "bound the vector scan", "a shelf ranks the artifacts it holds"],
   ["bound-the-shelf", "rank the shelf rows", "the shelf is bounded before it is drawn"],
@@ -111,10 +111,6 @@ const ARTIFACT_RANKING = `SELECT a.name FROM artifacts_fts f
    ORDER BY bm25(artifacts_fts, 5.0, 2.0, 1.0) LIMIT 51`;
 
 const ARTIFACT_QUERIES = ["rank", "scan", "archive", "board OR migration", "vector AND scan"];
-
-const ARTIFACT_INSERT = `INSERT INTO artifacts (user_id, name, rev, type, title, description, read_perm,
-   write_perm, entry_path, files, file_count, bytes, created_at, updated_at, last_writer_user_id)
- VALUES (?1, ?2, 1, 'document', ?3, ?4, 'private', 'owner', 'index.md', '[]', 1, 12, 1, 1, ?1)`;
 
 // What a memory carries that the index reads, for one fixed corpus. `in_scope` orders ahead of the
 // ranking, so every row is written with a tag and the scoped read asks for one of them.
@@ -218,12 +214,12 @@ describe("the tenant store", () => {
   it("ranks a history search the way bm25 ranks it", async () => {
     const userId = `user-${crypto.randomUUID()}`;
     for (const [sessionId, first, latest, subject, agent] of CORPUS) {
-      await env.DB.prepare(HISTORY_INSERT).bind(userId, sessionId, first, latest, subject, agent).run();
       await tenantRows(userId, HISTORY_INSERT, userId, sessionId, first, latest, subject, agent);
     }
     for (const query of QUERIES) {
-      const { results } = await env.DB.prepare(HISTORY_RANKING).bind(userId, query).all<{ session_id: string }>();
-      const ranked = results.map((row) => row.session_id);
+      const ranked = (await tenantRows<{ session_id: string }>(userId, HISTORY_RANKING, userId, query)).map(
+        (row) => row.session_id,
+      );
       const object = await inStore(userId, (db) => searchSessionHistory(db, userId, FILTER, query, FILTER.limit, NOW));
       expect(ranked).not.toEqual([]);
       expect(object.sessions.map((found) => found.sessionId)).toEqual(ranked);
@@ -233,7 +229,6 @@ describe("the tenant store", () => {
   it("ranks an artifact search the way bm25 weights it", async () => {
     const userId = `user-${crypto.randomUUID()}`;
     for (const [name, title, description] of ARTIFACTS) {
-      await env.DB.prepare(ARTIFACT_INSERT).bind(userId, name, title, description).run();
       const written = await inStore(userId, (db) =>
         createArtifact(db, {
           userId,
@@ -252,8 +247,9 @@ describe("the tenant store", () => {
       expect(written).toBe(true);
     }
     for (const query of ARTIFACT_QUERIES) {
-      const { results } = await env.DB.prepare(ARTIFACT_RANKING).bind(userId, query).all<{ name: string }>();
-      const ranked = results.map((row) => row.name);
+      const ranked = (await tenantRows<{ name: string }>(userId, ARTIFACT_RANKING, userId, query)).map(
+        (row) => row.name,
+      );
       expect(ranked).not.toEqual([]);
       const found = await inStore(userId, (db) => searchArtifacts(db, userId, "", query, 50));
       expect(found.artifacts.map((artifact) => artifact.name)).toEqual(ranked);
@@ -292,12 +288,12 @@ describe("the tenant store", () => {
   it("ranks a chunk search the way bm25 ranks it", async () => {
     const userId = `user-${crypto.randomUUID()}`;
     for (const [chunkSeq, sessionId, speaker, text] of CHUNKS) {
-      await env.DB.prepare(CHUNK_INSERT).bind(chunkSeq, userId, sessionId, chunkSeq, speaker, text, EMBEDDING).run();
       await tenantRows(userId, CHUNK_INSERT, chunkSeq, userId, sessionId, chunkSeq, speaker, text, EMBEDDING);
     }
     for (const query of CHUNK_QUERIES) {
-      const { results } = await env.DB.prepare(CHUNK_RANKING).bind(userId, query).all<{ chunk_seq: number }>();
-      const ranked = results.map((row) => row.chunk_seq);
+      const ranked = (await tenantRows<{ chunk_seq: number }>(userId, CHUNK_RANKING, userId, query)).map(
+        (row) => row.chunk_seq,
+      );
       const object = await inStore(userId, (db) => chunkMatches(db, userId, query, 10));
       expect(ranked).not.toEqual([]);
       expect(object.map((found) => found.chunkSeq)).toEqual(ranked);

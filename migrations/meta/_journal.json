@@ -22,6 +22,13 @@
       "when": 1762000000000,
       "tag": "0023_memories_moved",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1762000000000,
+      "tag": "0024_drop_migrated_tables",
+      "breakpoints": true
     }
   ]
 }
