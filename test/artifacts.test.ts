@@ -24,7 +24,7 @@ const listed = async (
   alice: Client,
   query = "",
 ): Promise<{ artifacts: ArtifactView[]; total: number; cut: boolean; nextCursor: string }> => {
-  const response = await alice.request("GET", `/v1/artifacts${query}`);
+  const response = await alice.request("GET", `/v2/artifacts${query}`);
   expect(response.status).toBe(200);
   return response.json();
 };
@@ -69,7 +69,7 @@ describe("publishing", () => {
       url: `https://${ARTIFACT_HOSTNAME}/a/q3-notes`,
     });
 
-    const read = await alice.request("GET", "/v1/artifacts/q3-notes");
+    const read = await alice.request("GET", "/v2/artifacts/q3-notes");
     expect(read.status).toBe(200);
     const found: { artifact: ArtifactView } = await read.json();
     expect(found.artifact.type).toBe("document");
@@ -116,9 +116,9 @@ describe("publishing", () => {
     expect(page.artifacts).toHaveLength(1);
     expect(page.artifacts[0]?.bytes).toBe("<p>redrawn</p>".length);
 
-    expect((await alice.request("DELETE", "/v1/artifacts/burn-up")).status).toBe(204);
+    expect((await alice.request("DELETE", "/v2/artifacts/burn-up")).status).toBe(204);
     expect((await h.sendToArtifactHost("/a/burn-up", assertion)).status).toBe(404);
-    expect((await alice.request("DELETE", "/v1/artifacts/burn-up")).status).toBe(404);
+    expect((await alice.request("DELETE", "/v2/artifacts/burn-up")).status).toBe(404);
   });
 
   it("holds the files of a replacement under their own revision", async () => {
@@ -182,7 +182,7 @@ describe("the artifact hostname", () => {
     const { h, alice, assertion } = await publisher();
     await alice.publish("burn-up", PAGE);
 
-    for (const path of ["/v1/memories", "/v1/artifacts", "/dashboard", "/dashboard/stats", "/device", "/"]) {
+    for (const path of ["/v2/memories", "/v2/artifacts", "/dashboard", "/dashboard/stats", "/device", "/"]) {
       const response = await h.sendToArtifactHost(path, assertion);
       expect([path, response.status]).toEqual([path, 404]);
     }
@@ -515,7 +515,7 @@ describe("a write permission", () => {
     const body: { error: string } = await refused.json();
     expect(body.error).toContain("owner");
     expect(body.error).not.toContain("site");
-    expect((await bob.request("DELETE", "/v1/artifacts/owned-ledger")).status).toBe(403);
+    expect((await bob.request("DELETE", "/v2/artifacts/owned-ledger")).status).toBe(403);
   });
 
   it("leaves another account its own first publish under an account-readable name", async () => {
@@ -529,7 +529,7 @@ describe("a write permission", () => {
     expect(mine.status).toBe(200);
     expect(await (await h.sendToArtifactHost("/a/notes", assertion)).text()).toBe("<p>alice</p>");
 
-    const bobEmail = (await bob.request("GET", "/v1/artifacts/notes")).json() as Promise<{ artifact: ArtifactView }>;
+    const bobEmail = (await bob.request("GET", "/v2/artifacts/notes")).json() as Promise<{ artifact: ArtifactView }>;
     expect((await bobEmail).artifact.bytes).toBe("<p>bob</p>".length);
   });
 
@@ -540,8 +540,8 @@ describe("a write permission", () => {
       write: "owner",
       files: [{ path: "index.html", body: "<p>shared</p>" }],
     });
-    const metadata = await bob.request("GET", "/v1/artifacts/shared-spec");
-    const file = await bob.request("GET", "/v1/artifacts/shared-spec/files/index.html");
+    const metadata = await bob.request("GET", "/v2/artifacts/shared-spec");
+    const file = await bob.request("GET", "/v2/artifacts/shared-spec/files/index.html");
     expect([metadata.status, file.status]).toEqual([200, 200]);
     const { artifact }: { artifact: ArtifactView } = await metadata.json();
     expect(artifact.read).toBe("account");
@@ -669,7 +669,7 @@ describe("resolving a name across two tenants", () => {
       read: "account",
       files: [{ path: "index.html", body: "<p>alice</p>" }],
     });
-    expect((await alice.request("DELETE", "/v1/artifacts/handed-back")).status).toBe(204);
+    expect((await alice.request("DELETE", "/v2/artifacts/handed-back")).status).toBe(204);
     expect(await claims("handed-back")).toEqual([]);
 
     const theirs = await bob.publishArtifact("handed-back", {
@@ -705,7 +705,7 @@ describe("resolving a name across two tenants", () => {
     await bob.publishArtifact("report", { type: "document", files: [{ path: "notes.md", body: "# bob\n" }] });
     expect(await heldBy(bobId, "report")).toEqual([{ name: "report" }]);
 
-    const made = await alice.request("POST", "/v1/artifacts/report/shares", { mode: "link" });
+    const made = await alice.request("POST", "/v2/artifacts/report/shares", { mode: "link" });
     expect(made.status).toBe(200);
     const { address }: { address: string } = await made.json();
     const page = await h.sendToSharePrefix(new URL(address).pathname, null);
@@ -728,7 +728,7 @@ describe("the main hostname", () => {
     const dashboard = await h.send("/dashboard", { headers: { "cf-access-jwt-assertion": assertion } });
     expect(dashboard.status).toBe(401);
 
-    const file = await alice.request("GET", "/v1/artifacts/burn-up/files/index.html");
+    const file = await alice.request("GET", "/v2/artifacts/burn-up/files/index.html");
     expect(await file.text()).toBe(PAGE);
     expect(file.headers.get("content-type")).toBe("text/html; charset=utf-8");
   });
@@ -744,7 +744,7 @@ describe("adopting what was published before a row carried a type", () => {
     expect(await served.text()).toBe("<p>from before</p>");
     expect((await listed(alice)).artifacts).toHaveLength(0);
 
-    const adopted = await alice.request("POST", "/v1/artifacts/adopt");
+    const adopted = await alice.request("POST", "/v2/artifacts/adopt");
     expect(adopted.status).toBe(200);
     expect(await adopted.json()).toEqual({ adopted: 1 });
 
@@ -753,7 +753,7 @@ describe("adopting what was published before a row carried a type", () => {
     expect(page.artifacts[0]?.type).toBe("site");
     expect(await (await h.sendToArtifactHost("/a/old-page", assertion)).text()).toBe("<p>from before</p>");
 
-    const again = await alice.request("POST", "/v1/artifacts/adopt");
+    const again = await alice.request("POST", "/v2/artifacts/adopt");
     expect(await again.json()).toEqual({ adopted: 0 });
   });
 });

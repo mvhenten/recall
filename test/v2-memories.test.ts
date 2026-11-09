@@ -21,18 +21,6 @@ interface V2Hit {
   score: number;
 }
 
-interface V1Memory {
-  memoryId: string;
-  name: string;
-  recallCount: number;
-  lastRecalledAt: number;
-}
-
-interface V1Hit {
-  memory: V1Memory;
-  score: number;
-}
-
 const CORPUS = [
   {
     name: "cursor-paging",
@@ -273,26 +261,5 @@ describe("the /v2 memories", () => {
       value: { query: "ranking", tags: ["search"], limit: 10, minScore: 0.1, mode: "hybrid" },
     });
     expect(v2(["Search", " search "]).ok).toBe(false);
-  });
-
-  it("answers the same corpus as /v1, listed and ranked alike", async () => {
-    const { user } = await harness();
-    const client = await user("equivalence");
-    await corpus(client);
-
-    const v1Listed: { memories: V1Memory[] } = await (await client.request("GET", "/v1/memories")).json();
-    const v2Listed: { memories: V2Memory[] } = await (await client.v2.memories()).json();
-    expect(v2Listed.memories).toHaveLength(CORPUS.length);
-    expect(v2Listed.memories.map((memory) => memory.memoryId)).toEqual(
-      v1Listed.memories.map((memory) => memory.memoryId),
-    );
-
-    const tagged = { query: "ranking", limit: 10, minScore: 0.1, mode: "hybrid" };
-    const v1Tagged = await client.request("POST", "/v1/search", { ...tagged, tags: ["search"], any: false });
-    const v2Tagged = await client.v2.searchMemories({ ...tagged, tags: ["search"], mode: "Hybrid" });
-    const v1Hits: { hits: V1Hit[]; elsewhere: Array<{ name: string }> } = await v1Tagged.json();
-    const v2Hits: { hits: V2Hit[]; elsewhere: Array<{ memoryName: string }> } = await v2Tagged.json();
-    expect(v2Hits.hits.map((hit) => hit.memory.memoryId)).toEqual(v1Hits.hits.map((hit) => hit.memory.memoryId));
-    expect(v2Hits.elsewhere.map((near) => near.memoryName)).toEqual(v1Hits.elsewhere.map((near) => near.name));
   });
 });

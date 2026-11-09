@@ -10,9 +10,8 @@
 // closed the last record, which is what makes a readback the file to its final byte rather than
 // one short of it.
 //
-// The `records/` prefix is what keeps the two paths apart in one bucket. A byte-path key is four
-// segments and `parseStretchKey` refuses a fifth, so the consumer that indexes the byte path reads
-// no record object and no change was needed there.
+// The `records/` prefix is what keeps the two paths apart in one bucket: a byte-path key is four
+// segments under the account's own id, and nothing that reads those reaches a record object.
 
 import type { RecordSpan } from "./transcript-plan";
 import type { RecordedFile } from "./transcripts";

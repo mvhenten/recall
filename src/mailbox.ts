@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { type Parsed, parseSessionId } from "./model";
+import { parseSessionId } from "./model";
 
 // A message is a ping that is relevant now. It goes to the sockets attached when it is sent and to
 // nothing else: the bus is not a board a session reads at boot, so one that was not listening then
@@ -133,56 +133,6 @@ interface Pending {
   resolve: (outcome: Outcome) => void;
   lapse: ReturnType<typeof setTimeout>;
 }
-
-const parseToSessionId = (value: unknown): Parsed<string> => {
-  if (value === undefined || value === "") return { ok: true, value: "" };
-  if (typeof value !== "string") {
-    return { ok: false, error: "toSessionId must be a session id, or empty for every session on the host" };
-  }
-  return parseSessionId(value);
-};
-
-const parseFromSessionId = (value: unknown): Parsed<string> => {
-  if (value === undefined || value === "") return { ok: true, value: "" };
-  if (typeof value !== "string") {
-    return { ok: false, error: "fromSessionId must be the id of a session on the sending host" };
-  }
-  return parseSessionId(value);
-};
-
-// A sender too old to name a kind is sending news.
-const parseKind = (value: unknown): Parsed<MessageKind> => {
-  if (value === undefined || value === "news") return { ok: true, value: "news" };
-  if (value === "order") return { ok: true, value: "order" };
-  return { ok: false, error: 'kind must be "news" for every session on the host, or "order" for one of them' };
-};
-
-export const parseSend = (input: unknown): Parsed<SendInput> => {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    return { ok: false, error: "body must be a JSON object" };
-  }
-  const { kind, toDeviceId, toSessionId, fromSessionId, body } = input as Record<string, unknown>;
-  if (typeof toDeviceId !== "string" || toDeviceId.length < 1) {
-    return { ok: false, error: "toDeviceId must be the id of a device on this account; see GET /v1/devices" };
-  }
-  if (typeof body !== "string" || body.length < 1) return { ok: false, error: "body must hold at least one character" };
-  const wanted = parseKind(kind);
-  if (!wanted.ok) return wanted;
-  const session = parseToSessionId(toSessionId);
-  if (!session.ok) return session;
-  const from = parseFromSessionId(fromSessionId);
-  if (!from.ok) return from;
-  return {
-    ok: true,
-    value: {
-      kind: wanted.value,
-      toDeviceId,
-      toSessionId: session.value,
-      fromSessionId: from.value,
-      body,
-    },
-  };
-};
 
 const readJson = (raw: string): unknown => {
   try {

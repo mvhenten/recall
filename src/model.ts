@@ -80,9 +80,7 @@ export const SESSION_TTL_MS = 86_400_000;
 // How long after its last prompt a session still reads as busy. Both sides derive busy and idle on
 // read, never storing either.
 export const IDLE_AFTER_MS = 300_000;
-export const MAX_FOCUS_CHARS = 200;
 export const MAX_SESSION_TEXT_CHARS = 500;
-export const MAX_PROMPTS = 1_000_000;
 
 export interface Focus {
   first: string;
@@ -189,7 +187,6 @@ export interface LabelTargets {
 // reading arrives again whenever that host backfills, and the row is the only thing that can tell
 // the rollup it has already counted it. One row per model, day and file is small enough to keep.
 export const USAGE_RETENTION_MS = 1_209_600_000;
-export const MAX_USAGE_TOKENS = 1_000_000_000;
 
 // The client dates its own deltas and the rollup is unbounded, so one delta dated 1970 would
 // stretch every month the insights page draws. recall did not exist before 2020, and a host's clock
@@ -410,21 +407,6 @@ export const parseTags = (value: unknown): Parsed<string[]> => {
   return { ok: true, value: [...tags].sort() };
 };
 
-export const parseSave = (body: unknown): Parsed<SaveInput> => {
-  if (!isRecord(body)) return fail("body must be a JSON object");
-  const { description, type, tags } = body;
-  if (typeof description !== "string" || description.length < 1 || description.length > 500) {
-    return fail("description must hold 1 to 500 characters");
-  }
-  if (!isOneOf(memoryTypes, type)) return fail(`type must be one of ${memoryTypes.join(", ")}`);
-  if (typeof body.body !== "string" || body.body.length > 100_000) {
-    return fail("body must be a string of at most 100000 characters");
-  }
-  const parsedTags = parseTags(tags);
-  if (!parsedTags.ok) return parsedTags;
-  return { ok: true, value: { description, type, body: body.body, tags: parsedTags.value } };
-};
-
 export const parseSearch = (body: unknown): Parsed<SearchInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
   const { query, any, limit, minScore, mode } = body;
@@ -511,19 +493,6 @@ export const parseLabels = (form: URLSearchParams): Parsed<Label[]> => {
   return { ok: true, value: labels };
 };
 
-export const sessionScopes = ["live", "history", "search"] as const;
-export type SessionScope = (typeof sessionScopes)[number];
-
-// Which sessions a listing covers: the ones running now, every one the account has on record, or
-// the ones a query finds by meaning. A scope this service does not know is refused rather than
-// read as the default, so a client asking for a listing it cannot give never takes the live
-// sessions for the whole span.
-export const parseSessionScope = (value: string | null): Parsed<SessionScope> => {
-  if (value === null || value === "") return { ok: true, value: "live" };
-  if (!isOneOf(sessionScopes, value)) return fail(`scope must be one of ${sessionScopes.join(", ")}`);
-  return { ok: true, value };
-};
-
 export const parseSessionSearch = (params: URLSearchParams): Parsed<SessionSearch> => {
   const query = params.get("q") ?? "";
   if (query.length < 1 || query.length > MAX_QUERY_CHARS) return fail(`q must hold 1 to ${MAX_QUERY_CHARS} characters`);
@@ -534,16 +503,10 @@ export const parseSessionSearch = (params: URLSearchParams): Parsed<SessionSearc
 
 const SESSION_ID = /^[A-Za-z0-9_-]{1,100}$/;
 
-const isText = (value: unknown, max: number): value is string => typeof value === "string" && value.length <= max;
-
 export const parseSessionId = (value: string): Parsed<string> =>
   SESSION_ID.test(value) ? { ok: true, value } : fail("the session id may hold 1 to 100 letters, digits, - and _");
 
 export const TRANSCRIPT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
-
-// A session delegates plenty of turns, and each writes a file; far past this the delta is not one
-// this service wrote the rules for.
-export const MAX_COUNTED_FILES = 500;
 
 // Which of a session's transcript files a stretch belongs to: `main` for the session's own, and one
 // name per delegated turn. It becomes part of an object key, so a name that could reach out of the
@@ -552,22 +515,6 @@ export const parseTranscriptFile = (value: string | null): Parsed<string> =>
   value !== null && TRANSCRIPT_FILE.test(value)
     ? { ok: true, value }
     : fail("file must open with a letter or digit and hold at most 101 of letters, digits, . _ and -");
-
-// The transcript files one delta read, which is what says their tokens are counted. A delta that
-// names none is one from a client that does not read them apart, and counts for no file.
-export const parseCountedFiles = (value: unknown): Parsed<string[]> => {
-  if (value === undefined) return { ok: true, value: [] };
-  if (!Array.isArray(value) || value.length > MAX_COUNTED_FILES) {
-    return fail(`files must be an array of at most ${MAX_COUNTED_FILES} transcript file names`);
-  }
-  const files = new Set<string>();
-  for (const raw of value) {
-    const file = parseTranscriptFile(typeof raw === "string" ? raw : null);
-    if (!file.ok) return file;
-    files.add(file.value);
-  }
-  return { ok: true, value: [...files] };
-};
 
 export const parseStretchOffset = (value: string | null): Parsed<number> => {
   const offset = Number(value);
@@ -623,26 +570,6 @@ export const parseStretchCursor = (value: string | null): Parsed<string> =>
     ? { ok: true, value: value ?? "" }
     : fail("after must name a stretch, as <start>, <start>.<end> or <start>.<end>.<inflates> in sixteen digits each");
 
-// Which stretch of a file an append is offering: where it begins in the file on disk and where it
-// ends there. Whether the body is one gzip member or the bytes of the file is the body's own to say
-// and never a caller's: a name claiming a length the body does not hold would place every stretch
-// past it in the wrong part of the archive. A host that names only `offset` is one from before a
-// redacted stretch could run to another length than the file it was read from, and means a place in
-// the archive by it; its stretches are stored and read back on those terms.
-export type StretchSpan = { kind: "span"; from: number; through: number } | { kind: "archive"; from: number };
-
-export const parseStretchSpan = (params: URLSearchParams): Parsed<StretchSpan> => {
-  const offset = parseStretchOffset(params.get("offset"));
-  if (!offset.ok) return offset;
-  const asked = params.get("through");
-  if (asked === null) return { ok: true, value: { kind: "archive", from: offset.value } };
-  const through = Number(asked);
-  if (!isInteger(through, offset.value + 1, offset.value + MAX_STRETCH_BYTES)) {
-    return fail(`through must be past offset, by at most ${MAX_STRETCH_BYTES} bytes`);
-  }
-  return { ok: true, value: { kind: "span", from: offset.value, through } };
-};
-
 const BYTE_RANGE = /^bytes=([0-9]{1,16})-([0-9]{1,16})$/;
 
 export interface ByteRange {
@@ -662,107 +589,4 @@ export const parseByteRange = (header: string | null): Parsed<ByteRange> => {
     isInteger(last, first, first + MAX_STRETCH_BYTES - 1)
     ? { ok: true, value: { offset: first, length: last - first + 1 } }
     : fail(`range must be bytes=<first>-<last>, spanning at most ${MAX_STRETCH_BYTES} bytes`);
-};
-
-const parseFocus = (value: unknown): Parsed<Focus> => {
-  if (!isRecord(value) || !isText(value.first, MAX_FOCUS_CHARS) || !isText(value.latest, MAX_FOCUS_CHARS)) {
-    return fail(`focus must be {first, latest}, each a string of at most ${MAX_FOCUS_CHARS} characters`);
-  }
-  return { ok: true, value: { first: value.first, latest: value.latest } };
-};
-
-export const parseSession = (body: unknown): Parsed<SessionInput> => {
-  if (!isRecord(body)) return fail("body must be a JSON object");
-  const { host, cwd, repo, branch, commit, startedAt, lastActivityAt, prompts, mode, permissionMode, pid } = body;
-  if (!isText(host, MAX_SESSION_TEXT_CHARS) || host.length < 1) {
-    return fail(`host must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
-  }
-  const text = (field: string): { ok: false; error: string } =>
-    fail(`${field} must be a string of at most ${MAX_SESSION_TEXT_CHARS} characters, empty when it does not apply`);
-  if (!isText(cwd, MAX_SESSION_TEXT_CHARS)) return text("cwd");
-  if (!isText(repo, MAX_SESSION_TEXT_CHARS)) return text("repo");
-  if (!isText(branch, MAX_SESSION_TEXT_CHARS)) return text("branch");
-  if (!isText(commit, MAX_SESSION_TEXT_CHARS)) return text("commit");
-  if (!isText(permissionMode, MAX_SESSION_TEXT_CHARS)) return text("permissionMode");
-  const epoch = (value: unknown): value is number => isInteger(value, 0, Number.MAX_SAFE_INTEGER);
-  if (!epoch(startedAt) || !epoch(lastActivityAt)) {
-    return fail("startedAt and lastActivityAt must be whole numbers of epoch milliseconds");
-  }
-  if (!isInteger(prompts, 0, MAX_PROMPTS)) return fail(`prompts must be a whole number from 0 to ${MAX_PROMPTS}`);
-  if (!isOneOf(sessionModes, mode))
-    return fail("mode must be interactive, headless, or empty when the host cannot tell");
-  if (!isInteger(pid, 0, Number.MAX_SAFE_INTEGER)) return fail("pid must be a whole number");
-  const focus = parseFocus(body.focus);
-  if (!focus.ok) return focus;
-  return {
-    ok: true,
-    value: {
-      host,
-      cwd,
-      repo,
-      branch,
-      commit,
-      startedAt,
-      lastActivityAt,
-      prompts,
-      focus: focus.value,
-      mode,
-      permissionMode,
-      pid,
-    },
-  };
-};
-
-export const parseUsage = (body: unknown, now: number): Parsed<UsageInput> => {
-  if (!isRecord(body)) return fail("body must be a JSON object");
-  const { seq, host, repo, provider, account, model, prompts, at, durable } = body;
-  const { inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens } = body;
-  if (durable !== undefined && typeof durable !== "boolean") return fail("durable must be true or false");
-  const files = parseCountedFiles(body.files);
-  if (!files.ok) return files;
-  if (!isInteger(seq, 0, Number.MAX_SAFE_INTEGER)) return fail("seq must be the whole number of a delta in a session");
-  if (!isText(host, MAX_SESSION_TEXT_CHARS) || host.length < 1) {
-    return fail(`host must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
-  }
-  if (!isText(repo, MAX_SESSION_TEXT_CHARS)) {
-    return fail(`repo must be a string of at most ${MAX_SESSION_TEXT_CHARS} characters, empty when it does not apply`);
-  }
-  if (!isText(provider, MAX_SESSION_TEXT_CHARS) || provider.length < 1) {
-    return fail(`provider must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
-  }
-  if (!isText(model, MAX_SESSION_TEXT_CHARS) || model.length < 1) {
-    return fail(`model must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
-  }
-  if (!isText(account, MAX_SESSION_TEXT_CHARS) || account.length < 1) {
-    return fail(`account must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);
-  }
-  if (!isInteger(prompts, 0, MAX_PROMPTS)) return fail(`prompts must be a whole number from 0 to ${MAX_PROMPTS}`);
-  if (!isInteger(at, USAGE_EPOCH, now + DAY_MS)) {
-    return fail("at must be a whole number of epoch milliseconds, no earlier than 2020 and no more than a day ahead");
-  }
-  const counter = (value: unknown): value is number => isInteger(value, 0, MAX_USAGE_TOKENS);
-  if (!counter(inputTokens) || !counter(outputTokens) || !counter(cacheWriteTokens) || !counter(cacheReadTokens)) {
-    return fail(
-      `inputTokens, outputTokens, cacheWriteTokens and cacheReadTokens must each be a whole number from 0 to ${MAX_USAGE_TOKENS}`,
-    );
-  }
-  return {
-    ok: true,
-    value: {
-      seq,
-      host,
-      repo,
-      provider,
-      account,
-      model,
-      prompts,
-      at,
-      inputTokens,
-      outputTokens,
-      cacheWriteTokens,
-      cacheReadTokens,
-      durable: durable === true,
-      files: files.value,
-    },
-  };
 };

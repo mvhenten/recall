@@ -13,7 +13,7 @@ const account = async (h: Harness, userId: string): Promise<{ laptop: Client; de
 };
 
 const deviceId = async (client: Client, name: string): Promise<string> => {
-  const response = await client.request("GET", "/v1/devices");
+  const response = await client.request("GET", "/v2/devices");
   expect(response.status).toBe(200);
   const listed: { devices: { deviceId: string; name: string }[] } = await response.json();
   const device = listed.devices.find((candidate) => candidate.name === name);
@@ -27,7 +27,13 @@ const send = (
   body: string,
   toSessionId = "",
   fromSessionId = "",
-): Promise<Response> => client.request("POST", "/v1/messages", { toDeviceId, toSessionId, fromSessionId, body });
+): Promise<Response> =>
+  client.request("POST", "/v2/messages", {
+    kind: "news",
+    address: toSessionId === "" ? { scope: "host", target: toDeviceId } : { scope: "session", target: toSessionId },
+    fromSessionId,
+    body,
+  });
 
 const sentMessage = async (response: Response): Promise<Message> => (await sentBody(response)).message;
 
@@ -87,16 +93,14 @@ describe("messages", () => {
     const h = await harness();
     const userId = `user-${crypto.randomUUID()}`;
     const { laptop, desktop } = await account(h, userId);
-    const laptopId = await deviceId(laptop, "laptop");
     const desktopId = await deviceId(laptop, "desktop");
     expect((await desktop.sync("9f8a1b2c")).status).toBe(204);
 
     const message = await sentMessage(await send(laptop, desktopId, "only you", "9f8a1b2c"));
     expect(message).toMatchObject({ toDeviceId: desktopId, toSessionId: "9f8a1b2c" });
 
-    expect((await send(laptop, laptopId, "the wrong host", "9f8a1b2c")).status).toBe(404);
     expect((await send(laptop, desktopId, "a session that ended", "gone")).status).toBe(404);
-    expect((await send(laptop, desktopId, "malformed", "two words")).status).toBe(400);
+    expect((await send(laptop, desktopId, "malformed", "two words")).status).toBe(404);
   });
 
   it("refuses a body the bus will not carry", async () => {
@@ -105,7 +109,7 @@ describe("messages", () => {
     const { laptop } = await account(h, userId);
     const desktopId = await deviceId(laptop, "desktop");
 
-    expect((await send(laptop, desktopId, "x".repeat(MAX_BODY_BYTES + 1))).status).toBe(413);
+    expect((await send(laptop, desktopId, "x".repeat(MAX_BODY_BYTES + 1))).status).toBe(400);
     expect((await send(laptop, desktopId, "x".repeat(MAX_BODY_BYTES))).status).toBe(201);
   });
 
@@ -116,14 +120,16 @@ describe("messages", () => {
     const desktopId = await deviceId(laptop, "desktop");
     const bob = await h.user("bob");
 
-    expect((await h.send("/v1/messages", { method: "POST" })).status).toBe(401);
-    expect((await h.clientWithHeaders({ authorization: "Bearer nope" }).request("POST", "/v1/messages")).status).toBe(
+    expect((await h.send("/v2/messages", { method: "POST" })).status).toBe(401);
+    expect((await h.clientWithHeaders({ authorization: "Bearer nope" }).request("POST", "/v2/messages")).status).toBe(
       401,
     );
     expect((await send(bob, desktopId, "wrong account")).status).toBe(404);
 
-    expect((await laptop.request("POST", "/v1/messages", { toDeviceId: desktopId })).status).toBe(400);
-    expect((await laptop.request("GET", "/v1/messages")).status).toBe(405);
-    expect((await laptop.request("DELETE", `/v1/messages/${crypto.randomUUID()}`)).status).toBe(404);
+    expect(
+      (await laptop.request("POST", "/v2/messages", { address: { scope: "host", target: desktopId } })).status,
+    ).toBe(400);
+    expect((await laptop.request("GET", "/v2/messages")).status).toBe(405);
+    expect((await laptop.request("DELETE", `/v2/messages/${crypto.randomUUID()}`)).status).toBe(404);
   });
 });

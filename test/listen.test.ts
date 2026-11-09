@@ -11,7 +11,7 @@ interface Listener {
 }
 
 const deviceId = async (client: Client, name: string): Promise<string> => {
-  const response = await client.request("GET", "/v1/devices");
+  const response = await client.request("GET", "/v2/devices");
   expect(response.status).toBe(200);
   const listed: { devices: { deviceId: string; name: string }[] } = await response.json();
   const device = listed.devices.find((candidate) => candidate.name === name);
@@ -33,14 +33,19 @@ const account = async (h: Harness) => {
 };
 
 const sent = async (client: Client, toDeviceId: string, body: string): Promise<Sent> => {
-  const response = await client.request("POST", "/v1/messages", { toDeviceId, body });
+  const response = await client.request("POST", "/v2/messages", {
+    kind: "news",
+    address: { scope: "host", target: toDeviceId },
+    fromSessionId: "",
+    body,
+  });
   expect(response.status).toBe(201);
   return await response.json();
 };
 
 // News is never answered, so this listener only records what it was handed.
 const listen = async (h: Harness, token: string): Promise<Listener> => {
-  const response = await h.send("/v1/messages/listen", {
+  const response = await h.send("/v2/messages/listen", {
     headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
   expect(response.status).toBe(101);
@@ -96,7 +101,7 @@ describe("messages listen", () => {
     const { laptop, desktopToken, desktopId } = await account(h);
     const desktop = await listen(h, desktopToken);
 
-    expect((await laptop.request("DELETE", `/v1/devices/${desktopId}`)).status).toBe(204);
+    expect((await laptop.request("DELETE", `/v2/devices/${desktopId}`)).status).toBe(204);
 
     await eventually(() => desktop.closed.includes(CLOSE_REVOKED), "the revoked socket closing");
   });

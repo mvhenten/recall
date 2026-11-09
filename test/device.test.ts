@@ -6,7 +6,7 @@ import { harness, tenantRows } from "./harness";
 interface ListedDevice {
   deviceId: string;
   name: string;
-  label: string;
+  hostLabel: string;
   createdAt: number;
   lastUsedAt: number;
   current: boolean;
@@ -63,7 +63,7 @@ describe("device login", () => {
     const client = h.clientWithToken(body.access_token);
     const saved = await client.save("first-note", { body: "hello from the device" });
     expect((await client.get("first-note")).memoryId).toBe(saved.memoryId);
-    const [device] = await devicesOf(await client.request("GET", "/v1/devices"));
+    const [device] = await devicesOf(await client.request("GET", "/v2/devices"));
     expect(device).toMatchObject({ name: "work laptop", current: true, lastUsedAt: h.now() });
 
     h.tick(5_000);
@@ -80,7 +80,7 @@ describe("device login", () => {
     const second = h.clientWithToken(await h.login(configured, "laptop"));
     expect((await first.save("shared-note", {})).userId).toBe(userId);
     expect((await second.get("shared-note")).userId).toBe(userId);
-    expect((await devicesOf(await second.request("GET", "/v1/devices"))).map((device) => device.name)).toEqual([
+    expect((await devicesOf(await second.request("GET", "/v2/devices"))).map((device) => device.name)).toEqual([
       "desktop",
       "laptop",
     ]);
@@ -101,10 +101,10 @@ describe("device login", () => {
     );
 
     expect(
-      (await devicesOf(await client.request("GET", "/v1/devices"))).map((device) => [device.name, device.label]),
+      (await devicesOf(await client.request("GET", "/v2/devices"))).map((device) => [device.name, device.hostLabel]),
     ).toEqual([
       ["ip-10-0-7-31", "core"],
-      ["tower", ""],
+      ["tower", "tower"],
     ]);
   });
 
@@ -123,7 +123,7 @@ describe("device login", () => {
     );
 
     expect(
-      (await devicesOf(await client.request("GET", "/v1/devices"))).map((device) => [device.name, device.label]),
+      (await devicesOf(await client.request("GET", "/v2/devices"))).map((device) => [device.name, device.hostLabel]),
     ).toEqual([
       ["core-box", "core"],
       ["core-box-2", "core"],
@@ -136,11 +136,11 @@ describe("device login", () => {
     await h.login(owner, "ubuntu");
     await h.login(owner, "ubuntu");
     const third = h.clientWithToken(await h.login(owner, "ubuntu"));
-    const names = (await devicesOf(await third.request("GET", "/v1/devices"))).map((device) => device.name);
+    const names = (await devicesOf(await third.request("GET", "/v2/devices"))).map((device) => device.name);
     expect(names).toEqual(["ubuntu", "ubuntu-2", "ubuntu-3"]);
 
     const stranger = h.clientWithToken(await h.login(await h.invite(email("bob")), "ubuntu"));
-    expect((await devicesOf(await stranger.request("GET", "/v1/devices"))).map((device) => device.name)).toEqual([
+    expect((await devicesOf(await stranger.request("GET", "/v2/devices"))).map((device) => device.name)).toEqual([
       "ubuntu",
     ]);
   });
@@ -180,9 +180,9 @@ describe("device login", () => {
 
   it("rejects malformed start and poll requests", async () => {
     const h = await harness();
-    const noName = await h.clientWithHeaders({}).request("POST", "/v1/device/code", { device_name: "" });
+    const noName = await h.clientWithHeaders({}).request("POST", "/v2/device/code", { device_name: "" });
     expect(await grantError(noName)).toBe("invalid_request");
-    const wrongGrant = await h.clientWithHeaders({}).request("POST", "/v1/device/token", {
+    const wrongGrant = await h.clientWithHeaders({}).request("POST", "/v2/device/token", {
       grant_type: "password",
       device_code: "x".repeat(43),
     });
@@ -254,13 +254,13 @@ describe("device tokens", () => {
     const bob = h.clientWithToken(await h.login(await h.invite(email("bob")), "bob-laptop"));
     await alice.save("private-plan", { body: "alice only" });
 
-    expect((await bob.request("GET", "/v1/memories/private-plan")).status).toBe(404);
-    expect((await bob.request("DELETE", "/v1/memories/private-plan")).status).toBe(404);
-    const [aliceDevice] = await devicesOf(await alice.request("GET", "/v1/devices"));
-    expect((await devicesOf(await bob.request("GET", "/v1/devices"))).map((device) => device.name)).toEqual([
+    expect((await bob.request("GET", "/v2/memories/private-plan")).status).toBe(404);
+    expect((await bob.request("DELETE", "/v2/memories/private-plan")).status).toBe(404);
+    const [aliceDevice] = await devicesOf(await alice.request("GET", "/v2/devices"));
+    expect((await devicesOf(await bob.request("GET", "/v2/devices"))).map((device) => device.name)).toEqual([
       "bob-laptop",
     ]);
-    expect((await bob.request("DELETE", `/v1/devices/${aliceDevice?.deviceId}`)).status).toBe(404);
+    expect((await bob.request("DELETE", `/v2/devices/${aliceDevice?.deviceId}`)).status).toBe(404);
     expect((await alice.get("private-plan")).body).toBe("alice only");
   });
 
@@ -269,16 +269,17 @@ describe("device tokens", () => {
     const owner = await h.invite(email("alice"));
     const laptop = h.clientWithToken(await h.login(owner, "laptop"));
     const desktop = h.clientWithToken(await h.login(owner, "desktop"));
-    const listed = await devicesOf(await desktop.request("GET", "/v1/devices"));
+    const listed = await devicesOf(await desktop.request("GET", "/v2/devices"));
     const laptopId = listed.find((device) => device.name === "laptop")?.deviceId;
+    const desktopId = listed.find((device) => device.name === "desktop")?.deviceId;
 
-    expect((await desktop.request("DELETE", `/v1/devices/${laptopId}`)).status).toBe(204);
-    const revoked = await laptop.request("GET", "/v1/memories");
+    expect((await desktop.request("DELETE", `/v2/devices/${laptopId}`)).status).toBe(204);
+    const revoked = await laptop.request("GET", "/v2/memories");
     expect(revoked.status).toBe(401);
     expect(await revoked.text()).toContain("run recall login");
 
-    expect((await desktop.request("DELETE", "/v1/devices/current")).status).toBe(204);
-    expect((await desktop.request("GET", "/v1/memories")).status).toBe(401);
+    expect((await desktop.request("DELETE", `/v2/devices/${desktopId}`)).status).toBe(204);
+    expect((await desktop.request("GET", "/v2/memories")).status).toBe(401);
 
     const malformed: Array<Record<string, string>> = [
       {},
@@ -286,7 +287,7 @@ describe("device tokens", () => {
       { authorization: "Basic abc" },
     ];
     for (const headers of malformed) {
-      expect((await h.clientWithHeaders(headers).request("GET", "/v1/memories")).status).toBe(401);
+      expect((await h.clientWithHeaders(headers).request("GET", "/v2/memories")).status).toBe(401);
     }
   });
 
@@ -366,7 +367,7 @@ describe("last used", () => {
     const client = h.clientWithToken(await h.login(await h.invite(email("alice"))));
     const issuedAt = h.now();
     const lastUsed = async (): Promise<number> => {
-      const [device] = await devicesOf(await client.request("GET", "/v1/devices"));
+      const [device] = await devicesOf(await client.request("GET", "/v2/devices"));
       return device?.lastUsedAt ?? 0;
     };
     h.tick(3_599_000);

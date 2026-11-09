@@ -1,6 +1,5 @@
 import { and, asc, count, desc, eq, getTableName, gt, gte, inArray, lt, lte, ne, or, type SQL, sql } from "drizzle-orm";
 import { type SQLiteColumn, type SQLiteTable, union, unionAll } from "drizzle-orm/sqlite-core";
-import type { ArtifactCopyReport } from "./artifact-copy";
 import {
   type ArtifactFile,
   type ArtifactListInput,
@@ -1280,9 +1279,9 @@ export const recordUsage = async (
   });
 };
 
-// How far one session's archive runs and how far the index has read of it. `archived` is a cache
-// of the objects, moved by the storage event that wrote them; `indexed` and `chunks` are the
-// index's own and no listing could recover them.
+// How far one session's archive runs and how far the index read of it before the byte path was
+// retired. Nothing writes `archived` any more; it is read to tell a session the byte path wrote
+// from one that never touched it, which is what a replay takes over.
 export interface IndexMark {
   archived: number;
   indexed: number;
@@ -1302,53 +1301,6 @@ export interface IndexedChunk {
   at: number;
   embedding: Uint8Array;
 }
-
-// A session is off the record mark while it holds no row for its own transcript. Every statement
-// the two indexing paths write carries it, so a session taken over by a replay stops the other
-// path dead rather than letting the two write the same prose twice.
-const offRecord = (userId: string, sessionId: string): SQL =>
-  sql`NOT EXISTS (SELECT 1 FROM ${sessionRecords}
-    WHERE ${sessionRecords.userId} = ${userId} AND ${sessionRecords.sessionId} = ${sessionId}
-      AND ${sessionRecords.file} = ${MAIN_FILE})`;
-
-// What one indexing pass produced, written in one batch with the mark that says how far it read.
-// The chunks are appended under ordinals that only climb, so a session indexed again after it was
-// resumed adds to what is there and nothing already indexed is rewritten or lost.
-//
-// It all lands in one batch, and every statement of it lands only while the session is off the
-// record mark. A session taken over by a replay goes on the mark in the batch that drops the
-// chunks this path wrote, so a pass that read its bite before the takeover and writes after it
-// writes nothing at all: there is no ordering of the two that leaves one session holding chunks
-// from both paths.
-export const writeChunks = async (
-  db: TenantDb,
-  userId: string,
-  sessionId: string,
-  from: number,
-  chunks: IndexedChunk[],
-  reached: number,
-): Promise<void> => {
-  db.transaction((tx) => {
-    chunks.forEach((chunk, index) => {
-      tx.insert(sessionChunks)
-        .select(
-          sql`SELECT NULL, ${userId}, ${sessionId}, ${from + index}, ${chunk.speaker}, ${chunk.text},
-            ${blobOf(chunk.embedding)}, ${chunk.at}
-          WHERE ${offRecord(userId, sessionId)}`,
-        )
-        .onConflictDoNothing({ target: [sessionChunks.userId, sessionChunks.sessionId, sessionChunks.ordinal] })
-        .run();
-    });
-    // The reach climbs and never drops back to what this pass read. Another writer may have moved
-    // it between the read and here — a record append, or the one-shot copy out of D1 shifting a
-    // session's copied chunks above the ordinals this object already holds — and a reach set back
-    // under theirs would have the next pass write over prose that is already indexed.
-    tx.update(sessionIndex)
-      .set({ bytes: reached, chunks: sql`MAX(chunks, ${from + chunks.length})` })
-      .where(and(eq(sessionIndex.userId, userId), eq(sessionIndex.sessionId, sessionId), offRecord(userId, sessionId)))
-      .run();
-  });
-};
 
 export interface ChunkCandidate {
   chunkSeq: number;
@@ -1553,9 +1505,6 @@ export interface ArtifactStore extends ArtifactReads {
   replaceArtifact(commit: ArtifactCommit, fromRev: number): Promise<boolean>;
   deleteArtifact(userId: string, name: string): Promise<void>;
   adoptArtifacts(userId: string): Promise<number>;
-  // The one-shot copy out of D1, which `./artifact-copy` holds and an operator drives once per
-  // account. It sits on the write side because it writes, and on no read path at all.
-  copyArtifacts(userId: string, now: number): Promise<ArtifactCopyReport>;
 }
 
 export const getArtifact = async (db: TenantDb, userId: string, name: string): Promise<ArtifactRecord | null> => {
@@ -2454,10 +2403,9 @@ export const recordReach = async (db: TenantDb, userId: string, sessionId: strin
 };
 
 // Whether a session's own transcript is on the record mark. A session with a row for `main` indexes
-// itself in the request that appends to it, so the consumer the byte path's storage event wakes
-// leaves it alone rather than indexing the same prose a second time. The mark is read for `main`
-// alone: a delegated file derives nothing either way, and a row for one of those would otherwise
-// stop the byte path from ever indexing the session's own prose.
+// itself in the request that appends to it, so a replay reading one knows the prose is already in
+// the index and takes nothing over. The mark is read for `main` alone: a delegated file derives
+// nothing either way, and a row for one of those would say the session had crossed when it had not.
 export const onRecordMark = async (db: TenantDb, userId: string, sessionId: string): Promise<boolean> =>
   db
     .select({ file: sessionRecords.file })

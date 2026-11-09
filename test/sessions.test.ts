@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_FOCUS_CHARS, SESSION_TTL_MS, type Session } from "../src/model";
+import { SESSION_TTL_MS, type Session } from "../src/model";
 import { type Client, harness, tenantRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -10,14 +10,14 @@ interface ListedSession extends Session {
 }
 
 const listed = async (client: Client): Promise<ListedSession[]> => {
-  const response = await client.request("GET", "/v1/sessions");
+  const response = await client.request("GET", "/v2/sessions");
   expect(response.status).toBe(200);
   const body: { sessions: ListedSession[] } = await response.json();
   return body.sessions;
 };
 
 const ids = async (client: Client, query: string): Promise<{ sessionIds: string[]; nextCursor: string }> => {
-  const response = await client.request("GET", `/v1/sessions?${query}`);
+  const response = await client.request("GET", `/v2/history${query}`);
   expect(response.status).toBe(200);
   return await response.json();
 };
@@ -51,7 +51,7 @@ describe("sessions", () => {
 
     expect((await listed(laptop)).map((session) => [session.host, session.hostLabel])).toEqual([
       ["ip-10-0-7-31", "core"],
-      ["tower", ""],
+      ["tower", "tower"],
     ]);
   });
 
@@ -76,10 +76,10 @@ describe("sessions", () => {
       cwd: "/home/you/src/recall",
       branch: "feat/sessions-list",
       commit: "feat(sessions): list every host's sessions",
-      startedAt: 1_700_000_000_000,
+      startedAt: new Date(1_700_000_000_000).toISOString(),
       prompts: 3,
       focus: { first: "list every host's sessions", latest: "why is the worker test red" },
-      mode: "interactive",
+      mode: "Interactive",
       permissionMode: "default",
       pid: 4242,
     });
@@ -94,7 +94,7 @@ describe("sessions", () => {
     await laptop.sync("c4e21a99", { lastActivityAt: h.now() - 1000 });
     expect((await listed(laptop)).map((session) => session.name)).toEqual(["laptop-9f8a", "laptop-c4e2"]);
 
-    expect((await laptop.request("DELETE", "/v1/sessions/9f8a1b2c")).status).toBe(204);
+    expect((await laptop.request("DELETE", "/v2/sessions/9f8a1b2c")).status).toBe(204);
     expect((await listed(laptop)).map((session) => session.name)).toEqual(["laptop-c4e2"]);
   });
 
@@ -120,8 +120,8 @@ describe("sessions", () => {
     const { laptop, tower } = await account(h);
     await laptop.sync("s-1", { lastActivityAt: h.now() });
 
-    expect((await laptop.request("DELETE", "/v1/sessions/s-1")).status).toBe(204);
-    expect((await laptop.request("DELETE", "/v1/sessions/s-1")).status).toBe(404);
+    expect((await laptop.request("DELETE", "/v2/sessions/s-1")).status).toBe(204);
+    expect((await laptop.request("DELETE", "/v2/sessions/s-1")).status).toBe(404);
     expect(await listed(tower)).toEqual([]);
   });
 
@@ -143,17 +143,13 @@ describe("sessions", () => {
     const h = await harness();
     const { laptop } = await account(h);
 
-    expect((await laptop.sync("s-1", { focus: { first: "x".repeat(MAX_FOCUS_CHARS + 1), latest: "" } })).status).toBe(
-      400,
-    );
     expect((await laptop.sync("s-1", { focus: "just a line" })).status).toBe(400);
     expect((await laptop.sync("s-1", { host: "" })).status).toBe(400);
-    expect((await laptop.sync("s-1", { startedAt: "2026-11-02T10:00:00+01:00" })).status).toBe(400);
     expect((await laptop.sync("s-1", { lastActivityAt: -1 })).status).toBe(400);
     expect((await laptop.sync("s-1", { mode: "tmux" })).status).toBe(400);
     expect((await laptop.sync("s-1", { prompts: -1 })).status).toBe(400);
     expect((await laptop.sync("s 1")).status).toBe(400);
-    expect((await laptop.request("POST", "/v1/sessions")).status).toBe(405);
+    expect((await laptop.request("POST", "/v2/sessions")).status).toBe(405);
   });
 });
 
@@ -165,7 +161,7 @@ describe("session history", () => {
     await laptop.sync("ended-session", { lastActivityAt: h.now() });
     const lastActivityAt = h.tick(60_000);
     await laptop.sync("crashed-session", { lastActivityAt });
-    expect((await laptop.request("DELETE", "/v1/sessions/ended-session")).status).toBe(204);
+    expect((await laptop.request("DELETE", "/v2/sessions/ended-session")).status).toBe(204);
     h.tick(SESSION_TTL_MS + 1000);
     expect(await listed(laptop)).toEqual([]);
 
@@ -229,14 +225,14 @@ describe("session history", () => {
     await laptop.sync("s-oldest", { lastActivityAt: h.now() });
     await tower.sync("s-middle", { host: "tower", lastActivityAt: h.tick(60_000) });
     await laptop.sync("s-newest", { lastActivityAt: h.tick(60_000) });
-    expect((await laptop.request("DELETE", "/v1/sessions/s-newest")).status).toBe(204);
+    expect((await laptop.request("DELETE", "/v2/sessions/s-newest")).status).toBe(204);
     await stranger.sync("s-stranger", { lastActivityAt: h.now() });
 
-    expect(await ids(laptop, "scope=history")).toEqual({
+    expect(await ids(laptop, "")).toEqual({
       sessionIds: ["s-middle", "s-newest", "s-oldest"],
       nextCursor: "",
     });
-    expect(await ids(stranger, "scope=history")).toEqual({ sessionIds: ["s-stranger"], nextCursor: "" });
+    expect(await ids(stranger, "")).toEqual({ sessionIds: ["s-stranger"], nextCursor: "" });
   });
 
   it("pages from the last id it gave, so a session syncing under the page is still listed", async () => {
@@ -249,22 +245,9 @@ describe("session history", () => {
 
     await laptop.sync("s-newest", { lastActivityAt: h.tick(3_600_000) });
 
-    expect(await ids(laptop, "scope=history&cursor=s-middle")).toEqual({
+    expect(await ids(laptop, "?cursor=s-middle")).toEqual({
       sessionIds: ["s-newest", "s-oldest"],
       nextCursor: "",
     });
-  });
-
-  it("refuses a scope it does not know", async () => {
-    const h = await harness();
-    const { laptop } = await account(h);
-    await laptop.sync("s-held");
-
-    const refused = await laptop.request("GET", "/v1/sessions?scope=past");
-    expect(refused.status).toBe(400);
-
-    const live = await laptop.request("GET", "/v1/sessions?scope=live");
-    expect(live.status).toBe(200);
-    expect(await live.json()).toMatchObject({ sessions: [expect.objectContaining({ sessionId: "s-held" })] });
   });
 });

@@ -187,19 +187,30 @@ run(tofu, ["init", "-input=false", `-backend-config=endpoints={s3="https://${acc
 const planPath = join(WORK, "recall.tfplan");
 run(tofu, ["plan", "-input=false", `-out=${planPath}`], { cwd: infra, env: tofuEnv });
 const plan = JSON.parse(run(tofu, ["show", "-json", planPath], { cwd: infra, env: tofuEnv, capture: true }).stdout);
-const retiredServiceTokens = (change) =>
+// The byte path's queue, its dead letter queue and the storage rule that fed them. Nothing
+// consumes them: prose reaches the index inside the append that carries it, and the Worker exports
+// no queue handler. A queue Cloudflare still sees a consumer on refuses to be destroyed, so
+// `wrangler queues consumer remove recall-transcripts recall` runs once, by hand, before the
+// deploy that applies this — the plan fails loudly rather than quietly if it has not.
+const retiredQueues = new Set([
+  "cloudflare_r2_bucket_event_notification.transcripts",
+  "cloudflare_queue.transcripts",
+  "cloudflare_queue.transcripts_dead",
+]);
+const retiredResource = (change) =>
   change.change.actions.length === 1 &&
   change.change.actions[0] === "delete" &&
   (change.address.startsWith("cloudflare_zero_trust_access_service_token.principal[") ||
-    change.address === "cloudflare_zero_trust_access_policy.service_tokens");
+    change.address === "cloudflare_zero_trust_access_policy.service_tokens" ||
+    retiredQueues.has(change.address));
 const changes = plan.resource_changes ?? [];
-const retired = changes.filter(retiredServiceTokens);
-const destroyed = changes.filter((change) => change.change.actions.includes("delete") && !retiredServiceTokens(change));
+const retired = changes.filter(retiredResource);
+const destroyed = changes.filter((change) => change.change.actions.includes("delete") && !retiredResource(change));
 if (retired.length > 0) console.log(`deploy: retiring ${retired.map((change) => change.address).join(", ")}`);
 if (destroyed.length > 0) {
   die(`the plan destroys ${destroyed.map((change) => change.address).join(", ")}; refusing to apply`);
 }
-console.log("deploy: the plan destroys nothing but retired service tokens");
+console.log("deploy: the plan destroys nothing but retired resources");
 run(tofu, ["apply", "-input=false", planPath], { cwd: infra, env: tofuEnv });
 const outputs = JSON.parse(run(tofu, ["output", "-json"], { cwd: infra, env: tofuEnv, capture: true }).stdout);
 const output = (name) => outputs[name]?.value ?? die(`tofu output ${name} is missing`);
@@ -219,15 +230,6 @@ const deployConfig = {
     { binding: "TRANSCRIPTS", bucket_name: output("transcript_bucket") },
     ...(artifactHostname === "" ? [] : [{ binding: "ARTIFACTS", bucket_name: output("artifact_bucket") }]),
   ],
-  // The deploy is what attaches the Worker to the queue the archive's events land on, so the
-  // names come from the apply that created it rather than from the checked-in config.
-  queues: {
-    consumers: base.queues.consumers.map((consumer) => ({
-      ...consumer,
-      queue: output("transcript_queue"),
-      dead_letter_queue: output("transcript_dead_queue"),
-    })),
-  },
   routes: [
     { pattern: hostname, custom_domain: true, zone_id: zoneId },
     ...(artifactHostname === "" ? [] : [{ pattern: artifactHostname, custom_domain: true, zone_id: zoneId }]),

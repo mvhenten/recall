@@ -246,8 +246,8 @@ describe("the history tab", () => {
       lastActivityAt: noon - DAY_MS,
     });
     await stranger.sync("aa11bb22", { host: "nomad", startedAt: noon, lastActivityAt: noon });
-    await owner.laptop.request("DELETE", "/v1/sessions/9f8a1b2c");
-    await owner.tower.request("DELETE", "/v1/sessions/c4e21a99");
+    await owner.laptop.request("DELETE", "/v2/sessions/9f8a1b2c");
+    await owner.tower.request("DELETE", "/v2/sessions/c4e21a99");
 
     const html = await historyTab(h, owner.assertion);
     expect(html).toContain("2026-10-30 · Fri 11:00–12:00 laptop-9f8a laptop");
@@ -265,7 +265,7 @@ describe("the history tab", () => {
     const now = h.now();
     await owner.laptop.sync("1111aaaa", { startedAt: now - 600_000, lastActivityAt: now });
     await owner.laptop.sync("2222bbbb", { startedAt: now - 600_000, lastActivityAt: now });
-    await owner.laptop.request("DELETE", "/v1/sessions/2222bbbb");
+    await owner.laptop.request("DELETE", "/v2/sessions/2222bbbb");
 
     const html = await historyTab(h, owner.assertion);
     expect(html).toContain("laptop-1111 laptop running");
@@ -405,7 +405,7 @@ describe("the memory tab", () => {
     await owner.client.save("read-often", { type: "user" });
     await owner.client.save("read-never", { type: "project" });
     await owner.client.save("read-never-either", { type: "project" });
-    expect((await owner.client.request("GET", "/v1/memories/read-often?recall=true")).status).toBe(200);
+    expect((await owner.client.v2.recallMemory("read-often")).status).toBe(200);
 
     const html = await memoryTab(h, owner);
     expect(html).toContain("3 memories");
@@ -543,7 +543,7 @@ describe("one memory's page", () => {
     const h = await harness();
     const owner = await withMemories(h);
     await owner.client.save("quiet-note", {});
-    expect((await owner.client.request("GET", "/v1/memories/quiet-note?recall=true")).status).toBe(200);
+    expect((await owner.client.v2.recallMemory("quiet-note")).status).toBe(200);
     const before = await owner.client.get("quiet-note");
     h.tick(60_000);
 
@@ -764,7 +764,7 @@ describe("the stats tab", () => {
 
 describe("the insights tab", () => {
   const recall = async (who: Reporter, name: string): Promise<void> => {
-    expect((await who.client.request("GET", `/v1/memories/${name}?recall=true`)).status).toBe(200);
+    expect((await who.client.v2.recallMemory(name)).status).toBe(200);
   };
 
   it("names the working set and its share of every recall", async () => {

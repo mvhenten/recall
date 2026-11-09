@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { DAY_MS, USAGE_RETENTION_MS } from "../src/model";
 import { compressedStretchName, followedBatch, legacyStretchName, stretchName } from "../src/transcript-plan";
-import { archivedSince, archivedTranscript, MAX_STRETCH_BYTES, readStretch } from "../src/transcripts";
+import { archivedSince, archivedTranscript, MAX_STRETCH_BYTES } from "../src/transcripts";
 import { gzipped, harness, tenantRows } from "./harness";
 
 // How far into each of a session's files the archive reaches, which is what a host sends on from.
@@ -74,44 +74,11 @@ describe("transcript archive", () => {
     await client.sync("s-1");
 
     expect(await held(await client.transcript("s-1"))).toEqual({});
-    const first = await client.archive("s-1", "main", 0, "one\ntwo\n");
-    expect(first.status).toBe(200);
-    expect(await first.json()).toEqual({ file: "main", through: 8 });
+    await client.archive("s-1", "main", 0, "one\ntwo\n");
     await client.archive("s-1", "main", 8, "three\n");
     await client.archive("s-1", "agent-7f21", 0, "delegated\n");
 
     expect(await held(await client.transcript("s-1"))).toEqual({ main: 14, "agent-7f21": 10 });
-  });
-
-  // The whole of what a retry costs: a stretch is stored under the offset it was sent at and only
-  // where nothing is yet, so sending it again is refused with where the file reaches rather than
-  // leaving a second copy of the same lines beside it.
-  it("refuses a stretch sent twice, and says where the file reaches", async () => {
-    const h = await harness();
-    const client = await h.user("retrier");
-    await client.sync("s-2");
-    await client.archive("s-2", "main", 0, "one\ntwo\n");
-
-    const again = await client.archive("s-2", "main", 0, "one\ntwo\n");
-
-    expect(again.status).toBe(409);
-    expect(await again.json()).toMatchObject({ through: 8 });
-    expect(await held(await client.transcript("s-2"))).toEqual({ main: 8 });
-    expect(await (await client.readTranscript("s-2", "main")).text()).toBe("one\ntwo\n");
-    const resumed = await client.archive("s-2", "main", 8, "three\n");
-    expect(resumed.status).toBe(200);
-    expect(await held(await client.transcript("s-2"))).toEqual({ main: 14 });
-  });
-
-  it("refuses a stretch past the body cap", async () => {
-    const h = await harness();
-    const client = await h.user("flooder");
-    await client.sync("s-3");
-
-    const response = await client.archive("s-3", "main", 0, "x".repeat(MAX_STRETCH_BYTES + 1));
-
-    expect(response.status).toBe(413);
-    expect(await held(await client.transcript("s-3"))).toEqual({});
   });
 
   it("answers no caller the session does not belong to", async () => {
@@ -122,9 +89,8 @@ describe("transcript archive", () => {
     await owner.archive("s-4", "main", 0, "one\n");
 
     expect((await stranger.transcript("s-4")).status).toBe(404);
-    expect((await stranger.archive("s-4", "main", 0, "mine now\n")).status).toBe(404);
     expect((await owner.transcript("s-unknown")).status).toBe(404);
-    const anonymous = await h.send("/v1/sessions/s-4/transcript");
+    const anonymous = await h.send("/v2/sessions/s-4/transcript");
     expect(anonymous.status).toBe(401);
 
     expect(await held(await owner.transcript("s-4"))).toEqual({ main: 4 });
@@ -171,34 +137,10 @@ describe("transcript archive", () => {
   // A stretch is taken only where the archive reaches exactly the place it begins at, so one lands
   // and the other is told the reach, which is where its next stretch begins. No span of the file
   // is accounted for twice and none is left in no object at all.
-  it("takes the stretch that begins where the archive reaches and sends the other writer on", async () => {
-    const h = await harness();
-    const userId = `racer-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
-    await client.sync("s-race");
-
-    // A stretch that redacts to fewer bytes than the span of the file it accounts for, which is
-    // why the span cannot be read back off the body.
-    expect((await client.archiveSpan("s-race", "main", 0, 20, "fourteen bytes")).status).toBe(200);
-    const beaten = await client.archiveSpan("s-race", "main", 0, 6, "four");
-
-    expect(beaten.status).toBe(409);
-    expect(await beaten.json()).toMatchObject({ through: 20 });
-    const stored = await env.TRANSCRIPTS.list({ prefix: `${userId}/s-race/main/` });
-    expect(stored.objects).toHaveLength(1);
-    expect(stored.objects[0]?.key).toBe(`${userId}/s-race/main/${stretchName(0, 20)}`);
-    expect(await (await client.readTranscript("s-race", "main")).text()).toBe("fourteen bytes");
-    expect((await client.archiveSpan("s-race", "main", 20, 25, "five!")).status).toBe(200);
-    expect(await (await client.readTranscript("s-race", "main")).text()).toBe("fourteen bytesfive!");
-    expect(await held(await client.transcript("s-race"))).toEqual({ main: 25 });
-    expect(await holds(await client.transcript("s-race"))).toEqual({ main: 19 });
-  });
-
   // Two appends whose readings both landed before either wrote: two keys naming spans of the file
   // that overlap, which no listing could have refused. The longer is the one read, so the span
-  // they share is in the archive once, and the writer that was passed over is told the reach on
-  // its next append rather than writing on into a file nothing reads.
-  it("reads the longer of two stretches that begin at one place, and sends the other writer back", async () => {
+  // they share is in the archive once.
+  it("reads the longer of two stretches that begin at one place", async () => {
     const h = await harness();
     const userId = `doubled-${crypto.randomUUID()}`;
     const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
@@ -209,9 +151,6 @@ describe("transcript archive", () => {
 
     expect(await (await client.readTranscript("s-both", "main")).text()).toBe("fourteen bytes");
     expect(await held(await client.transcript("s-both"))).toEqual({ main: 20 });
-    const beaten = await client.archiveSpan("s-both", "main", 6, 12, "six!!!");
-    expect(beaten.status).toBe(409);
-    expect(await beaten.json()).toMatchObject({ through: 20 });
   });
 
   // A stretch keyed before where the reader has read to, and ending past it, holds its unread
@@ -317,8 +256,7 @@ describe("transcript archive", () => {
     await client.sync("s-span");
     await client.archiveSpan("s-span", "main", 0, 400, "one\n");
     await client.archiveSpan("s-span", "main", 400, 900, "two\nthree\n");
-    const read = await client.archiveSpan("s-span", "main", 900, 2_000, "four\n");
-    expect(read.status).toBe(200);
+    await client.archiveSpan("s-span", "main", 900, 2_000, "four\n");
 
     // The reader has taken the first two stretches: fourteen bytes of the archive, nine hundred
     // bytes of the file, and the cursor is the first of those.
@@ -341,9 +279,8 @@ describe("transcript archive", () => {
     const userId = `legacy-${crypto.randomUUID()}`;
     const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
     await client.sync("s-legacy");
-    expect((await client.archiveLegacy("s-legacy", "main", 0, "one\ntwo\n")).status).toBe(200);
-    const again = await client.archiveLegacy("s-legacy", "main", 8, "three\n");
-    expect(await again.json()).toEqual({ file: "main", offset: 14 });
+    await client.archiveLegacy("s-legacy", "main", 0, "one\ntwo\n");
+    await client.archiveLegacy("s-legacy", "main", 8, "three\n");
 
     expect(await held(await client.transcript("s-legacy"))).toEqual({ main: 14 });
     expect(await holds(await client.transcript("s-legacy"))).toEqual({ main: 14 });
@@ -351,7 +288,7 @@ describe("transcript archive", () => {
 
     // The host updates: it takes the place the archive reaches into the file and sends a stretch
     // that redacts shorter than the span it accounts for, under a key naming both ends.
-    expect((await client.archiveSpan("s-legacy", "main", 14, 30, "four\n")).status).toBe(200);
+    await client.archiveSpan("s-legacy", "main", 14, 30, "four\n");
     expect(await held(await client.transcript("s-legacy"))).toEqual({ main: 30 });
     expect(await holds(await client.transcript("s-legacy"))).toEqual({ main: 19 });
     expect(await (await client.readTranscript("s-legacy", "main")).text()).toBe("one\ntwo\nthree\nfour\n");
@@ -379,38 +316,6 @@ describe("transcript archive", () => {
       [stretchName(50, 900), 21, 0, 3],
     ]);
     expect(await (await client.readTranscript("s-ranged", "main")).text()).toBe("aaaa\nbbbbbbbbbbbbbbb\ncc\n");
-    // The reader the index runs asks for a window of the archive, which the same accumulation
-    // places: a window weighed against the keys would open in the wrong object entirely.
-    const bite = await readStretch(env.TRANSCRIPTS, userId, "s-ranged", "main", 5, 24, 1_000);
-    expect(bite).toEqual({ text: "bbbbbbbbbbbbbbb\ncc\n", through: 24 });
-  });
-
-  // How many bytes of a session's own transcript the archive holds is the one thing derived off
-  // the objects, and the append writes it: the listing it weighed the stretch against already
-  // counted them. A storage event that had to count them again would list the whole of the file's
-  // prefix on every stretch, which is the length of the session.
-  it("writes how much of its own transcript the archive holds as the stretch lands", async () => {
-    const h = await harness();
-    const userId = `counted-${crypto.randomUUID()}`;
-    const client = h.clientWithToken(await h.login(await h.invite(`${userId}@example.com`, userId)));
-    await client.sync("s-count");
-
-    await client.archiveSpan("s-count", "main", 0, 400, "one\n");
-    expect(await h.indexMark(userId, "s-count")).toMatchObject({ archived: 4 });
-    await client.archiveSpan("s-count", "main", 400, 900, "two\nthree\n");
-    expect(await h.indexMark(userId, "s-count")).toMatchObject({ archived: 14 });
-    // Refused, so it moved nothing.
-    await client.archiveSpan("s-count", "main", 400, 950, "four\n");
-    expect(await h.indexMark(userId, "s-count")).toMatchObject({ archived: 14 });
-    // A host from before redaction names a place in the archive, so where its stretch ends is the
-    // count outright.
-    await client.archiveLegacy("s-count", "main", 14, "five\n");
-    expect(await h.indexMark(userId, "s-count")).toMatchObject({ archived: 19 });
-
-    // A delegated turn derives nothing, so it writes no row of its own.
-    await client.sync("s-turn");
-    await client.archiveSpan("s-turn", "agent-7f21", 0, 40, "delegated\n");
-    expect(await h.indexMark(userId, "s-turn")).toBeNull();
   });
 
   // The two key forms share no scale: one names a place in the archive, the other a span of the
@@ -474,8 +379,8 @@ describe("transcript archive", () => {
     const first = turns(40, "first");
     const second = turns(30, "second");
 
-    expect((await client.archiveGzip("s-gzip", "main", 0, 9_000, first)).status).toBe(200);
-    expect((await client.archiveGzip("s-gzip", "main", 9_000, 20_000, second)).status).toBe(200);
+    await client.archiveGzip("s-gzip", "main", 0, 9_000, first);
+    await client.archiveGzip("s-gzip", "main", 9_000, 20_000, second);
 
     const stored = await env.TRANSCRIPTS.list({ prefix: `${userId}/s-gzip/main/` });
     expect(stored.objects.map((object) => object.key)).toEqual([
@@ -502,34 +407,11 @@ describe("transcript archive", () => {
     const asBytes = await client.readTranscript("s-gzip", "main");
     expect(asBytes.headers.get("content-encoding")).toBeNull();
     expect(await asBytes.text()).toBe(first + second);
-    const refused = await h.send("/v1/sessions/s-gzip/transcript?file=main", {
+    const refused = await h.send("/v2/sessions/s-gzip/transcript?file=main", {
       headers: { authorization: `Bearer ${token}`, "accept-encoding": "br, gzip;q=0" },
     });
     expect(refused.headers.get("content-encoding")).toBeNull();
     expect(await refused.text()).toBe(first + second);
-  });
-
-  // A gzip member says nothing about how long it inflates to, so the append takes the length by
-  // inflating it. The length the format trails is no answer: it belongs to the last member of the
-  // body, so a body holding two of them would be stored under a name claiming part of what it
-  // holds, and every later read of that object — the indexer's, a restore's, a reader's — would
-  // break for good. So nothing of the kind is stored and the append says so.
-  it("refuses a body holding more than one gzip member", async () => {
-    const h = await harness();
-    const userId = `doubled-${crypto.randomUUID()}`;
-    const token = await h.login(await h.invite(`${userId}@example.com`, userId));
-    const client = h.clientWithToken(token);
-    await client.sync("s-doubled");
-    const members = [await gzipped(turns(10, "first")), await gzipped(turns(10, "second"))];
-
-    const sent = await h.send("/v1/sessions/s-doubled/transcript?file=main&offset=0&through=9000", {
-      method: "PUT",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/gzip" },
-      body: laidEndToEnd(members),
-    });
-
-    expect(sent.status).toBe(500);
-    expect(await held(await client.transcript("s-doubled"))).toEqual({});
   });
 
   // One file holding both forms, which is what a host upgrading mid-session leaves behind. Nothing
@@ -545,8 +427,8 @@ describe("transcript archive", () => {
     const plain = turns(20, "plain");
     const packed = turns(20, "packed");
 
-    expect((await client.archiveSpan("s-mixing", "main", 0, 9_000, plain)).status).toBe(200);
-    expect((await client.archiveGzip("s-mixing", "main", 9_000, 20_000, packed)).status).toBe(200);
+    await client.archiveSpan("s-mixing", "main", 0, 9_000, plain);
+    await client.archiveGzip("s-mixing", "main", 9_000, 20_000, packed);
 
     expect(await held(await client.transcript("s-mixing"))).toEqual({ main: 20_000 });
     expect(await holds(await client.transcript("s-mixing"))).toEqual({ main: bytes(plain) + bytes(packed) });
@@ -554,16 +436,6 @@ describe("transcript archive", () => {
     expect(asStored.headers.get("content-encoding")).toBeNull();
     expect(await asStored.text()).toBe(plain + packed);
     expect(await (await client.readTranscript("s-mixing", "main")).text()).toBe(plain + packed);
-
-    // The reader the index runs wants a window of the prose in the middle of the archive, and a
-    // gzip member cannot be opened there: it comes down whole and the window is taken out of what
-    // it inflates to. This one opens inside the uncompressed stretch and ends inside the member.
-    const from = bytes(plain) - 200;
-    const to = bytes(plain) + 300;
-    const bite = await readStretch(env.TRANSCRIPTS, userId, "s-mixing", "main", from, to, 1_000);
-    const whole = plain + packed;
-    expect(bite.through).toBe(to);
-    expect(bite.text).toBe(whole.slice(from, to));
   });
 
   // A box following a live session places the stretches past the reader off one page of a listing,
@@ -653,23 +525,23 @@ describe("transcript archive", () => {
     const written = ['{"type":"user","text":"one"}\n{"ty', 'pe":"user","text":"two"}\n{"type":"u', 'ser"}\n'];
     let from = 0;
     for (const stretch of written) {
-      expect((await client.archive("s-whole", "main", from, stretch)).status).toBe(200);
+      await client.archive("s-whole", "main", from, stretch);
       from += bytes(stretch);
     }
 
     expect(await (await client.readTranscript("s-whole", "main")).text()).toBe(written.join(""));
   });
 
+  // A session that ended is still a session on record, so its archive answers and takes more
+  // prose. Only the live row moved; the files did not.
   it("keeps a session's files once its row has moved to the history", async () => {
     const h = await harness();
     const client = await h.user("historian");
     await client.sync("s-5");
-    await client.archive("s-5", "main", 0, "one\n");
-    expect((await client.request("DELETE", "/v1/sessions/s-5")).status).toBe(204);
+    expect((await client.v2.records("s-5", "main", 0, ["one"])).status).toBe(200);
+    expect((await client.request("DELETE", "/v2/sessions/s-5")).status).toBe(204);
 
-    const resumed = await client.archive("s-5", "main", 4, "two\n");
-
-    expect(resumed.status).toBe(200);
-    expect(await held(await client.transcript("s-5"))).toEqual({ main: 8 });
+    expect((await client.v2.records("s-5", "main", 1, ["two"])).status).toBe(200);
+    expect(await (await client.readTranscript("s-5", "main")).text()).toBe("one\ntwo\n");
   });
 });

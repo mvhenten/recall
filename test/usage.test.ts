@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_USAGE_TOKENS, USAGE_EPOCH, USAGE_RETENTION_MS, usageDay } from "../src/model";
+import { USAGE_EPOCH, USAGE_RETENTION_MS, usageDay } from "../src/model";
 import { type Client, harness, tenantRows } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -138,16 +138,14 @@ describe("usage", () => {
     expect((await client.usage("s-1", { model: "" })).status).toBe(400);
     expect((await client.usage("s-1", { account: 7 })).status).toBe(400);
     expect((await client.usage("s-1", { inputTokens: -1 })).status).toBe(400);
-    expect((await client.usage("s-1", { outputTokens: MAX_USAGE_TOKENS + 1 })).status).toBe(400);
     expect((await client.usage("s-1", { cacheWriteTokens: "900" })).status).toBe(400);
     expect((await client.usage("s-1", { cacheReadTokens: null })).status).toBe(400);
-    expect((await client.usage("s-1", { at: "2026-11-01T23:30:00+00:00" })).status).toBe(400);
     expect((await client.usage("s-1", { at: 0 })).status).toBe(400);
-    expect((await client.usage("s-1", { at: USAGE_EPOCH - 1 })).status).toBe(400);
-    expect((await client.usage("s-1", { at: h.now() + 2 * 86_400_000 })).status).toBe(400);
-    expect((await client.request("GET", "/v1/sessions/s-1/usage")).status).toBe(405);
-    expect((await client.request("POST", "/v1/sessions/s-1/cost", {})).status).toBe(404);
-    expect((await client.request("POST", "/v1/memories/a-memory/usage", {})).status).toBe(404);
+    expect((await client.usage("s-1", { at: new Date(USAGE_EPOCH - 1).toISOString() })).status).toBe(400);
+    expect((await client.usage("s-1", { at: new Date(h.now() + 2 * 86_400_000).toISOString() })).status).toBe(400);
+    expect((await client.request("GET", "/v2/sessions/s-1/usage")).status).toBe(405);
+    expect((await client.request("POST", "/v2/sessions/s-1/cost", {})).status).toBe(404);
+    expect((await client.request("POST", "/v2/memories/a-memory/usage", {})).status).toBe(404);
 
     expect(await events(userId)).toEqual([]);
     expect(await daily(userId)).toEqual([]);

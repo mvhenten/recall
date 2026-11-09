@@ -108,7 +108,7 @@ interface Made {
 
 const share = async (alice: Client, name: string, address?: string): Promise<Made> => {
   const body = address === undefined ? { mode: "link" } : { mode: "email", address };
-  const response = await alice.request("POST", `/v1/artifacts/${encodeURIComponent(name)}/shares`, body);
+  const response = await alice.request("POST", `/v2/artifacts/${encodeURIComponent(name)}/shares`, body);
   if (response.status !== 200) throw new Error(`share ${name}: ${response.status} ${await response.text()}`);
   return response.json();
 };
@@ -188,7 +188,7 @@ describe("a link share", () => {
     const revoked = pathOf((await share(o.alice, "release-notes")).address);
 
     const unknown = await o.h.sendToSharePrefix(`${SHARE_LINK_PREFIX}/${newShareToken()}`, null);
-    await o.alice.request("DELETE", "/v1/artifacts/release-notes/shares?link");
+    await o.alice.request("DELETE", "/v2/artifacts/release-notes/shares?link");
     const gone = await o.h.sendToSharePrefix(revoked, null);
     o.h.tick(SHARE_WINDOW_MS + 1);
     const expired = await o.h.sendToSharePrefix(dead, null);
@@ -263,7 +263,7 @@ describe("a link share", () => {
     expect(mine).toContain("Alice");
     expect(mine).not.toContain("Bob");
 
-    expect((await o.alice.request("DELETE", "/v1/artifacts/notes")).status).toBe(204);
+    expect((await o.alice.request("DELETE", "/v2/artifacts/notes")).status).toBe(204);
     expect((await o.h.sendToSharePrefix(base, null)).status).toBe(404);
   });
 
@@ -281,7 +281,7 @@ describe("a link share", () => {
     });
     expect(await (await o.h.sendToSharePrefix(base, null)).text()).toContain("Redrawn");
 
-    expect((await o.alice.request("DELETE", "/v1/artifacts/quarterly-plan")).status).toBe(204);
+    expect((await o.alice.request("DELETE", "/v2/artifacts/quarterly-plan")).status).toBe(204);
     expect((await o.h.sendToSharePrefix(base, null)).status).toBe(404);
     expect(await rowOf(made.share.shareId)).toBe(null);
     await document(o.alice, "quarterly-plan");
@@ -320,7 +320,7 @@ describe("an email share", () => {
     expect(again.renewed).toBe(true);
     expect(again.share.shareId).toBe(first.share.shareId);
     expect(again.share.expiresAt).toBeGreaterThan(first.share.expiresAt);
-    const listed = await o.alice.request("GET", "/v1/artifacts/quarterly-plan/shares");
+    const listed = await o.alice.request("GET", "/v2/artifacts/quarterly-plan/shares");
     const { shares }: { shares: ShareView[] } = await listed.json();
     expect(shares).toHaveLength(1);
   });
@@ -331,7 +331,7 @@ describe("an email share", () => {
     for (let index = 0; index < MAX_EMAIL_SHARES; index += 1) {
       await share(o.alice, "quarterly-plan", `reader-${index}@example.com`);
     }
-    const refused = await o.alice.request("POST", "/v1/artifacts/quarterly-plan/shares", {
+    const refused = await o.alice.request("POST", "/v2/artifacts/quarterly-plan/shares", {
       mode: "email",
       address: "one-too-many@example.com",
     });
@@ -352,7 +352,7 @@ describe("the share API", () => {
     o.h.tick(1_000);
     await share(o.alice, "quarterly-plan", "reader@example.com");
 
-    const response = await o.alice.request("GET", "/v1/artifacts/quarterly-plan/shares");
+    const response = await o.alice.request("GET", "/v2/artifacts/quarterly-plan/shares");
     expect(response.status).toBe(200);
     const body = await response.text();
     expect(body).not.toContain(pathOf(link.address).slice(SHARE_LINK_PREFIX.length + 1));
@@ -378,7 +378,7 @@ describe("the share API", () => {
     expect((await o.h.sendToSharePrefix(pathOf(first.address), null)).status).toBe(404);
     expect((await o.h.sendToSharePrefix(pathOf(second.address), null)).status).toBe(200);
     const { shares }: { shares: ShareView[] } = await (
-      await o.alice.request("GET", "/v1/artifacts/quarterly-plan/shares")
+      await o.alice.request("GET", "/v2/artifacts/quarterly-plan/shares")
     ).json();
     expect(shares).toHaveLength(1);
   });
@@ -390,28 +390,28 @@ describe("the share API", () => {
     const jo = await share(o.alice, "quarterly-plan", "jo@example.org");
     await share(o.alice, "quarterly-plan", "reader@example.com");
 
-    const one = await o.alice.request("DELETE", `/v1/artifacts/quarterly-plan/shares/${jo.share.shareId}`);
+    const one = await o.alice.request("DELETE", `/v2/artifacts/quarterly-plan/shares/${jo.share.shareId}`);
     expect(one.status).toBe(200);
     expect(await one.json()).toMatchObject({ revoked: 1 });
-    expect((await o.alice.request("DELETE", `/v1/artifacts/quarterly-plan/shares/${jo.share.shareId}`)).status).toBe(
+    expect((await o.alice.request("DELETE", `/v2/artifacts/quarterly-plan/shares/${jo.share.shareId}`)).status).toBe(
       404,
     );
 
-    const byLink = await o.alice.request("DELETE", "/v1/artifacts/quarterly-plan/shares?link");
+    const byLink = await o.alice.request("DELETE", "/v2/artifacts/quarterly-plan/shares?link");
     expect(await byLink.json()).toMatchObject({ revoked: 1 });
 
-    const none = await o.alice.request("DELETE", "/v1/artifacts/quarterly-plan/shares");
+    const none = await o.alice.request("DELETE", "/v2/artifacts/quarterly-plan/shares");
     expect(none.status).toBe(400);
     expect((await none.json<{ error: string }>()).error).toContain("exactly one of link, email=<address> and all=true");
-    const both = await o.alice.request("DELETE", "/v1/artifacts/quarterly-plan/shares?link&all=true");
+    const both = await o.alice.request("DELETE", "/v2/artifacts/quarterly-plan/shares?link&all=true");
     expect(both.status).toBe(400);
 
-    const byAddress = await o.alice.request("DELETE", "/v1/artifacts/quarterly-plan/shares?email=Reader%40Example.com");
+    const byAddress = await o.alice.request("DELETE", "/v2/artifacts/quarterly-plan/shares?email=Reader%40Example.com");
     const left: { revoked: number; shares: ShareView[] } = await byAddress.json();
     expect(left).toMatchObject({ revoked: 1, shares: [] });
 
     await share(o.alice, "quarterly-plan", "last@example.org");
-    const all = await o.alice.request("DELETE", "/v1/artifacts/quarterly-plan/shares?all=true");
+    const all = await o.alice.request("DELETE", "/v2/artifacts/quarterly-plan/shares?all=true");
     expect(await all.json()).toMatchObject({ revoked: 1, shares: [] });
   });
 
@@ -421,19 +421,19 @@ describe("the share API", () => {
     await o.h.invite(bob);
     await document(o.h.clientWithToken(await o.h.login(bob)), "panel-episode-99", "account");
 
-    const theirs = await o.alice.request("GET", "/v1/artifacts/panel-episode-99/shares");
+    const theirs = await o.alice.request("GET", "/v2/artifacts/panel-episode-99/shares");
     expect(theirs.status).toBe(403);
     expect((await theirs.json<{ error: string }>()).error).toBe("only an artifact's owner shares it");
 
-    const missing = await o.alice.request("POST", "/v1/artifacts/no-such-thing/shares", { mode: "link" });
+    const missing = await o.alice.request("POST", "/v2/artifacts/no-such-thing/shares", { mode: "link" });
     expect(missing.status).toBe(404);
-    expect((await o.alice.request("GET", "/v1/artifacts/quarterly-plan/shares")).status).toBe(404);
+    expect((await o.alice.request("GET", "/v2/artifacts/quarterly-plan/shares")).status).toBe(404);
   });
 
   it("takes a device token and nothing else", async () => {
     const o = await owner();
     await document(o.alice, "quarterly-plan");
-    const anonymous = await o.h.send("/v1/artifacts/quarterly-plan/shares");
+    const anonymous = await o.h.send("/v2/artifacts/quarterly-plan/shares");
     expect(anonymous.status).toBe(401);
   });
 
@@ -445,7 +445,7 @@ describe("the share API", () => {
     await share(o.alice, "quarterly-plan", "jo@example.org");
     await share(o.alice, "release-notes");
 
-    const counted = await o.alice.request("GET", "/v1/artifacts?sort=name");
+    const counted = await o.alice.request("GET", "/v2/artifacts?sort=name");
     const { artifacts }: { artifacts: ArtifactView[] } = await counted.json();
     expect(artifacts.map((one) => [one.name, one.shareCount])).toEqual([
       ["panel-notes", 0],
@@ -453,13 +453,13 @@ describe("the share API", () => {
       ["release-notes", 1],
     ]);
 
-    const page = await o.alice.request("GET", "/v1/artifacts?shares=true&sort=name&limit=2");
+    const page = await o.alice.request("GET", "/v2/artifacts?shares=true&sort=name&limit=2");
     const first: { artifacts: Array<ArtifactView & { shares: ShareView[] }>; nextCursor: string } = await page.json();
     expect(first.artifacts.map((one) => one.shares.length)).toEqual([0, 1]);
     expect(first.artifacts[1]?.shares[0]?.mode).toBe("email");
     const next = await o.alice.request(
       "GET",
-      `/v1/artifacts?shares=true&sort=name&limit=2&cursor=${encodeURIComponent(first.nextCursor)}`,
+      `/v2/artifacts?shares=true&sort=name&limit=2&cursor=${encodeURIComponent(first.nextCursor)}`,
     );
     const rest: { artifacts: Array<ArtifactView & { shares: ShareView[] }> } = await next.json();
     expect(rest.artifacts.map((one) => [one.name, one.shares.length])).toEqual([["release-notes", 1]]);
@@ -531,18 +531,18 @@ describe("a name that reads like a route", () => {
       ],
     });
 
-    const read = await o.alice.request("GET", "/v1/artifacts/shares");
+    const read = await o.alice.request("GET", "/v2/artifacts/shares");
     expect(read.status).toBe(200);
     expect((await read.json<{ artifact: ArtifactView }>()).artifact.name).toBe("shares");
 
     const made = await share(o.alice, "shares");
-    const listed = await o.alice.request("GET", "/v1/artifacts/shares/shares");
+    const listed = await o.alice.request("GET", "/v2/artifacts/shares/shares");
     const { shares }: { shares: ShareView[] } = await listed.json();
     expect(shares.map((one) => one.shareId)).toEqual([made.share.shareId]);
 
-    const file = await o.alice.request("GET", "/v1/artifacts/deck/files/shares");
+    const file = await o.alice.request("GET", "/v2/artifacts/deck/files/shares");
     expect(await file.text()).toBe("a file called shares");
-    expect((await o.alice.request("GET", "/v1/artifacts/deck/elsewhere")).status).toBe(404);
+    expect((await o.alice.request("GET", "/v2/artifacts/deck/elsewhere")).status).toBe(404);
     expect((await o.h.sendToArtifactHost("/a/shares", o.assertion)).status).toBe(200);
   });
 
@@ -557,8 +557,8 @@ describe("a name that reads like a route", () => {
     }
     await share(o.alice, "plan-000");
 
-    const counted = await o.alice.request("GET", "/v1/artifacts?limit=100&sort=name");
-    const listed = await o.alice.request("GET", "/v1/artifacts?limit=100&sort=name&shares=true");
+    const counted = await o.alice.request("GET", "/v2/artifacts?limit=100&sort=name");
+    const listed = await o.alice.request("GET", "/v2/artifacts?limit=100&sort=name&shares=true");
 
     expect([counted.status, listed.status]).toEqual([200, 200]);
     const page = await counted.json<{ artifacts: ArtifactView[] }>();
@@ -575,15 +575,15 @@ describe("a deployment that binds no share audience", () => {
     const o = await owner("off");
     await document(o.alice, "quarterly-plan");
 
-    const refused = await o.alice.request("POST", "/v1/artifacts/quarterly-plan/shares", { mode: "link" });
+    const refused = await o.alice.request("POST", "/v2/artifacts/quarterly-plan/shares", { mode: "link" });
     expect(refused.status).toBe(404);
     expect((await refused.json<{ error: string }>()).error).toContain("binds no share audience");
-    expect((await o.alice.request("GET", "/v1/artifacts/quarterly-plan/shares")).status).toBe(404);
+    expect((await o.alice.request("GET", "/v2/artifacts/quarterly-plan/shares")).status).toBe(404);
 
     expect((await o.h.sendToSharePrefix(`${SHARE_LINK_PREFIX}/${newShareToken()}`, null)).status).toBe(404);
     expect((await o.h.sendToSharePrefix(`${SHARE_EMAIL_PREFIX}/${newShareId()}`, null)).status).toBe(404);
 
-    const { artifacts }: { artifacts: ArtifactView[] } = await (await o.alice.request("GET", "/v1/artifacts")).json();
+    const { artifacts }: { artifacts: ArtifactView[] } = await (await o.alice.request("GET", "/v2/artifacts")).json();
     expect(artifacts.map((one) => one.shareCount)).toEqual([0]);
     const page = await (await o.h.sendToArtifactHost("/a/quarterly-plan", o.assertion)).text();
     expect(page).not.toContain('class="band"');

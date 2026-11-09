@@ -103,7 +103,7 @@ interface Minted {
 
 const mint = async (alice: Client, name: string, address?: string): Promise<Minted> => {
   const body = address === undefined ? { mode: "link" } : { mode: "email", address };
-  const response = await alice.request("POST", `/v1/artifacts/${encodeURIComponent(name)}/shares`, body);
+  const response = await alice.request("POST", `/v2/artifacts/${encodeURIComponent(name)}/shares`, body);
   if (response.status !== 200) throw new Error(`share: ${response.status} ${await response.text()}`);
   return response.json();
 };

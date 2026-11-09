@@ -1,4 +1,3 @@
-import { SessionCopySchema } from "../typespec/generated/schemas";
 import { EMAIL_ONLY, emailOf } from "./access";
 import {
   type ArtifactChrome,
@@ -32,8 +31,8 @@ import {
   RAW_INLINE_BYTES,
   readArtifactFile,
 } from "./artifacts";
-import { type BoardAddress, type BoardPost, type BoardTaker, parsePost, parseV2Post } from "./board";
-import { type Chunk, chunkTurns, chunkTurnsCarrying, closeChunks } from "./chunks";
+import { type BoardAddress, type BoardPost, type BoardTaker, parseV2Post } from "./board";
+import { type Chunk, chunkTurnsCarrying, closeChunks } from "./chunks";
 import {
   ARTIFACTS_TAB,
   type ArtifactShelf,
@@ -100,18 +99,9 @@ import {
   userForEmail,
 } from "./device";
 import { ARTIFACT_SORTS, CURSOR_PARAM, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortInForce } from "./listing";
-import {
-  DEVICE_HEADER,
-  MAX_BODY_BYTES,
-  type Mailbox,
-  ORDERS_HEADER,
-  parseSend,
-  type Sender,
-  type SendInput,
-} from "./mailbox";
+import { DEVICE_HEADER, MAX_BODY_BYTES, type Mailbox, ORDERS_HEADER, type Sender, type SendInput } from "./mailbox";
 import { render } from "./markdown";
 import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
-import { copyMemories } from "./memory-copy";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -131,18 +121,13 @@ import {
   parseName,
   parseRecordCursor,
   parseRecordWindow,
-  parseSave,
   parseSearch,
-  parseSession,
   parseSessionId,
-  parseSessionScope,
   parseSessionSearch,
   parseStretchCursor,
   parseStretchName,
   parseStretchOffset,
-  parseStretchSpan,
   parseTranscriptFile,
-  parseUsage,
   type SaveInput,
   type SearchInput,
   type SessionHit,
@@ -183,7 +168,6 @@ import {
   recordsFault,
   recordsReach,
 } from "./records";
-import { copySessions } from "./session-copy";
 import {
   ARTIFACT_PREFIX,
   FILE_SEGMENT,
@@ -234,7 +218,6 @@ import {
   getMemory,
   historyCursorDirection,
   type IndexedChunk,
-  type IndexMark,
   indexMark,
   labelTargets,
   listBoard,
@@ -279,7 +262,6 @@ import {
   textCandidates,
   userForServiceClient,
   vectorCandidates,
-  writeChunks,
   writeLabels,
 } from "./store";
 import type { Tenant } from "./tenant";
@@ -297,24 +279,15 @@ import {
   TOOLS,
   toolArguments,
 } from "./tools";
-import { legacyStretchName, packedStretch, type Reach, type RecordReach } from "./transcript-plan";
+import { packedStretch, type Reach, type RecordReach } from "./transcript-plan";
 import {
-  appendStretch,
   archivedFiles,
   archivedSince,
   archivedTranscript,
-  cacheArchived,
   type HeldFile,
   MAIN_FILE,
-  MAX_STRETCH_BYTES,
   openStretch,
-  parseStretchKey,
-  putStretch,
-  readStretch,
   readTranscript,
-  type StretchBody,
-  type Stretched,
-  storedStretch,
 } from "./transcripts";
 import { agentName, readTurns } from "./turns";
 import {
@@ -323,7 +296,6 @@ import {
   memoryView,
   nearbyMemoryView,
   parseAppendRecords,
-  parseCopySessions,
   parseMemoryList,
   parseMemoryName,
   parseSaveMemory,
@@ -425,18 +397,14 @@ export interface TenantCall {
   artifacts: { hostname: string; dashboard: string; sharing: boolean } | null;
 }
 
-export type Delivered = Pick<Message<unknown>, "body" | "ack" | "retry">;
-
 export interface App {
   fetch(request: Request, env: AppEnv): Promise<Response>;
-  consume(env: AppEnv, delivered: readonly Delivered[]): Promise<void>;
 }
 
 export interface TenantApi {
   api(request: Request, env: TenantEnv, caller: Caller): Promise<Response>;
   dashboard(request: Request, env: TenantEnv, userId: string, email: string): Promise<Response>;
   tool(made: ToolCall, env: TenantEnv, caller: Caller): Promise<ToolResult>;
-  index(env: TenantEnv, userId: string, sessionId: string): Promise<boolean>;
 }
 
 // The artifacts collection, which the Worker answers for itself. Its rows are a tenant's and
@@ -502,12 +470,6 @@ export const DASHBOARD_DEVICE = "dashboard";
 // How many board messages one page of the listing holds, for the dashboard and `recall board`
 // alike. The window is a week, so a board a fleet actually works from fits in one or two.
 const BOARD_PAGE = 50;
-
-// How much of one file an indexing pass reads. A stretch is at most a megabyte, so a session
-// keeping up with its own events is caught up in one pass per event; a session far behind — one
-// backfilled from years of transcripts — is caught up over as many passes as it takes, each
-// committing its own mark, so the work survives a consumer that runs out of time and resumes.
-const INDEX_BYTES_PER_PASS = 1_048_576;
 
 // The largest set of chunks one embedding call carries.
 const EMBED_BATCH = 96;
@@ -675,7 +637,6 @@ const artifactStoreFor = (env: Pick<AppEnv, "TENANT">): ArtifactStore => ({
   replaceArtifact: (commit, fromRev) => tenantOf(env, commit.userId).replaceArtifact(commit, fromRev),
   deleteArtifact: (userId, name) => tenantOf(env, userId).deleteArtifact(userId, name),
   adoptArtifacts: (userId) => tenantOf(env, userId).adoptArtifacts(userId),
-  copyArtifacts: (userId, now) => tenantOf(env, userId).copyArtifacts(userId, now),
 });
 
 // Everything the dashboard reads off an address before it knows who is asking: which tab the
@@ -820,130 +781,6 @@ const transcriptRecords = async (
 };
 
 export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
-  const devices = async (
-    request: Request,
-    env: TenantEnv,
-    caller: Caller,
-    deviceId: string | undefined,
-  ): Promise<Response> => {
-    if (deviceId === undefined) {
-      if (request.method !== "GET") return error(405, "method not allowed");
-      const [listed, labels] = await Promise.all([
-        listDevices(env.ACCOUNT, caller.userId),
-        readLabels(env.DB, caller.userId),
-      ]);
-      return json({
-        devices: listed.map((device) => ({
-          ...device,
-          label: labels.hosts.get(device.host) ?? "",
-          current: device.deviceId === caller.deviceId,
-        })),
-      });
-    }
-    if (request.method !== "DELETE") return error(405, "method not allowed");
-    const target = deviceId === "current" ? caller.deviceId : deviceId;
-    if (!(await revokeDevice(env.ACCOUNT, caller.userId, target))) return error(404, `no device ${target}`);
-    await mailboxFor(env, caller.userId).revoke(target);
-    return new Response(null, { status: 204 });
-  };
-
-  const sessions = async (
-    request: Request,
-    url: URL,
-    env: TenantEnv,
-    caller: Caller,
-    rawSessionId: string | undefined,
-    subresource: string | undefined,
-  ): Promise<Response> => {
-    const db = env.DB;
-    if (rawSessionId === undefined) {
-      if (request.method !== "GET") return error(405, "method not allowed");
-      const scope = parseSessionScope(url.searchParams.get("scope"));
-      if (!scope.ok) return error(400, scope.error);
-      if (scope.value === "history") return sessionHistoryIds(url, db, caller);
-      if (scope.value === "search") return searchSessions(url, db, caller.userId);
-      const [listed, labels] = await Promise.all([
-        listSessions(db, caller.userId, deps.now()),
-        readLabels(db, caller.userId),
-      ]);
-      return json({
-        sessions: listed.map((session) => ({
-          ...session,
-          hostLabel: labels.hosts.get(session.host) ?? "",
-          current: session.deviceId === caller.deviceId,
-        })),
-      });
-    }
-    // The copy of this account's sessions out of D1 and into its own object, run against a running
-    // deployment by `npm run copy-sessions` and by nothing else. A session answers a GET, a PUT
-    // and a DELETE at its own id and never a POST, so a session id of `copy` shadows nothing. It
-    // is here rather than on a read path because a read path must never migrate anything.
-    //
-    // `after` opens the walk of the prose where the call before it left off, so a corpus too big
-    // for one request's budget is finished by calling again rather than by a run that restarts and
-    // re-reads what it already copied. `metadataComplete` says a call of the same run already
-    // wrote every table but the prose, which only a report of that call can tell the caller; false,
-    // those tables are read and written again, which costs one pass and finishes a call that died
-    // in the middle of them.
-    //
-    // The report is held against the contract on the way out, which is the one route that does.
-    // Everything an operator reads the run's soundness off is in it, the caps on its id lists
-    // included, and a report that has drifted from what the contract says should stop the run
-    // rather than be read as one that verified.
-    if (rawSessionId === "copy" && subresource === undefined && request.method === "POST") {
-      const input = parseCopySessions(await readJson(request));
-      if (!input.ok) return error(400, input.error);
-      const report = await copySessions(
-        db,
-        env.ACCOUNT,
-        caller.userId,
-        input.value.after,
-        input.value.metadataComplete,
-      );
-      return json(SessionCopySchema.parse(report));
-    }
-    const sessionId = parseSessionId(decodeSegment(rawSessionId) ?? "");
-    if (!sessionId.ok) return error(400, sessionId.error);
-    if (subresource !== undefined) {
-      if (subresource === "usage") return usage(request, db, caller, sessionId.value);
-      if (subresource !== "transcript") return error(404, "not found");
-      return transcript(request, url, env, caller, sessionId.value);
-    }
-    if (request.method === "GET") return session(env, caller, sessionId.value);
-    if (request.method === "PUT") {
-      const input = parseSession(await readJson(request));
-      if (!input.ok) return error(400, input.error);
-      await putSession(db, caller, sessionId.value, input.value, deps.now());
-      return new Response(null, { status: 204 });
-    }
-    if (request.method !== "DELETE") return error(405, "method not allowed");
-    if (!(await endSession(db, caller.userId, sessionId.value))) return error(404, `no session ${sessionId.value}`);
-    return new Response(null, { status: 204 });
-  };
-
-  const sessionHistoryIds = async (url: URL, db: TenantDb, caller: Caller): Promise<Response> =>
-    json(await listSessionHistoryIds(db, caller.userId, url.searchParams.get("cursor") ?? ""));
-
-  // One session, addressed by its Claude Code session id, by the name the harness gave it, or by
-  // the handle `recall send` takes. It answers with the transcript files the archive holds too, so
-  // a host restoring the session asks once and then reads them. Those are counted off the objects:
-  // a restore writes the files it is given to disk, so a count a second behind would write a
-  // session short of its last stretch.
-  const session = async (env: TenantEnv, caller: Caller, target: string): Promise<Response> => {
-    const db = env.DB;
-    const found = await findSession(db, caller.userId, target, deps.now());
-    if (!found) return error(404, `no session named ${target}`);
-    const [files, labels] = await Promise.all([
-      archivedFiles(env.TRANSCRIPTS, caller.userId, found.session.sessionId),
-      readLabels(db, caller.userId),
-    ]);
-    return json({
-      session: { ...found.session, hostLabel: labels.hosts.get(found.session.host) ?? "" },
-      matches: found.matches,
-      files,
-    });
-  };
-
   // The chunks with their vectors, embedded in batches the provider takes in one call.
   const embedChunks = async (closed: readonly Chunk[]): Promise<IndexedChunk[]> => {
     const indexed: IndexedChunk[] = [];
@@ -1021,187 +858,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return { ok: true, value: hits };
   };
 
-  const searchSessions = async (url: URL, db: TenantDb, userId: string): Promise<Response> => {
-    const hits = await sessionSearchHits(url, db, userId);
-    return hits.ok ? json({ hits: hits.value }) : error(400, hits.error);
-  };
-
-  // One bite of one session's prose, read out of the archive and written into the index. It
-  // reads from where the last bite stopped and at most a megabyte, and the mark it leaves is
-  // where the bite ended in the file and never how much it read, so a pass over a hole in the
-  // archive moves on rather than reading the same bite again. The pass answers where it reached,
-  // which is what says whether there is more.
-  const indexBite = async (env: TenantEnv, userId: string, sessionId: string, mark: IndexMark): Promise<number> => {
-    const bite = await readStretch(
-      env.TRANSCRIPTS,
-      userId,
-      sessionId,
-      MAIN_FILE,
-      mark.indexed,
-      mark.archived,
-      INDEX_BYTES_PER_PASS,
-    );
-    if (mark.indexed === 0 && bite.text !== "") {
-      const named = agentName(bite.text.slice(0, HEAD_BYTES));
-      if (named !== "") await nameSession(env.DB, userId, sessionId, named);
-    }
-    const chunks = chunkTurns(readTurns(bite.text, MAIN_FILE));
-    const indexed: IndexedChunk[] = [];
-    for (let at = 0; at < chunks.length; at += EMBED_BATCH) {
-      const batch = chunks.slice(at, at + EMBED_BATCH);
-      const vectors = await deps.embedder.embed(batch.map((chunk) => chunk.text));
-      batch.forEach((chunk, index) => {
-        const vector = vectors[index];
-        if (!vector) throw new Error(`the embedder answered ${batch.length} chunks with ${vectors.length} vectors`);
-        indexed.push({ ...chunk, embedding: quantize(vector) });
-      });
-    }
-    await writeChunks(env.DB, userId, sessionId, mark.chunks, indexed, bite.through);
-    return bite.through;
-  };
-
-  // One bite of one session, and whether that leaves it caught up with its archive. The event that
-  // wrote the stretch is what brings the indexer here, so there is no queue to read and no session
-  // to pick; a session with nothing new costs the row that says so.
-  //
-  // It is one bite and not every bite the session is behind, because a session hundreds of bites
-  // behind is what a host running a backfill leaves, and taking those in one invocation ran to
-  // over a second of CPU against an invocation ceiling of ten milliseconds. A session still behind
-  // answers so, and the message is sent back for redelivery, which is what brings the next bite.
-  //
-  // A bite that reaches no further than the last is the end of what the objects hold, whatever the
-  // cache says, and answers caught up rather than asking for those bytes again on every event.
-  const indexSession = async (env: TenantEnv, userId: string, sessionId: string): Promise<boolean> => {
-    const mark = await indexMark(env.DB, userId, sessionId);
-    if (mark === null || mark.indexed >= mark.archived) return true;
-    const through = await indexBite(env, userId, sessionId, mark);
-    if (through <= mark.indexed) return true;
-    return through >= mark.archived;
-  };
-
-  const usage = async (request: Request, db: TenantDb, caller: Caller, sessionId: string): Promise<Response> => {
-    if (request.method !== "POST") return error(405, "method not allowed");
-    const now = deps.now();
-    const input = parseUsage(await readJson(request), now);
-    if (!input.ok) return error(400, input.error);
-    await recordUsage(db, caller.userId, sessionId, input.value, now);
-    return new Response(null, { status: 204 });
-  };
-
-  // A session's transcript, read back as the stretches already written and appended to one stretch
-  // at a time. The host that holds the file asks where it left off and sends on from there; it is
-  // its own mark, so what the usage counter has read of the same file moves apart from it.
-  //
-  // The listing is counted off the objects, since a host deciding where to write next cannot be
-  // a second behind the archive. An append is one read and one write and claims nothing: the read
-  // says how far into the file the archive reaches, the write lands only where the stretch begins
-  // exactly there, and how far the archive reaches afterwards is the stretch's own end. A writer
-  // beaten to the place is told the reach and carries on from it.
-  const transcript = async (
-    request: Request,
-    url: URL,
-    env: TenantEnv,
-    caller: Caller,
-    sessionId: string,
-  ): Promise<Response> => {
-    if (request.method !== "GET" && request.method !== "PUT") return error(405, "method not allowed");
-    if (!(await sessionOnRecord(env.DB, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
-    const wanted = url.searchParams.get("file");
-    if (request.method === "GET" && wanted === null) {
-      const [files, counted] = await Promise.all([
-        archivedFiles(env.TRANSCRIPTS, caller.userId, sessionId),
-        countedFiles(env.DB, caller.userId, sessionId),
-      ]);
-      return json({ files, counted });
-    }
-    const file = parseTranscriptFile(wanted);
-    if (!file.ok) return error(400, file.error);
-    if (request.method === "GET") {
-      // Gzip members laid end to end are one gzip stream, so a file stored that way goes over as it
-      // stands and the reader inflates it. A reader that does not take gzip, and a file holding a
-      // stretch stored as it stands, are answered the bytes of the file instead.
-      const archived = await readTranscript(env.TRANSCRIPTS, caller.userId, sessionId, file.value, takesGzip(request));
-      if (archived === null) return error(404, `session ${sessionId} has no ${file.value} on record`);
-      return new Response(archived.body, {
-        headers: {
-          "content-type": "application/x-ndjson",
-          "cache-control": "no-store",
-          ...(archived.gzip ? { "content-encoding": "gzip" } : {}),
-        },
-      });
-    }
-    const tooLarge = error(413, `a transcript stretch must hold at most ${MAX_STRETCH_BYTES} bytes`);
-    if (Number(request.headers.get("content-length") ?? 0) > MAX_STRETCH_BYTES) return tooLarge;
-    const body = await request.arrayBuffer();
-    if (body.byteLength > MAX_STRETCH_BYTES) return tooLarge;
-    const span = parseStretchSpan(url.searchParams);
-    if (!span.ok) return error(400, span.error);
-    const asked = span.value;
-    // A host that named the span of the file its stretch accounts for is answered in places in
-    // that file; one that named an archive offset is answered in those. So the deploy that takes
-    // the span strands no host that has yet to learn to send one.
-    if (asked.kind !== "archive") {
-      // A gzip member is inflated once here and the length taken, which is the one number the name
-      // of the stretch carries beyond its span. Reading it off the frame instead would take a body
-      // holding two members for one holding part of what it holds, and the archive would place
-      // every stretch past it wrongly for good.
-      const landed = await appendStretch(
-        env.TRANSCRIPTS,
-        caller.userId,
-        sessionId,
-        file.value,
-        asked.from,
-        asked.through,
-        await storedStretch(body),
-      );
-      if (landed.kind === "refused") {
-        return json(
-          {
-            error: `the archive of ${file.value} reaches ${landed.through} bytes into the file; send the stretch starting there`,
-            through: landed.through,
-            named: landed.named,
-          },
-          409,
-        );
-      }
-      // How many bytes of the file the archive holds now, written down off the listing the append
-      // already paid for. The row is what a following box and the indexer are weighed against, so
-      // it goes down before the storage event wakes either of them.
-      if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, landed.archived, landed.held);
-      }
-      return json({ file: file.value, through: landed.through });
-    }
-    // A host from before redaction never gzipped a stretch, so this one is stored as it stands.
-    const legacy: StretchBody = { kind: "plain", bytes: body };
-    if (
-      await putStretch(env.TRANSCRIPTS, caller.userId, sessionId, file.value, legacyStretchName(asked.from), legacy)
-    ) {
-      // The one offset this caller names is a place in the archive, so where its stretch ends is
-      // how many bytes of the file the archive holds — the one key form whose row needs no listing
-      // at all. It is folded in with MAX, so a stretch landing below one already there leaves the
-      // row where the further one put it.
-      if (file.value === MAIN_FILE) {
-        await cacheArchived(env.DB, caller.userId, sessionId, asked.from + body.byteLength, asked.from);
-      }
-      return json({ file: file.value, offset: asked.from + body.byteLength });
-    }
-    const held = await archivedFiles(env.TRANSCRIPTS, caller.userId, sessionId);
-    const reaches = held.find((archived) => archived.file === file.value)?.bytes;
-    // The put was refused because an object already sits at that key, and the listing that found
-    // it out is strongly consistent, so the file is always among them. Answering `offset` where it
-    // is not would send the client back to the stretch it was just refused, forever.
-    if (reaches === undefined) {
-      throw new Error(
-        `the archive refused a stretch of ${file.value} but holds no ${file.value} of session ${sessionId}`,
-      );
-    }
-    return json(
-      { error: `${file.value} holds ${reaches} bytes; send the stretch starting there`, offset: reaches },
-      409,
-    );
-  };
-
   // The handle is minted the same way the sessions listing mints it, so `recall send` takes it back
   // verbatim. A sender naming a session it does not have live is named by its host alone.
   const senderOf = async (db: TenantDb, caller: Caller, fromSessionId: string, now: number): Promise<Sender> => {
@@ -1215,27 +871,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     };
   };
 
-  const sendMessage = async (request: Request, env: TenantEnv, caller: Caller): Promise<Response> => {
-    const input = parseSend(await readJson(request));
-    if (!input.ok) return error(400, input.error);
-    if (new TextEncoder().encode(input.value.body).byteLength > MAX_BODY_BYTES) {
-      return error(413, `body must hold at most ${MAX_BODY_BYTES} bytes`);
-    }
-    const { toDeviceId, toSessionId, fromSessionId } = input.value;
-    const now = deps.now();
-    if (!(await hasDevice(env.ACCOUNT, caller.userId, toDeviceId))) return error(404, `no device ${toDeviceId}`);
-    if (toSessionId !== "" && !(await sessionOnDevice(env.DB, caller.userId, toSessionId, toDeviceId, now))) {
-      return error(404, `no session ${toSessionId} on device ${toDeviceId}`);
-    }
-    const sender = await senderOf(env.DB, caller, fromSessionId, now);
-    return json(await mailboxFor(env, caller.userId).publish(input.value, sender, now), 201);
-  };
-
   // The board, which is the bus's opposite. A message posted here is held until a session picks it
   // up, and the address is the one `recall send` already resolves: the fleet, a host, or a session.
-  // The two surfaces address a post differently and resolve it the same way: `/v1` names the
-  // target in one of two optional fields, `/v2` in the one `address` every other `/v2` endpoint
-  // carries.
+  // A post names its target in the one `address` every other endpoint carries.
   const board = async (
     request: Request,
     url: URL,
@@ -1648,7 +1286,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   // The dashboard's own post, which is the Labels tab's post shape pointed at the board. A browser
-  // carries no device token, so it cannot reach `POST /v1/board`; what it shares with it is the
+  // carries no device token, so it cannot reach `POST /v2/board`; what it shares with it is the
   // table. Every refusal re-renders with the typing still in the box and says what went wrong.
   const postFromDashboard = async (
     request: Request,
@@ -1768,16 +1406,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   // Whether anyone is still running the session, and the stretches of its file around and past
-  // where the reader has read. A box following a live session beats against this, so it answers
-  // off the cheapest readings there are: the extent the storage event caches says whether the
-  // file has grown past where the reader has read, and a beat that finds it has not opens no
-  // object and lists nothing at all.
-  //
-  // That extent is a cache and lags the objects for as long as the event behind it is in flight,
-  // so it is trusted to say a file has grown and never to say it has not. A session no event has
-  // ever landed for keeps no row at all, and that one never corrects itself; with no row the
-  // objects are listed regardless, so a reader is never left watching a box that beats on in
-  // silence about a session writing away.
+  // where the reader has read. Nothing writes the byte archive any more, so a file held as bytes
+  // cannot grow and the listing is the whole of the answer: a beat over one costs the page below
+  // and never a row read first to find out whether to pay for it.
   //
   // The cursor is where the reader has read to and the stretch it read to the end of, and the two
   // come off the manifest the archive itself wrote: a read is taken whole, so `from` is always the
@@ -1836,14 +1467,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (!from.ok) return error(400, from.error);
     const after = parseStretchCursor(url.searchParams.get("after"));
     if (!after.ok) return error(400, after.error);
-    const [mark, device] = await Promise.all([
-      indexMark(env.DB, userId, session.value),
+    const [device, runs] = await Promise.all([
       liveSessionDevice(env.DB, userId, session.value, deps.now()),
+      archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value),
     ]);
-    const grown = mark === null || mark.archived > from.value;
-    const runs = grown
-      ? await archivedSince(env.TRANSCRIPTS, userId, session.value, file.value, from.value, after.value)
-      : [];
     const reach: Reach = { running: device !== null, runs };
     return json(reach, 200, { "cache-control": "no-store" });
   };
@@ -1886,7 +1513,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   // The dashboard's own send, which is the Labels tab's post shape pointed at the message bus: an
-  // origin and CSRF check, then the same publish `POST /v1/messages` makes. A browser carries no
+  // origin and CSRF check, then the same publish `POST /v2/messages` makes. A browser carries no
   // device token, so it cannot reach that endpoint; what it shares with it is the mailbox.
   //
   // Every refusal, the refused origin and token among them, re-renders the page with the typing
@@ -2051,7 +1678,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     };
   };
 
-  // The artifacts this account has published, off the same listing `GET /v1/artifacts` reads and
+  // The artifacts this account has published, off the same listing `GET /v2/artifacts` reads and
   // scoped by the user the Access assertion resolved to. The tab browses and nothing else:
   // publishing and unpublishing stay with `recall publish` and `recall unpublish`.
   const artifactsTab = async (
@@ -2105,15 +1732,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const rankings = await rank(db, userId, searched.value, filter.types);
     const found = await hits(db, userId, rankings.inScope, searched.value.limit);
     return memorySearchPage(email, live, url, filter, counts, found, now);
-  };
-
-  const save = async (request: Request, db: TenantDb, userId: string, name: string): Promise<Response> => {
-    const input = parseSave(await readJson(request));
-    if (!input.ok) return error(400, input.error);
-    const [vector] = await deps.embedder.embed([embeddingText(name, input.value.description, input.value.body)]);
-    if (!vector) throw new Error("the embedder answered the memory with no vector");
-    const saved = await saveMemory(db, userId, name, input.value, quantize(vector), deps.now());
-    return json(saved, saved.created ? 201 : 200);
   };
 
   // What a publish for the whole account to read is refused with when another account already
@@ -2468,16 +2086,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (request.method !== "GET") return error(405, "method not allowed");
       return artifactsListing(url, account, store, host, userId, now);
     }
-    // An artifact answers a PUT, a GET and a DELETE and never a POST, so neither the adopt nor
-    // the copy can be shadowed by an artifact named adopt or copy.
+    // An artifact answers a PUT, a GET and a DELETE and never a POST, so the adopt cannot be
+    // shadowed by an artifact named adopt.
     if (rawName === "adopt" && rest.length === 0 && request.method === "POST") {
       return json({ adopted: await store.adoptArtifacts(userId) });
-    }
-    // The one-shot copy of this account's artifact rows out of D1 and into its own object, run
-    // once against a running deployment by `npm run copy-artifacts` and by nothing else. It is
-    // here rather than on a read path because a read path must never migrate anything.
-    if (rawName === "copy" && rest.length === 0 && request.method === "POST") {
-      return json(await store.copyArtifacts(userId, now));
     }
     const name = parseName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
@@ -2507,14 +2119,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const record = await resolveArtifact(account, store, userId, name.value);
     if (record === null) return error(404, `no artifact named ${name.value}`);
     return json({ artifact: viewOf(host, record, await sharesHeld(account, host, record, userId, now)) });
-  };
-
-  const list = async (url: URL, db: TenantDb, userId: string): Promise<Response> => {
-    const input = parseList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
-    if (!input.ok) return error(400, input.error);
-    const cursor = decodeCursor(input.value.cursor, memoryCursorDirection(input.value.sort));
-    if (!cursor) return error(400, "cursor is malformed; pass the nextCursor of a previous page");
-    return json(await listMemories(db, userId, input.value, cursor));
   };
 
   const vectorRankings = async (
@@ -2608,12 +2212,6 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return { hits: shown, elsewhere };
   };
 
-  const search = async (request: Request, db: TenantDb, userId: string): Promise<Response> => {
-    const parsed = parseSearch(await readJson(request));
-    if (!parsed.ok) return error(400, parsed.error);
-    return json(await searched(db, userId, parsed.value));
-  };
-
   const v2MemoriesList = async (url: URL, db: TenantDb, caller: Caller): Promise<Response> => {
     const input = parseMemoryList(url.searchParams, sortInForce(url, MEMORY_SORTS).sort);
     if (!input.ok) return error(400, input.error);
@@ -2655,11 +2253,12 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2Memories = async (
     request: Request,
     url: URL,
-    db: TenantDb,
+    env: TenantEnv,
     caller: Caller,
     rawName: string | undefined,
     word: string | undefined,
   ): Promise<Response> => {
+    const db = env.DB;
     if (rawName === undefined) {
       return request.method === "GET" ? v2MemoriesList(url, db, caller) : error(405, "method not allowed");
     }
@@ -2779,10 +2378,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     };
   };
 
-  // The second version of the API, which is the first one with its sentinels and its epoch
-  // integers taken out. `/v1` is untouched and stays the live surface until every host has
-  // crossed; this answers beside it, authenticates with the same device tokens, and shares every
-  // handler whose shape was never the problem.
+  // The API a host speaks, which is the first version with its sentinels and its epoch integers
+  // taken out.
   //
   // A caller is proved once, here, and handed to every handler below with the database it reads.
   // No handler under this branch reaches back into the environment for a binding once the caller
@@ -2843,8 +2440,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ session: pastSessionView(found.session, labels.hosts), matches: found.matches, files });
   };
 
-  // The transcript files a session has on record, which `/v1` served from the transcript path when
-  // no file was named. One path, one shape.
+  // The transcript files a session has on record. One path, one shape.
   const v2Files = async (
     request: Request,
     bucket: R2Bucket,
@@ -2861,8 +2457,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ files, counted });
   };
 
-  // One file of a session's transcript, read back. The PUT `/v1` answered here is gone: a host
-  // sends records now, and the records endpoint is the one way prose enters the archive on `/v2`.
+  // One file of a session's transcript, read back. A host sends records, and the records endpoint
+  // is the one way prose enters the archive.
   const v2Transcript = async (
     request: Request,
     url: URL,
@@ -3087,12 +2683,13 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2Sessions = async (
     request: Request,
     url: URL,
-    bucket: R2Bucket,
-    db: TenantDb,
+    env: TenantEnv,
     caller: Caller,
     rawSessionId: string | undefined,
     subresource: string | undefined,
   ): Promise<Response> => {
+    const bucket = env.TRANSCRIPTS;
+    const db = env.DB;
     if (rawSessionId === undefined) {
       return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
     }
@@ -3198,58 +2795,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return sessionsPage(email, live, url, listed, labels, now);
   };
 
-  // The tenant half of `/v1`, which is every collection below the device token. The Worker weighed
-  // the shape of the address and proved the caller; nothing here reaches back for a binding.
-  const routeV1 = async (
-    request: Request,
-    url: URL,
-    env: TenantEnv,
-    caller: Caller,
-    collection: string | undefined,
-    rawName: string | undefined,
-    rest: readonly string[],
-  ): Promise<Response> => {
-    if (collection === "devices") return devices(request, env, caller, rawName);
-    if (collection === "board") return board(request, url, env, caller, rawName, parsePost);
-    if (collection === "sessions") return sessions(request, url, env, caller, rawName, rest[0]);
-    if (collection === "messages") {
-      if (rawName !== undefined) return error(404, "not found");
-      return request.method === "POST" ? sendMessage(request, env, caller) : error(405, "method not allowed");
-    }
-    const { userId } = caller;
-    const db = env.DB;
-    if (collection === "search" && rawName === undefined) {
-      return request.method === "POST" ? search(request, db, userId) : error(405, "method not allowed");
-    }
-    if (collection !== "memories") return error(404, "not found");
-    if (rawName === undefined) {
-      return request.method === "GET" ? list(url, db, userId) : error(405, "method not allowed");
-    }
-    // The one-shot copy of this account's memories out of D1 and into its own object, run once
-    // against a running deployment by `npm run copy-memories` and by nothing else. A memory
-    // answers a GET, a PUT and a DELETE at its own name and never a POST, so a memory named copy
-    // shadows nothing. It is here rather than on a read path because a read path must never
-    // migrate anything.
-    if (rawName === "copy" && rest.length === 0 && request.method === "POST") {
-      return json(await copyMemories(db, env.ACCOUNT, userId, deps.embedder));
-    }
-    const name = parseName(decodeSegment(rawName) ?? "");
-    if (!name.ok) return error(400, name.error);
-    if (request.method === "PUT") return save(request, db, userId, name.value);
-    if (request.method !== "GET" && request.method !== "DELETE") return error(405, "method not allowed");
-    const memory = await getMemory(db, userId, name.value);
-    if (!memory) return error(404, `no memory named ${name.value}`);
-    if (request.method === "GET" && url.searchParams.get("recall") !== "true") return json({ memory });
-    if (request.method === "GET") {
-      const [recalled] = await recall(db, userId, [memory.memoryId], deps.now());
-      return recalled ? json({ memory: recalled }) : error(404, `no memory named ${name.value}`);
-    }
-    await deleteMemory(db, userId, memory.memoryId);
-    return new Response(null, { status: 204 });
-  };
-
-  // The tenant half of `/v2`. A caller is proved once, in the Worker, and handed to every handler
-  // below with the stores it reads.
+  // The tenant half of the API, which is every collection below the device token. The Worker
+  // weighed the shape of the address and proved the caller; nothing here reaches back for a
+  // binding.
   const routeV2 = async (
     request: Request,
     url: URL,
@@ -3262,12 +2810,12 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const db = env.DB;
     if (collection === "devices") return v2Devices(request, env, caller, rawName);
     if (collection === "board") return board(request, url, env, caller, rawName, parseV2Post);
-    if (collection === "sessions") return v2Sessions(request, url, env.TRANSCRIPTS, db, caller, rawName, rest[0]);
+    if (collection === "sessions") return v2Sessions(request, url, env, caller, rawName, rest[0]);
     if (collection === "history") {
       if (rawName !== undefined) return error(404, "not found");
       return v2History(request, url, db, caller);
     }
-    if (collection === "memories") return v2Memories(request, url, db, caller, rawName, rest[0]);
+    if (collection === "memories") return v2Memories(request, url, env, caller, rawName, rest[0]);
     if (collection !== "messages") return error(404, "not found");
     if (rawName !== undefined) return error(404, "not found");
     return request.method === "POST" ? v2SendMessage(request, env, caller) : error(405, "method not allowed");
@@ -3276,22 +2824,13 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   return {
     api(request: Request, env: TenantEnv, caller: Caller): Promise<Response> {
       const url = new URL(request.url);
-      const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
-      return version === "v2"
-        ? routeV2(request, url, env, caller, collection, rawName, rest)
-        : routeV1(request, url, env, caller, collection, rawName, rest);
+      const [, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
+      return routeV2(request, url, env, caller, collection, rawName, rest);
     },
     dashboard,
     artifacts,
     tool(made: ToolCall, env: TenantEnv, caller: Caller): Promise<ToolResult> {
       return runTool(env, caller)(made);
-    },
-    // One bite of one session's archive, written into this tenant's index. A session on the record
-    // mark indexes itself inside the append that writes it, so the byte path leaves it alone: the
-    // two read the same prose, and a session on both marks would hold every chunk of it twice.
-    async index(env: TenantEnv, userId: string, sessionId: string): Promise<boolean> {
-      if (await onRecordMark(env.DB, userId, sessionId)) return true;
-      return indexSession(env, userId, sessionId);
     },
   };
 };
@@ -3802,8 +3341,7 @@ export const createApp = (deps: Deps): App => {
     }
     if (rest.length > 1 && collection !== "artifacts") return error(404, "not found");
     // The device grant is RFC 8628 and its snake_case is the standard rather than a slip, so it is
-    // carried over as it stands: a client that signed in against `/v1` signs in against `/v2` with
-    // the same code, and `/v1` can go whole.
+    // carried over as it stands.
     if (collection === "device") {
       if (request.method !== "POST") return error(405, "method not allowed");
       if (rawName === "code") return startDevice(request, url, env.DB);
@@ -3851,82 +3389,11 @@ export const createApp = (deps: Deps): App => {
       );
     }
     const [version, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
-    if (version === "v2") return routeV2(request, url, env, collection, rawName, rest);
-    if (version !== "v1") return error(404, "not found");
-    // An artifact's files are addressed by a path of up to three segments, so the tail below the
-    // name belongs to the collection rather than to the router.
-    if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts") return error(404, "not found");
-    if (rest.length > 1 && collection !== "artifacts") return error(404, "not found");
-    if (collection === "device") {
-      if (request.method !== "POST") return error(405, "method not allowed");
-      if (rawName === "code") return startDevice(request, url, env.DB);
-      if (rawName === "token") return pollDevice(request, env.DB);
-      return error(404, "not found");
-    }
-    const caller = await authenticate(request, env.DB);
-    if (caller instanceof Response) return caller;
-    if (collection === "messages" && rawName === "listen") {
-      if (request.method !== "GET") return error(405, "method not allowed");
-      if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") {
-        return error(426, "/v1/messages/listen only answers a WebSocket upgrade; send Upgrade: websocket");
-      }
-      return listen(request, env, caller);
-    }
-    if (collection === "artifacts") {
-      return account.artifacts(request, url, env.DB, artifactStoreFor(env), caller, rawName, rest);
-    }
-    return tenantOf(env, caller.userId).api(request, caller, handed());
+    if (version !== "v2") return error(404, "not found");
+    return routeV2(request, url, env, collection, rawName, rest);
   };
 
   return {
-    // Indexing one session, done when a stretch of its own transcript lands. The storage event
-    // carries the object key, the key says which file of which session grew, and the index is
-    // then read off the objects of that file — never off what the consumer did last — so an event
-    // delivered twice indexes nothing a second time.
-    //
-    // How many bytes of the file the archive holds is written by the append itself: a redacted
-    // stretch runs to another length than the file it was read from, so where it sits in the
-    // archive is the sizes of the stretches in front of it, and the append already paid for the
-    // listing that counts them. That leaves nothing here to count, and a beat of a following box
-    // costs one page of a listing however long the session has run.
-    //
-    // Indexing is caught per session, and the messages that brought a session here are sent back
-    // for redelivery while it is behind: a transcript the indexer cannot get through — a hole in
-    // the archive, an embedding call the model refuses — is tried again on its own while every
-    // other session's message acks, and a session still behind after its bite comes back for the
-    // next one.
-    async consume(env: AppEnv, delivered: readonly Delivered[]): Promise<void> {
-      const sessions = new Map<string, { stretch: Stretched; messages: Delivered[] }>();
-      for (const message of delivered) {
-        const event = isRecord(message.body) && isRecord(message.body.object) ? message.body.object : {};
-        const { key } = event;
-        const stretch = typeof key === "string" ? parseStretchKey(key) : null;
-        if (stretch === null) {
-          console.error(JSON.stringify({ error: "no transcript stretch in this storage event", event: message.body }));
-          message.ack();
-          continue;
-        }
-        if (stretch.file !== MAIN_FILE) continue;
-        const session = sessions.get(`${stretch.userId}/${stretch.sessionId}`);
-        if (session === undefined)
-          sessions.set(`${stretch.userId}/${stretch.sessionId}`, { stretch, messages: [message] });
-        else session.messages.push(message);
-      }
-      for (const { stretch, messages } of sessions.values()) {
-        const tenant = tenantOf(env, stretch.userId);
-        const caughtUp = await tenant.index(stretch.userId, stretch.sessionId, handed()).catch((failure: unknown) => {
-          console.error(
-            JSON.stringify({
-              error: failure instanceof Error ? failure.message : String(failure),
-              indexing: stretch.sessionId,
-              stack: failure instanceof Error ? failure.stack : "",
-            }),
-          );
-          return false;
-        });
-        if (!caughtUp) for (const message of messages) message.retry();
-      }
-    },
     async fetch(request: Request, env: AppEnv): Promise<Response> {
       return route(request, workerEnv(env)).catch((failure: unknown) => {
         const requestId = crypto.randomUUID();

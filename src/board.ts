@@ -73,34 +73,11 @@ export interface BoardInput {
   createdAt: number;
 }
 
-// The fleet names no target because the fleet is the account, which the caller's token is what
-// settles; the other two scopes are addressed by the poster and checked against the account where
-// the post is taken.
+// The same address `/v2/messages` carries, with the fleet as its third scope. The scope says
+// where a post is going and `target` is that one place; the fleet is the account, which the
+// caller's token settles, so that scope names no target rather than one the caller would have to
+// be told.
 const parseAddress = (input: Record<string, unknown>, userId: string): Parsed<BoardAddress> => {
-  const { scope, deviceId, sessionId } = input;
-  if (scope === "fleet") return { ok: true, value: { scope: "fleet", target: userId } };
-  if (scope === "host") {
-    if (typeof deviceId !== "string" || deviceId.length < 1) {
-      return fail("deviceId must be the id of a device on this account; see GET /v1/devices");
-    }
-    return { ok: true, value: { scope: "host", target: deviceId } };
-  }
-  if (scope !== "session") {
-    return fail(
-      'scope must be "fleet" for every host on the account, "host" for one host, or "session" for one session',
-    );
-  }
-  if (typeof sessionId !== "string") return fail("sessionId must be the id of a session on this account");
-  const parsed = parseSessionId(sessionId);
-  return parsed.ok ? { ok: true, value: { scope: "session", target: parsed.value } } : parsed;
-};
-
-// The same address `/v2/messages` carries, with the fleet as its third scope. `/v1` named the
-// target in one of two fields and left the other out, so a post said where it was going by which
-// field it had filled in. Here the scope says it and `target` is that one place; the fleet is the
-// account, which the caller's token settles, so that scope names no target rather than one the
-// caller would have to be told.
-const parseV2Address = (input: Record<string, unknown>, userId: string): Parsed<BoardAddress> => {
   const { address } = input;
   if (typeof address !== "object" || address === null || Array.isArray(address)) {
     return fail('address must be {"scope":"fleet"}, or a scope of "host" or "session" with the target it names');
@@ -124,15 +101,13 @@ const parseV2Address = (input: Record<string, unknown>, userId: string): Parsed<
   return parsed.ok ? { ok: true, value: { scope: "session", target: parsed.value } } : parsed;
 };
 
-type AddressReader = (fields: Record<string, unknown>, userId: string) => Parsed<BoardAddress>;
-
-const parsedPost = (input: unknown, userId: string, readAddress: AddressReader): Parsed<BoardPost> => {
+export const parseV2Post = (input: unknown, userId: string): Parsed<BoardPost> => {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return fail("body must be a JSON object");
   const fields = input as Record<string, unknown>;
   if (typeof fields.body !== "string" || fields.body.trim().length < 1) {
     return fail("body must hold at least one character");
   }
-  const address = readAddress(fields, userId);
+  const address = parseAddress(fields, userId);
   if (!address.ok) return address;
   const { fromSessionId } = fields;
   if (fromSessionId !== undefined && fromSessionId !== "") {
@@ -143,8 +118,3 @@ const parsedPost = (input: unknown, userId: string, readAddress: AddressReader):
   }
   return { ok: true, value: { address: address.value, fromSessionId: "", body: fields.body } };
 };
-
-export const parsePost = (input: unknown, userId: string): Parsed<BoardPost> => parsedPost(input, userId, parseAddress);
-
-export const parseV2Post = (input: unknown, userId: string): Parsed<BoardPost> =>
-  parsedPost(input, userId, parseV2Address);

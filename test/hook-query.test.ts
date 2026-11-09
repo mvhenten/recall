@@ -10,13 +10,12 @@ describe("hook search query", () => {
 
     const h = await harness();
     const alice = await h.user("alice");
-    const response = await alice.request("POST", "/v1/search", {
+    const response = await alice.request("POST", "/v2/memories/search", {
       query,
       tags: [],
-      any: true,
       limit: 5,
       minScore: 0.65,
-      mode: "vector",
+      mode: "Vector",
     });
     expect(response.status).toBe(200);
   });

@@ -2,13 +2,15 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { accessVerifier, type KeySource, localKeys } from "../src/access";
-import { createApp, type Delivered } from "../src/app";
-import { DEVICE_CODE_LIMITS, type DeviceCodeLimits } from "../src/device";
+import { createApp } from "../src/app";
+import { DEVICE_CODE_LIMITS, type DeviceCodeLimits, sha256Hex } from "../src/device";
 import { MCP_PATH } from "../src/mcp";
 import type { Embedder, Memory } from "../src/model";
 import { DIMENSIONS, normalize } from "../src/rank";
 import { putRecords, RECORDS_PREFIX } from "../src/records";
 import { SHARE_EMAIL_PREFIX, SHARE_LINK_PREFIX } from "../src/shares";
+import { compressedStretchName, legacyStretchName, stretchName } from "../src/transcript-plan";
+import { archivedFiles } from "../src/transcripts";
 
 const ISSUER = "https://recall-test.cloudflareaccess.com";
 const ORIGIN = "https://recall.test";
@@ -83,7 +85,7 @@ export interface PublishInput {
 }
 
 // What a host speaks to `/v2` with. It is its own handle rather than a second set of methods on
-// the `/v1` client, so a test naming `client.v2` is saying which surface it is about.
+// the client above it, so a test naming `client.v2` is saying which surface it is about.
 export interface V2Client {
   request(method: string, path: string, body?: unknown): Promise<Response>;
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
@@ -120,29 +122,18 @@ export interface Client {
   sync(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   usage(sessionId: string, fields?: Record<string, unknown>): Promise<Response>;
   /// One stretch of a file no secret was taken out of, so the span of the file it accounts for is
-  /// its own length.
-  archive(sessionId: string, file: string, from: number, body: string | Uint8Array): Promise<Response>;
+  /// its own length. Nothing writes the byte archive over the API any more, so this lands the
+  /// object and the reach the archive is read against directly, and there is no answer to weigh.
+  archive(sessionId: string, file: string, from: number, body: string | Uint8Array): Promise<void>;
   /// One stretch that accounts for a span of the file its own bytes do not run to, which is every
   /// stretch a secret was taken out of.
-  archiveSpan(
-    sessionId: string,
-    file: string,
-    from: number,
-    through: number,
-    body: string | Uint8Array,
-  ): Promise<Response>;
-  /// One stretch as every host sends one: the span of the file it accounts for, and the bytes
+  archiveSpan(sessionId: string, file: string, from: number, through: number, body: string | Uint8Array): Promise<void>;
+  /// One stretch as every host sent one: the span of the file it accounts for, and the bytes
   /// gzipped.
-  archiveGzip(
-    sessionId: string,
-    file: string,
-    from: number,
-    through: number,
-    body: string | Uint8Array,
-  ): Promise<Response>;
-  /// One stretch as a host from before redaction offers it: one offset, meaning a place in the
+  archiveGzip(sessionId: string, file: string, from: number, through: number, body: string | Uint8Array): Promise<void>;
+  /// One stretch as a host from before redaction wrote one: one offset, meaning a place in the
   /// archive and in the file at once.
-  archiveLegacy(sessionId: string, file: string, offset: number, body: string | Uint8Array): Promise<Response>;
+  archiveLegacy(sessionId: string, file: string, offset: number, body: string | Uint8Array): Promise<void>;
   transcript(sessionId: string): Promise<Response>;
   readTranscript(sessionId: string, file: string): Promise<Response>;
   /// One file read back by a reader that takes the gzip members the archive stores, which is every
@@ -150,6 +141,34 @@ export interface Client {
   readTranscriptGzip(sessionId: string, file: string): Promise<Response>;
   session(target: string): Promise<Response>;
   searchSessions(query: string, limit?: number): Promise<Response>;
+}
+
+const MEMORY_TYPE_OUT: Record<string, string> = {
+  user: "User",
+  feedback: "Feedback",
+  project: "Project",
+  reference: "Reference",
+};
+
+const MEMORY_TYPE_IN: Record<string, Memory["type"]> = {
+  User: "user",
+  Feedback: "feedback",
+  Project: "project",
+  Reference: "reference",
+};
+
+const SEARCH_MODE_OUT: Record<Mode, string> = { hybrid: "Hybrid", vector: "Vector", text: "Text" };
+
+interface MemoryView {
+  memoryId: string;
+  memoryName: string;
+  description: string;
+  type: string;
+  body: string;
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+  recallCount: number;
 }
 
 // What the account's own rows look like from outside. They live in that account's Durable Object
@@ -162,6 +181,34 @@ const inTenant = <T>(userId: string, read: (sql: SqlStorage) => T): Promise<T> =
 export const tenantRows = <T>(userId: string, query: string, ...binds: SqlStorageValue[]): Promise<T[]> =>
   // The row shape is the caller's assertion, the way `.all<Row>()` is on D1.
   inTenant(userId, (sql) => sql.exec<Record<string, SqlStorageValue>>(query, ...binds).toArray() as T[]);
+
+// How far into the file the archive reaches, which the append that wrote the byte path kept
+// beside the objects. A test laying a stretch down lays this with it, since every reader of the
+// archive is weighed against it.
+const reach = async (userId: string, sessionId: string, archived: number): Promise<void> => {
+  await inTenant(userId, (sql) => {
+    sql.exec(
+      `INSERT INTO session_index (user_id, session_id, archived, bytes, chunks) VALUES (?, ?, ?, 0, 0)
+        ON CONFLICT (user_id, session_id) DO UPDATE SET archived = MAX(session_index.archived, excluded.archived)`,
+      userId,
+      sessionId,
+      archived,
+    );
+  });
+};
+
+// An instant a test names as the epoch milliseconds `/v1` took, in the offset-carrying form `/v2`
+// takes. A number that is no instant is left alone, since what it is refused for is the point.
+const dated = (fields: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> => {
+  const written = { ...fields };
+  for (const key of keys) {
+    const value = written[key];
+    if (typeof value === "number" && value > 0) written[key] = new Date(value).toISOString();
+  }
+  return written;
+};
+
+const MAIN = "main";
 
 const held = (body: string | Uint8Array): number =>
   typeof body === "string" ? new TextEncoder().encode(body).byteLength : body.byteLength;
@@ -229,8 +276,8 @@ const V2_USAGE_DELTA: Record<string, unknown> = {
   files: [],
 };
 
-// The same memory `Client.save` writes through `/v1`, in the vocabulary `/v2` takes: a type that
-// names itself and no name in the body, since the path already carries it.
+// The memory `Client.save` writes, in the vocabulary `/v2` takes: a type that names itself and no
+// name in the body, since the path already carries it.
 const V2_MEMORY_DOCUMENT = (name: string): Record<string, unknown> => ({
   description: `about ${name}`,
   type: "Project",
@@ -275,7 +322,6 @@ export const harness = async ({
     refresh: () => Promise.reject(new Error("Access signing keys answered 503")),
   };
   let clock = 1_700_000_000_000;
-  let retried = 0;
   const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
   // Which account a service token acts for is a row of the account store now, not a map the
   // Worker was built with. A test still names the pair outright; the write it queues is drained
@@ -357,7 +403,7 @@ export const harness = async ({
     assertionFor(email, ARTIFACT_SHARE_AUDIENCE, expiresAt);
 
   const requestDevice = (deviceName: string, clientIp: string): Promise<Response> =>
-    send("/v1/device/code", {
+    send("/v2/device/code", {
       method: "POST",
       headers: { "content-type": "application/json", "cf-connecting-ip": clientIp },
       body: JSON.stringify({ device_name: deviceName }),
@@ -380,7 +426,7 @@ export const harness = async ({
   };
 
   const poll = (deviceCode: string): Promise<Response> =>
-    send("/v1/device/token", {
+    send("/v2/device/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -456,7 +502,7 @@ export const harness = async ({
       );
       for (const file of sized) form.append("file", file.blob, file.path);
       const replace = input.replace === true ? "?replace=true" : "";
-      return send(`/v1/artifacts/${name}${replace}`, { method: "PUT", headers: { ...headers }, body: form });
+      return send(`/v2/artifacts/${name}${replace}`, { method: "PUT", headers: { ...headers }, body: form });
     };
     const v2: V2Client = {
       request: (method, path, body) =>
@@ -509,96 +555,129 @@ export const harness = async ({
         return this.request("POST", "/v2/memories/search", { ...V2_SEARCH_DOCUMENT, ...fields });
       },
     };
+    // Which account this client signs in as. A caller that named one is taken at its word; the
+    // rest are read off the device row the bearer token belongs to, which is what the Worker does
+    // with it on every request.
+    const accountId = async (): Promise<string> => {
+      if (userId !== "") return userId;
+      const token = (headers.authorization ?? "").replace("Bearer ", "");
+      const row = await env.DB.prepare("SELECT user_id FROM devices WHERE token_sha256 = ?")
+        .bind(await sha256Hex(token))
+        .first<{ user_id: string }>();
+      if (row === null) throw new Error("this client signs in as no account");
+      return row.user_id;
+    };
+    // What `/v2` answers about a memory, read back in the shape the store holds it in, which is
+    // what a test asserting on a corpus reads. The two fields `/v2` does not carry are read off
+    // the account's own row.
+    const memoryOf = async (view: MemoryView): Promise<Memory> => {
+      const account = await accountId();
+      const [row] = await tenantRows<{ user_id: string; last_recalled_at: number }>(
+        account,
+        "SELECT user_id, last_recalled_at FROM memories WHERE memory_id = ?",
+        view.memoryId,
+      );
+      return {
+        memoryId: view.memoryId,
+        userId: row?.user_id ?? account,
+        name: view.memoryName,
+        description: view.description,
+        type: MEMORY_TYPE_IN[view.type] ?? "project",
+        body: view.body,
+        tags: view.tags,
+        createdAt: view.createdAt,
+        updatedAt: view.updatedAt,
+        recallCount: view.recallCount,
+        lastRecalledAt: row?.last_recalled_at ?? 0,
+      };
+    };
+    // One stretch laid into the byte archive. The API that took these is gone and the archive they
+    // are in is read-only, so a test of what reads it back lays the object and the reach down the
+    // way the append that is gone did.
+    const putArchived = async (
+      sessionId: string,
+      file: string,
+      name: string,
+      body: string | Uint8Array,
+      gzip: boolean,
+    ): Promise<void> => {
+      const account = await accountId();
+      await env.TRANSCRIPTS.put(`${account}/${sessionId}/${file}/${name}`, body, {
+        httpMetadata: { contentType: "application/x-ndjson", ...(gzip ? { contentEncoding: "gzip" } : {}) },
+      });
+      if (file !== MAIN) return;
+      const held = (await archivedFiles(env.TRANSCRIPTS, account, sessionId)).find((one) => one.file === MAIN);
+      await reach(account, sessionId, held?.bytes ?? 0);
+    };
     return {
       v2,
       userId,
       request,
       async save(name, fields) {
-        const response = await request("PUT", `/v1/memories/${name}`, {
-          description: `about ${name}`,
-          type: "project",
-          body: `notes on ${name}`,
-          tags: [],
-          ...fields,
+        const { type, ...rest } = fields;
+        const response = await v2.saveMemory(name, {
+          ...rest,
+          ...(type === undefined ? {} : { type: MEMORY_TYPE_OUT[type] ?? type }),
         });
         if (response.status >= 300) throw new Error(`save ${name}: ${response.status} ${await response.text()}`);
-        const saved: { memory: Memory } = await response.json();
-        return saved.memory;
+        const saved: { memory: MemoryView } = await response.json();
+        return memoryOf(saved.memory);
       },
       publish: (name, html) => publishArtifact(name, { files: [{ path: "index.html", body: html }] }),
       publishArtifact,
       async get(name) {
-        const response = await request("GET", `/v1/memories/${name}`);
+        const response = await v2.memory(name);
         if (response.status !== 200) throw new Error(`get ${name}: ${response.status} ${await response.text()}`);
-        const found: { memory: Memory } = await response.json();
-        return found.memory;
+        const found: { memory: MemoryView } = await response.json();
+        return memoryOf(found.memory);
       },
       sync(sessionId, fields = {}) {
-        return request("PUT", `/v1/sessions/${sessionId}`, { ...SESSION_DOCUMENT, ...fields });
+        return v2.sync(sessionId, dated(fields, ["startedAt", "lastActivityAt"]));
       },
       usage(sessionId, fields = {}) {
-        return request("POST", `/v1/sessions/${sessionId}/usage`, { ...USAGE_DELTA, ...fields });
+        return v2.usage(sessionId, dated(fields, ["at"]));
       },
       archive(sessionId, file, from, body) {
         return this.archiveSpan(sessionId, file, from, from + held(body), body);
       },
       archiveSpan(sessionId, file, from, through, body) {
-        return send(
-          `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${from}&through=${through}`,
-          {
-            method: "PUT",
-            headers: { ...headers, "content-type": "application/x-ndjson" },
-            body,
-          },
-        );
+        return putArchived(sessionId, file, stretchName(from, through), body, false);
       },
       async archiveGzip(sessionId, file, from, through, body) {
         const member = await gzipped(body);
-        return send(
-          `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${from}&through=${through}`,
-          {
-            method: "PUT",
-            headers: { ...headers, "content-type": "application/gzip" },
-            body: member,
-          },
-        );
+        return putArchived(sessionId, file, compressedStretchName(from, through, held(body)), member, true);
       },
       archiveLegacy(sessionId, file, offset, body) {
-        return send(`/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}&offset=${offset}`, {
-          method: "PUT",
-          headers: { ...headers, "content-type": "application/x-ndjson" },
-          body,
-        });
+        return putArchived(sessionId, file, legacyStretchName(offset), body, false);
       },
       transcript(sessionId) {
-        return request("GET", `/v1/sessions/${sessionId}/transcript`);
+        return v2.files(sessionId);
       },
       readTranscript(sessionId, file) {
-        return request("GET", `/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}`);
+        return v2.transcript(sessionId, file);
       },
       readTranscriptGzip(sessionId, file) {
-        return send(`/v1/sessions/${sessionId}/transcript?file=${encodeURIComponent(file)}`, {
+        return send(`/v2/sessions/${encodeURIComponent(sessionId)}/transcript?file=${encodeURIComponent(file)}`, {
           headers: { ...headers, "accept-encoding": "gzip, br" },
         });
       },
       session(target) {
-        return request("GET", `/v1/sessions/${encodeURIComponent(target)}`);
+        return v2.session(target);
       },
       searchSessions(query, limit = 10) {
-        return request("GET", `/v1/sessions?scope=search&q=${encodeURIComponent(query)}&limit=${limit}`);
+        return v2.searchHistory(query, limit);
       },
       async search(query, tags, mode = "hybrid") {
-        const response = await request("POST", "/v1/search", {
+        const response = await v2.searchMemories({
           query,
           tags: tags === "any" ? [] : tags,
-          any: tags === "any",
           limit: 10,
           minScore: 0.1,
-          mode,
+          mode: SEARCH_MODE_OUT[mode],
         });
         if (response.status !== 200) throw new Error(`search: ${response.status} ${await response.text()}`);
-        const result: { hits: Hit[] } = await response.json();
-        return result.hits;
+        const result: { hits: Array<{ memory: MemoryView; score: number }> } = await response.json();
+        return Promise.all(result.hits.map(async (hit) => ({ memory: await memoryOf(hit.memory), score: hit.score })));
       },
     };
   };
@@ -666,38 +745,6 @@ export const harness = async ({
     clientWithToken,
     clientWithHeaders,
     assertionFor,
-    // What R2 does when a stretch lands, stood in for: every object this harness's users wrote is
-    // announced to the consumer in the shape Cloudflare's event notifications carry. Announcing
-    // all of them on every call is deliberate — a consumer deriving anything from what it had seen
-    // before, rather than from the key in front of it, comes apart here.
-    deliver: async (): Promise<void> => {
-      const delivered: Delivered[] = [];
-      retried = 0;
-      for (const userId of invited) {
-        let cursor: string | undefined;
-        do {
-          const page = await env.TRANSCRIPTS.list({ prefix: `${userId}/`, cursor });
-          for (const object of page.objects) {
-            delivered.push({
-              body: {
-                account: "test",
-                action: "PutObject",
-                bucket: "recall-transcripts",
-                object: { key: object.key, size: object.size, eTag: object.etag },
-                eventTime: new Date(clock).toISOString(),
-              },
-              ack: () => {},
-              retry: () => {
-                retried += 1;
-              },
-            });
-          }
-          cursor = page.truncated ? page.cursor : undefined;
-        } while (cursor !== undefined);
-      }
-      await app.consume(env, delivered);
-    },
-    retried: () => retried,
     // The clock every handler reads, moved on. A device grant refuses a poll that comes back
     // inside its own interval, so a test driving one has to let the interval pass.
     advance: (ms: number): void => {

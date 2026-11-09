@@ -6,14 +6,6 @@ output "transcript_bucket" {
   value = cloudflare_r2_bucket.transcripts.name
 }
 
-output "transcript_queue" {
-  value = cloudflare_queue.transcripts.queue_name
-}
-
-output "transcript_dead_queue" {
-  value = cloudflare_queue.transcripts_dead.queue_name
-}
-
 output "hostname" {
   value = var.hostname
 }
