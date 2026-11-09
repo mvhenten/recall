@@ -10,24 +10,17 @@ describe("hook search query", () => {
 
     const h = await harness();
     const alice = await h.user("alice");
-    const response = await alice.request("POST", "/v2/memories/search", {
+    const response = await alice.request("POST", "/v2/memories/inject", {
       query,
-      tags: [],
+      preferScope: [],
       limit: 5,
       minScore: 0.65,
-      mode: "Vector",
     });
     expect(response.status).toBe(200);
   });
 
-  it("drops memories the session was already shown, in scope and elsewhere", () => {
-    const found = {
-      hits: [{ memory: { name: "shown-hit" } }, { memory: { name: "new-hit" } }],
-      elsewhere: [{ name: "shown-elsewhere" }, { name: "new-elsewhere" }],
-    };
-    expect(unseen(found, new Set(["shown-hit", "shown-elsewhere"]))).toEqual({
-      hits: [{ memory: { name: "new-hit" } }],
-      elsewhere: [{ name: "new-elsewhere" }],
-    });
+  it("drops memories the session was already shown", () => {
+    const found = [{ name: "shown-hit" }, { name: "new-hit" }, { name: "new-elsewhere" }];
+    expect(unseen(found, new Set(["shown-hit"]))).toEqual([{ name: "new-hit" }, { name: "new-elsewhere" }]);
   });
 });

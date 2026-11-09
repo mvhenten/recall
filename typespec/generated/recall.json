@@ -700,17 +700,26 @@
           "minLength": 1,
           "maxLength": 2000
         },
-        "tags": {
+        "scope": {
           "type": "array",
           "items": {
             "$ref": "MemoryTag.json"
           },
-          "maxItems": 50
+          "maxItems": 50,
+          "description": "Narrows the search to memories carrying one of these tags. An empty list searches every memory."
+        },
+        "preferScope": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryTag.json"
+          },
+          "maxItems": 50,
+          "description": "Ranks memories carrying one of these tags above the rest, score settling each group. An empty list ranks on score alone."
         },
         "limit": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 50
+          "maximum": 25
         },
         "minScore": {
           "type": "number",
@@ -721,7 +730,8 @@
           "$ref": "SearchMode.json"
         }
       },
-      "required": ["query", "tags", "limit", "minScore", "mode"]
+      "required": ["query", "scope", "preferScope", "limit", "minScore", "mode"],
+      "description": "What a deliberate search asks for. Breadth is the default: an empty `scope` searches every\nmemory this account holds. `preferScope` is a sort key and never a filter, so a memory from\nanother repo that answers the query well is ranked below the ones from here rather than dropped."
     },
     "SearchMode": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -739,13 +749,92 @@
         },
         "score": {
           "type": "number"
+        },
+        "inScope": {
+          "type": "boolean",
+          "description": "Whether this memory carries one of the tags `preferScope` named."
         }
       },
-      "required": ["memory", "score"]
+      "required": ["memory", "score", "inScope"]
     },
-    "NearbyMemory": {
+    "ScopeCount": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "$id": "NearbyMemory.json",
+      "$id": "ScopeCount.json",
+      "type": "object",
+      "properties": {
+        "scope": {
+          "$ref": "MemoryTag.json"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      },
+      "required": ["scope", "count"],
+      "description": "One scope the match set holds, and how many of the matches carry it."
+    },
+    "SearchResults": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "SearchResults.json",
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryHit.json"
+          },
+          "maxItems": 25
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "ScopeCount.json"
+          }
+        }
+      },
+      "required": ["count", "results", "scopes"],
+      "description": "What a search answers with. `count` and `scopes` cover the whole match set; `results` is the\nfirst page of it, ranked. A caller reading a `count` in the hundreds narrows with a `scope` the\n`scopes` list named rather than paging blind."
+    },
+    "InjectMemories": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InjectMemories.json",
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "preferScope": {
+          "type": "array",
+          "items": {
+            "$ref": "MemoryTag.json"
+          },
+          "maxItems": 50
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "minScore": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 1
+        }
+      },
+      "required": ["query", "preferScope", "limit", "minScore"],
+      "description": "What the prompt hook asks for on every prompt. It searches every memory and never filters:\n`preferScope` carries where the caller is, and ranks those memories above the rest."
+    },
+    "InjectedMemory": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InjectedMemory.json",
       "type": "object",
       "properties": {
         "score": {
@@ -766,9 +855,13 @@
         },
         "description": {
           "$ref": "MemoryDescription.json"
+        },
+        "inScope": {
+          "type": "boolean"
         }
       },
-      "required": ["score", "memoryName", "type", "tags", "description"]
+      "required": ["score", "memoryName", "type", "tags", "description", "inScope"],
+      "description": "One memory worth putting in front of a prompt, without its body: enough to decide whether to read it."
     }
   }
 }

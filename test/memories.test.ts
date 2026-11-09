@@ -146,16 +146,17 @@ describe("hybrid search", () => {
     const search = (mode: "Hybrid" | "Text") =>
       alice.request("POST", "/v2/memories/search", {
         query: "warming the cache",
-        tags: [],
+        scope: [],
+        preferScope: [],
         limit: 10,
         minScore: 0.5,
         mode,
       });
 
-    const text: { hits: Array<{ memory: MemoryView }> } = await (await search("Text")).json();
-    expect(text.hits.map((hit) => hit.memory.memoryName)).toEqual(["cache-warming"]);
-    const hybrid: { hits: Array<{ memory: MemoryView }> } = await (await search("Hybrid")).json();
-    expect(hybrid.hits.map((hit) => hit.memory.memoryName)).toEqual(["cache-warming"]);
+    const text: { results: Array<{ memory: MemoryView }> } = await (await search("Text")).json();
+    expect(text.results.map((hit) => hit.memory.memoryName)).toEqual(["cache-warming"]);
+    const hybrid: { results: Array<{ memory: MemoryView }> } = await (await search("Hybrid")).json();
+    expect(hybrid.results.map((hit) => hit.memory.memoryName)).toEqual(["cache-warming"]);
   });
 
   it("removes a deleted memory from the full-text index", async () => {
@@ -229,7 +230,8 @@ describe("tags", () => {
 
     const unscoped = await alice.request("POST", "/v2/memories/search", {
       query: "release checklist",
-      tags: [],
+      scope: [],
+      preferScope: [],
       limit: 10,
       minScore: 0,
       mode: "Nowhere",
@@ -263,24 +265,18 @@ describe("tags", () => {
   });
 });
 
-interface Elsewhere {
-  memoryName: string;
-  type: string;
-  tags: string[];
-  description: string;
-  score: number;
-}
-
 const scopedSearch = async (
   client: Client,
   query: string,
-  tags: string[],
+  preferScope: string[],
   mode: "Hybrid" | "Vector" | "Text" = "Hybrid",
-): Promise<{ hits: Array<{ memory: MemoryView }>; elsewhere: Elsewhere[] }> => {
+  limit = 10,
+): Promise<SearchResponse> => {
   const response = await client.request("POST", "/v2/memories/search", {
     query,
-    tags,
-    limit: 10,
+    scope: [],
+    preferScope,
+    limit,
     minScore: 0.1,
     mode,
   });
@@ -288,8 +284,14 @@ const scopedSearch = async (
   return response.json();
 };
 
-describe("elsewhere", () => {
-  it("lists a match from another scope apart from the hits, without recalling it", async () => {
+interface SearchResponse {
+  count: number;
+  results: Array<{ memory: MemoryView; score: number; inScope: boolean }>;
+  scopes: Array<{ scope: string; count: number }>;
+}
+
+describe("scope", () => {
+  it("ranks the memories from here first and keeps the rest below them", async () => {
     const h = await harness();
     const alice = await h.user("alice");
     await alice.save("here-deploy", { body: "deploy pipeline uses blue green", tags: ["repo:github.com/acme/app"] });
@@ -302,42 +304,89 @@ describe("elsewhere", () => {
 
     for (const mode of ["Hybrid", "Vector", "Text"] as const) {
       const result = await scopedSearch(alice, "deploy pipeline", ["repo:github.com/acme/app", "global"], mode);
-      expect(result.hits.map((hit) => hit.memory.memoryName)).toEqual(["here-deploy"]);
-      expect(result.elsewhere).toHaveLength(1);
-      expect(result.elsewhere[0]).toMatchObject({
-        memoryName: "other-deploy",
-        type: "Reference",
-        tags: ["repo:github.com/acme/other"],
-        description: "deploy notes for the other repo",
-      });
-      expect(result.elsewhere[0]?.score).toBeGreaterThan(0);
+      expect(result.results.map((hit) => hit.memory.memoryName)).toEqual(["here-deploy", "other-deploy"]);
+      expect(result.results.map((hit) => hit.inScope)).toEqual([true, false]);
+      expect(result.count).toBe(2);
     }
 
-    const other = await alice.get("other-deploy");
-    expect(other.recallCount).toBe(0);
-    expect(other.lastRecalledAt).toBe(0);
+    // A search is a read. Nothing it surfaces counts as a recall of it.
+    expect((await alice.get("other-deploy")).recallCount).toBe(0);
     expect((await alice.get("here-deploy")).recallCount).toBe(0);
-
-    const everywhere = await scopedSearch(alice, "deploy pipeline", []);
-    expect(everywhere.hits).toHaveLength(2);
-    expect(everywhere.elsewhere).toEqual([]);
   });
 
-  it("caps elsewhere at three and keeps it inside the user", async () => {
+  // The old shape held three slots open for memories from elsewhere whatever they scored. One
+  // ranked list gives the caller the limit it asked for and nothing beyond it.
+  it("cuts once, so what comes from elsewhere is only what fits below the rest", async () => {
     const h = await harness();
     const alice = await h.user("alice");
     const bob = await h.user("bob");
     for (const repo of ["one", "two", "three", "four"]) {
       await alice.save(`cache-${repo}`, { body: "build cache warming steps", tags: [`repo:github.com/acme/${repo}`] });
     }
+    await alice.save("cache-here", { body: "build cache warming steps", tags: ["global"] });
     await bob.save("bob-cache", { body: "build cache warming steps", tags: ["repo:github.com/bob/tool"] });
 
-    const alices = await scopedSearch(alice, "build cache warming", ["global"]);
-    expect(alices.hits).toEqual([]);
-    expect(alices.elsewhere).toHaveLength(3);
-    expect(alices.elsewhere.map((entry) => entry.memoryName)).not.toContain("bob-cache");
+    const alices = await scopedSearch(alice, "build cache warming", ["global"], "Hybrid", 2);
+    expect(alices.count).toBe(5);
+    expect(alices.results).toHaveLength(2);
+    expect(alices.results[0]?.memory.memoryName).toBe("cache-here");
+    expect(alices.results[0]?.inScope).toBe(true);
+    expect(alices.results[1]?.inScope).toBe(false);
+    expect(alices.results.map((hit) => hit.memory.memoryName)).not.toContain("bob-cache");
 
     const bobs = await scopedSearch(bob, "build cache warming", ["global"]);
-    expect(bobs.elsewhere.map((entry) => entry.memoryName)).toEqual(["bob-cache"]);
+    expect(bobs.results.map((hit) => hit.memory.memoryName)).toEqual(["bob-cache"]);
+  });
+
+  it("counts every match and names the scopes they carry, not just the page", async () => {
+    const h = await harness();
+    const alice = await h.user("alice");
+    for (const repo of ["one", "two", "three"]) {
+      await alice.save(`cache-${repo}`, { body: "build cache warming steps", tags: ["global", `repo:${repo}`] });
+    }
+
+    const found = await scopedSearch(alice, "build cache warming", [], "Hybrid", 1);
+    expect(found.count).toBe(3);
+    expect(found.results).toHaveLength(1);
+    expect(found.scopes).toContainEqual({ scope: "global", count: 3 });
+    expect(found.scopes.map((entry) => entry.scope).sort()).toEqual(["global", "repo:one", "repo:three", "repo:two"]);
+  });
+});
+
+describe("inject", () => {
+  it("answers one ranked list, in scope first, without the bodies", async () => {
+    const h = await harness();
+    const alice = await h.user("alice");
+    await alice.save("here-deploy", { body: "deploy pipeline uses blue green", tags: ["repo:github.com/acme/app"] });
+    await alice.save("other-deploy", {
+      description: "deploy notes for the other repo",
+      body: "deploy pipeline uses canary releases",
+      tags: ["repo:github.com/acme/other"],
+    });
+
+    const response = await alice.request("POST", "/v2/memories/inject", {
+      query: "deploy pipeline",
+      preferScope: ["repo:github.com/acme/app", "global"],
+      limit: 5,
+      minScore: 0.1,
+    });
+    expect(response.status).toBe(200);
+    const found: { hits: Array<{ memoryName: string; inScope: boolean; description: string }> } = await response.json();
+    expect(found.hits.map((hit) => hit.memoryName)).toEqual(["here-deploy", "other-deploy"]);
+    expect(found.hits.map((hit) => hit.inScope)).toEqual([true, false]);
+    expect(found.hits[1]).not.toHaveProperty("body");
+    expect((await alice.get("other-deploy")).recallCount).toBe(0);
+  });
+
+  it("refuses more than ten", async () => {
+    const h = await harness();
+    const alice = await h.user("alice");
+    const response = await alice.request("POST", "/v2/memories/inject", {
+      query: "deploy pipeline",
+      preferScope: [],
+      limit: 11,
+      minScore: 0.1,
+    });
+    expect(response.status).toBe(400);
   });
 });

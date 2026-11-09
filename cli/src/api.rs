@@ -103,9 +103,12 @@ pub struct Saved {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Hit {
     pub score: f64,
     pub memory: Memory,
+    #[serde(default)]
+    pub in_scope: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -254,15 +257,32 @@ pub struct Published {
     pub owned_by_another: bool,
 }
 
+/// What a search answers with. `count` and `scopes` cover every match; `results` is the first page
+/// of the ranking. A caller reading a count in the hundreds narrows with a scope it was told about
+/// rather than paging blind.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub hits: Vec<Hit>,
-    #[serde(default)]
-    pub elsewhere: Vec<Elsewhere>,
+    pub count: u32,
+    pub results: Vec<Hit>,
+    pub scopes: Vec<ScopeCount>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Elsewhere {
+pub struct ScopeCount {
+    pub scope: String,
+    pub count: u32,
+}
+
+/// What the prompt hook asks for: a handful of memories, without their bodies, ranked with the
+/// ambient scope first.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InjectResult {
+    pub hits: Vec<Injected>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Injected {
     pub score: f64,
     #[serde(rename = "memoryName")]
     pub name: String,
@@ -270,16 +290,25 @@ pub struct Elsewhere {
     pub kind: String,
     pub tags: Vec<String>,
     pub description: String,
+    pub in_scope: bool,
 }
 
-/// What a search asks for. An empty tag list means every memory, which is what `--any` resolves to
-/// before it gets here; `/v1` took a boolean beside the list that had to agree with it.
+/// What a search asks for. An empty `scope` searches every memory, which is the default; an empty
+/// `prefer_scope` ranks on score alone.
 pub struct SearchRequest<'a> {
     pub query: &'a str,
-    pub tags: &'a [String],
+    pub scope: &'a [String],
+    pub prefer_scope: &'a [String],
     pub limit: u32,
     pub min_score: f64,
     pub mode: &'a str,
+}
+
+pub struct InjectRequest<'a> {
+    pub query: &'a str,
+    pub prefer_scope: &'a [String],
+    pub limit: u32,
+    pub min_score: f64,
 }
 
 pub struct Client {
@@ -1064,12 +1093,27 @@ impl Client {
             .authed(self.agent.post(self.url("/v2/memories/search")))
             .send_json(serde_json::json!({
                 "query": request.query,
-                "tags": request.tags,
+                "scope": request.scope,
+                "preferScope": request.prefer_scope,
                 "limit": request.limit,
                 "minScore": request.min_score,
                 "mode": capitalised(request.mode),
             }))?;
         Ok(check(response, "searching")?.body_mut().read_json()?)
+    }
+
+    pub fn inject(&self, request: &InjectRequest) -> Result<InjectResult> {
+        let response = self
+            .authed(self.agent.post(self.url("/v2/memories/inject")))
+            .send_json(serde_json::json!({
+                "query": request.query,
+                "preferScope": request.prefer_scope,
+                "limit": request.limit,
+                "minScore": request.min_score,
+            }))?;
+        Ok(check(response, "reading memories for a prompt")?
+            .body_mut()
+            .read_json()?)
     }
 
     fn session_path(session_id: &str) -> String {

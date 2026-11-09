@@ -19,6 +19,13 @@ interface V2Memory {
 interface V2Hit {
   memory: V2Memory;
   score: number;
+  inScope: boolean;
+}
+
+interface SearchBody {
+  count: number;
+  results: V2Hit[];
+  scopes: Array<{ scope: string; count: number }>;
 }
 
 const CORPUS = [
@@ -129,27 +136,30 @@ describe("the /v2 memories", () => {
     expect((await client.v2.deleteMemory("fresh-note")).status).toBe(404);
   });
 
-  it("matches every memory on an empty tag list and only the tagged ones on a full one", async () => {
+  it("matches every memory on an empty scope and only the tagged ones on a full one", async () => {
     const { user } = await harness();
     const client = await user("scoping");
     await corpus(client);
 
-    const everything = await client.v2.searchMemories({ query: "the", tags: [], minScore: -1, limit: 50 });
+    const everything = await client.v2.searchMemories({ query: "the", scope: [], minScore: -1, limit: 25 });
     expect(everything.status).toBe(200);
-    const all: { hits: V2Hit[]; elsewhere: unknown[] } = await everything.json();
-    expect(all.hits.map((hit) => hit.memory.memoryName).sort()).toEqual(CORPUS.map((one) => one.name).sort());
-    expect(all.elsewhere).toEqual([]);
+    const all: SearchBody = await everything.json();
+    expect(all.results.map((hit) => hit.memory.memoryName).sort()).toEqual(CORPUS.map((one) => one.name).sort());
+    expect(all.count).toBe(CORPUS.length);
 
-    const scoped = await client.v2.searchMemories({ query: "the", tags: ["search"], minScore: -1, limit: 50 });
-    const some: { hits: V2Hit[] } = await scoped.json();
-    expect(some.hits.map((hit) => hit.memory.memoryName).sort()).toEqual(["embedding-quantisation", "ranking-fusion"]);
+    const scoped = await client.v2.searchMemories({ query: "the", scope: ["search"], minScore: -1, limit: 25 });
+    const some: SearchBody = await scoped.json();
+    expect(some.results.map((hit) => hit.memory.memoryName).sort()).toEqual([
+      "embedding-quantisation",
+      "ranking-fusion",
+    ]);
+    expect(some.scopes).toContainEqual({ scope: "search", count: 2 });
 
-    // `any` is gone rather than renamed: a body still carrying it is read for its tags alone,
-    // where `/v1` refused the pair outright.
+    // `tags` and `any` are gone rather than renamed. A body still carrying them narrows by
+    // nothing, which is the new default rather than the old pair's refusal.
     const legacy = await client.v2.searchMemories({ query: "the", tags: ["search"], any: true, minScore: -1 });
-    expect(legacy.status).toBe(200);
-    const read: { hits: V2Hit[] } = await legacy.json();
-    expect(read.hits.map((hit) => hit.memory.memoryName).sort()).toEqual(["embedding-quantisation", "ranking-fusion"]);
+    const read: SearchBody = await legacy.json();
+    expect(read.count).toBe(CORPUS.length);
   });
 
   it("holds the slug, the tag charset and the body ceiling to the generated schema", async () => {
@@ -183,8 +193,8 @@ describe("the /v2 memories", () => {
     expect((await memoryOf(await client.v2.memory("search"))).memoryName).toBe("search");
     const found = await client.v2.searchMemories({ query: "route word" });
     expect(found.status).toBe(200);
-    const { hits }: { hits: V2Hit[] } = await found.json();
-    expect(hits.map((hit) => hit.memory.memoryName)).toContain("search");
+    const { results }: SearchBody = await found.json();
+    expect(results.map((hit) => hit.memory.memoryName)).toContain("search");
   });
 
   it("keeps one account's memories out of another's reach", async () => {
@@ -201,8 +211,8 @@ describe("the /v2 memories", () => {
     const { memories }: { memories: V2Memory[] } = await listed.json();
     expect(memories).toEqual([]);
     const found = await theirs.v2.searchMemories({ query: "owner reads this", minScore: -1 });
-    const { hits }: { hits: V2Hit[] } = await found.json();
-    expect(hits).toEqual([]);
+    const { results }: SearchBody = await found.json();
+    expect(results).toEqual([]);
 
     // A write under the same name makes the stranger their own memory and leaves the owner's row
     // where it stood.
@@ -243,22 +253,30 @@ describe("the /v2 memories", () => {
   // parsers build. These bodies reach that: `/v1` folds a tag's case and the space around it,
   // where `/v2` holds the caller to the charset the contract writes down.
   it("reads a search body the same as /v1 except where /v1 normalises a tag", () => {
-    const search = (tags: string[]): Record<string, unknown> => ({
+    const search = (scope: string[]): Record<string, unknown> => ({
       query: "ranking",
-      tags,
+      scope,
+      preferScope: ["global"],
       limit: 10,
       minScore: 0.1,
     });
-    const v1 = (tags: string[]) => parseSearch({ ...search(tags), any: tags.length === 0, mode: "hybrid" });
-    const v2 = (tags: string[]) => parseSearchMemories({ ...search(tags), mode: "Hybrid" });
+    const v1 = (scope: string[]) => parseSearch({ ...search(scope), mode: "hybrid" });
+    const v2 = (scope: string[]) => parseSearchMemories({ ...search(scope), mode: "Hybrid" });
 
-    for (const tags of [[], ["search"], ["storage", "search"], ["search", "storage"], ["search", "search"]]) {
-      expect(v2(tags)).toEqual(v1(tags));
+    for (const scope of [[], ["search"], ["storage", "search"], ["search", "storage"], ["search", "search"]]) {
+      expect(v2(scope)).toEqual(v1(scope));
     }
 
     expect(v1(["Search", " search "])).toEqual({
       ok: true,
-      value: { query: "ranking", tags: ["search"], limit: 10, minScore: 0.1, mode: "hybrid" },
+      value: {
+        query: "ranking",
+        scope: ["search"],
+        preferScope: ["global"],
+        limit: 10,
+        minScore: 0.1,
+        mode: "hybrid",
+      },
     });
     expect(v2(["Search", " search "]).ok).toBe(false);
   });

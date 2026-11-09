@@ -1,4 +1,4 @@
-import { integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 import { vector } from "./columns";
 
 // One account's own tables, in the Durable Object addressed by its user id. Every table here keeps
@@ -261,9 +261,15 @@ export const memories = sqliteTable(
     recallCount: integer("recall_count").notNull(),
     lastRecalledAt: integer("last_recalled_at").notNull(),
   },
-  (table) => [unique().on(table.userId, table.name)],
+  // `memories_by_user_memory` is what a hydration seeks on. A set of memory ids comes in as one
+  // JSON parameter, and without an index leading on both columns SQLite walks the account's whole
+  // range testing each row rather than seeking the handful named.
+  (table) => [unique().on(table.userId, table.name), index("memories_by_user_memory").on(table.userId, table.memoryId)],
 );
 
+// `memory_tags_by_tag` reads the primary key backwards: the key answers "what does this memory
+// carry", and resolving a scope asks "what carries this tag". Covering both columns lets one seek
+// per tag settle the whole scope rather than a probe per memory.
 export const memoryTags = sqliteTable(
   "memory_tags",
   {
@@ -272,7 +278,10 @@ export const memoryTags = sqliteTable(
       .references(() => memories.memoryId, { onDelete: "cascade" }),
     tag: text("tag").notNull(),
   },
-  (table) => [primaryKey({ columns: [table.memoryId, table.tag] })],
+  (table) => [
+    primaryKey({ columns: [table.memoryId, table.tag] }),
+    index("memory_tags_by_tag").on(table.tag, table.memoryId),
+  ],
 );
 
 // WITHOUT ROWID likewise. The primary key is the whole of the single-taker guarantee.

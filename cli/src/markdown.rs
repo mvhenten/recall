@@ -1,6 +1,6 @@
 use crate::api::{
-    Artifact, Audience, BoardEntry, BoardMessage, Elsewhere, HeldFile, Hit, Memory, PastSession, Session, SessionHit,
-    Share,
+    Artifact, Audience, BoardEntry, BoardMessage, HeldFile, Hit, Injected, Memory, PastSession, ScopeCount, Session,
+    SessionHit, Share,
 };
 use crate::sessions;
 use jiff::Timestamp;
@@ -350,24 +350,37 @@ pub fn render_session_hits(hits: &[SessionHit]) -> String {
         .collect()
 }
 
-pub fn render_elsewhere(entries: &[Elsewhere]) -> String {
-    if entries.is_empty() {
+/// What the whole match set holds, under the page of it the search printed. A count past the page
+/// is only useful beside the scopes the matches carry, which is what the next search narrows with.
+pub fn render_scopes(count: u32, scopes: &[ScopeCount]) -> String {
+    if scopes.is_empty() {
         return String::new();
     }
-    let lines: String = entries
+    let listed: Vec<String> = scopes
+        .iter()
+        .map(|entry| format!("{} ({})", entry.scope, entry.count))
+        .collect();
+    format!("{count} memories matched. Scopes: {}\n", listed.join(", "))
+}
+
+/// One line per memory the prompt hook was given, in the order it was ranked. A memory from
+/// another scope reads as the scope it came from rather than being held back for a section of
+/// its own.
+pub fn render_injected(entries: &[Injected]) -> String {
+    entries
         .iter()
         .map(|entry| {
             format!(
-                "- **{}** ({}, score {:.3}) {} `[{}]`\n",
+                "- **{}** ({}, score {:.3}){} {} `[{}]`\n",
                 entry.name,
                 entry.kind,
                 entry.score,
+                if entry.in_scope { "" } else { " elsewhere" },
                 entry.description,
                 entry.tags.join(", ")
             )
         })
-        .collect();
-    format!("Also in other scopes:\n\n{lines}")
+        .collect()
 }
 
 /// Who posted a board message, as the one who reads it sees it: the host's label where it carries
@@ -536,19 +549,40 @@ mod tests {
     }
 
     #[test]
-    fn lists_other_scopes_after_the_hits() {
-        let entries = [Elsewhere {
+    fn marks_the_memories_that_came_from_elsewhere() {
+        let entry = |name: &str, in_scope: bool| Injected {
             score: 0.5,
-            name: "other-deploy".into(),
+            name: name.into(),
             kind: "reference".into(),
             tags: vec!["repo:github.com/acme/other".into()],
             description: "deploy notes".into(),
-        }];
+            in_scope,
+        };
         assert_eq!(
-            render_elsewhere(&entries),
-            "Also in other scopes:\n\n- **other-deploy** (reference, score 0.500) deploy notes `[repo:github.com/acme/other]`\n"
+            render_injected(&[entry("here-deploy", true), entry("other-deploy", false)]),
+            "- **here-deploy** (reference, score 0.500) deploy notes `[repo:github.com/acme/other]`\n\
+             - **other-deploy** (reference, score 0.500) elsewhere deploy notes `[repo:github.com/acme/other]`\n"
         );
-        assert_eq!(render_elsewhere(&[]), "");
+        assert_eq!(render_injected(&[]), "");
+    }
+
+    #[test]
+    fn names_the_scopes_the_whole_match_set_holds() {
+        let scopes = [
+            ScopeCount {
+                scope: "global".into(),
+                count: 94,
+            },
+            ScopeCount {
+                scope: "writing".into(),
+                count: 7,
+            },
+        ];
+        assert_eq!(
+            render_scopes(101, &scopes),
+            "101 memories matched. Scopes: global (94), writing (7)\n"
+        );
+        assert_eq!(render_scopes(0, &[]), "");
     }
 
     #[test]

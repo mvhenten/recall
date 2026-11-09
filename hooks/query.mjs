@@ -6,9 +6,6 @@ export function searchQuery(prompt) {
   return prompt.slice(0, MAX_QUERY_CHARS);
 }
 
-export function unseen({ hits, elsewhere }, shown) {
-  return {
-    hits: hits.filter(({ memory }) => !shown.has(memory.name)),
-    elsewhere: elsewhere.filter(({ name }) => !shown.has(name)),
-  };
+export function unseen(hits, shown) {
+  return hits.filter(({ name }) => !shown.has(name));
 }

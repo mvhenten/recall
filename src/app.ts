@@ -109,6 +109,7 @@ import {
   type Embedder,
   FRESH_WINDOW_MS,
   fail,
+  type InjectInput,
   isRecord,
   type Live,
   type MemoryHit,
@@ -129,7 +130,9 @@ import {
   parseStretchOffset,
   parseTranscriptFile,
   type SaveInput,
+  SEARCH_RESULTS,
   type SearchInput,
+  type SearchResults,
   type SessionHit,
   type StatsWindows,
   sessionHandle,
@@ -151,7 +154,7 @@ import {
   SENT_COOKIE,
   sizeText,
 } from "./page";
-import { dot, ftsQuery, quantize, reciprocalRankFusion } from "./rank";
+import { dot, ftsQuery, quantize, rankByScope, reciprocalRankFusion, type Scored } from "./rank";
 import {
   MAX_RECORDS_BYTES,
   MAX_RECORDS_PER_APPEND,
@@ -258,7 +261,7 @@ import {
   shareCountsFor,
   sharesFor,
   startCursor,
-  TEXT_CANDIDATES,
+  tagsOfMemories,
   textCandidates,
   userForServiceClient,
   vectorCandidates,
@@ -292,10 +295,10 @@ import {
 import { agentName, readTurns } from "./turns";
 import {
   deviceView,
-  memoryHitView,
+  injectedMemoryView,
   memoryView,
-  nearbyMemoryView,
   parseAppendRecords,
+  parseInjectMemories,
   parseMemoryList,
   parseMemoryName,
   parseSaveMemory,
@@ -304,6 +307,7 @@ import {
   parseUsageDelta,
   parseV2Send,
   pastSessionView,
+  searchResultsView,
   sendInputOf,
   sessionHitView,
   sessionView,
@@ -459,7 +463,9 @@ const GRANT_ERRORS = {
   access_denied: "the sign-in was denied in the browser",
 } as const;
 
-const ELSEWHERE_LIMIT = 3;
+// How deep a search ranks before it cuts. One pass of the corpus produces the matches; this bounds
+// the set whose scope is settled and whose head is read back, so neither grows with the corpus.
+const CANDIDATE_LIMIT = 100;
 
 // A message typed into the dashboard comes from a person at a browser and from no device at all,
 // so it says so rather than borrowing one: its host and its device id both read `dashboard`, and
@@ -483,13 +489,6 @@ export const HEAD_BYTES = 8_192;
 // an archive of a thousand chunks and on one of a million.
 const CHUNK_MATCHES = 100;
 export const CHUNK_RECENT = 500;
-
-type Ranking = Array<[string, number]>;
-
-interface Rankings {
-  inScope: Ranking;
-  elsewhere: Ranking;
-}
 
 // The largest manifest a publish may send. It carries a title, a description, two permissions and
 // at most fifty paths, so a body past this is not a manifest.
@@ -1720,18 +1719,19 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       const page = await listMemories(db, userId, filter, cursor);
       return memoriesPage(email, live, url, filter, counts, page.memories, page.nextCursor, now);
     }
-    const searched = parseSearch({
+    // The dashboard sits at no repo, so it names no scope to rank by: the tags the filter holds
+    // narrow the search and score settles the rest.
+    const asked = parseSearch({
       query,
-      tags: filter.tags,
-      any: filter.tags.length === 0,
-      limit: filter.limit,
+      scope: filter.tags,
+      preferScope: [],
+      limit: Math.min(filter.limit, SEARCH_RESULTS),
       minScore: DEFAULT_MIN_SCORE,
       mode: "hybrid",
     });
-    if (!searched.ok) return lost(400, "Search refused", `${searched.error}.`);
-    const rankings = await rank(db, userId, searched.value, filter.types);
-    const found = await hits(db, userId, rankings.inScope, searched.value.limit);
-    return memorySearchPage(email, live, url, filter, counts, found, now);
+    if (!asked.ok) return lost(400, "Search refused", `${asked.error}.`);
+    const found = await searched(db, userId, asked.value, filter.types);
+    return memorySearchPage(email, live, url, filter, counts, found.results, now);
   };
 
   // What a publish for the whole account to read is refused with when another account already
@@ -2121,95 +2121,103 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json({ artifact: viewOf(host, record, await sharesHeld(account, host, record, userId, now)) });
   };
 
-  const vectorRankings = async (
+  const vectorScores = async (
     db: TenantDb,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
-  ): Promise<Rankings> => {
+  ): Promise<Scored[]> => {
     const [vector] = await deps.embedder.embed([input.query]);
     if (!vector) throw new Error("the embedder answered the query with no vector");
-    const inScope: Ranking = [];
-    const elsewhere: Ranking = [];
-    for (const candidate of await vectorCandidates(db, userId, input.tags, types)) {
+    const scored: Scored[] = [];
+    for (const candidate of await vectorCandidates(db, userId, input.scope, types)) {
       const score = dot(vector, candidate.embedding);
-      if (score >= input.minScore) (candidate.inScope ? inScope : elsewhere).push([candidate.memoryId, score]);
+      if (score >= input.minScore) scored.push({ memoryId: candidate.memoryId, score });
     }
-    const byScore = (a: [string, number], b: [string, number]): number => b[1] - a[1];
-    return { inScope: inScope.sort(byScore), elsewhere: elsewhere.sort(byScore) };
+    return scored.sort((left, right) => right.score - left.score);
   };
 
-  const textRankings = async (
+  const textScores = async (
     db: TenantDb,
     userId: string,
     input: SearchInput,
     types: MemoryType[],
-  ): Promise<{ inScope: string[]; elsewhere: string[] }> => {
+  ): Promise<string[]> => {
     const match = ftsQuery(input.query);
-    const candidates = match ? await textCandidates(db, userId, input.tags, types, match, TEXT_CANDIDATES) : [];
-    return {
-      inScope: candidates.filter((candidate) => candidate.inScope).map((candidate) => candidate.memoryId),
-      elsewhere: candidates.filter((candidate) => !candidate.inScope).map((candidate) => candidate.memoryId),
-    };
+    return match === null ? [] : textCandidates(db, userId, input.scope, types, match);
   };
 
-  const rank = async (db: TenantDb, userId: string, input: SearchInput, types: MemoryType[]): Promise<Rankings> => {
-    if (input.mode === "vector") return vectorRankings(db, userId, input, types);
+  // Every memory the query matches, best first, before scope has anything to say about it. The
+  // whole match set comes back rather than a page of it, because what a search answers with counts
+  // the matches and divides them by scope; the cap below bounds only what is ranked and shown.
+  const matches = async (db: TenantDb, userId: string, input: SearchInput, types: MemoryType[]): Promise<Scored[]> => {
+    if (input.mode === "vector") return vectorScores(db, userId, input, types);
     if (input.mode === "text") {
-      const text = await textRankings(db, userId, input, types);
-      return { inScope: reciprocalRankFusion([text.inScope]), elsewhere: reciprocalRankFusion([text.elsewhere]) };
+      const text = await textScores(db, userId, input, types);
+      return reciprocalRankFusion([text]).map(([memoryId, score]) => ({ memoryId, score }));
     }
     const [vector, text] = await Promise.all([
-      vectorRankings(db, userId, input, types),
-      textRankings(db, userId, input, types),
+      vectorScores(db, userId, input, types),
+      textScores(db, userId, input, types),
     ]);
-    const ids = (ranking: Ranking): string[] => ranking.map(([id]) => id);
-    return {
-      inScope: reciprocalRankFusion([ids(vector.inScope), text.inScope]),
-      elsewhere: reciprocalRankFusion([ids(vector.elsewhere), text.elsewhere]),
-    };
+    return reciprocalRankFusion([vector.map(({ memoryId }) => memoryId), text]).map(([memoryId, score]) => ({
+      memoryId,
+      score,
+    }));
   };
 
-  const hits = async (db: TenantDb, userId: string, ranking: Ranking, limit: number): Promise<MemoryHit[]> => {
-    const top = ranking.slice(0, limit);
-    if (top.length === 0) return [];
+  const hydrate = async (db: TenantDb, userId: string, ranked: Scored[], inScope: ReadonlySet<string>) => {
+    if (ranked.length === 0) return [];
     const described = await describeMemories(
       db,
       userId,
-      top.map(([id]) => id),
+      ranked.map(({ memoryId }) => memoryId),
     );
     const byId = new Map(described.map((memory) => [memory.memoryId, memory]));
-    return top.flatMap(([id, score]) => {
-      const memory = byId.get(id);
-      return memory ? [{ memory, score }] : [];
+    return ranked.flatMap(({ memoryId, score }) => {
+      const memory = byId.get(memoryId);
+      return memory ? [{ memory, score, inScope: inScope.has(memoryId) }] : [];
     });
   };
 
-  // What a query finds: the memories in scope of its tags, and the ones it would have found had the
-  // tags not been named. Both surfaces rank the same way and differ only in how they write a hit.
-  const ranked = async (
+  // One search, cut once. The matches are capped, their scope is settled in one read of the tags
+  // they carry, and the head of the ranking is read back whole — three statements whatever the
+  // corpus holds, and the last of them reads at most as many rows as the caller asked to see.
+  const searched = async (
     db: TenantDb,
     userId: string,
     input: SearchInput,
-  ): Promise<{ shown: MemoryHit[]; nearby: MemoryHit[] }> => {
-    const rankings = await rank(db, userId, input, []);
-    const [shown, nearby] = await Promise.all([
-      hits(db, userId, rankings.inScope, input.limit),
-      hits(db, userId, rankings.elsewhere, ELSEWHERE_LIMIT),
-    ]);
-    return { shown, nearby };
+    types: MemoryType[],
+  ): Promise<SearchResults> => {
+    const found = await matches(db, userId, input, types);
+    const capped = found.slice(0, CANDIDATE_LIMIT);
+    const tags = await tagsOfMemories(
+      db,
+      capped.map(({ memoryId }) => memoryId),
+    );
+    const inScope = new Set(tags.filter(([, tag]) => input.preferScope.includes(tag)).map(([memoryId]) => memoryId));
+    const counts = new Map<string, number>();
+    for (const [, tag] of tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    return {
+      count: found.length,
+      results: await hydrate(db, userId, rankByScope(capped, inScope, input.limit), inScope),
+      scopes: [...counts]
+        .map(([scope, count]) => ({ scope, count }))
+        .sort((left, right) => right.count - left.count || left.scope.localeCompare(right.scope)),
+    };
   };
 
-  const searched = async (db: TenantDb, userId: string, input: SearchInput): Promise<unknown> => {
-    const { shown, nearby } = await ranked(db, userId, input);
-    const elsewhere = nearby.map(({ memory, score }) => ({
-      score,
-      name: memory.name,
-      type: memory.type,
-      tags: memory.tags,
-      description: memory.description,
-    }));
-    return { hits: shown, elsewhere };
+  // What goes in front of a prompt. The same three statements as a search with the counting left
+  // off, because the hook prints what it is given and never pages.
+  const injected = async (db: TenantDb, userId: string, input: InjectInput): Promise<MemoryHit[]> => {
+    const search: SearchInput = { ...input, scope: [], mode: "vector" };
+    const capped = (await matches(db, userId, search, [])).slice(0, CANDIDATE_LIMIT);
+    const tags = await tagsOfMemories(
+      db,
+      capped.map(({ memoryId }) => memoryId),
+    );
+    const inScope = new Set(tags.filter(([, tag]) => input.preferScope.includes(tag)).map(([memoryId]) => memoryId));
+    return hydrate(db, userId, rankByScope(capped, inScope, input.limit), inScope);
   };
 
   const v2MemoriesList = async (url: URL, db: TenantDb, caller: Caller): Promise<Response> => {
@@ -2224,8 +2232,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2MemorySearch = async (request: Request, db: TenantDb, caller: Caller): Promise<Response> => {
     const input = parseSearchMemories(await readJson(request));
     if (!input.ok) return error(400, input.error);
-    const { shown, nearby } = await ranked(db, caller.userId, input.value);
-    return json({ hits: shown.map(memoryHitView), elsewhere: nearby.map(nearbyMemoryView) });
+    return json(searchResultsView(await searched(db, caller.userId, input.value, [])));
+  };
+
+  // What the prompt hook calls on every prompt, kept apart from the search beside it because the
+  // two want different things: this one is bounded, carries no body and never pages, and a person
+  // searching deliberately wants the count and the scopes that one leaves out.
+  const v2MemoryInject = async (request: Request, db: TenantDb, caller: Caller): Promise<Response> => {
+    const input = parseInjectMemories(await readJson(request));
+    if (!input.ok) return error(400, input.error);
+    const found = await injected(db, caller.userId, input.value);
+    return json({ hits: found.map(injectedMemoryView) });
   };
 
   const v2MemorySave = async (request: Request, db: TenantDb, caller: Caller, name: string): Promise<Response> => {
@@ -2265,6 +2282,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (rawName === "search" && word === undefined && request.method === "POST") {
       return v2MemorySearch(request, db, caller);
     }
+    if (rawName === "inject" && word === undefined && request.method === "POST") {
+      return v2MemoryInject(request, db, caller);
+    }
     const name = parseMemoryName(decodeSegment(rawName) ?? "");
     if (!name.ok) return error(400, name.error);
     if (word === "recall") {
@@ -2301,10 +2321,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (call.name === "recall_search") {
         const input = parseSearchArgs(args.value);
         if (!input.ok) return refused(input.error);
-        const { query, tags, mode } = input.value;
-        return document(
-          await searched(db, userId, { query, tags, mode, limit: SEARCH_LIMIT, minScore: DEFAULT_MIN_SCORE }),
+        const { query, scope, mode } = input.value;
+        const found = await searched(
+          db,
+          userId,
+          { query, scope, preferScope: [], mode, limit: SEARCH_LIMIT, minScore: DEFAULT_MIN_SCORE },
+          [],
         );
+        return document(searchResultsView(found));
       }
       if (call.name === "recall_get") {
         const input = parseNameArgs(args.value);

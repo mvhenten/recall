@@ -126,11 +126,12 @@ const MEMORY_FIELDS = {
      ORDER BY ${qualified(memoryTags.tag)}))`,
 };
 
+// Which memories carry one of these tags, as one seek per tag rather than a probe per memory. An
+// empty list narrows nothing, which is what "search everything" resolves to before it gets here.
 const tagFilter = (tags: readonly string[]): SQL =>
-  sql`(json_array_length(${JSON.stringify(tags)}) = 0 OR EXISTS (
-    SELECT 1 FROM ${memoryTags}
-    WHERE ${qualified(memoryTags.memoryId)} = ${qualified(memories.memoryId)}
-      AND ${qualified(memoryTags.tag)} IN ${jsonEach(tags)}))`;
+  sql`(json_array_length(${JSON.stringify(tags)}) = 0 OR ${qualified(memories.memoryId)} IN (
+    SELECT ${qualified(memoryTags.memoryId)} FROM ${memoryTags}
+    WHERE ${qualified(memoryTags.tag)} IN ${jsonEach(tags)}))`;
 
 const typeFilter = (types: readonly MemoryType[]): SQL =>
   sql`(json_array_length(${JSON.stringify(types)}) = 0 OR ${qualified(memories.type)} IN ${jsonEach(types)})`;
@@ -341,55 +342,52 @@ export const memoryCounts = async (db: TenantDb, userId: string, since: number):
 export interface VectorCandidate {
   memoryId: string;
   embedding: Uint8Array;
-  inScope: boolean;
 }
 
-export interface TextCandidate {
-  memoryId: string;
-  inScope: boolean;
-}
-
-// Read as positional rows rather than objects: this is every vector the account holds, and naming a
-// column per row costs more than the scoring does.
+// Every vector the account holds, read as positional rows rather than objects: naming a column per
+// row costs more than the scoring does. Without a vector index this read is the floor of a search
+// and there is nothing to narrow it with, so nothing tries; scope is settled afterwards, over the
+// handful that clear the floor, rather than per row here.
 export const vectorCandidates = async (
   db: TenantDb,
   userId: string,
-  tags: string[],
-  types: MemoryType[],
+  scope: readonly string[],
+  types: readonly MemoryType[],
 ): Promise<VectorCandidate[]> => {
-  const rows = db.values<[string, unknown, number]>(sql`
-    SELECT ${memories.memoryId}, ${memories.embedding}, ${tagFilter(tags)} FROM ${memories}
-    WHERE ${memories.userId} = ${userId} AND ${typeFilter(types)}`);
-  return rows.map(([memoryId, embedding, inScope]) => ({
-    memoryId,
-    embedding: toBytes(embedding),
-    inScope: inScope === 1,
-  }));
+  const rows = db.values<[string, unknown]>(sql`
+    SELECT ${memories.memoryId}, ${memories.embedding} FROM ${memories}
+    WHERE ${memories.userId} = ${userId} AND ${tagFilter(scope)} AND ${typeFilter(types)}`);
+  return rows.map(([memoryId, embedding]) => ({ memoryId, embedding: toBytes(embedding) }));
 };
 
-// How deep a text match a search reads. The limit is the caller's because it bounds the rows the
-// statement returns, not the rows the caller keeps: a caller that drops some of them afterwards
-// has to ask for them on top.
-export const TEXT_CANDIDATES = 50;
-
+// Every memory whose text answers the query, best first. The caller counts them and keeps the head,
+// so this returns the whole match set rather than a page of it: the count a search answers with is
+// over every match and not over what it shows.
 export const textCandidates = async (
   db: TenantDb,
   userId: string,
-  tags: string[],
-  types: MemoryType[],
+  scope: readonly string[],
+  types: readonly MemoryType[],
   query: string,
-  limit: number,
-): Promise<TextCandidate[]> => {
-  const results = db
-    .select({ memoryId: memories.memoryId, inScope: tagFilter(tags).mapWith(Number).as("in_scope") })
+): Promise<string[]> =>
+  db
+    .select({ memoryId: memories.memoryId })
     .from(memoriesFts)
     .innerJoin(memories, eq(memories.memorySeq, memoriesFts.rowid))
-    .where(and(sql`${memoriesFts} MATCH ${query}`, eq(memories.userId, userId), typeFilter(types)))
-    .orderBy(sql`in_scope DESC, bm25(${memoriesFts}, 5.0, 2.0, 1.0)`)
-    .limit(limit)
-    .all();
-  return results.map((row) => ({ memoryId: row.memoryId, inScope: row.inScope === 1 }));
-};
+    .where(and(sql`${memoriesFts} MATCH ${query}`, eq(memories.userId, userId), tagFilter(scope), typeFilter(types)))
+    .orderBy(sql`bm25(${memoriesFts}, 5.0, 2.0, 1.0)`)
+    .all()
+    .map((row) => row.memoryId);
+
+// The tags a set of memories carries, one seek per memory. Both things a ranking needs of a tag
+// come off this one read: which memories are in scope, and how the match set divides by scope.
+export const tagsOfMemories = async (db: TenantDb, memoryIds: readonly string[]): Promise<[string, string][]> =>
+  db
+    .values<[string, string]>(
+      sql`SELECT ${qualified(memoryTags.memoryId)}, ${qualified(memoryTags.tag)} FROM ${memoryTags}
+        WHERE ${qualified(memoryTags.memoryId)} IN ${jsonEach(memoryIds)}`,
+    )
+    .map(([memoryId, tag]) => [memoryId, tag]);
 
 export const describeMemories = async (db: TenantDb, userId: string, memoryIds: string[]): Promise<Memory[]> => {
   const results = db

@@ -32,12 +32,23 @@ export interface SaveInput {
   tags: string[];
 }
 
+// `scope` narrows and `preferScope` ranks. They are two fields rather than one because they are
+// two different things: an empty `scope` searches the whole corpus, and an empty `preferScope`
+// ranks on score alone.
 export interface SearchInput {
   query: string;
-  tags: string[];
+  scope: string[];
+  preferScope: string[];
   limit: number;
   minScore: number;
   mode: Mode;
+}
+
+export interface InjectInput {
+  query: string;
+  preferScope: string[];
+  limit: number;
+  minScore: number;
 }
 
 export interface ListInput {
@@ -52,6 +63,20 @@ export interface ListInput {
 export interface MemoryHit {
   memory: Memory;
   score: number;
+  inScope: boolean;
+}
+
+export interface ScopeCount {
+  scope: string;
+  count: number;
+}
+
+// What a search answers with: the whole match set counted and divided by scope, and the head of
+// the ranking. A caller reading a count in the hundreds narrows with a scope it was told about.
+export interface SearchResults {
+  count: number;
+  results: MemoryHit[];
+  scopes: ScopeCount[];
 }
 
 export interface MemoryCounts {
@@ -65,6 +90,11 @@ export const FRESH_WINDOW_DAYS = 30;
 export const FRESH_WINDOW_MS = FRESH_WINDOW_DAYS * 86_400_000;
 export const DEFAULT_MIN_SCORE = 0.55;
 export const MAX_QUERY_CHARS = 2_000;
+
+// The page a search answers with, and the most memories one prompt is enriched with. Both are
+// ceilings the contract carries, so a caller asking for more is refused rather than silently cut.
+export const SEARCH_RESULTS = 25;
+export const INJECT_HITS = 10;
 
 // Embedding is batched because indexing a session asks for a hundred vectors at once and one call
 // per chunk would be a hundred round trips. A memory asks for one and takes the first back.
@@ -409,19 +439,18 @@ export const parseTags = (value: unknown): Parsed<string[]> => {
 
 export const parseSearch = (body: unknown): Parsed<SearchInput> => {
   if (!isRecord(body)) return fail("body must be a JSON object");
-  const { query, any, limit, minScore, mode } = body;
+  const { query, limit, minScore, mode } = body;
   if (typeof query !== "string" || query.length < 1 || query.length > MAX_QUERY_CHARS) {
     return fail(`query must hold 1 to ${MAX_QUERY_CHARS} characters`);
   }
-  const tags = parseTags(body.tags);
-  if (!tags.ok) return tags;
-  if (typeof any !== "boolean" || any === tags.value.length > 0) {
-    return fail("tags: pass at least one tag, or any: true with no tags to match every memory");
-  }
-  if (!isInteger(limit, 1, 50)) return fail("limit must be a whole number from 1 to 50");
+  const scope = parseTags(body.scope);
+  if (!scope.ok) return scope;
+  const preferScope = parseTags(body.preferScope);
+  if (!preferScope.ok) return preferScope;
+  if (!isInteger(limit, 1, SEARCH_RESULTS)) return fail(`limit must be a whole number from 1 to ${SEARCH_RESULTS}`);
   if (typeof minScore !== "number" || minScore < -1 || minScore > 1) return fail("minScore must be between -1 and 1");
   if (!isOneOf(modes, mode)) return fail(`mode must be one of ${modes.join(", ")}`);
-  return { ok: true, value: { query, tags: tags.value, limit, minScore, mode } };
+  return { ok: true, value: { query, scope: scope.value, preferScope: preferScope.value, limit, minScore, mode } };
 };
 
 export const parseTypes = (values: string[]): Parsed<MemoryType[]> => {

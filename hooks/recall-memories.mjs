@@ -13,12 +13,16 @@ function entry({ name, type, tags, description }) {
 }
 
 function header(repoTag) {
-  const scope = repoTag ? `${repoTag} + global` : "global only";
-  return `Memories from recall that may be relevant to this prompt. Searched ${scope}. \`recall search --any "<query>"\` searches every memory; \`recall get <name>\` prints one in full. Read the full text of any that looks relevant before acting on it:`;
+  const scope = repoTag ? `${repoTag} + global first` : "global first";
+  return `Memories from recall that may be relevant to this prompt. Searched every memory, ${scope}. \`recall search "<query>"\` searches them deliberately; \`recall get <name>\` prints one in full. Read the full text of any that looks relevant before acting on it:`;
 }
 
-function contextBlock({ hits, elsewhere }, repoTag) {
-  const lines = [header(repoTag), ...hits.map(({ memory }) => entry(memory))];
+// One ranked list, so the ones from elsewhere are whatever sorted below the ones from here rather
+// than a section held open for them. A prompt whose answer lives in another repo now gets it.
+function contextBlock(hits, repoTag) {
+  const here = hits.filter((hit) => hit.inScope);
+  const elsewhere = hits.filter((hit) => !hit.inScope);
+  const lines = [header(repoTag), ...here.map(entry)];
   if (elsewhere.length > 0) lines.push("In other scopes:", ...elsewhere.map(entry));
   return lines.join("\n");
 }
@@ -52,7 +56,7 @@ async function memories(input, prompt) {
   if (prompt.split(/\s+/).filter(Boolean).length < MIN_WORDS) return "skipped:short-prompt";
 
   const result = await recall(
-    ["search", "--json", "--mode", "vector", "--limit", "5", `--min-score=${MIN_SCORE}`, "--", searchQuery(prompt)],
+    ["inject", "--json", "--limit", "5", `--min-score=${MIN_SCORE}`, "--", searchQuery(prompt)],
     {
       cwd: input.cwd,
       timeout: TIMEOUT_MS,
@@ -63,22 +67,17 @@ async function memories(input, prompt) {
     return result.timedOut ? "timeout" : `error:${firstLine(result.error)}`;
   }
 
-  const parsed = JSON.parse(result.stdout);
   const shown = readShown(input.session_id);
-  const found = unseen(Array.isArray(parsed) ? { hits: parsed, elsewhere: [] } : parsed, shown);
-  if (found.hits.length === 0 && found.elsewhere.length === 0) return "no-hits";
+  const found = unseen(JSON.parse(result.stdout).hits, shown);
+  if (found.length === 0) return "no-hits";
   emit({
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
       additionalContext: contextBlock(found, await repoTagOf(input.cwd)),
     },
   });
-  recordShown(input.session_id, [
-    ...shown,
-    ...found.hits.map(({ memory }) => memory.name),
-    ...found.elsewhere.map(({ name }) => name),
-  ]);
-  return `hits=${found.hits.length} elsewhere=${found.elsewhere.length}`;
+  recordShown(input.session_id, [...shown, ...found.map(({ name }) => name)]);
+  return `hits=${found.length} elsewhere=${found.filter((hit) => !hit.inScope).length}`;
 }
 
 async function run(input) {

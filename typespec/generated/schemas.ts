@@ -196,7 +196,7 @@ export const ListMemoriesSchema = z.object({
 
 export const SearchMemoriesSchema = z.object({
   query: z.string().min(1).max(2000),
-  tags: z
+  scope: z
     .array(
       z
         .string()
@@ -205,7 +205,16 @@ export const SearchMemoriesSchema = z.object({
         .max(200),
     )
     .max(50),
-  limit: z.int().min(1).max(50),
+  preferScope: z
+    .array(
+      z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+        .min(1)
+        .max(200),
+    )
+    .max(50),
+  limit: z.int().min(1).max(25),
   minScore: z.number().min(-1).max(1),
   mode: SearchModeSchema,
 });
@@ -213,9 +222,40 @@ export const SearchMemoriesSchema = z.object({
 export const MemoryHitSchema = z.object({
   memory: MemorySchema,
   score: z.number(),
+  inScope: z.boolean(),
 });
 
-export const NearbyMemorySchema = z.object({
+export const ScopeCountSchema = z.object({
+  scope: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+    .min(1)
+    .max(200),
+  count: z.int().min(1),
+});
+
+export const SearchResultsSchema = z.object({
+  count: z.int().min(0),
+  results: z.array(MemoryHitSchema).max(25),
+  scopes: z.array(ScopeCountSchema),
+});
+
+export const InjectMemoriesSchema = z.object({
+  query: z.string().min(1).max(2000),
+  preferScope: z
+    .array(
+      z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._:/-]*$/)
+        .min(1)
+        .max(200),
+    )
+    .max(50),
+  limit: z.int().min(1).max(10),
+  minScore: z.number().min(-1).max(1),
+});
+
+export const InjectedMemorySchema = z.object({
   score: z.number(),
   memoryName: z
     .string()
@@ -233,4 +273,5 @@ export const NearbyMemorySchema = z.object({
     )
     .max(50),
   description: z.string().min(1).max(500),
+  inScope: z.boolean(),
 });
