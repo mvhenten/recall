@@ -319,8 +319,11 @@ export const revokeDevice = async (db: AccountDb, userId: string, deviceId: stri
   return revoked.length === 1;
 };
 
-// The row the MCP endpoint acts as. Its token column holds the digest of a string no issued token
-// can hash to, so the connector is reachable through Access alone and never through a bearer token.
+// The row the MCP endpoint acts as. It is one row per account however many connectors the account
+// has, and its token column holds the digest of a string no token this service issues can hash to:
+// `deviceForToken` reads `/v2` device tokens out of this table, so the row the connector acts as
+// must be unreachable by that lookup. What opens the connector is a bearer token of its own, which
+// lives in `oauth_tokens` and is read there.
 export const connectorDevice = async (db: AccountDb, userId: string, now: number): Promise<Caller> => {
   const row = await db
     .insert(devices)

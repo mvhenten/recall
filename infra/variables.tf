@@ -5,7 +5,7 @@ variable "account_id" {
 
 variable "hostname" {
   type        = string
-  description = "Hostname the Worker serves; only /device and /dashboard sit behind a Cloudflare Access login."
+  description = "Hostname the Worker serves; only /device, /dashboard and /oauth/consent sit behind a Cloudflare Access login."
 }
 
 variable "artifact_hostname" {
@@ -22,7 +22,7 @@ variable "artifact_hostname" {
 variable "mcp_connector" {
   type        = bool
   default     = false
-  description = "Serve the MCP connector at <hostname>/mcp, behind its own Access application and one service token per user. False leaves it off."
+  description = "Serve the MCP connector at <hostname>/mcp, with its OAuth sign-in step behind its own Access application and one service token per user. False leaves it off."
 }
 
 variable "otp_idp_id" {

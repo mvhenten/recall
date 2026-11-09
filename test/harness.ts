@@ -6,6 +6,8 @@ import { createApp } from "../src/app";
 import { DEVICE_CODE_LIMITS, type DeviceCodeLimits, sha256Hex } from "../src/device";
 import { MCP_PATH } from "../src/mcp";
 import type { Embedder, Memory } from "../src/model";
+import { AUTHORIZE_PATH, CONSENT_PATH, REGISTER_PATH, TOKEN_PATH } from "../src/oauth";
+import { CONNECT_CSRF_COOKIE } from "../src/page";
 import { DIMENSIONS, normalize } from "../src/rank";
 import { putRecords, RECORDS_PREFIX } from "../src/records";
 import { SHARE_EMAIL_PREFIX, SHARE_LINK_PREFIX } from "../src/shares";
@@ -23,9 +25,22 @@ export const ARTIFACT_AUDIENCE = "recall-test-artifact-aud";
 // wrong one of these two.
 export const ARTIFACT_SHARE_AUDIENCE = "recall-test-share-aud";
 
-// The connector's own Access application, which is neither the dashboard's nor the artifact host's.
+// The Access application fronting the connector's consent page, which is neither the dashboard's
+// nor the artifact host's. It is the whole of what Access proves for a connector: the endpoint
+// itself takes a bearer token the sign-in behind this audience led to.
 export const MCP_AUDIENCE = "recall-test-mcp-aud";
 export const MCP_PROTOCOL_VERSION = "2025-11-25";
+
+// A callback a client may register, standing in for the ones the hosted clients publish.
+export const CONNECTOR_CALLBACK = "https://claude.ai/api/mcp/auth_callback";
+
+// What one walk of the connect flow leaves a test holding.
+export interface Connected {
+  clientId: string;
+  verifier: string;
+  accessToken: string;
+  refreshToken: string;
+}
 
 export interface DeviceStart {
   device_code: string;
@@ -269,21 +284,6 @@ export const harness = async ({
   };
   let clock = 1_700_000_000_000;
   const source = keys === "up" ? localKeys([{ kid: "test", kty: "RSA", n, e }]) : unavailable;
-  // Which account a service token acts for is a row of the account store now, not a map the
-  // Worker was built with. A test still names the pair outright; the write it queues is drained
-  // before the next request goes in, so nothing a test does has to be awaited twice.
-  let clientRows: Promise<unknown> = Promise.resolve();
-  const serviceClients = {
-    set(clientId: string, userId: string): void {
-      clientRows = clientRows.then(() =>
-        env.DB.prepare(
-          "INSERT INTO mcp_clients (client_id, user_id) VALUES (?, ?) ON CONFLICT (client_id) DO UPDATE SET user_id = excluded.user_id",
-        )
-          .bind(clientId, userId)
-          .run(),
-      );
-    },
-  };
   const app = createApp({
     verify: accessVerifier(source, ISSUER, DASHBOARD_AUDIENCE),
     artifactHost:
@@ -318,13 +318,12 @@ export const harness = async ({
   ): Promise<string> => signed({ email }, audience, expiresAt);
 
   // What Access mints for a service token: a common name derived from the client id, and no email.
-  const serviceAssertionFor = (commonName: string, audience = MCP_AUDIENCE): Promise<string> =>
+  // The audience is named outright because every lane that still takes one takes a different one.
+  const serviceAssertionFor = (commonName: string, audience: string): Promise<string> =>
     signed({ common_name: commonName }, audience, "5m");
 
-  const send = async (path: string, init: RequestInit = {}): Promise<Response> => {
-    await clientRows;
-    return app.fetch(new Request(`${ORIGIN}${path}`, init), env);
-  };
+  const send = (path: string, init: RequestInit = {}): Promise<Response> =>
+    app.fetch(new Request(`${ORIGIN}${path}`, init), env);
 
   const sendToArtifactHost = (path: string, assertion: string | null, init: RequestInit = {}): Promise<Response> =>
     app.fetch(
@@ -607,8 +606,71 @@ export const harness = async ({
       body: JSON.stringify({ jsonrpc: "2.0", ...message }),
     });
 
+  // The whole connect flow a web MCP client walks, for a test that is about what happens after it:
+  // register, open the authorize address, sign in to Access at the consent page, approve, and
+  // redeem the code. Nothing is written behind the endpoint's back, so a test calling a tool is
+  // also proving the flow that got it a token.
+  const connect = async (email: string, callback = CONNECTOR_CALLBACK): Promise<Connected> => {
+    const registered = await send(REGISTER_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: [callback], client_name: "a test client" }),
+    });
+    if (registered.status !== 201) throw new Error(`register: ${registered.status} ${await registered.text()}`);
+    const { client_id: clientId } = (await registered.json()) as { client_id: string };
+    const verifier = "v".repeat(43);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+    let binary = "";
+    for (const byte of digest) binary += String.fromCharCode(byte);
+    const challenge = btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+    const query = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: callback,
+      state: "harness-state",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    const started = await send(`${AUTHORIZE_PATH}?${query.toString()}`);
+    if (started.status !== 303) throw new Error(`authorize: ${started.status} ${await started.text()}`);
+    const requestId = new URL(started.headers.get("location") ?? "", ORIGIN).searchParams.get("request") ?? "";
+    const assertion = await assertionFor(email, MCP_AUDIENCE);
+    const drawn = await send(`${CONSENT_PATH}?request=${requestId}`, {
+      headers: { "cf-access-jwt-assertion": assertion },
+    });
+    if (drawn.status !== 200) throw new Error(`consent: ${drawn.status} ${await drawn.text()}`);
+    const csrf = await csrfOf(drawn);
+    const granted = await send(CONSENT_PATH, {
+      method: "POST",
+      headers: {
+        "cf-access-jwt-assertion": assertion,
+        origin: ORIGIN,
+        cookie: `${CONNECT_CSRF_COOKIE}=${csrf}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ request: requestId, action: "approve", csrf }),
+    });
+    if (granted.status !== 303) throw new Error(`approve: ${granted.status} ${await granted.text()}`);
+    const code = new URL(granted.headers.get("location") ?? "").searchParams.get("code") ?? "";
+    const answered = await send(TOKEN_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        code_verifier: verifier,
+        client_id: clientId,
+        redirect_uri: callback,
+      }),
+    });
+    if (answered.status !== 200) throw new Error(`token: ${answered.status} ${await answered.text()}`);
+    const tokens = (await answered.json()) as { access_token: string; refresh_token: string };
+    return { clientId, verifier, accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+  };
+
   const connector = async (email: string) => {
-    const headers = { "cf-access-jwt-assertion": await assertionFor(email, MCP_AUDIENCE) };
+    const connected = await connect(email);
+    const headers = { authorization: `Bearer ${connected.accessToken}` };
     let id = 0;
     const call = async (method: string, params?: unknown): Promise<Record<string, unknown>> => {
       id += 1;
@@ -624,6 +686,7 @@ export const harness = async ({
       return block?.text ?? "";
     };
     return {
+      ...connected,
       headers,
       call,
       tool,
@@ -639,6 +702,7 @@ export const harness = async ({
 
   return {
     user,
+    connect,
     invite,
     requestDevice,
     send,
@@ -648,7 +712,6 @@ export const harness = async ({
     rpc,
     connector,
     serviceAssertionFor,
-    serviceClients,
     login,
     startDevice,
     poll,

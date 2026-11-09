@@ -30,9 +30,9 @@ export interface Env {
   // artifacts and share none. It is the email share application's audience, and binding it is what
   // turns both share modes on.
   ARTIFACT_SHARE_ACCESS_AUD?: string;
-  // The connector's Access audience, and the whole of what a deployment binds to serve one: which
-  // service token acts for which account is a row in `mcp_clients`, so adding a tenant to the
-  // connector is a write rather than a config edit and a deploy.
+  // The whole of what a deployment binds to serve a connector. It is the audience of the Access
+  // application fronting the connector's consent page, which is the one address of the flow a
+  // person signs in at; the endpoint itself takes a bearer token that sign-in led to.
   MCP_ACCESS_AUD?: string;
 }
 

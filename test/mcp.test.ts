@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MCP_PATH } from "../src/mcp";
 import { TOOLS } from "../src/tools";
-import { harness, MCP_AUDIENCE, MCP_PROTOCOL_VERSION } from "./harness";
+import { harness, MCP_PROTOCOL_VERSION } from "./harness";
 
 const MODERN = "2026-07-28";
 const MODERN_META = { "io.modelcontextprotocol/protocolVersion": MODERN };
@@ -89,7 +89,7 @@ describe("the connector handshake", () => {
     });
     expect(refused.status).toBe(401);
     expect(refused.headers.get("content-type")).toBe("text/event-stream");
-    expect(await refused.text()).toContain("sign in to Access in a browser first");
+    expect(await refused.text()).toContain("no bearer token reached /mcp");
   });
 
   it("refuses a malformed message and an unknown method with JSON-RPC errors", async () => {
@@ -131,38 +131,38 @@ describe("the per-request protocol revision", () => {
     method,
     params: { ...params, _meta: MODERN_META },
   });
-  const headers = (assertion: string, method: string, extra: Record<string, string> = {}) => ({
-    "cf-access-jwt-assertion": assertion,
+  const headers = (token: string, method: string, extra: Record<string, string> = {}) => ({
+    authorization: `Bearer ${token}`,
     "mcp-protocol-version": MODERN,
     "mcp-method": method,
     ...extra,
   });
 
   it("discovers the server and lists tools when the headers mirror the body", async () => {
-    const { h, email } = await signedIn();
-    const assertion = await h.assertionFor(email, MCP_AUDIENCE);
-    const discovered = await h.rpc(modern("server/discover"), headers(assertion, "server/discover"));
+    const { h, mcp } = await signedIn();
+    const token = mcp.accessToken;
+    const discovered = await h.rpc(modern("server/discover"), headers(token, "server/discover"));
     const result = ((await discovered.json()) as { result: Record<string, unknown> }).result;
     expect(result.resultType).toBe("complete");
     expect(result.supportedVersions).toEqual([MODERN, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]);
 
-    const listed = await h.rpc(modern("tools/list"), headers(assertion, "tools/list"));
+    const listed = await h.rpc(modern("tools/list"), headers(token, "tools/list"));
     expect(((await listed.json()) as { result: { tools: unknown[] } }).result.tools).toHaveLength(TOOLS.length);
   });
 
   it("refuses a header that does not match the body, and a version it does not serve", async () => {
-    const { h, email } = await signedIn();
-    const assertion = await h.assertionFor(email, MCP_AUDIENCE);
+    const { h, mcp } = await signedIn();
+    const token = mcp.accessToken;
     const mismatched = await h.rpc(
       modern("tools/call", { name: "recall_list", arguments: {} }),
-      headers(assertion, "tools/call", { "mcp-name": "recall_search" }),
+      headers(token, "tools/call", { "mcp-name": "recall_search" }),
     );
     expect(mismatched.status).toBe(400);
     expect(((await mismatched.json()) as { error: { code: number } }).error.code).toBe(-32020);
 
     const old = await h.rpc(
       { id: 1, method: "tools/list", params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2025-06-18" } } },
-      headers(assertion, "tools/list", { "mcp-protocol-version": "2025-06-18" }),
+      headers(token, "tools/list", { "mcp-protocol-version": "2025-06-18" }),
     );
     expect(old.status).toBe(400);
     const refusal = (await old.json()) as { error: { code: number; data: { supported: string[] } } };
@@ -171,103 +171,33 @@ describe("the per-request protocol revision", () => {
   });
 
   it("takes a tools/call whose Mcp-Name is base64 encoded", async () => {
-    const { h, email } = await signedIn();
-    const assertion = await h.assertionFor(email, MCP_AUDIENCE);
+    const { h, mcp } = await signedIn();
+    const token = mcp.accessToken;
     const encoded = `=?base64?${btoa("recall_list")}?=`;
     const answered = await h.rpc(
       modern("tools/call", { name: "recall_list", arguments: {} }),
-      headers(assertion, "tools/call", { "mcp-name": encoded }),
+      headers(token, "tools/call", { "mcp-name": encoded }),
     );
     expect(answered.status).toBe(200);
     expect(((await answered.json()) as { result: { isError?: boolean } }).result.isError).toBeUndefined();
   });
 });
 
-describe("the connector's two Access schemes", () => {
-  it("names the scheme it tried when no assertion reaches the Worker", async () => {
+describe("what the connector endpoint refuses", () => {
+  it("names the credential it wanted when none reached the Worker", async () => {
     const h = await harness();
     const bare = await h.rpc({ id: 1, method: "tools/list" });
     expect(bare.status).toBe(401);
     expect(((await bare.json()) as { error: { message: string } }).error.message).toContain(
-      "sign in to Access in a browser first",
-    );
-
-    const serviceHeaders = await h.rpc({ id: 1, method: "tools/list" }, { "cf-access-client-id": "abc.access" });
-    expect(((await serviceHeaders.json()) as { error: { message: string } }).error.message).toContain(
-      "not a service token this account issued",
+      "no bearer token reached /mcp",
     );
   });
 
-  it("refuses an assertion meant for another Access application", async () => {
-    const h = await harness();
-    const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
-    const refused = await h.rpc(
-      { id: 1, method: "tools/list" },
-      { "cf-access-jwt-assertion": await h.assertionFor(email) },
-    );
-    expect(refused.status).toBe(401);
-    expect(((await refused.json()) as { error: { message: string } }).error.message).toContain(
-      "meant for another Access application",
-    );
-  });
-
-  it("refuses an email no one invited and a service token mapped to no user", async () => {
-    const h = await harness();
-    const stranger = await h.rpc(
-      { id: 1, method: "tools/list" },
-      { "cf-access-jwt-assertion": await h.assertionFor("nobody@example.com", MCP_AUDIENCE) },
-    );
-    expect(stranger.status).toBe(403);
-    expect(((await stranger.json()) as { error: { message: string } }).error.message).toContain("is not invited");
-
-    const unmapped = await h.rpc(
-      { id: 1, method: "tools/list" },
-      {
-        "cf-access-jwt-assertion": await h.serviceAssertionFor("stray.access"),
-        "cf-access-client-id": "stray.access",
-      },
-    );
-    expect(unmapped.status).toBe(403);
-    expect(((await unmapped.json()) as { error: { message: string } }).error.message).toContain(
-      "acts for no user of this recall",
-    );
-  });
-
-  it("serves a service token the deployment maps to a user", async () => {
-    const h = await harness();
-    const userId = `user-${crypto.randomUUID()}`;
-    await h.invite(`owner-${crypto.randomUUID()}@example.com`, userId);
-    h.serviceClients.set("connector.access", userId);
-    const answered = await h.rpc(
-      { id: 1, method: "tools/list" },
-      {
-        "cf-access-jwt-assertion": await h.serviceAssertionFor("connector.access"),
-        "cf-access-client-id": "connector.access",
-      },
-    );
-    expect(answered.status).toBe(200);
-    expect(((await answered.json()) as { result: { tools: unknown[] } }).result.tools).toHaveLength(TOOLS.length);
-  });
-
-  it("refuses a request carried from another origin, whichever scheme proved it", async () => {
+  it("refuses a request carried from another origin", async () => {
     const { h, mcp } = await signedIn();
     const refused = await h.rpc({ id: 1, method: "tools/list" }, { ...mcp.headers, origin: "https://evil.test" });
     expect(refused.status).toBe(403);
     expect(((await refused.json()) as { error: { message: string } }).error.message).toContain("https://evil.test");
-
-    const userId = `user-${crypto.randomUUID()}`;
-    await h.invite(`owner-${crypto.randomUUID()}@example.com`, userId);
-    h.serviceClients.set("connector.access", userId);
-    const token = await h.rpc(
-      { id: 1, method: "tools/list" },
-      {
-        "cf-access-jwt-assertion": await h.serviceAssertionFor("connector.access"),
-        "cf-access-client-id": "connector.access",
-        origin: "https://evil.test",
-      },
-    );
-    expect(token.status).toBe(403);
-    expect(((await token.json()) as { error: { message: string } }).error.message).toContain("https://evil.test");
   });
 
   it("answers 404 where the deployment switched no connector on", async () => {

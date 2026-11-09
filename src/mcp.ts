@@ -56,9 +56,15 @@ const refuse = (id: Id, code: number, message: string, status: number, data?: un
     { status, headers: { "cache-control": "no-store" } },
   );
 
-// An auth refusal names the scheme that failed, since the desktop app offers several and only the
-// message tells the user which one the endpoint actually saw.
-export const mcpRefusal = (status: number, message: string): Response => refuse(null, UNAUTHORIZED, message, status);
+// An auth refusal names the scheme that failed, since a client offers several and only the message
+// tells the user which one the endpoint actually saw. The headers are where `WWW-Authenticate`
+// rides: a web client starts its whole connect flow from that one header on this one refusal, so
+// it is carried through the SSE framing below as well as out of the JSON body.
+export const mcpRefusal = (status: number, message: string, headers: Record<string, string> = {}): Response => {
+  const answer = refuse(null, UNAUTHORIZED, message, status);
+  for (const [name, value] of Object.entries(headers)) answer.headers.set(name, value);
+  return answer;
+};
 
 // A client that accepts text/event-stream and nothing else, which no published revision describes
 // but the desktop app sends: it reads its answer off a stream rather than out of a JSON body. The
@@ -69,16 +75,20 @@ const takesEventStream = (request: Request): boolean => {
   return accept.includes("text/event-stream") && !accept.includes("application/json") && !accept.includes("*/*");
 };
 
+const CARRIED_HEADERS = ["www-authenticate", "access-control-allow-origin", "vary"];
+
 const asEventStream = async (answer: Response): Promise<Response> => {
   if (answer.body === null) return answer;
-  return new Response(`event: message\ndata: ${await answer.text()}\n\n`, {
-    status: answer.status,
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-store",
-      "x-accel-buffering": "no",
-    },
+  const headers = new Headers({
+    "content-type": "text/event-stream",
+    "cache-control": "no-store",
+    "x-accel-buffering": "no",
   });
+  for (const name of CARRIED_HEADERS) {
+    const value = answer.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  return new Response(`event: message\ndata: ${await answer.text()}\n\n`, { status: answer.status, headers });
 };
 
 const decodeHeader = (value: string): string => {

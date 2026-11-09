@@ -58,7 +58,7 @@ import {
   usageDay,
   usageDayStart,
 } from "./model";
-import { artifactNames, artifactShares, mcpClients } from "./schema/account";
+import { artifactNames, artifactShares } from "./schema/account";
 import { blobOf, toBytes } from "./schema/columns";
 import { artifactsFts, memoriesFts, sessionChunksFts, sessionHistoryFts } from "./schema/fts";
 import {
@@ -2083,17 +2083,6 @@ export const revokeShares = async (
     .returning({ shareId: artifactShares.shareId })
     .all();
   return revoked.length;
-};
-
-// Which account an Access service token acts for. A deployment adds a tenant to the connector by
-// writing this row, not by editing the Worker's env and deploying again.
-export const userForServiceClient = async (db: AccountDb, clientId: string): Promise<string | null> => {
-  const row = await db
-    .select({ userId: mcpClients.userId })
-    .from(mcpClients)
-    .where(eq(mcpClients.clientId, clientId))
-    .get();
-  return row?.userId ?? null;
 };
 
 const LEGACY_PAGE = 1_000;

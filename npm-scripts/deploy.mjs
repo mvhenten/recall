@@ -197,11 +197,17 @@ const retiredQueues = new Set([
   "cloudflare_queue.transcripts",
   "cloudflare_queue.transcripts_dead",
 ]);
+// The connector's service token per user and the non-identity policy that admitted them. They
+// worked because Access fronted /mcp and exchanged the client id and secret for an assertion; /mcp
+// now sits outside Access so the flow starts from its own 401, and nothing exchanges a pair any
+// more. A connector authorizes itself through OAuth instead.
 const retiredResource = (change) =>
   change.change.actions.length === 1 &&
   change.change.actions[0] === "delete" &&
   (change.address.startsWith("cloudflare_zero_trust_access_service_token.principal[") ||
+    change.address.startsWith("cloudflare_zero_trust_access_service_token.connector[") ||
     change.address === "cloudflare_zero_trust_access_policy.service_tokens" ||
+    change.address === "cloudflare_zero_trust_access_policy.connector_tokens[0]" ||
     retiredQueues.has(change.address));
 const changes = plan.resource_changes ?? [];
 const retired = changes.filter(retiredResource);
@@ -256,21 +262,14 @@ writeFileSync(deployConfigPath, `${JSON.stringify(deployConfig, null, 2)}\n`);
 wrangler(["d1", "migrations", "apply", "recall", "--remote", "-c", deployConfigPath]);
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
-// Which account each Access service token acts for. Terraform still names the pairs, but they go
-// in as rows beside the invitations rather than as a Worker variable, so adding one later is a
-// write against the running deployment.
-const serviceClients = Object.entries(JSON.parse(output("mcp_service_clients") || "{}"));
 const sync = [
   `DELETE FROM principals WHERE email NOT IN (${emailOwners.map(([email]) => quote(email)).join(", ")});`,
   ...emailOwners.map(
     ([email, userId]) =>
       `INSERT INTO principals (email, user_id) VALUES (${quote(email)}, ${quote(userId)}) ON CONFLICT (email) DO UPDATE SET user_id = excluded.user_id;`,
   ),
-  ...serviceClients.map(
-    ([clientId, userId]) =>
-      `INSERT INTO mcp_clients (client_id, user_id) VALUES (${quote(clientId)}, ${quote(userId)}) ON CONFLICT (client_id) DO UPDATE SET user_id = excluded.user_id;`,
-  ),
   "DELETE FROM devices WHERE user_id NOT IN (SELECT user_id FROM principals);",
+  "DELETE FROM oauth_tokens WHERE user_id NOT IN (SELECT user_id FROM principals);",
 ].join("\n");
 mkdirSync(WORK, { recursive: true });
 const syncPath = join(WORK, "principals.sql");

@@ -2,6 +2,12 @@ import { ARTIFACT_CONTENT_TYPE } from "./artifacts";
 
 export const CSRF_COOKIE = "__Host-recall_csrf";
 
+// The connector's consent form carries its own token under its own name. The `__Host-` prefix
+// demands `Path=/`, so neither cookie can be scoped to the page that set it: one name for both
+// forms would mean an open consent tab silently invalidating a device approval waiting in another,
+// and the user would see a refused form with nothing to tell them why.
+export const CONNECT_CSRF_COOKIE = "__Host-recall_connect";
+
 // What a send that worked leaves behind, so the page it redirects to can say so once. The notice
 // belongs to that one navigation and not to the address, which a reader bookmarks, reloads and
 // walks back to; carrying it in the URL would reprint it every time.
@@ -146,6 +152,35 @@ export const confirmPage = (email: string, userCode: string, deviceName: string,
 </form>`,
     {
       "set-cookie": `${CSRF_COOKIE}=${csrf}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict`,
+    },
+  );
+
+// What the connector's interactive sign-in ends on. Access has just proved the email; this is the
+// one step that is the user's rather than Access's, so a client already holding an Access session
+// still says yes before a token is minted for it.
+//
+// Approving answers a redirect to the client's own callback, and `form-action` is checked across a
+// redirect, so the policy names that one origin beside this one. It is the origin of an address the
+// client registered and no other.
+export const grantPage = (
+  email: string,
+  clientName: string,
+  callbackOrigin: string,
+  requestId: string,
+  csrf: string,
+): Response =>
+  page(
+    200,
+    "Connect recall",
+    `<p><strong>${escapeHtml(clientName)}</strong> asks to read and write your recall memories as ${escapeHtml(email)}.</p>
+<p>It reaches the memory tools and nothing else.</p>
+<form method="post" action="/oauth/consent">
+<input type="hidden" name="request" value="${escapeHtml(requestId)}"><input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+<button type="submit" name="action" value="approve">Connect</button><button type="submit" name="action" value="deny">Cancel</button>
+</form>`,
+    {
+      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callbackOrigin}; frame-ancestors 'none'; base-uri 'none'`,
+      "set-cookie": `${CONNECT_CSRF_COOKIE}=${csrf}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict`,
     },
   );
 
