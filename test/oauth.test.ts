@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MCP_PATH } from "../src/mcp";
+import { CONNECT_CSRF_COOKIE } from "../src/page";
 import { harness, MCP_AUDIENCE } from "./harness";
 
 const ORIGIN = "https://recall.test";
@@ -32,10 +33,19 @@ const registeredClient = async (h: Harness, fields: Record<string, unknown> = {}
   return (await body<{ client_id: string }>(response)).client_id;
 };
 
-const authorize = (h: Harness, params: Record<string, string>): Promise<Response> =>
-  h.send(`/oauth/authorize?${new URLSearchParams(params).toString()}`);
+// A parameter set to undefined is one the client did not send, which is not the same as one it
+// sent empty: the query carries neither the name nor a value for it.
+const authorize = (h: Harness, params: Record<string, string | undefined>): Promise<Response> => {
+  const query = new URLSearchParams();
+  for (const [name, value] of Object.entries(params)) if (value !== undefined) query.set(name, value);
+  return h.send(`/oauth/authorize?${query.toString()}`);
+};
 
-const ask = async (h: Harness, clientId: string, overrides: Record<string, string> = {}): Promise<Response> =>
+const ask = async (
+  h: Harness,
+  clientId: string,
+  overrides: Record<string, string | undefined> = {},
+): Promise<Response> =>
   authorize(h, {
     response_type: "code",
     client_id: clientId,
@@ -71,7 +81,7 @@ const consent = async (
     headers: {
       "cf-access-jwt-assertion": assertion,
       origin: ORIGIN,
-      cookie: `__Host-recall_csrf=${csrf}`,
+      cookie: `${CONNECT_CSRF_COOKIE}=${csrf}`,
       "content-type": "application/x-www-form-urlencoded",
     },
     body: new URLSearchParams({ request: requestId, action, csrf }),
@@ -99,22 +109,6 @@ interface Tokens {
   expires_in: number;
   scope: string;
 }
-
-// The whole flow, from a client that has never been seen to the tokens it ends up holding.
-const connected = async (h: Harness, email: string): Promise<{ clientId: string; tokens: Tokens }> => {
-  const clientId = await registeredClient(h);
-  const started = await ask(h, clientId);
-  const granted = await consent(h, requestIdOf(started), await h.assertionFor(email, MCP_AUDIENCE));
-  const answered = await redeem(h, {
-    grant_type: "authorization_code",
-    code: codeOf(granted),
-    code_verifier: VERIFIER,
-    client_id: clientId,
-    redirect_uri: CALLBACK,
-  });
-  if (answered.status !== 200) throw new Error(`token: ${answered.status} ${await answered.text()}`);
-  return { clientId, tokens: await body<Tokens>(answered) };
-};
 
 const toolsList = (h: Harness, headers: Record<string, string>): Promise<Response> =>
   h.rpc({ id: 1, method: "tools/list" }, headers);
@@ -258,7 +252,17 @@ describe("the authorize, consent, code and token chain", () => {
   it("carries a client through to a bearer token that reaches the tools", async () => {
     const h = await harness();
     const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
-    const { tokens } = await connected(h, email);
+    const clientId = await registeredClient(h);
+    const granted = await consent(h, requestIdOf(await ask(h, clientId)), await h.assertionFor(email, MCP_AUDIENCE));
+    const answered = await redeem(h, {
+      grant_type: "authorization_code",
+      code: codeOf(granted),
+      code_verifier: VERIFIER,
+      client_id: clientId,
+      redirect_uri: CALLBACK,
+    });
+    expect(answered.status).toBe(200);
+    const tokens = await body<Tokens>(answered);
     expect(tokens.token_type).toBe("Bearer");
     expect(tokens.expires_in).toBe(3600);
     expect(tokens.scope).toBe("recall");
@@ -267,8 +271,8 @@ describe("the authorize, consent, code and token chain", () => {
     expect(listed.status).toBe(200);
     expect((await body<{ result: { tools: unknown[] } }>(listed)).result.tools.length).toBeGreaterThan(0);
 
-    // The bearer lane registers the same connector row every other scheme does, so a tool call
-    // lands in the account the consent named.
+    // The bearer lane registers the connector row every connector takes, so a tool call lands in
+    // the account the consent named.
     const saved = await h.rpc(
       {
         id: 2,
@@ -332,7 +336,7 @@ describe("the authorize, consent, code and token chain", () => {
         headers: {
           "cf-access-jwt-assertion": assertion,
           origin,
-          cookie: `__Host-recall_csrf=${cookie}`,
+          cookie: `${CONNECT_CSRF_COOKIE}=${cookie}`,
           "content-type": "application/x-www-form-urlencoded",
         },
         body: new URLSearchParams({ request: requestId, action: "approve", csrf: formCsrf }),
@@ -352,7 +356,7 @@ describe("the authorize, consent, code and token chain", () => {
     expect(uninvited.status).toBe(403);
 
     const machine = await h.send(`/oauth/consent?request=${requestIdOf(await ask(h, clientId))}`, {
-      headers: { "cf-access-jwt-assertion": await h.serviceAssertionFor("recall-alice-connector") },
+      headers: { "cf-access-jwt-assertion": await h.serviceAssertionFor("recall-alice-connector", MCP_AUDIENCE) },
     });
     expect(machine.status).toBe(401);
   });
@@ -404,9 +408,55 @@ describe("the authorize, consent, code and token chain", () => {
       code: codeOf(second),
       code_verifier: VERIFIER,
       client_id: clientId,
+      redirect_uri: CALLBACK,
       resource: "https://elsewhere.example/mcp",
     });
     expect((await body<{ error: string }>(elsewhere)).error).toBe("invalid_target");
+  });
+});
+
+describe("what an uncredentialed write may leave behind", () => {
+  it("caps the state it will hold for a client", async () => {
+    const h = await harness();
+    const clientId = await registeredClient(h);
+    const refused = await ask(h, clientId, { state: "s".repeat(513) });
+    expect(refused.status).toBe(303);
+    expect(new URL(refused.headers.get("location") ?? "").searchParams.get("error")).toBe("invalid_request");
+    expect((await ask(h, clientId, { state: "s".repeat(512) })).status).toBe(303);
+  });
+
+  // Not sent and sent empty are different answers, which is why the row says which it was rather
+  // than reading the empty string as an absence.
+  it("echoes the state a client sent, including none at all and the empty one", async () => {
+    const h = await harness();
+    const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
+    const assertion = await h.assertionFor(email, MCP_AUDIENCE);
+    const clientId = await registeredClient(h);
+
+    const silent = await consent(h, requestIdOf(await ask(h, clientId, { state: undefined })), assertion);
+    expect(new URL(silent.headers.get("location") ?? "").searchParams.has("state")).toBe(false);
+
+    const empty = await consent(h, requestIdOf(await ask(h, clientId, { state: "" })), assertion);
+    expect(new URL(empty.headers.get("location") ?? "").searchParams.get("state")).toBe("");
+  });
+
+  it("sweeps a registration no client ever carried through a sign-in", async () => {
+    const h = await harness();
+    const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
+    const abandoned = await registeredClient(h);
+    const connected = await h.connect(email);
+    // The abandoned client got as far as an authorize address and no further, which is the state
+    // that would pin its row if liveness were read off the request existing.
+    expect((await ask(h, abandoned)).status).toBe(303);
+
+    // The sweep rides the next registration, so nothing is dropped until one arrives.
+    h.tick(3_600_001);
+    expect((await ask(h, abandoned)).status).toBe(303);
+    await registeredClient(h);
+
+    expect((await ask(h, abandoned)).status).toBe(400);
+    // The one that reached a sign-in holds a refresh token, and its row stands as long as that does.
+    expect((await ask(h, connected.clientId)).status).toBe(303);
   });
 });
 
@@ -451,6 +501,7 @@ describe("what the token endpoint refuses", () => {
       code: first.code,
       code_verifier: VERIFIER,
       client_id: first.clientId,
+      redirect_uri: CALLBACK,
     };
     expect((await redeem(h, spent)).status).toBe(200);
     expect((await redeem(h, spent)).status).toBe(400);
@@ -462,6 +513,7 @@ describe("what the token endpoint refuses", () => {
       code: second.code,
       code_verifier: VERIFIER,
       client_id: second.clientId,
+      redirect_uri: CALLBACK,
     });
     expect(await body(stale)).toMatchObject({ error: "invalid_grant" });
   });
@@ -479,6 +531,7 @@ describe("what the token endpoint refuses", () => {
           code: borrowed.code,
           code_verifier: VERIFIER,
           client_id: other,
+          redirect_uri: CALLBACK,
         }),
       ),
     ).toMatchObject({ error: "invalid_grant" });
@@ -504,9 +557,24 @@ describe("what the token endpoint refuses", () => {
           code: short.code,
           code_verifier: "too-short",
           client_id: short.clientId,
+          redirect_uri: CALLBACK,
         }),
       ),
     ).toMatchObject({ error: "invalid_request" });
+
+    // The authorize step resolved a callback whether the client named one or not, so the
+    // comparison always has something to compare and a redemption that leaves it out is refused.
+    const silent = await spend(h, email);
+    expect(
+      await body(
+        await redeem(h, {
+          grant_type: "authorization_code",
+          code: silent.code,
+          code_verifier: VERIFIER,
+          client_id: silent.clientId,
+        }),
+      ),
+    ).toMatchObject({ error: "invalid_grant" });
   });
 
   it("refuses a grant type it does not serve", async () => {
@@ -521,29 +589,29 @@ describe("the token a client holds afterwards", () => {
   it("stops working when it expires and keeps the refresh token going", async () => {
     const h = await harness();
     const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
-    const { clientId, tokens } = await connected(h, email);
-    expect((await toolsList(h, { authorization: `Bearer ${tokens.access_token}` })).status).toBe(200);
+    const { clientId, accessToken, refreshToken } = await h.connect(email);
+    expect((await toolsList(h, { authorization: `Bearer ${accessToken}` })).status).toBe(200);
 
     h.tick(3_600_001);
-    const stale = await toolsList(h, { authorization: `Bearer ${tokens.access_token}` });
+    const stale = await toolsList(h, { authorization: `Bearer ${accessToken}` });
     expect(stale.status).toBe(401);
     expect(stale.headers.get("www-authenticate")).toContain('error="invalid_token"');
     expect(stale.headers.get("www-authenticate")).toContain(RESOURCE_METADATA);
 
     const refreshed = await redeem(h, {
       grant_type: "refresh_token",
-      refresh_token: tokens.refresh_token,
+      refresh_token: refreshToken,
       client_id: clientId,
     });
     expect(refreshed.status).toBe(200);
     const second = await body<Tokens>(refreshed);
-    expect(second.access_token).not.toBe(tokens.access_token);
+    expect(second.access_token).not.toBe(accessToken);
     expect((await toolsList(h, { authorization: `Bearer ${second.access_token}` })).status).toBe(200);
 
     // The refresh is a rotation, so the token just spent is no longer one.
     const replayed = await redeem(h, {
       grant_type: "refresh_token",
-      refresh_token: tokens.refresh_token,
+      refresh_token: refreshToken,
       client_id: clientId,
     });
     expect(await body(replayed)).toMatchObject({ error: "invalid_grant" });
@@ -552,48 +620,27 @@ describe("the token a client holds afterwards", () => {
   it("refuses a refresh token another client presents and one that expired", async () => {
     const h = await harness();
     const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
-    const { tokens } = await connected(h, email);
+    const borrowed = await h.connect(email);
     const other = await registeredClient(h);
     expect(
       await body(
-        await redeem(h, { grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: other }),
+        await redeem(h, { grant_type: "refresh_token", refresh_token: borrowed.refreshToken, client_id: other }),
       ),
     ).toMatchObject({ error: "invalid_grant" });
 
-    const { clientId, tokens: fresh } = await connected(h, email);
+    const fresh = await h.connect(email);
     h.tick(2_592_000_001);
     expect(
       await body(
-        await redeem(h, { grant_type: "refresh_token", refresh_token: fresh.refresh_token, client_id: clientId }),
+        await redeem(h, { grant_type: "refresh_token", refresh_token: fresh.refreshToken, client_id: fresh.clientId }),
       ),
     ).toMatchObject({ error: "invalid_grant" });
   });
 
-  it("refuses an unknown bearer token and one a revoke took away", async () => {
+  it("refuses a bearer token it never issued", async () => {
     const h = await harness();
-    const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
-    const { tokens } = await connected(h, email);
     const unknown = await toolsList(h, { authorization: `Bearer ${"z".repeat(43)}` });
     expect(unknown.status).toBe(401);
     expect(unknown.headers.get("www-authenticate")).toContain(RESOURCE_METADATA);
-
-    await h.revokeOauthTokens(await h.userIdFor(email));
-    expect((await toolsList(h, { authorization: `Bearer ${tokens.access_token}` })).status).toBe(401);
-  });
-});
-
-describe("the schemes the connector served before", () => {
-  it("still takes an Access sign-in and an Access service token on the endpoint", async () => {
-    const h = await harness();
-    const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
-    const signedIn = await toolsList(h, { "cf-access-jwt-assertion": await h.assertionFor(email, MCP_AUDIENCE) });
-    expect(signedIn.status).toBe(200);
-
-    h.serviceClients.set("connector.access", await h.userIdFor(email));
-    const machine = await toolsList(h, {
-      "cf-access-jwt-assertion": await h.serviceAssertionFor("connector.access"),
-      "cf-access-client-id": "connector.access",
-    });
-    expect(machine.status).toBe(200);
   });
 });

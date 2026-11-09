@@ -1,19 +1,25 @@
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, gt, lte, notExists } from "drizzle-orm";
 import type { AccountDb } from "./db";
 import { randomToken, sameSecret, sha256Hex } from "./device";
 import { MCP_PATH } from "./mcp";
 import { oauthClients, oauthCodes, oauthRequests, oauthTokens } from "./schema/account";
 
-// The OAuth surface a web MCP client walks to reach the connector. Three of its four endpoints are
-// machine to machine and carry no credential of ours at all: a client discovers the two metadata
-// documents, registers itself, and redeems a code for a token. Only the consent step proves a
-// person, and it proves one the way every other page here does — a Cloudflare Access sign-in whose
-// assertion names an email — so this holds no password, no session and no identity provider.
+// The OAuth surface a web MCP client walks to reach the connector. Only one address of it proves
+// a person: the consent page, which proves one the way every other page here does — a Cloudflare
+// Access sign-in whose assertion names an email — so this holds no password, no session and no
+// identity provider of its own. The two metadata documents, the registration endpoint, the
+// authorize address and the token endpoint all carry no credential of ours at all, which is why
+// Access covers the consent page and none of the rest.
 //
-// The tokens it issues are opaque and stored as digests, bound to the user who consented, to the
-// client that registered, and to the one resource this deployment serves. Nothing here is a JWT:
-// `/mcp` reads a bearer token by looking it up, so a revoke is a delete rather than a list the
-// endpoint has to consult.
+// The tokens it issues are opaque and stored as digests, naming the user who consented and the
+// client that registered. They name no audience: one deployment serves one connector endpoint, so
+// there is no second resource a token could be meant for, and the `resource` parameter is checked
+// against that one address rather than written down. Nothing here is a JWT — `/mcp` reads a bearer
+// token by looking it up, so a revoke is a delete rather than a list the endpoint has to consult.
+//
+// Every table it writes is written by an unauthenticated request, so every table it writes is
+// swept: the three TTL'd ones by the next write that needs them, and the registrations by the next
+// registration.
 
 export const AUTHORIZE_PATH = "/oauth/authorize";
 export const CONSENT_PATH = "/oauth/consent";
@@ -33,16 +39,25 @@ export const AUTHORIZATION_SERVER_PATH = "/.well-known/oauth-authorization-serve
 export const SCOPE = "recall";
 
 // Where a browser-side MCP client calls the connector and its metadata from. The endpoint answers
-// its own origin and these, and no other: the Origin header is what keeps a page on some fourth
-// host from driving the connector with the Access cookie of whoever is reading it.
+// its own origin and these, and no other. No answer carries `Access-Control-Allow-Credentials`, so
+// admitting an origin hands a page nothing beyond what the bearer token it already holds gives it;
+// the check is here because the MCP spec makes Origin validation a MUST on every connection.
 export const CONNECTOR_ORIGINS = ["https://claude.ai", "https://chatgpt.com", "https://chat.mistral.ai"];
 
 const REQUEST_TTL_MS = 600_000;
 const CODE_TTL_MS = 120_000;
 const ACCESS_TTL_MS = 3_600_000;
 const REFRESH_TTL_MS = 2_592_000_000;
+// How long a registration that never reached a sign-in is kept. It outlasts the authorize request
+// it was made for, which lives ten minutes, so a sweep never takes a client out from under a
+// consent page still open.
+const CLIENT_TTL_MS = 3_600_000;
 const CLIENT_NAME_LIMIT = 100;
 const REDIRECT_URI_LIMIT = 10;
+// The longest `state` the authorize address will hold. A client's state is opaque and this is
+// generous for one; the cap is here because the parameter is written to storage by a request that
+// carries no credential.
+const STATE_LIMIT = 512;
 const VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/;
 const CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
@@ -84,7 +99,9 @@ export interface AuthorizationRequest {
   clientId: string;
   clientName: string;
   redirectUri: string;
-  state: string;
+  // Null where the client sent no `state`, which it may: the parameter is RECOMMENDED and the
+  // empty string is a state a client can legitimately have sent.
+  state: string | null;
   codeChallenge: string;
 }
 
@@ -162,6 +179,11 @@ export const registrationResponse = (client: OauthClient, now: number): unknown 
   scope: SCOPE,
 });
 
+// Registering takes no credential, so each registration sweeps the ones before it: a row older
+// than the client TTL holding neither a live token nor a live authorization request is one nothing
+// can still be done with. A client that reached a sign-in holds a refresh token for a month, which
+// is what keeps its row; liveness is read off the expiry rather than off the row existing, because
+// an expired row that nothing has swept yet would otherwise pin its client forever.
 export const registerClient = async (
   db: AccountDb,
   clientName: string,
@@ -169,10 +191,28 @@ export const registerClient = async (
   now: number,
 ): Promise<OauthClient> => {
   const clientId = randomToken();
-  await db
-    .insert(oauthClients)
-    .values({ clientId, clientName, redirectUris: JSON.stringify(redirectUris), createdAt: now })
-    .run();
+  await db.batch([
+    db.delete(oauthClients).where(
+      and(
+        lte(oauthClients.createdAt, now - CLIENT_TTL_MS),
+        notExists(
+          db
+            .select({ clientId: oauthTokens.clientId })
+            .from(oauthTokens)
+            .where(and(eq(oauthTokens.clientId, oauthClients.clientId), gt(oauthTokens.expiresAt, now))),
+        ),
+        notExists(
+          db
+            .select({ clientId: oauthRequests.clientId })
+            .from(oauthRequests)
+            .where(and(eq(oauthRequests.clientId, oauthClients.clientId), gt(oauthRequests.expiresAt, now))),
+        ),
+      ),
+    ),
+    db
+      .insert(oauthClients)
+      .values({ clientId, clientName, redirectUris: JSON.stringify(redirectUris), createdAt: now }),
+  ]);
   return { clientId, clientName, redirectUris };
 };
 
@@ -200,7 +240,9 @@ export interface AuthorizeAsk {
   responseType: string;
   clientId: string;
   redirectUri: string;
-  state: string;
+  // Null where the client sent no `state`. It is not the empty string, which is a state a client
+  // can have sent and must then be echoed back as one.
+  state: string | null;
   codeChallenge: string;
   codeChallengeMethod: string;
   resources: string[];
@@ -214,11 +256,12 @@ export const readAuthorizeAsk = (url: URL): AuthorizeAsk => {
     const values = url.searchParams.getAll(name);
     return values.length === 1 ? (values[0] ?? "") : "";
   };
+  const states = url.searchParams.getAll("state");
   return {
     responseType: one("response_type"),
     clientId: one("client_id"),
     redirectUri: one("redirect_uri"),
-    state: one("state"),
+    state: states.length === 1 ? (states[0] ?? null) : null,
     codeChallenge: one("code_challenge"),
     codeChallengeMethod: one("code_challenge_method"),
     resources: url.searchParams.getAll("resource"),
@@ -227,8 +270,9 @@ export const readAuthorizeAsk = (url: URL): AuthorizeAsk => {
 
 // RFC 8707 is optional on both endpoints here: claude.ai sends no `resource` at all, and refusing
 // it for that is what Cloudflare's own managed OAuth does and why it cannot serve that client. A
-// value that is sent is still held to naming this endpoint, so a token minted for some other
-// audience is never one of ours.
+// value that is sent is held to naming this endpoint, which is the whole of the check — one
+// deployment serves one connector, so there is no second audience a grant could be meant for and
+// nothing to write on the row.
 export const resourceMismatch = (resources: string[], origin: string): boolean =>
   resources.some((resource) => resource !== resourceOf(origin) && resource !== origin);
 
@@ -249,6 +293,9 @@ export const askRefusal = (ask: AuthorizeAsk, origin: string): AskRefusal | null
   if (!CHALLENGE_PATTERN.test(ask.codeChallenge)) {
     return { error: "invalid_request", description: "code_challenge must be a base64url SHA-256 digest" };
   }
+  if (ask.state !== null && ask.state.length > STATE_LIMIT) {
+    return { error: "invalid_request", description: `state holds at most ${STATE_LIMIT} characters` };
+  }
   if (resourceMismatch(ask.resources, origin)) {
     return { error: "invalid_target", description: `resource must be ${resourceOf(origin)}` };
   }
@@ -260,13 +307,13 @@ export const askRefusal = (ask: AuthorizeAsk, origin: string): AskRefusal | null
 // that checks it must find it on the error as readily as on the code.
 export const redirectBack = (
   redirectUri: string,
-  state: string,
+  state: string | null,
   origin: string,
   answer: Record<string, string>,
 ): string => {
   const url = new URL(redirectUri);
   for (const [name, value] of Object.entries(answer)) url.searchParams.set(name, value);
-  if (state !== "") url.searchParams.set("state", state);
+  if (state !== null) url.searchParams.set("state", state);
   url.searchParams.set("iss", origin);
   return url.toString();
 };
@@ -283,8 +330,11 @@ export const startAuthorization = async (
     db.insert(oauthRequests).values({
       requestId,
       clientId: ask.clientId,
+      // The address the authorize step resolved, so the token endpoint has one value to compare
+      // against however the client wrote the parameter, or left it out.
       redirectUri,
-      state: ask.state,
+      state: ask.state ?? "",
+      stateSent: ask.state === null ? 0 : 1,
       codeChallenge: ask.codeChallenge,
       createdAt: now,
       expiresAt: now + REQUEST_TTL_MS,
@@ -305,6 +355,7 @@ export const pendingAuthorization = async (
       clientName: oauthClients.clientName,
       redirectUri: oauthRequests.redirectUri,
       state: oauthRequests.state,
+      stateSent: oauthRequests.stateSent,
       codeChallenge: oauthRequests.codeChallenge,
       expiresAt: oauthRequests.expiresAt,
     })
@@ -318,7 +369,7 @@ export const pendingAuthorization = async (
     clientId: row.clientId,
     clientName: row.clientName,
     redirectUri: row.redirectUri,
-    state: row.state,
+    state: row.stateSent === 0 ? null : row.state,
     codeChallenge: row.codeChallenge,
   };
 };
@@ -425,7 +476,10 @@ export const redeemCode = async (
   if (spent.clientId !== redemption.clientId) {
     return refuseGrant("invalid_grant", "the authorization code was issued to another client");
   }
-  if (redemption.redirectUri !== "" && redemption.redirectUri !== spent.redirectUri) {
+  // RFC 6749 has the client send back the callback the authorization went to, and the comparison
+  // is unconditional: the authorize step resolved one address and wrote it down, so there is no
+  // case here where nothing is compared.
+  if (redemption.redirectUri !== spent.redirectUri) {
     return refuseGrant("invalid_grant", "redirect_uri does not match the one the authorization carried");
   }
   if (!(await pkceMatches(redemption.codeVerifier, spent.codeChallenge))) {

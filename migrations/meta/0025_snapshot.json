@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "e40d0151-d85b-419d-aa85-935a2243359a",
+  "id": "2ec498fc-4af9-430a-b68b-2bf8b9bad4ba",
   "prevId": "bdee3f50-53df-4f96-bb55-b3a6531fa21e",
   "tables": {
     "artifact_names": {
@@ -416,6 +416,13 @@
         "state": {
           "name": "state",
           "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "state_sent": {
+          "name": "state_sent",
+          "type": "integer",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false

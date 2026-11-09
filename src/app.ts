@@ -172,6 +172,7 @@ import {
 import {
   ARTIFACT_CSP,
   artifactPage,
+  CONNECT_CSRF_COOKIE,
   CSRF_COOKIE,
   confirmPage,
   enterCodePage,
@@ -289,7 +290,6 @@ import {
   startCursor,
   tagsOfMemories,
   textCandidates,
-  userForServiceClient,
   vectorCandidates,
   writeLabels,
 } from "./store";
@@ -355,11 +355,10 @@ export interface ArtifactHost extends Omit<ArtifactSurface, "sharing"> {
   sharing: { verify: Verify } | null;
 }
 
-// The connector endpoint, where a deployment switched it on. Its Access application admits a
-// browser sign-in and an Access service token, and the service token's common name names the user
-// it acts for, since a token carries no email to look up.
-// Which service tokens act for which accounts is a table in the account store, not a field here:
-// adding a tenant to the connector is a row rather than a config edit and a redeploy.
+// The connector, where a deployment switched it on. One binding turns the whole of it on — the
+// endpoint, the two discovery documents and the OAuth flow behind them — and `verify` is bound to
+// the Access application fronting the one address of it a person signs in at: a connector's tokens
+// are minted for the account that email names, and nothing else here proves an identity.
 export interface McpHost {
   verify: Verify;
 }
@@ -3117,18 +3116,18 @@ export const createApp = (deps: Deps): App => {
   const seeOther = (location: string): Response =>
     new Response(null, { status: 303, headers: { location, "cache-control": "no-store" } });
 
-  const mcpCaller = async (request: Request, env: WorkerEnv, host: McpHost): Promise<Caller | Response> => {
+  // A bearer token the OAuth flow issued is the whole of what this endpoint takes. Access used to
+  // front it and admit a browser session or a service token; it no longer can, because the flow a
+  // web client walks starts from this endpoint's own 401 and an Access application here would
+  // answer that 401 itself, stripping the header the flow turns on. Access still proves the person
+  // at the consent step, which is the one address of the connector behind the login.
+  const mcpCaller = async (request: Request, env: WorkerEnv): Promise<Caller | Response> => {
     const own = new URL(request.url).origin;
-    // The one header a web MCP client starts its whole connect flow from. It rides every refusal
-    // this endpoint makes for want of a credential, and names the document that leads to the
-    // authorization server, the registration endpoint and the sign-in.
-    const challenge = {
-      "www-authenticate": `Bearer resource_metadata="${resourceMetadataUrl(own)}"`,
-      ...corsHeaders(request),
-    };
-    // Origin validation is a MUST on every incoming connection, whichever scheme proves the
-    // caller, so it runs before any of them. This host is a browser signed in to Access here; the
-    // others are the web clients that reach the connector as a custom connector.
+    const metadata = resourceMetadataUrl(own);
+    // Origin validation is a MUST on every incoming connection. The widened list is safe because
+    // no answer here ever carries `Access-Control-Allow-Credentials`: a page on one of these hosts
+    // reaches the endpoint with a bearer token it already holds and never with a cookie of this
+    // host, so admitting the origin grants nothing a stolen token would not have granted anyway.
     const origin = request.headers.get("origin");
     if (origin !== null && origin !== own && !CONNECTOR_ORIGINS.includes(origin)) {
       return mcpRefusal(
@@ -3137,49 +3136,22 @@ export const createApp = (deps: Deps): App => {
       );
     }
     const authorization = request.headers.get("authorization") ?? "";
-    if (authorization.startsWith("Bearer ")) {
-      const userId = await userForAccessToken(env.DB, authorization.slice(7), deps.now());
-      if (userId === null) {
-        return mcpRefusal(401, "this access token is unknown, expired or revoked; connect the connector again", {
-          ...challenge,
-          "www-authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl(own)}"`,
-        });
-      }
-      return connectorDevice(env.DB, userId, deps.now());
-    }
-    const assertion = request.headers.get("cf-access-jwt-assertion");
-    const sentServiceHeaders = request.headers.get("cf-access-client-id") !== null;
-    if (assertion === null) {
+    // `resource_metadata` is the one header a web MCP client starts its whole connect flow from: it
+    // names the document that leads to the authorization server, the registration endpoint and the
+    // sign-in, so it rides every refusal made for want of a credential.
+    if (!authorization.startsWith("Bearer ")) {
       return mcpRefusal(
         401,
-        sentServiceHeaders
-          ? "Cloudflare Access let the request through without an assertion, so the CF-Access-Client-Id and CF-Access-Client-Secret pair is not a service token this account issued"
-          : `no credential reached ${MCP_PATH}: add it as a custom connector and sign in, send Authorization: Bearer with a token that flow issued, or sign in to Access in a browser`,
-        challenge,
+        `no bearer token reached ${MCP_PATH}: add it as a custom connector, which registers itself and takes you through the sign-in`,
+        { "www-authenticate": `Bearer resource_metadata="${metadata}"`, ...corsHeaders(request) },
       );
     }
-    const verified = await host.verify(assertion);
-    if (!verified.ok) {
-      return mcpRefusal(
-        401,
-        `Cloudflare Access ${sentServiceHeaders ? "service token" : "sign-in"} rejected: ${verified.reason}`,
-        challenge,
-      );
-    }
-    const { principal } = verified;
-    if (principal.kind === "serviceToken") {
-      const owner = await userForServiceClient(env.DB, principal.commonName);
-      if (owner === null) {
-        return mcpRefusal(
-          403,
-          `the Access service token ${principal.commonName} acts for no user of this recall; the deployment names one token per user`,
-        );
-      }
-      return connectorDevice(env.DB, owner, deps.now());
-    }
-    const userId = await userForEmail(env.DB, principal.email);
+    const userId = await userForAccessToken(env.DB, authorization.slice(7), deps.now());
     if (userId === null) {
-      return mcpRefusal(403, `${principal.email} is not invited to this recall; ask its owner to add it`);
+      return mcpRefusal(401, "this access token is unknown, expired or revoked; connect the connector again", {
+        "www-authenticate": `Bearer error="invalid_token", resource_metadata="${metadata}"`,
+        ...corsHeaders(request),
+      });
     }
     return connectorDevice(env.DB, userId, deps.now());
   };
@@ -3268,7 +3240,7 @@ export const createApp = (deps: Deps): App => {
       return grantPage(email, asked.clientName, new URL(asked.redirectUri).origin, asked.requestId, randomToken());
     }
     const form = new URLSearchParams(await request.text());
-    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
+    const cookie = readCookie(request.headers.get("cookie"), CONNECT_CSRF_COOKIE);
     const csrf = form.get("csrf") ?? "";
     if (request.headers.get("origin") !== url.origin || cookie === null || !sameSecret(cookie, csrf)) {
       return messagePage(403, "Request refused", "The form did not come from this page. Reload it and try again.");
@@ -3350,11 +3322,10 @@ export const createApp = (deps: Deps): App => {
 
   const mcp = async (request: Request, env: WorkerEnv): Promise<Response> => {
     const answered = await mcpEndpoint(request, async () => {
-      const host = deps.mcpHost;
-      if (host === null) {
+      if (deps.mcpHost === null) {
         return mcpRefusal(404, "this recall serves no MCP connector; its deployment has not switched one on");
       }
-      const caller = await mcpCaller(request, env, host);
+      const caller = await mcpCaller(request, env);
       if (caller instanceof Response) return caller;
       const tenant = tenantOf(env, caller.userId);
       return (made: ToolCall): Promise<ToolResult> => tenant.tool(made, caller, handed());

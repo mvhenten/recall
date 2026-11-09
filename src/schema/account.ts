@@ -56,18 +56,14 @@ export const artifactNames = sqliteTable("artifact_names", {
   readPerm: text("read_perm", { enum: ["private", "account"] }).notNull(),
 });
 
-// Which account an Access service token acts for. It was a JSON object in the Worker's env, which
-// made adding a tenant a config edit and a redeploy; it is a row so that it is a write.
-//
-// WITHOUT ROWID likewise.
-export const mcpClients = sqliteTable("mcp_clients", {
-  clientId: text("client_id").primaryKey(),
-  userId: text("user_id").notNull(),
-});
-
 // A web MCP client that registered itself under RFC 7591. It carries no secret: a client running
 // in a browser can keep none, so what binds a redemption is the code and the PKCE verifier, and
 // `redirect_uris` is the one thing registration decides.
+//
+// Registration takes no credential, so the table is swept by the registration that follows: a row
+// older than an hour holding neither a token nor a pending request is one no client ever carried
+// through a sign-in, and it goes. A client that did carry one through holds a refresh token for a
+// month, and the row stands as long as any of its tokens do.
 export const oauthClients = sqliteTable("oauth_clients", {
   clientId: text("client_id").primaryKey(),
   clientName: text("client_name").notNull(),
@@ -78,12 +74,18 @@ export const oauthClients = sqliteTable("oauth_clients", {
 // One authorize address, held while the user signs in to Access and decides. It exists so the
 // consent page carries an id and not the client's own parameters: nothing the browser posts back
 // decides which client, which callback or which challenge the code is bound to. A request nobody
-// completes is swept by the next one that starts. `state` is empty where the client sent none.
+// completes is swept by the next one that starts.
+//
+// `redirect_uri` is the address the authorize step resolved, never the raw parameter, so the token
+// endpoint has one value to compare against and no case where it compares nothing. `state` is
+// RECOMMENDED and not required, so whether the client sent one is its own column: a client that
+// sent the empty string is echoed the empty string, and one that sent none is echoed nothing.
 export const oauthRequests = sqliteTable("oauth_requests", {
   requestId: text("request_id").primaryKey(),
   clientId: text("client_id").notNull(),
   redirectUri: text("redirect_uri").notNull(),
   state: text("state").notNull(),
+  stateSent: integer("state_sent").notNull(),
   codeChallenge: text("code_challenge").notNull(),
   createdAt: integer("created_at").notNull(),
   expiresAt: integer("expires_at").notNull(),
@@ -104,7 +106,9 @@ export const oauthCodes = sqliteTable("oauth_codes", {
 
 // The tokens the connector issued, as digests. They are opaque rather than signed, so `/mcp` reads
 // one by looking it up and a revoke is a delete; `kind` separates the hour-long access token from
-// the month-long refresh token it is rotated with.
+// the month-long refresh token it is rotated with. A row names the account and the client and no
+// audience: one deployment serves one connector endpoint, so there is no second resource a token
+// of this table could have been minted for.
 export const oauthTokens = sqliteTable("oauth_tokens", {
   tokenSha256: text("token_sha256").primaryKey(),
   clientId: text("client_id").notNull(),

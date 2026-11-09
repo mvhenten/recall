@@ -61,27 +61,10 @@ resource "cloudflare_zero_trust_access_policy" "approvers" {
   include    = [for email in local.emails : { email = { email = email } }]
 }
 
-# One service token per user, so the connector endpoint can tell whose memories a token reaches.
-# The secret is minted once and lives only in state; rotate it in the dashboard to read it.
-resource "cloudflare_zero_trust_access_service_token" "connector" {
-  for_each = var.mcp_connector ? var.users : {}
-
-  account_id = var.account_id
-  name       = "recall-${each.key}-connector"
-  duration   = "forever"
-}
-
-resource "cloudflare_zero_trust_access_policy" "connector_tokens" {
-  count      = var.mcp_connector ? 1 : 0
-  account_id = var.account_id
-  name       = "recall connector tokens"
-  decision   = "non_identity"
-  include = [
-    for token in cloudflare_zero_trust_access_service_token.connector : {
-      service_token = { token_id = token.id }
-    }
-  ]
-}
+# The service token per user and the non-identity policy that admitted them are gone. They worked
+# because Access fronted /mcp and exchanged the client id and secret for an assertion; /mcp is now
+# outside Access, so nothing exchanges a pair and no request can carry one. A connector authorizes
+# itself through the OAuth flow instead, and `npm-scripts/deploy.mjs` retires the three resources.
 
 resource "cloudflare_zero_trust_access_application" "recall" {
   account_id                = var.account_id
@@ -124,8 +107,8 @@ resource "cloudflare_zero_trust_access_application" "artifacts" {
 #
 # Access matches the longest path first, so this covers /oauth/consent and the bypass over the
 # hostname leaves /mcp, the discovery documents, /oauth/register, /oauth/authorize and /oauth/token
-# to the Worker. The connector's service tokens still admit a machine here; the Worker refuses a
-# service-token assertion on this page, because the consent is a person's to give.
+# to the Worker. Only a person gets through it: the policy admits the approver emails and nothing
+# else, because the consent is a person's to give.
 resource "cloudflare_zero_trust_access_application" "mcp" {
   count                     = var.mcp_connector ? 1 : 0
   account_id                = var.account_id
@@ -143,12 +126,8 @@ resource "cloudflare_zero_trust_access_application" "mcp" {
   ]
   policies = [
     {
-      id         = one(cloudflare_zero_trust_access_policy.connector_tokens[*].id)
-      precedence = 1
-    },
-    {
       id         = cloudflare_zero_trust_access_policy.approvers.id
-      precedence = 2
+      precedence = 1
     }
   ]
 }

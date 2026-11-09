@@ -33,8 +33,15 @@
     {
       "idx": 25,
       "version": "6",
-      "when": 1794244498969,
+      "when": 1794245878112,
       "tag": "0025_connector_oauth",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1794245896649,
+      "tag": "0026_drop_mcp_clients",
       "breakpoints": true
     }
   ]

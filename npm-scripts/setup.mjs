@@ -181,33 +181,13 @@ const approvers = await upsertPolicy(
   (existing) => (existing.include ?? []).length === approverEmails.length,
 );
 
-// One service token for this user, named for the user it acts for. Its secret is shown by
-// Cloudflare once, at creation, and is never read or printed here: rotate the token in the
-// dashboard to get a secret you can paste into the desktop app.
-const connectorTokenName = `${name}-${user}-connector`;
-const connectorToken = mcpConnector
-  ? ((await list(`${account}/access/service_tokens`)).find((entry) => entry.name === connectorTokenName) ??
-    (await create(`Access service token ${connectorTokenName}`, () =>
-      cf("POST", `${account}/access/service_tokens`, { name: connectorTokenName, duration: "forever" }),
-    )))
-  : null;
-
-const connectorPolicyName = `${name} connector tokens`;
-const connectorPolicy = connectorToken
-  ? await upsertPolicy(
-      connectorPolicyName,
-      {
-        name: connectorPolicyName,
-        decision: "non_identity",
-        include: [{ service_token: { token_id: connectorToken.id } }],
-      },
-      (existing) => (existing.include ?? []).some((rule) => rule.service_token?.token_id === connectorToken.id),
-    )
-  : null;
-
 const apps = await list(`${account}/access/apps`);
+// An application is found by its name before its address. The name is what holds still when a
+// destination moves; matching on the address alone would post a second application beside the one
+// already covering the old path, and both would answer while the audience the Worker binds named
+// only the new one.
 const upsertApp = async (domain, body) => {
-  const existing = apps.find((app) => app.domain === domain);
+  const existing = apps.find((app) => app.name === body.name) ?? apps.find((app) => app.domain === domain);
   if (!existing) return create(`Access application for ${domain}`, () => cf("POST", `${account}/access/apps`, body));
   const policyIds = (existing.policies ?? []).map((p) => p.id);
   const wanted = body.policies.map((p) => p.id);
@@ -275,10 +255,7 @@ const mcpApp = mcpConnector
       allowed_idps: otp ? [otp.id] : [],
       auto_redirect_to_identity: true,
       destinations: [{ type: "public", uri: consentDomain }],
-      policies: [
-        ...(connectorPolicy ? [{ id: connectorPolicy.id, precedence: 1 }] : []),
-        ...(approvers ? [{ id: approvers.id, precedence: 2 }] : []),
-      ],
+      policies: approvers ? [{ id: approvers.id, precedence: 1 }] : [],
     })
   : null;
 
@@ -330,7 +307,7 @@ const config = {
           DASHBOARD_HOSTNAME: hostname,
         }
       : {}),
-    ...(mcpApp && connectorToken ? { MCP_ACCESS_AUD: mcpApp.aud } : {}),
+    ...(mcpApp ? { MCP_ACCESS_AUD: mcpApp.aud } : {}),
   },
 };
 mkdirSync(WORK, { recursive: true });
@@ -338,11 +315,6 @@ const configPath = join(WORK, "wrangler.json");
 writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
 const principalPath = join(WORK, "principals.sql");
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
-// Which account the connector's service token acts for is a row rather than a Worker variable, so
-// it is written here beside the invitations and off the same credentials.
-const connectorRow = connectorToken
-  ? `INSERT INTO mcp_clients (client_id, user_id) VALUES (${quote(connectorToken.client_id)}, ${quote(user)}) ON CONFLICT (client_id) DO UPDATE SET user_id = excluded.user_id;\n`
-  : "";
 writeFileSync(
   principalPath,
   emails
@@ -350,7 +322,7 @@ writeFileSync(
       (email) =>
         `INSERT INTO principals (email, user_id) VALUES (${quote(email)}, ${quote(user)}) ON CONFLICT (email) DO UPDATE SET user_id = excluded.user_id;\n`,
     )
-    .join("") + connectorRow,
+    .join(""),
 );
 
 run(["d1", "migrations", "apply", name, "--remote", "-c", configPath]);
@@ -365,12 +337,7 @@ const probe = async () => {
       signal: AbortSignal.timeout(15_000),
     }).catch((error) => ({ status: 0, statusText: error.message }));
     if (response.status === 401) {
-      if (mcpApp && connectorToken) {
-        say(`connector URL: https://${hostname}/mcp, as Access service token ${connectorToken.client_id}`);
-        say(
-          `rotate ${connectorTokenName} under Zero Trust, Access, Service Auth to read its Client Secret; setup never prints it`,
-        );
-      }
+      if (mcpApp) say(`connector URL: https://${hostname}/mcp, added as a custom connector in the client`);
       return say(`https://${hostname} answers; on each host run: recall login --endpoint https://${hostname}`);
     }
     if (Date.now() + delay > deadline) {

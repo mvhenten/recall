@@ -2,6 +2,12 @@ import { ARTIFACT_CONTENT_TYPE } from "./artifacts";
 
 export const CSRF_COOKIE = "__Host-recall_csrf";
 
+// The connector's consent form carries its own token under its own name. The `__Host-` prefix
+// demands `Path=/`, so neither cookie can be scoped to the page that set it: one name for both
+// forms would mean an open consent tab silently invalidating a device approval waiting in another,
+// and the user would see a refused form with nothing to tell them why.
+export const CONNECT_CSRF_COOKIE = "__Host-recall_connect";
+
 // What a send that worked leaves behind, so the page it redirects to can say so once. The notice
 // belongs to that one navigation and not to the address, which a reader bookmarks, reloads and
 // walks back to; carrying it in the URL would reprint it every time.
@@ -174,7 +180,7 @@ export const grantPage = (
 </form>`,
     {
       "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callbackOrigin}; frame-ancestors 'none'; base-uri 'none'`,
-      "set-cookie": `${CSRF_COOKIE}=${csrf}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict`,
+      "set-cookie": `${CONNECT_CSRF_COOKIE}=${csrf}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Strict`,
     },
   );
 
