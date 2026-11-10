@@ -70,6 +70,11 @@ pub fn sessions_dir() -> PathBuf {
     runtime_dir().join("sessions")
 }
 
+/// What each session last sent of each of its files, shared by the daemon and `recall sessions`.
+pub fn uploaded_dir() -> PathBuf {
+    runtime_dir().join("uploaded")
+}
+
 pub fn seen_path() -> PathBuf {
     runtime_dir().join("seen.json")
 }
@@ -346,6 +351,7 @@ fn report_ended(client: &Arc<Client>, places: &Arc<Mutex<transcripts::Archive>>,
                 Err(error) => format!("sessions:end-failed:{id}:{error:#}"),
             };
             log(&outcome, started.elapsed());
+            transcripts::forget_uploaded(&uploaded_dir(), id);
         }
     });
 }
@@ -378,16 +384,12 @@ fn archive(
     }
 }
 
-/// The floor the debounce never drops below, whatever the archive interval scales it down to.
-pub const MIN_DEBOUNCE: Duration = Duration::from_millis(500);
-
 /// How long a write waits for the writes behind it. A turn lands as a run of lines and a persisted
 /// tool output as a run of blocks, so a pass per event would send one file a dozen times over
-/// where a single pass carries all of it. Scaled off the archive interval rather than fixed, so a
-/// host that set a short interval because it wants its lines up sooner is not undercut by a
-/// debounce that outlasts the interval it configured.
+/// where a single pass carries all of it. The wait is the whole archive interval, so a session
+/// writing without pause uploads at most once per interval.
 pub fn debounce(every: Duration) -> Duration {
-    MIN_DEBOUNCE.max(every / 4)
+    every
 }
 
 /// What a pass over the live transcripts runs on.
@@ -542,7 +544,7 @@ async fn serve(archive_every: Duration) -> Result<()> {
         log(&format!("sessions:adopt-failed:{error:#}"), Duration::ZERO);
     }
     let adopting = Arc::new(AtomicBool::new(false));
-    let held_at = Arc::new(Mutex::new(transcripts::Archive::default()));
+    let held_at = Arc::new(Mutex::new(transcripts::Archive::at(uploaded_dir())));
     let (wake, woken) = watch::wake();
     let watching = match watch::Watch::new(wake) {
         Ok(watch) => Some(watch),
@@ -1042,7 +1044,7 @@ mod tests {
             wake.send(()).unwrap();
         }
 
-        let _ = tokio::time::timeout(every / 2, wake_loop(every, debounce(every), &mut woken, pass)).await;
+        let _ = tokio::time::timeout(every + every / 2, wake_loop(every, debounce(every), &mut woken, pass)).await;
 
         assert_eq!(
             ran.load(Ordering::Acquire),
@@ -1073,8 +1075,8 @@ mod tests {
     }
 
     /// A beat behind a pass the watch asked for would send over files the pass just read. The
-    /// window is a fraction of the beat here, so a write early in a beat still leaves most of one
-    /// behind it, and nothing but the reset keeps the beat from firing into it.
+    /// beat falls due inside the window, and nothing but the reset keeps it from firing the moment
+    /// the written pass is done.
     #[tokio::test(start_paused = true)]
     async fn a_write_pushes_the_beat_out_rather_than_adding_a_pass_to_it() {
         let every = Duration::from_secs(10);
@@ -1082,12 +1084,12 @@ mod tests {
         let (ran, pass) = passes();
         let (wake, mut woken) = watch::wake();
         tokio::spawn(async move {
-            tokio::time::sleep(every - debounce * 2).await;
+            tokio::time::sleep(every / 2).await;
             wake.send(()).unwrap();
             std::future::pending::<()>().await;
         });
 
-        let _ = tokio::time::timeout(every + every / 2, wake_loop(every, debounce, &mut woken, pass)).await;
+        let _ = tokio::time::timeout(every * 2, wake_loop(every, debounce, &mut woken, pass)).await;
 
         assert_eq!(
             ran.load(Ordering::Acquire),

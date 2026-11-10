@@ -652,7 +652,12 @@ fn sync_session(session_id: &str) -> Result<()> {
     }
     // A sync says nothing about the session being over, so the record half written at the end of
     // a file waits for the pass that holds the whole of it.
-    let archived = transcripts::Archive::default().send(&client, session_id, &record.transcript_path, Pass::Open)?;
+    let archived = transcripts::Archive::at(listen::uploaded_dir()).send(
+        &client,
+        session_id,
+        &record.transcript_path,
+        Pass::Open,
+    )?;
     if archived > 0 {
         println!("archived {archived} transcript records for {session_id}");
     }
@@ -679,14 +684,19 @@ fn end_session(session_id: &str) -> Result<()> {
         }
         // The session is over, so the end of each of its files is the end for good and the last
         // record of each goes up whether or not the line it sits on was finished.
-        let archived =
-            transcripts::Archive::default().send(&client, session_id, &record.transcript_path, Pass::Final)?;
+        let archived = transcripts::Archive::at(listen::uploaded_dir()).send(
+            &client,
+            session_id,
+            &record.transcript_path,
+            Pass::Final,
+        )?;
         if archived > 0 {
             println!("archived {archived} transcript records for {session_id}");
         }
     }
     let ended = client.end_session(session_id)?;
     sessions::forget(&dir, session_id);
+    transcripts::forget_uploaded(&listen::uploaded_dir(), session_id);
     println!("{} {session_id}", if ended { "ended" } else { "already gone" });
     Ok(())
 }

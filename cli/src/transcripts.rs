@@ -45,6 +45,8 @@ use crate::redact;
 use crate::watch::Depth;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader};
@@ -665,10 +667,15 @@ pub fn records_held(path: &Path, holds: Holds) -> Result<i64> {
 /// the one before opens no file and sends no call. The place is this run's own: a session it has
 /// never seen opens at nothing and the first append it offers is the one record that asks the
 /// service where the file really waits.
+///
+/// An archive opened `at` a directory also keeps, per session, the SHA-256 of each file as it last
+/// went up whole, shared by every run on this host. A file this run has not placed whose content
+/// still hashes the same is skipped outright: no probe, no append.
 #[derive(Debug)]
 pub struct Archive {
     seen: HashMap<String, HashMap<String, Seen>>,
     appends: usize,
+    uploaded: Option<PathBuf>,
 }
 
 impl Default for Archive {
@@ -676,8 +683,59 @@ impl Default for Archive {
         Archive {
             seen: HashMap::new(),
             appends: MAX_APPENDS_PER_PASS,
+            uploaded: None,
         }
     }
+}
+
+/// One file as it last went up whole: the hash of its content, the record the archive waits at
+/// after it, and whether the pass that sent it was the final one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Uploaded {
+    sha256: String,
+    next: i64,
+    #[serde(rename = "final")]
+    last: bool,
+}
+
+fn sha256(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read =
+            std::io::Read::read(&mut file, &mut buffer).with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn uploaded_path(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.json"))
+}
+
+fn read_uploaded(dir: &Path, session_id: &str) -> HashMap<String, Uploaded> {
+    std::fs::read(uploaded_path(dir, session_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_uploaded(dir: &Path, session_id: &str, uploaded: &HashMap<String, Uploaded>) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = uploaded_path(dir, session_id);
+    let partial = dir.join(format!("{session_id}.json.{}", std::process::id()));
+    std::fs::write(&partial, serde_json::to_vec(uploaded)?)
+        .with_context(|| format!("writing {}", partial.display()))?;
+    std::fs::rename(&partial, &path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Drops what this host kept of a session it no longer runs.
+pub fn forget_uploaded(dir: &Path, session_id: &str) {
+    let _ = std::fs::remove_file(uploaded_path(dir, session_id));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -691,6 +749,14 @@ struct Seen {
 }
 
 impl Archive {
+    /// An archive that keeps what went up in `dir`, so a later run skips what has not changed.
+    pub fn at(dir: PathBuf) -> Archive {
+        Archive {
+            uploaded: Some(dir),
+            ..Archive::default()
+        }
+    }
+
     /// Every file of one session, caught up with the service. The session's own transcript is what
     /// names the set, so a session whose record carries none sends nothing.
     ///
@@ -715,9 +781,38 @@ impl Archive {
         {
             return Ok(0);
         }
+        let mut uploaded = self
+            .uploaded
+            .as_deref()
+            .map(|dir| read_uploaded(dir, session_id))
+            .unwrap_or_default();
         let mut sent = 0;
         let mut ends: HashMap<String, Seen> = HashMap::new();
         for source in &sources.found {
+            let quiet = pass == Pass::Open
+                && known
+                    .get(&source.file)
+                    .is_some_and(|seen| seen.size == source.size && !seen.more);
+            let hash = match self.uploaded {
+                Some(_) if !quiet => Some(sha256(&source.path)?),
+                _ => None,
+            };
+            let unchanged = hash.as_ref().and_then(|hash| {
+                uploaded
+                    .get(&source.file)
+                    .filter(|was| &was.sha256 == hash && (pass == Pass::Open || was.last))
+            });
+            if let (None, Some(was)) = (known.get(&source.file), unchanged) {
+                ends.insert(
+                    source.file.clone(),
+                    Seen {
+                        place: Place::reached(was.next),
+                        size: source.size,
+                        more: false,
+                    },
+                );
+                continue;
+            }
             let from = known
                 .get(&source.file)
                 .map(|seen| seen.place)
@@ -732,9 +827,28 @@ impl Archive {
                     more: reached.more,
                 },
             );
+            match hash {
+                Some(sha256) if !reached.more => {
+                    uploaded.insert(
+                        source.file.clone(),
+                        Uploaded {
+                            sha256,
+                            next: reached.next,
+                            last: pass == Pass::Final,
+                        },
+                    );
+                }
+                _ if quiet => {}
+                _ => {
+                    uploaded.remove(&source.file);
+                }
+            }
             sent += reached.records;
         }
         self.seen.insert(session_id.to_string(), ends);
+        if let Some(dir) = self.uploaded.as_deref() {
+            write_uploaded(dir, session_id, &uploaded)?;
+        }
         if first && !sources.unsendable.is_empty() {
             let named: Vec<String> = sources
                 .unsendable
@@ -1091,6 +1205,44 @@ mod tests {
             offered + 1,
             "and a session this run already placed sends the one append it owes and nothing else"
         );
+    }
+
+    /// Every prompt runs `recall sessions --sync`, a fresh run with no place of its own. A file
+    /// whose content hashes the same as when it last went up costs no call at all.
+    #[test]
+    fn a_fresh_run_over_an_unchanged_transcript_offers_no_append() {
+        let sandbox = Sandbox::new("unchanged");
+        let transcript = sandbox.transcript("s-1", "one\ntwo\n");
+        sandbox.delegated("s-1", "agent-a", "ay\n");
+        let uploaded = sandbox.dir.join("uploaded");
+        let service = Fake::default();
+
+        assert_eq!(
+            Archive::at(uploaded.clone())
+                .send(&service, "s-1", &transcript, Pass::Open)
+                .unwrap(),
+            3
+        );
+        let offered = *service.offered.borrow();
+        for _ in 0..5 {
+            assert_eq!(
+                Archive::at(uploaded.clone())
+                    .send(&service, "s-1", &transcript, Pass::Open)
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(*service.offered.borrow(), offered, "no probe and no append");
+
+        std::fs::write(&transcript, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(
+            Archive::at(uploaded)
+                .send(&service, "s-1", &transcript, Pass::Open)
+                .unwrap(),
+            1
+        );
+        assert_eq!(service.body("main"), "one\ntwo\nthree\n");
+        assert_eq!(service.body("agent-a"), "ay\n");
     }
 
     #[test]
