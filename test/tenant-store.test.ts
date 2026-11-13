@@ -196,7 +196,7 @@ describe("the tenant store", () => {
       const again = await writePeek(db, userId, "s-1", "peek-1", "running the tests");
       return { onItsOwn, onAnother, again };
     });
-    expect(written).toEqual({ onItsOwn: true, onAnother: false, again: false });
+    expect(written).toEqual({ onItsOwn: "written", onAnother: "missing", again: "held" });
     expect(await inStore(userId, (db) => listPeeks(db, userId, "s-1"))).toEqual([
       { peekId: "peek-1", digest: "rebasing the branch", requestedAt: NOW },
     ]);

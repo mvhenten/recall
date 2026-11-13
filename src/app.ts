@@ -253,6 +253,7 @@ import {
   labelTargets,
   listBoard,
   listMemories,
+  listPeeks,
   listSessionHistory,
   listSessionHistoryIds,
   listSessions,
@@ -274,6 +275,7 @@ import {
   recordUsage,
   releaseArtifactName,
   replaceLinkShare,
+  requestPeek,
   resolveArtifact,
   revokeShares,
   saveMemory,
@@ -292,6 +294,7 @@ import {
   textCandidates,
   vectorCandidates,
   writeLabels,
+  writePeek,
 } from "./store";
 import type { Tenant } from "./tenant";
 import {
@@ -325,7 +328,9 @@ import {
   parseSessionSync,
   parseUsageDelta,
   parseV2Send,
+  parseWritePeek,
   pastSessionView,
+  peekView,
   searchResultsView,
   sendInputOf,
   sessionHitView,
@@ -2582,16 +2587,71 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     });
   };
 
+  // What one running session is doing, asked for and read back. The asker writes the row and the
+  // host's summariser fills it in: the two never meet, so the row is written before the peek goes
+  // out and a digest put back the moment the host reads the frame lands on a peek that is there.
+  //
+  // Nothing here runs a model. The digest is written by the host the session runs on, which is
+  // what keeps the summary out of that session's own context.
+  const v2Peek = async (
+    request: Request,
+    env: TenantEnv,
+    caller: Caller,
+    sessionId: string,
+    rawPeekId: string | undefined,
+  ): Promise<Response> => {
+    const db = env.DB;
+    const { userId } = caller;
+    if (rawPeekId !== undefined) {
+      if (request.method !== "PUT") return error(405, "method not allowed");
+      const peekId = decodeSegment(rawPeekId);
+      if (peekId === null) return error(400, "the peek id is not a valid path segment");
+      const written = parseWritePeek(await readJson(request));
+      if (!written.ok) return error(400, written.error);
+      // The digest is the host's to write, and the host is the device the session runs on. Another
+      // device of the same account holds no transcript of it and so has nothing to summarise from.
+      if (!(await sessionOnDevice(db, userId, sessionId, caller.deviceId, deps.now()))) {
+        return error(404, `no session ${sessionId} running on this device`);
+      }
+      const landed = await writePeek(db, userId, sessionId, peekId, written.value.digest);
+      if (landed === "written") return new Response(null, { status: 204 });
+      if (landed === "missing") return error(404, `no peek ${peekId} on session ${sessionId}`);
+      return error(409, `peek ${peekId} already holds a digest`);
+    }
+    if (request.method === "GET") {
+      if (!(await sessionOnRecord(db, userId, sessionId))) return error(404, `no session ${sessionId}`);
+      return json({ peeks: (await listPeeks(db, userId, sessionId)).map(peekView) });
+    }
+    if (request.method !== "POST") return error(405, "method not allowed");
+    const now = deps.now();
+    // A peek reads the tail of a transcript on the host the session runs on, so a session that is
+    // over or that this account never had is a 404 and never a request nobody can answer.
+    const toDeviceId = await liveSessionDevice(db, userId, sessionId, now);
+    if (toDeviceId === null) return error(404, `no session ${sessionId} running on this account`);
+    const peek = await requestPeek(db, userId, sessionId, crypto.randomUUID(), now);
+    const outcome = await mailboxFor(env, userId).peek({
+      peekId: peek.peekId,
+      sessionId,
+      toDeviceId,
+      requestedAt: now,
+    });
+    return json({ peek: peekView(peek), outcome }, 201);
+  };
+
   const v2Sessions = async (
     request: Request,
     url: URL,
     env: TenantEnv,
     caller: Caller,
     rawSessionId: string | undefined,
-    subresource: string | undefined,
+    rest: readonly string[],
   ): Promise<Response> => {
     const bucket = env.TRANSCRIPTS;
     const db = env.DB;
+    // One peek of a session is the only address below a subresource here, so every deeper one is
+    // nothing this collection answers.
+    const [subresource, rawPeekId] = rest;
+    if (rest.length > 2 || (rest.length === 2 && subresource !== "peek")) return error(404, "not found");
     if (rawSessionId === undefined) {
       return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
     }
@@ -2600,6 +2660,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (subresource === "usage") return v2Usage(request, db, caller, sessionId.value);
     if (subresource === "records") return v2Records(request, bucket, db, caller, sessionId.value);
     if (subresource === "files") return v2Files(request, bucket, db, caller, sessionId.value);
+    if (subresource === "peek") return v2Peek(request, env, caller, sessionId.value, rawPeekId);
     if (subresource === "transcript") {
       return v2Transcript(request, url, bucket, db, caller, sessionId.value);
     }
@@ -2712,7 +2773,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const db = env.DB;
     if (collection === "devices") return v2Devices(request, env, caller, rawName);
     if (collection === "board") return board(request, url, env, caller, rawName, parseV2Post);
-    if (collection === "sessions") return v2Sessions(request, url, env, caller, rawName, rest[0]);
+    if (collection === "sessions") return v2Sessions(request, url, env, caller, rawName, rest);
     if (collection === "history") {
       if (rawName !== undefined) return error(404, "not found");
       return v2History(request, url, db, caller);
@@ -3424,7 +3485,9 @@ export const createApp = (deps: Deps): App => {
     if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts" && collection !== "memories") {
       return error(404, "not found");
     }
-    if (rest.length > 1 && collection !== "artifacts") return error(404, "not found");
+    if (rest.length > 1 && collection !== "artifacts" && collection !== "sessions") {
+      return error(404, "not found");
+    }
     // The device grant is RFC 8628 and its snake_case is the standard rather than a slip, so it is
     // carried over as it stands.
     if (collection === "device") {

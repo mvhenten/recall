@@ -611,32 +611,37 @@ export const requestPeek = async (
   return peek;
 };
 
+// What became of a digest a summariser wrote: it filled the peek it names, that peek already holds
+// one, or the session holds no such peek at all.
+export type PeekWrite = "written" | "held" | "missing";
+
 // The digest lands on the row the request wrote, so a summariser naming a peek this session does
-// not hold is answered false rather than writing a row of its own. The empty digest in the
-// predicate is what makes the first answer the one that stands: a session peeked at once is
-// summarised by one run, and a second arriving late is told it lost rather than overwriting it.
-// RETURNING is what counts the rows an update reached, as `endSession` says.
+// not hold writes no row of its own. The empty digest in the predicate is what makes the first
+// answer the one that stands: a session peeked at once is summarised by one run, and a second
+// arriving late is told it lost rather than overwriting it. RETURNING is what counts the rows an
+// update reached, as `endSession` says; the row is read back only where the update reached none,
+// which is the one reading the predicate cannot tell apart on its own.
 export const writePeek = async (
   db: TenantDb,
   userId: string,
   sessionId: string,
   peekId: string,
   digest: string,
-): Promise<boolean> => {
+): Promise<PeekWrite> => {
+  const named = and(
+    eq(sessionPeeks.userId, userId),
+    eq(sessionPeeks.sessionId, sessionId),
+    eq(sessionPeeks.peekId, peekId),
+  );
   const written = db
     .update(sessionPeeks)
     .set({ digest })
-    .where(
-      and(
-        eq(sessionPeeks.userId, userId),
-        eq(sessionPeeks.sessionId, sessionId),
-        eq(sessionPeeks.peekId, peekId),
-        eq(sessionPeeks.digest, ""),
-      ),
-    )
+    .where(and(named, eq(sessionPeeks.digest, "")))
     .returning({ peekId: sessionPeeks.peekId })
     .all();
-  return written.length === 1;
+  if (written.length === 1) return "written";
+  const held = db.select({ peekId: sessionPeeks.peekId }).from(sessionPeeks).where(named).get();
+  return held === undefined ? "missing" : "held";
 };
 
 export const listPeeks = async (db: TenantDb, userId: string, sessionId: string): Promise<Peek[]> =>

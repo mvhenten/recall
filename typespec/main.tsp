@@ -266,8 +266,12 @@ model Peek {
   requestedAt: offsetDateTime;
 }
 
-@doc("What a summariser puts back on the peek it was handed.")
+@doc("""
+  What a summariser puts back on the peek it was handed. A digest of no characters is what a
+  pending peek already holds, so one is refused rather than taken for an answer.
+  """)
 model WritePeek {
+  @minLength(1)
   digest: PeekDigest;
 }
 

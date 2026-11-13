@@ -18,6 +18,7 @@ import {
   type MemorySchema,
   type MemoryTypeSchema,
   type PastSessionSchema,
+  type PeekSchema,
   type RecordsAcceptedSchema,
   type RecordsConflictSchema,
   SaveMemorySchema,
@@ -30,6 +31,7 @@ import {
   type SessionSchema,
   SessionSyncSchema,
   UsageDeltaSchema,
+  WritePeekSchema,
 } from "../typespec/generated/schemas";
 import type { Device } from "./device";
 import type { SendInput } from "./mailbox";
@@ -44,6 +46,7 @@ import {
   type Mode,
   type Parsed,
   type PastSession,
+  type Peek,
   type SaveInput,
   type SearchInput,
   type SearchResults,
@@ -69,6 +72,8 @@ export type V2Memory = z.infer<typeof MemorySchema>;
 export type V2MemoryHit = z.infer<typeof MemoryHitSchema>;
 export type V2SearchResults = z.infer<typeof SearchResultsSchema>;
 export type V2InjectedMemory = z.infer<typeof InjectedMemorySchema>;
+export type V2Peek = z.infer<typeof PeekSchema>;
+export type V2WritePeek = z.infer<typeof WritePeekSchema>;
 
 // The three things a session's mode can be. `/v1` said "the host could not tell" with an empty
 // string, which reads as a missing field rather than as an answer.
@@ -179,6 +184,16 @@ export const sessionHitView = (hit: SessionHit, labels: Map<string, string>): V2
   excerpt: { speaker: hit.excerpt.speaker, text: hit.excerpt.text, at: isoOf(hit.excerpt.at) },
 });
 
+// A peek as `/v2` answers with one. The state is read off the digest rather than kept beside it: a
+// row a summariser has not answered holds none, and the two words the contract names are what that
+// reads as. Nothing stores the state, so nothing can store one the digest disagrees with.
+export const peekView = (peek: Peek): V2Peek => ({
+  peekId: peek.peekId,
+  state: peek.digest === "" ? "Pending" : "Ready",
+  digest: peek.digest,
+  requestedAt: isoOf(peek.requestedAt),
+});
+
 // A memory as `/v2` answers with one. `lastRecalledAt` is off the wire: `recallCount` already says
 // whether a memory has ever been recalled, and the zero a never-recalled row carries read as an
 // instant in 1970 to every client that printed it. The column stays where it is.
@@ -229,6 +244,8 @@ const validated = <T extends Record<string, unknown>>(schema: z.ZodType<T>, body
 };
 
 export const parseAppendRecords = (body: unknown): Parsed<V2AppendRecords> => validated(AppendRecordsSchema, body);
+
+export const parseWritePeek = (body: unknown): Parsed<V2WritePeek> => validated(WritePeekSchema, body);
 
 // What one call of the session copy is told. It is a body rather than a query string because both
 // of its fields are the run's own state carried between calls, and a contract is what says so.
