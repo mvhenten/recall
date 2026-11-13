@@ -13,7 +13,7 @@ import {
   REPO_TAG,
   type Session,
 } from "./model";
-import type { V2Device, V2Session } from "./v2";
+import type { V2Device, V2Peek, V2Session } from "./v2";
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
 // its own from #[tool] macros, so the two sets are maintained separately and the wording differs
@@ -61,6 +61,10 @@ export interface EditArgs {
 export interface SendArgs {
   to: string;
   message: string;
+}
+
+export interface PeekArgs {
+  session: string;
 }
 
 export interface ToolSchema {
@@ -182,7 +186,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_sessions",
     description:
-      "List the live Claude Code sessions on every host signed in as this user, newest activity first. Each one carries the name it was given, the handle recall_send takes, the host it runs on, the directory it works in and the prompt it is working on.",
+      "List the live Claude Code sessions on every host signed in as this user, newest activity first. Each one carries the name it was given, the handle recall_send and recall_peek take, the host it runs on, the directory it works in and the prompt it is working on.",
     inputSchema: schema({}),
   },
   {
@@ -194,7 +198,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_send",
     description:
-      "Message one Claude Code session running on a host signed in as this user, named by the handle recall_sessions shows, or every session on a host named by its label or as recall_devices shows it. The message arrives as a user turn there.",
+      "Message one Claude Code session running on a host signed in as this user, named by the handle recall_sessions shows, or every session on a host named by its label or as recall_devices shows it. The message arrives as a user turn there. recall_peek says what one session is doing without interrupting it.",
     inputSchema: schema(
       {
         to: text(
@@ -203,6 +207,19 @@ export const TOOLS: ToolDefinition[] = [
         message: text("The message to deliver there."),
       },
       ["to", "message"],
+    ),
+  },
+  {
+    name: "recall_peek",
+    description:
+      "Ask one Claude Code session on a host signed in as this user what it is working on right now. A side process on that session's host summarises the end of its transcript and writes the digest back: the session is not interrupted, is not messaged, and carries none of this in its context, so a peek costs that session nothing. Returns the peek with state Ready and the digest once its host has answered, which takes a few seconds, and state Pending where it had not answered in that time. Use it to see what a session is doing before sending it anything with recall_send.",
+    inputSchema: schema(
+      {
+        session: text(
+          "The session to ask, named by the handle recall_sessions shows, by the name Claude Code gave it, or by its session id. A host is not a peek target: one summariser answers for one session.",
+        ),
+      },
+      ["session"],
     ),
   },
 ];
@@ -371,6 +388,38 @@ export const parseSendArgs = (args: Record<string, unknown>): Parsed<SendArgs> =
   const message = requiredText(args.message, "message", 32_768);
   if (!message.ok) return message;
   return { ok: true, value: { to: to.value, message: message.value } };
+};
+
+export const parsePeekArgs = (args: Record<string, unknown>): Parsed<PeekArgs> => {
+  const session = requiredText(args.session, "session", 500);
+  return session.ok ? { ok: true, value: { session: session.value } } : session;
+};
+
+// How many times a peek is read back before the caller is told it is still pending, and how long
+// the read back waits each time. The summariser runs one Haiku call over the tail of a transcript,
+// which answers in seconds; a host slower than that is read again by the next call rather than
+// waited on here. api::PEEK_READS and api::PEEK_WAIT are the same two on the stdio side.
+export const PEEK_READS = 5;
+export const PEEK_WAIT_MS = 2_000;
+
+// Reads one peek back until it holds a digest, at most PEEK_READS times. The wait comes first each
+// time, since the host starts the summariser as it reads the frame and the digest is never there
+// the instant the ask answers. The peek the ask wrote is what this gives back where the digest
+// never lands, so a request still pending reads as the request it is.
+export const readBackPeek = async (
+  asked: V2Peek,
+  read: () => Promise<V2Peek | null>,
+  wait: (ms: number) => Promise<void>,
+): Promise<V2Peek> => {
+  let held = asked;
+  for (let taken = 0; taken < PEEK_READS; taken += 1) {
+    await wait(PEEK_WAIT_MS);
+    const found = await read();
+    if (found === null) return held;
+    if (found.state === "Ready") return found;
+    held = found;
+  }
+  return held;
 };
 
 // What a listing hands the model: the fields its tool description names, and not the whole view
