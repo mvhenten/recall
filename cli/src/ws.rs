@@ -1,6 +1,7 @@
 use crate::api::Message;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -20,11 +21,24 @@ pub const ORDERS_HEADER: &str = "x-recall-orders";
 
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// `token` is the claim the mailbox handed this socket along with an order, and the receipt has to
-/// quote it back. News answers nothing, so its frame carries no claim and this is left empty.
+/// What this host is asked to summarise: the session, and the row the digest lands on. It carries
+/// no prose and no sender, because nobody wrote it at a session; the asker wrote the row and this
+/// says which one. The frame names the device it went to and when it was asked for, which this
+/// host already knows and so never reads.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Peek {
+    pub peek_id: String,
+    pub session_id: String,
+}
+
+/// `token` is the claim the mailbox handed this socket along with an order or a peek, and the
+/// receipt has to quote it back. News answers nothing, so its frame carries no claim and this is
+/// left empty.
 #[derive(Debug)]
 pub enum Incoming {
     Message { message: Box<Message>, token: String },
+    Peek { peek: Box<Peek>, token: String },
     Ignored,
 }
 
@@ -69,19 +83,45 @@ pub fn receipt(message_id: &str, token: &str, reply: &Reply) -> String {
     }
 }
 
-/// News and an order are deliberately different shapes: only an order's frame carries the claim
-/// its receipt has to quote, so the two are told apart by the frame type rather than by a field
-/// one of them leaves empty.
+/// What this host writes back about a peek: that it started the summariser, or that it is not
+/// running the session the peek names. The receipt names no session, since the peek named one when
+/// it went out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Peeked {
+    Took,
+    NoSession,
+}
+
+pub fn peek_receipt(peek_id: &str, token: &str, peeked: &Peeked) -> String {
+    let answer = match peeked {
+        Peeked::Took => "peek-took",
+        Peeked::NoSession => "peek-none",
+    };
+    serde_json::json!({ "type": answer, "peekId": peek_id, "token": token }).to_string()
+}
+
+/// News, an order and a peek are deliberately different shapes: only an order's and a peek's frame
+/// carry the claim their receipt has to quote, and only a peek carries no message at all, so they
+/// are told apart by the frame type rather than by a field one of them leaves empty.
 pub fn parse_frame(raw: &str) -> Result<Incoming> {
     let frame: Value = serde_json::from_str(raw).context("the mailbox sent a frame that is not JSON")?;
-    if !matches!(frame.get("type").and_then(Value::as_str), Some("message" | "order")) {
-        return Ok(Incoming::Ignored);
-    }
+    let kind = frame.get("type").and_then(Value::as_str).unwrap_or_default();
     let token = frame
         .get("token")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if kind == "peek" {
+        let body = frame.get("peek").cloned().unwrap_or(Value::Null);
+        let peek: Peek = serde_json::from_value(body).context("the mailbox sent a peek frame it cannot read")?;
+        return Ok(Incoming::Peek {
+            peek: Box::new(peek),
+            token,
+        });
+    }
+    if !matches!(kind, "message" | "order") {
+        return Ok(Incoming::Ignored);
+    }
     let body = frame.get("message").cloned().unwrap_or(Value::Null);
     let message: Message = serde_json::from_value(body).context("the mailbox sent a message frame it cannot read")?;
     Ok(Incoming::Message {
@@ -111,9 +151,15 @@ pub async fn connect(url: &str, token: &str) -> Result<Socket> {
     Ok(socket)
 }
 
-/// Reads the mailbox until it closes, handing every message to `on_message` and writing back the
-/// receipt it asks for, quoting the claim the message arrived under. News asks for none.
-pub async fn pump(socket: &mut Socket, mut on_message: impl AsyncFnMut(Message) -> Option<Reply>) -> Result<Ended> {
+/// Reads the mailbox until it closes, handing every message to `on_message` and every peek to
+/// `on_peek`, and writing back the receipt each asks for, quoting the claim it arrived under. News
+/// asks for none. A peek is answered either way, so it never reaches `on_message` and never
+/// becomes a message a session is handed.
+pub async fn pump(
+    socket: &mut Socket,
+    mut on_message: impl AsyncFnMut(Message) -> Option<Reply>,
+    mut on_peek: impl AsyncFnMut(Peek) -> Peeked,
+) -> Result<Ended> {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.tick().await;
     let mut silent = false;
@@ -132,19 +178,27 @@ pub async fn pump(socket: &mut Socket, mut on_message: impl AsyncFnMut(Message) 
         let Some(frame) = frame else { return Ok(Ended::Closed) };
         silent = false;
         match frame.context("reading from the mailbox")? {
-            Frame::Text(text) => {
-                let Incoming::Message { message, token } = parse_frame(&text)? else {
-                    continue;
-                };
-                let message_id = message.message_id.clone();
-                let Some(reply) = on_message(*message).await else {
-                    continue;
-                };
-                socket
-                    .send(Frame::text(receipt(&message_id, &token, &reply)))
-                    .await
-                    .context("reporting on an order")?;
-            }
+            Frame::Text(text) => match parse_frame(&text)? {
+                Incoming::Ignored => continue,
+                Incoming::Peek { peek, token } => {
+                    let peek_id = peek.peek_id.clone();
+                    let peeked = on_peek(*peek).await;
+                    socket
+                        .send(Frame::text(peek_receipt(&peek_id, &token, &peeked)))
+                        .await
+                        .context("reporting on a peek")?;
+                }
+                Incoming::Message { message, token } => {
+                    let message_id = message.message_id.clone();
+                    let Some(reply) = on_message(*message).await else {
+                        continue;
+                    };
+                    socket
+                        .send(Frame::text(receipt(&message_id, &token, &reply)))
+                        .await
+                        .context("reporting on an order")?;
+                }
+            },
             Frame::Close(Some(close)) if u16::from(close.code) == CLOSE_REVOKED => return Ok(Ended::Revoked),
             Frame::Close(_) => return Ok(Ended::Closed),
             _ => {}
@@ -160,6 +214,11 @@ mod tests {
 
     const MESSAGE: &str = r#"{"type":"message","message":{"messageId":"m-1","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"ship it","createdAt":1,"expiresAt":1}}"#;
     const ORDER: &str = r#"{"type":"order","token":"t-order","message":{"messageId":"m-2","kind":"order","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"rerun the migration","createdAt":1,"expiresAt":1}}"#;
+    const PEEK: &str = r#"{"type":"peek","token":"t-peek","peek":{"peekId":"p-1","sessionId":"s-9f8a","toDeviceId":"d-here","requestedAt":1}}"#;
+
+    async fn no_peek(_: Peek) -> Peeked {
+        Peeked::NoSession
+    }
 
     #[test]
     fn the_endpoint_becomes_the_listen_url() {
@@ -178,6 +237,20 @@ mod tests {
     fn a_frame_that_is_not_a_message_is_ignored() {
         assert!(matches!(parse_frame(r#"{"type":"hello"}"#).unwrap(), Incoming::Ignored));
         let error = parse_frame(r#"{"type":"message","message":{}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot read"), "{error}");
+    }
+
+    #[test]
+    fn a_peek_names_the_session_to_summarise_and_the_row_the_digest_lands_on() {
+        let Incoming::Peek { peek, token } = parse_frame(PEEK).unwrap() else {
+            panic!("the peek frame was not read as one");
+        };
+        assert_eq!(peek.peek_id, "p-1");
+        assert_eq!(peek.session_id, "s-9f8a");
+        assert_eq!(token, "t-peek");
+        let error = parse_frame(r#"{"type":"peek","token":"t-peek","peek":{}}"#)
             .unwrap_err()
             .to_string();
         assert!(error.contains("cannot read"), "{error}");
@@ -223,10 +296,14 @@ mod tests {
             .await
             .unwrap();
         let mut delivered = Vec::new();
-        let ended = pump(&mut socket, async |message: Message| {
-            delivered.push(message.body);
-            None
-        })
+        let ended = pump(
+            &mut socket,
+            async |message: Message| {
+                delivered.push(message.body);
+                None
+            },
+            no_peek,
+        )
         .await
         .unwrap();
 
@@ -263,14 +340,18 @@ mod tests {
             .await
             .unwrap();
         let mut answered = 0;
-        pump(&mut socket, async |message: Message| {
-            assert!(matches!(message.kind, Kind::Order));
-            answered += 1;
-            Some(match answered {
-                1 => Reply::Took("s-9f8a".to_string()),
-                _ => Reply::NoTaker,
-            })
-        })
+        pump(
+            &mut socket,
+            async |message: Message| {
+                assert!(matches!(message.kind, Kind::Order));
+                answered += 1;
+                Some(match answered {
+                    1 => Reply::Took("s-9f8a".to_string()),
+                    _ => Reply::NoTaker,
+                })
+            },
+            no_peek,
+        )
         .await
         .unwrap();
 
@@ -287,6 +368,71 @@ mod tests {
                 serde_json::json!({ "type": "none", "messageId": "m-2", "token": "t-order" }),
             ]
         );
+    }
+
+    /// A peek is answered either way, like an order, and reaches no session on the way: a host
+    /// that handed it to one would put the summary it asks for into that session's own context.
+    /// The frame it cannot read is the daemon older than peeks reading one of these, which goes on
+    /// taking orders rather than losing the socket.
+    #[tokio::test]
+    async fn a_peek_is_answered_either_way_and_is_never_handed_to_a_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Frame::text(r#"{"type":"whatever"}"#)).await.unwrap();
+            socket.send(Frame::text(PEEK)).await.unwrap();
+            socket.send(Frame::text(PEEK)).await.unwrap();
+            let mut replies = Vec::new();
+            while let Some(frame) = socket.next().await {
+                let Ok(Frame::Text(text)) = frame else { break };
+                replies.push(text.to_string());
+                if replies.len() == 2 {
+                    break;
+                }
+            }
+            socket.close(None).await.unwrap();
+            replies
+        });
+
+        let mut socket = connect(&format!("ws://127.0.0.1:{port}/v2/messages/listen"), "t-token")
+            .await
+            .unwrap();
+        let mut delivered = Vec::new();
+        let mut asked = 0;
+        pump(
+            &mut socket,
+            async |message: Message| {
+                delivered.push(message.message_id);
+                None
+            },
+            async |peek: Peek| {
+                assert_eq!(peek.session_id, "s-9f8a");
+                asked += 1;
+                match asked {
+                    1 => Peeked::Took,
+                    _ => Peeked::NoSession,
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let replies: Vec<Value> = server
+            .await
+            .unwrap()
+            .iter()
+            .map(|reply| serde_json::from_str(reply).unwrap())
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                serde_json::json!({ "type": "peek-took", "peekId": "p-1", "token": "t-peek" }),
+                serde_json::json!({ "type": "peek-none", "peekId": "p-1", "token": "t-peek" }),
+            ]
+        );
+        assert!(delivered.is_empty(), "a peek is no message: {delivered:?}");
     }
 
     #[tokio::test]
@@ -310,7 +456,7 @@ mod tests {
         let mut socket = connect(&format!("ws://127.0.0.1:{port}/v2/messages/listen"), "t-token")
             .await
             .unwrap();
-        let ended = pump(&mut socket, async |_: Message| None).await.unwrap();
+        let ended = pump(&mut socket, async |_: Message| None, no_peek).await.unwrap();
         assert!(matches!(ended, Ended::Revoked));
     }
 }

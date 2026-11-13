@@ -6,7 +6,7 @@ use crate::sessions;
 use crate::settings::Settings;
 use crate::transcripts;
 use crate::watch;
-use crate::ws::{self, Ended, Reply};
+use crate::ws::{self, Ended, Peeked, Reply};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::Serialize;
@@ -19,7 +19,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -133,20 +133,23 @@ pub fn ensure(path: &Path, spawn: impl FnOnce() -> Result<()>) -> Result<bool> {
     Ok(true)
 }
 
-fn spawn_daemon() -> Result<()> {
-    let exe = std::env::current_exe().context("finding the recall binary")?;
-    let mut command = Command::new(&exe);
-    command
-        .arg("listen")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+/// A session of its own with nothing to write to, so the run outlives whatever started it and
+/// reports through the hooks log.
+fn detached(command: &mut Command) {
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     unsafe {
         command.pre_exec(|| match libc::setsid() {
             -1 => Err(std::io::Error::last_os_error()),
             _ => Ok(()),
         });
     }
+}
+
+fn spawn_daemon() -> Result<()> {
+    let exe = std::env::current_exe().context("finding the recall binary")?;
+    let mut command = Command::new(&exe);
+    command.arg("listen");
+    detached(&mut command);
     command
         .spawn()
         .with_context(|| format!("starting {} listen", exe.display()))?;
@@ -281,12 +284,91 @@ async fn order(message: &Message, sessions_dir: &Path, body: &str, started: Inst
     reply
 }
 
+/// The subcommand of its own binary the daemon starts a summariser as.
+pub const PEEK_RUN: &str = "peek-run";
+
+/// What the summariser is started as: the session to read and the row the digest lands on, and
+/// nothing else. The run reads the transcript through the registry, so no path and no transcript
+/// ever travels on a command line.
+fn peek_command(exe: &Path, session_id: &str, peek_id: &str) -> Command {
+    let mut command = Command::new(exe);
+    command.arg(PEEK_RUN).arg(session_id).arg(peek_id);
+    command
+}
+
+/// Waits on the summariser where it cannot hold the pump up. A child nobody waits on stays a
+/// zombie for as long as this daemon runs, and its exit is the only notice a summariser that
+/// failed on the host leaves.
+fn reap(mut child: Child, peek_id: String) {
+    let started = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        let outcome = match child.wait() {
+            Ok(status) if status.success() => format!("peek:{peek_id}:summarised"),
+            Ok(status) => format!("peek:{peek_id}:summariser-failed:{status}"),
+            Err(error) => format!("peek:{peek_id}:summariser-lost:{error}"),
+        };
+        log(&outcome, started.elapsed());
+    });
+}
+
+/// Whether this host runs the session a peek names and can still read its transcript. The registry
+/// holds this host's sessions and nothing else, and the summariser reads the transcript the record
+/// names, so a record naming none is nothing to summarise from.
+fn summarisable(sessions_dir: &Path, session_id: &str) -> bool {
+    sessions::record(sessions_dir, session_id)
+        .map(|record| record.transcript_path)
+        .is_some_and(|path| !path.as_os_str().is_empty() && path.exists())
+}
+
+/// A peek asks what one session is doing, and is answered the way an order is: at once, either
+/// way. The summariser runs as a process of its own and puts the digest up itself, so the peek
+/// reaches no session's inbox and the session it asks about carries none of it in its context.
+fn peek(exe: &Path, order: &ws::Peek, sessions_dir: &Path) -> Peeked {
+    let started = Instant::now();
+    let id = &order.peek_id;
+    let session_id = &order.session_id;
+    if !summarisable(sessions_dir, session_id) {
+        log(&format!("peek:{id}:{session_id}:no-session"), started.elapsed());
+        return Peeked::NoSession;
+    }
+    let mut command = peek_command(exe, session_id, id);
+    detached(&mut command);
+    match command.spawn() {
+        Ok(child) => {
+            reap(child, id.clone());
+            log(&format!("peek:{id}:{session_id}:started"), started.elapsed());
+            Peeked::Took
+        }
+        Err(error) => {
+            log(
+                &format!("peek:{id}:{session_id}:start-failed:{error}"),
+                started.elapsed(),
+            );
+            Peeked::NoSession
+        }
+    }
+}
+
+pub const NO_SUMMARISER: &str =
+    "this recall reads a peek but cannot summarise one yet, so the peek keeps no digest; update recall on this host";
+
+/// The other half of the detached run, which the release after this one fills in. It writes
+/// nothing to the service and nothing to the session, so a peek it was started for is left with
+/// the empty digest the asker already reads back.
+pub fn peek_run(session_id: &str, peek_id: &str) -> Result<()> {
+    log(&format!("peek:{peek_id}:{session_id}:no-summariser"), Duration::ZERO);
+    bail!("{NO_SUMMARISER}")
+}
+
 async fn session(url: &str, token: &str, sessions_dir: &Path, seen: &mut Seen) -> Result<Ended> {
+    let exe = std::env::current_exe().context("finding the recall binary")?;
     let mut socket = ws::connect(url, token).await?;
     log("listen:connected", Duration::ZERO);
-    ws::pump(&mut socket, async |message: Message| {
-        deliver(&message, sessions_dir, seen).await
-    })
+    ws::pump(
+        &mut socket,
+        async |message: Message| deliver(&message, sessions_dir, seen).await,
+        async |order: ws::Peek| peek(&exe, &order, sessions_dir),
+    )
     .await
 }
 
@@ -1127,5 +1209,63 @@ mod tests {
         );
         assert_eq!(spawned, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The summariser runs this daemon's own binary on the session and the peek, and is handed
+    /// nothing else: the transcript it reads it finds through the registry, so no path and no
+    /// line of a transcript ever travels on a command line.
+    #[test]
+    fn the_summariser_is_started_as_this_binary_on_the_session_and_the_peek() {
+        let command = peek_command(Path::new("/usr/local/bin/recall"), "s-9f8a", "p-1");
+
+        assert_eq!(command.get_program(), "/usr/local/bin/recall");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect::<Vec<&str>>(),
+            vec![PEEK_RUN, "s-9f8a", "p-1"]
+        );
+    }
+
+    /// A session of this host, as its hooks wrote it into the registry, with the transcript the
+    /// summariser reads.
+    fn registered(registry: &Path, session_id: &str) {
+        let transcript = registry.join(format!("{session_id}.jsonl"));
+        std::fs::write(&transcript, "").unwrap();
+        let mut record = status(session_id, "/src/recall", sessions::State::Adopted).record;
+        record.transcript_path = transcript;
+        std::fs::write(
+            registry.join(format!("{session_id}.json")),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A peek is answered either way and at once, like an order. The one it is answered for starts
+    /// the summariser detached, and the asker reads the digest back off the service; a session
+    /// this host is not running has nothing here to read, and a binary that will not start is the
+    /// same answer, since a host that said it took one would leave the asker waiting on a digest
+    /// nothing is writing.
+    #[tokio::test]
+    async fn a_peek_starts_a_summariser_for_a_session_this_host_runs_and_answers_none_for_the_rest() {
+        let registry = sandbox("peek");
+        registered(&registry, "s-9f8a");
+        let asked = |session_id: &str| ws::Peek {
+            peek_id: "p-1".to_string(),
+            session_id: session_id.to_string(),
+        };
+
+        assert_eq!(peek(Path::new("/bin/true"), &asked("s-9f8a"), &registry), Peeked::Took);
+        assert_eq!(
+            peek(Path::new("/bin/true"), &asked("s-elsewhere"), &registry),
+            Peeked::NoSession
+        );
+        assert_eq!(
+            peek(&registry.join("no-recall-here"), &asked("s-9f8a"), &registry),
+            Peeked::NoSession
+        );
+
+        let _ = std::fs::remove_dir_all(&registry);
     }
 }
