@@ -621,6 +621,15 @@ export type PeekWrite = "written" | "held" | "missing";
 // arriving late is told it lost rather than overwriting it. RETURNING is what counts the rows an
 // update reached, as `endSession` says; the row is read back only where the update reached none,
 // which is the one reading the predicate cannot tell apart on its own.
+const PEEK_FIELDS = {
+  peekId: sessionPeeks.peekId,
+  digest: sessionPeeks.digest,
+  requestedAt: sessionPeeks.requestedAt,
+};
+
+const peekNamed = (userId: string, sessionId: string, peekId: string) =>
+  and(eq(sessionPeeks.userId, userId), eq(sessionPeeks.sessionId, sessionId), eq(sessionPeeks.peekId, peekId));
+
 export const writePeek = async (
   db: TenantDb,
   userId: string,
@@ -628,11 +637,7 @@ export const writePeek = async (
   peekId: string,
   digest: string,
 ): Promise<PeekWrite> => {
-  const named = and(
-    eq(sessionPeeks.userId, userId),
-    eq(sessionPeeks.sessionId, sessionId),
-    eq(sessionPeeks.peekId, peekId),
-  );
+  const named = peekNamed(userId, sessionId, peekId);
   const written = db
     .update(sessionPeeks)
     .set({ digest })
@@ -646,11 +651,19 @@ export const writePeek = async (
 
 export const listPeeks = async (db: TenantDb, userId: string, sessionId: string): Promise<Peek[]> =>
   db
-    .select({ peekId: sessionPeeks.peekId, digest: sessionPeeks.digest, requestedAt: sessionPeeks.requestedAt })
+    .select(PEEK_FIELDS)
     .from(sessionPeeks)
     .where(and(eq(sessionPeeks.userId, userId), eq(sessionPeeks.sessionId, sessionId)))
     .orderBy(desc(sessionPeeks.requestedAt), desc(sessionPeeks.peekId))
     .all();
+
+// The one peek a read back is waiting on, which is the row it already knows the id of.
+export const readPeek = async (db: TenantDb, userId: string, sessionId: string, peekId: string): Promise<Peek | null> =>
+  db
+    .select(PEEK_FIELDS)
+    .from(sessionPeeks)
+    .where(peekNamed(userId, sessionId, peekId))
+    .get() ?? null;
 
 // `live` is the moment a session counts as gone.
 const pastSessionsFrom = (db: TenantDb, live: number) =>

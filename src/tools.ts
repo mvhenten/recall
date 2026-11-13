@@ -212,7 +212,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_peek",
     description:
-      "Ask one Claude Code session on a host signed in as this user what it is working on right now. A side process on that session's host summarises the end of its transcript and writes the digest back: the session is not interrupted, is not messaged, and carries none of this in its context, so a peek costs that session nothing. Returns the peek with state Ready and the digest once its host has answered, which takes a few seconds, and state Pending where it had not answered in that time; calling again asks the session afresh. Use it to see what a session is doing before sending it anything with recall_send.",
+      "Ask one Claude Code session on a host signed in as this user what it is working on right now. A side process on that session's host summarises the end of its transcript and writes the digest back: the session is not interrupted, is not messaged, and carries none of this in its context, so a peek costs that session nothing. Returns the peek with state Ready and the digest once its host has answered, which takes a few seconds, and state Pending where it had not answered in that time. Use it to see what a session is doing before sending it anything with recall_send.",
     inputSchema: schema(
       {
         session: text(
@@ -408,14 +408,14 @@ export const PEEK_WAIT_MS = 2_000;
 // never lands, so a request still pending reads as the request it is.
 export const readBackPeek = async (
   asked: V2Peek,
-  peeks: () => Promise<V2Peek[]>,
+  read: () => Promise<V2Peek | null>,
   wait: (ms: number) => Promise<void>,
 ): Promise<V2Peek> => {
   let held = asked;
-  for (let read = 0; read < PEEK_READS; read += 1) {
+  for (let taken = 0; taken < PEEK_READS; taken += 1) {
     await wait(PEEK_WAIT_MS);
-    const found = (await peeks()).find((peek) => peek.peekId === held.peekId);
-    if (found === undefined) return held;
+    const found = await read();
+    if (found === null) return held;
     if (found.state === "Ready") return found;
     held = found;
   }

@@ -276,6 +276,7 @@ import {
   type RevokeScope,
   readInsights,
   readLabels,
+  readPeek,
   readStats,
   recall,
   recordReach,
@@ -319,6 +320,7 @@ import {
   renderMemory,
   resolveTarget,
   SEARCH_LIMIT,
+  type SendTarget,
   sessionDigest,
   TOOLS,
   toolArguments,
@@ -2231,6 +2233,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // timer src/mailbox.ts already waits on for a receipt.
   const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+  // Who a tool is addressing, read off the two listings a send and a peek both resolve against.
+  // api::resolve_target reads the same two in the same order on the stdio side.
+  const addressed = async (env: TenantEnv, userId: string, to: string, now: number): Promise<Parsed<SendTarget>> => {
+    const [devices, sessions, labels] = await Promise.all([
+      listDevices(env.ACCOUNT, userId),
+      listSessions(env.DB, userId, now),
+      readLabels(env.DB, userId),
+    ]);
+    return resolveTarget(devices, labels, sessions, to);
+  };
+
   const runTool = (env: TenantEnv, caller: Caller): RunTool => {
     // Every tool but the two listings and the send one reads or writes a memory, which is a row of
     // this account's own.
@@ -2321,12 +2334,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         if (!asking.ok) return refused(asking.error);
         const { session } = asking.value;
         const at = deps.now();
-        const [devices, sessions, labels] = await Promise.all([
-          listDevices(env.ACCOUNT, userId),
-          listSessions(db, userId, at),
-          readLabels(db, userId),
-        ]);
-        const peeked = resolveTarget(devices, labels, sessions, session);
+        const peeked = await addressed(env, userId, session, at);
         if (!peeked.ok) return refused(peeked.error);
         const { toSessionId } = peeked.value;
         if (toSessionId === "") {
@@ -2341,7 +2349,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         }
         const peek = await readBackPeek(
           asked.peek,
-          async () => (await listPeeks(db, userId, toSessionId)).map(peekView),
+          async () => {
+            const read = await readPeek(db, userId, toSessionId, asked.peek.peekId);
+            return read === null ? null : peekView(read);
+          },
           delay,
         );
         return document({ sessionId: toSessionId, peek });
@@ -2349,12 +2360,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       const input = parseSendArgs(args.value);
       if (!input.ok) return refused(input.error);
       const now = deps.now();
-      const [devices, sessions, labels] = await Promise.all([
-        listDevices(env.ACCOUNT, userId),
-        listSessions(env.DB, userId, now),
-        readLabels(env.DB, userId),
-      ]);
-      const target = resolveTarget(devices, labels, sessions, input.value.to);
+      const target = await addressed(env, userId, input.value.to, now);
       if (!target.ok) return refused(target.error);
       if (new TextEncoder().encode(input.value.message).byteLength > MAX_BODY_BYTES) {
         return refused(`message must hold at most ${MAX_BODY_BYTES} bytes`);

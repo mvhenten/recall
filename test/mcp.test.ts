@@ -28,8 +28,14 @@ const peekable = async () => {
 
 // A host that takes every peek it is handed and writes the digest its summariser would have
 // written, one per peek in the order they arrive. A peek past the digests given is taken and left
-// pending, which is a host whose summariser has not answered yet.
-const summarising = async (h: Harness, token: string, host: Client, digests: string[]): Promise<PeekOrder[]> => {
+// pending, which is a host whose summariser has not answered yet. `written` carries each write, so
+// a test reads what the service made of it rather than watching the read back time out.
+interface Summariser {
+  handed: PeekOrder[];
+  written: Array<Promise<Response>>;
+}
+
+const summarising = async (h: Harness, token: string, host: Client, digests: string[]): Promise<Summariser> => {
   const response = await h.send("/v2/messages/listen", {
     headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
@@ -37,17 +43,19 @@ const summarising = async (h: Harness, token: string, host: Client, digests: str
   const socket = response.webSocket;
   if (!socket) throw new Error("the listen upgrade carried no socket");
   socket.accept();
-  const handed: PeekOrder[] = [];
+  const summariser: Summariser = { handed: [], written: [] };
   socket.addEventListener("message", (event) => {
     const frame: PeekFrame = JSON.parse(String(event.data));
     if (frame.type !== "peek") return;
-    handed.push(frame.peek);
+    summariser.handed.push(frame.peek);
     socket.send(JSON.stringify({ type: "peek-took", peekId: frame.peek.peekId, token: frame.token }));
-    const digest = digests[handed.length - 1];
+    const digest = digests[summariser.handed.length - 1];
     if (digest === undefined) return;
-    void host.request("PUT", `/v2/sessions/${frame.peek.sessionId}/peek/${frame.peek.peekId}`, { digest });
+    summariser.written.push(
+      host.request("PUT", `/v2/sessions/${frame.peek.sessionId}/peek/${frame.peek.peekId}`, { digest }),
+    );
   });
-  return handed;
+  return summariser;
 };
 
 const history = async (host: Client, sessionId: string): Promise<V2Peek[]> => {
@@ -406,7 +414,7 @@ describe("peeking from the connector", () => {
   // what each one answered with.
   it("asks one session and answers the digest its host wrote", async () => {
     const { h, mcp, laptop, token, sessionId } = await peekable();
-    const handed = await summarising(h, token, laptop, ["running the tenant migration", "reading the transcript"]);
+    const host = await summarising(h, token, laptop, ["running the tenant migration", "reading the transcript"]);
     const [session] = (await mcp.json("recall_sessions")) as Array<{ handle: string }>;
 
     const first = (await mcp.json("recall_peek", { session: session?.handle ?? "" })) as {
@@ -423,7 +431,9 @@ describe("peeking from the connector", () => {
     expect(second.peek).toMatchObject({ state: "Ready", digest: "reading the transcript" });
     expect(second.peek.peekId).not.toBe(first.peek.peekId);
 
-    expect(handed.map((peek) => peek.peekId)).toEqual([first.peek.peekId, second.peek.peekId]);
+    const written = await Promise.all(host.written);
+    expect(written.map((response) => response.status)).toEqual([204, 204]);
+    expect(host.handed.map((peek) => peek.peekId)).toEqual([first.peek.peekId, second.peek.peekId]);
     expect(await history(laptop, sessionId)).toEqual([second.peek, first.peek]);
   }, 30_000);
 
@@ -462,11 +472,11 @@ describe("reading a peek back", () => {
 
   it("waits before every read and stops at the digest", async () => {
     const waits: number[] = [];
-    const reads = [[pending], [pending], [ready]];
+    const reads = [pending, pending, ready];
 
     const peek = await readBackPeek(
       pending,
-      () => Promise.resolve(reads.shift() ?? []),
+      () => Promise.resolve(reads.shift() ?? null),
       (ms) => {
         waits.push(ms);
         return Promise.resolve();
@@ -484,12 +494,24 @@ describe("reading a peek back", () => {
       pending,
       () => {
         reads += 1;
-        return Promise.resolve([pending]);
+        return Promise.resolve(pending);
       },
       () => Promise.resolve(),
     );
 
     expect(peek).toEqual(pending);
     expect(reads).toBe(PEEK_READS);
+  });
+
+  // A peek trimmed out of the history while its host was still summarising has nothing left to
+  // read, and the request the caller asked for is what it reads as.
+  it("answers the request it asked where the peek is gone", async () => {
+    const peek = await readBackPeek(
+      pending,
+      () => Promise.resolve(null),
+      () => Promise.resolve(),
+    );
+
+    expect(peek).toEqual(pending);
   });
 });
