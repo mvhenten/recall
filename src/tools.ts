@@ -18,7 +18,9 @@ import {
 // current repo's first and here it ranks by score alone, and a project or reference save is
 // refused here rather than tagged. A tool added to one side is therefore a known gap on the other
 // until it is added there too. The tools that take a path on disk are not here at all: this end
-// holds no working copy.
+// holds no working copy. The two listings are this end's own: a harness with a shell runs recall
+// sessions and recall devices for them, and one without a shell had no way at all to learn what it
+// can send to.
 
 export interface SearchArgs {
   query: string;
@@ -175,13 +177,25 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: NAME_SCHEMA,
   },
   {
+    name: "recall_sessions",
+    description:
+      "List the live Claude Code sessions on every host signed in as this user, newest activity first. Each one names the handle recall_send takes, the host it runs on, the directory it works in and what it is working on.",
+    inputSchema: schema({}),
+  },
+  {
+    name: "recall_devices",
+    description:
+      "List the hosts signed in as this user. Each one names a host recall_send reaches every live session on, by its label, its device name or its device id.",
+    inputSchema: schema({}),
+  },
+  {
     name: "recall_send",
     description:
-      "Message one Claude Code session running on a host signed in as this user, named by the handle recall sessions prints, or every session on a host named by its label or as recall devices shows it. The message arrives as a user turn there.",
+      "Message one Claude Code session running on a host signed in as this user, named by the handle recall_sessions shows, or every session on a host named by its label or as recall_devices shows it. The message arrives as a user turn there.",
     inputSchema: schema(
       {
         to: text(
-          "The session to reach, named by the handle recall sessions shows, or a host to reach every session on it.",
+          "The session to reach, named by the handle recall_sessions shows, or a host to reach every session on it.",
         ),
         message: text("The message to deliver there."),
       },
@@ -395,7 +409,7 @@ export const resolveTarget = (
   }
   if (addressed.length === 0) {
     return fail(
-      `no host or session named ${to}; recall devices lists the hosts signed in as you and recall sessions the handle of each live session`,
+      `no host or session named ${to}; recall_devices lists the hosts signed in as you and recall_sessions the handle of each live session`,
     );
   }
   return fail(

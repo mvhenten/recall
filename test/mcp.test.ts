@@ -30,12 +30,14 @@ describe("the connector handshake", () => {
     const tools = (listed.result as { tools: Array<{ name: string; inputSchema: unknown }> }).tools;
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       "recall_delete",
+      "recall_devices",
       "recall_edit",
       "recall_get",
       "recall_list",
       "recall_save",
       "recall_search",
       "recall_send",
+      "recall_sessions",
     ]);
     expect(tools.every((tool) => tool.inputSchema !== undefined)).toBe(true);
   });
@@ -273,6 +275,21 @@ describe("the connector's tools", () => {
       .tool("recall_search", { query: "q", tags: ["style"] })
       .catch((error: Error) => error.message);
     expect(gone).toBe("recall: recall_search takes no argument tags");
+  });
+
+  it("lists the live sessions and the hosts a send can be addressed to", async () => {
+    const { h, email, mcp } = await signedIn();
+    const client = h.clientWithToken(await h.login(email, "laptop"));
+    expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now() })).status).toBe(204);
+
+    const sessions = (await mcp.json("recall_sessions")) as Array<{ sessionId: string; host: string; name: string }>;
+    expect(sessions.map((session) => [session.sessionId, session.host])).toEqual([["s-ship", "laptop"]]);
+    expect(await mcp.json("recall_send", { to: sessions[0]?.name ?? "", message: "ship it" })).toMatchObject({
+      toSessionId: "s-ship",
+    });
+
+    const devices = (await mcp.json("recall_devices")) as Array<{ name: string; hostLabel: string }>;
+    expect(devices.map((device) => [device.name, device.hostLabel])).toEqual([["laptop", "laptop"]]);
   });
 
   it("sends a message to a host and never reads as one itself", async () => {

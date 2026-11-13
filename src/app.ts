@@ -2187,7 +2187,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const runTool = (env: TenantEnv, caller: Caller): RunTool => {
-    // Every tool but the send one reads or writes a memory, which is a row of this account's own.
+    // Every tool but the two listings and the send one reads or writes a memory, which is a row of
+    // this account's own.
     const db = env.DB;
     const { userId } = caller;
     const refused = (reason: string): ToolResult => ({ ok: false, error: `recall: ${reason}` });
@@ -2258,6 +2259,16 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         if (memory === null) return refused(`no memory named ${input.value.name}`);
         await deleteMemory(db, userId, memory.memoryId);
         return document({ deleted: memory.name });
+      }
+      // The two listings answer what `recall sessions` and `recall devices` print, off the same
+      // reads the routes behind those commands make.
+      if (call.name === "recall_sessions") {
+        const [listed, labels] = await Promise.all([listSessions(db, userId, deps.now()), readLabels(db, userId)]);
+        return document(listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)));
+      }
+      if (call.name === "recall_devices") {
+        const [listed, labels] = await Promise.all([listDevices(env.ACCOUNT, userId), readLabels(db, userId)]);
+        return document(listed.map((device) => deviceView(device, labels.hosts, caller.deviceId)));
       }
       const input = parseSendArgs(args.value);
       if (!input.ok) return refused(input.error);
