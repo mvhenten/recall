@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { NO_PEEK_LISTENING, ORDERS, ORDERS_HEADER, type PeekFrame, type PeekOrder } from "../src/mailbox";
 import { MCP_PATH } from "../src/mcp";
-import { TOOLS } from "../src/tools";
-import { harness, MCP_PROTOCOL_VERSION } from "./harness";
+import { PEEK_READS, PEEK_WAIT_MS, readBackPeek, TOOLS } from "../src/tools";
+import type { V2Peek } from "../src/v2";
+import { type Client, harness, MCP_PROTOCOL_VERSION } from "./harness";
 
 const MODERN = "2026-07-28";
 const MODERN_META = { "io.modelcontextprotocol/protocolVersion": MODERN };
@@ -10,6 +12,49 @@ const signedIn = async () => {
   const h = await harness();
   const email = await h.invite(`owner-${crypto.randomUUID()}@example.com`);
   return { h, email, mcp: await h.connector(email) };
+};
+
+type Harness = Awaited<ReturnType<typeof harness>>;
+
+// One live session on one host of the same account, which is what a peek is asked of.
+const peekable = async () => {
+  const signed = await signedIn();
+  const token = await signed.h.login(signed.email, "laptop");
+  const laptop = signed.h.clientWithToken(token);
+  const sessionId = `laptop-${crypto.randomUUID()}`;
+  expect((await laptop.sync(sessionId, { host: "laptop", lastActivityAt: signed.h.now() })).status).toBe(204);
+  return { ...signed, laptop, token, sessionId };
+};
+
+// A host that takes every peek it is handed and writes the digest its summariser would have
+// written, one per peek in the order they arrive. A peek past the digests given is taken and left
+// pending, which is a host whose summariser has not answered yet.
+const summarising = async (h: Harness, token: string, host: Client, digests: string[]): Promise<PeekOrder[]> => {
+  const response = await h.send("/v2/messages/listen", {
+    headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
+  });
+  expect(response.status).toBe(101);
+  const socket = response.webSocket;
+  if (!socket) throw new Error("the listen upgrade carried no socket");
+  socket.accept();
+  const handed: PeekOrder[] = [];
+  socket.addEventListener("message", (event) => {
+    const frame: PeekFrame = JSON.parse(String(event.data));
+    if (frame.type !== "peek") return;
+    handed.push(frame.peek);
+    socket.send(JSON.stringify({ type: "peek-took", peekId: frame.peek.peekId, token: frame.token }));
+    const digest = digests[handed.length - 1];
+    if (digest === undefined) return;
+    void host.request("PUT", `/v2/sessions/${frame.peek.sessionId}/peek/${frame.peek.peekId}`, { digest });
+  });
+  return handed;
+};
+
+const history = async (host: Client, sessionId: string): Promise<V2Peek[]> => {
+  const response = await host.request("GET", `/v2/sessions/${sessionId}/peek`);
+  expect(response.status).toBe(200);
+  const read: { peeks: V2Peek[] } = await response.json();
+  return read.peeks;
 };
 
 describe("the connector handshake", () => {
@@ -34,6 +79,7 @@ describe("the connector handshake", () => {
       "recall_edit",
       "recall_get",
       "recall_list",
+      "recall_peek",
       "recall_save",
       "recall_search",
       "recall_send",
@@ -352,5 +398,95 @@ describe("the connector's tools", () => {
     const one = listed.sessions[0];
     const answered = await mcp.json("recall_send", { to: (one?.name ?? "").toUpperCase(), message: "ship it" });
     expect(answered).toMatchObject({ toSessionId: one?.sessionId, sessions: 1, handles: [one?.name] });
+  });
+});
+
+describe("peeking from the connector", () => {
+  // Each call asks once and reads the answer back, so two calls are two peeks and the history holds
+  // what each one answered with.
+  it("asks one session and answers the digest its host wrote", async () => {
+    const { h, mcp, laptop, token, sessionId } = await peekable();
+    const handed = await summarising(h, token, laptop, ["running the tenant migration", "reading the transcript"]);
+    const [session] = (await mcp.json("recall_sessions")) as Array<{ handle: string }>;
+
+    const first = (await mcp.json("recall_peek", { session: session?.handle ?? "" })) as {
+      sessionId: string;
+      peek: V2Peek;
+    };
+    expect(first.sessionId).toBe(sessionId);
+    expect(first.peek).toMatchObject({ state: "Ready", digest: "running the tenant migration" });
+
+    const second = (await mcp.json("recall_peek", { session: sessionId })) as { sessionId: string; peek: V2Peek };
+    expect(second.peek).toMatchObject({ state: "Ready", digest: "reading the transcript" });
+    expect(second.peek.peekId).not.toBe(first.peek.peekId);
+
+    expect(handed.map((peek) => peek.peekId)).toEqual([first.peek.peekId, second.peek.peekId]);
+    expect(await history(laptop, sessionId)).toEqual([second.peek, first.peek]);
+  }, 30_000);
+
+  // Nothing is kept for a host that attaches later, so a peek nobody took has nothing to read back
+  // and the caller is told what the bus made of it.
+  it("names the reason no host took the peek", async () => {
+    const { mcp, sessionId } = await peekable();
+
+    const refused = await mcp.tool("recall_peek", { session: sessionId }).catch((error: Error) => error.message);
+
+    expect(refused).toBe(`recall: no host took the peek of ${sessionId}: ${NO_PEEK_LISTENING}`);
+  });
+
+  it("refuses a host, which recall_send takes and one summariser cannot answer for", async () => {
+    const { h, mcp, laptop, token } = await peekable();
+    await summarising(h, token, laptop, []);
+
+    const refused = await mcp.tool("recall_peek", { session: "laptop" }).catch((error: Error) => error.message);
+
+    expect(refused).toContain("laptop names a host, and a peek asks one session");
+  });
+
+  it("refuses a session this account is not running", async () => {
+    const { mcp } = await peekable();
+
+    const refused = await mcp.tool("recall_peek", { session: "s-gone" }).catch((error: Error) => error.message);
+
+    expect(refused).toContain("no host or session named s-gone");
+  });
+});
+
+// The read back itself, which the tool runs with a two second wait and a test with none.
+describe("reading a peek back", () => {
+  const pending: V2Peek = { peekId: "p-1", state: "Pending", digest: "", requestedAt: "2026-01-01T00:00:00Z" };
+  const ready: V2Peek = { ...pending, state: "Ready", digest: "running the tenant migration" };
+
+  it("waits before every read and stops at the digest", async () => {
+    const waits: number[] = [];
+    const reads = [[pending], [pending], [ready]];
+
+    const peek = await readBackPeek(
+      pending,
+      () => Promise.resolve(reads.shift() ?? []),
+      (ms) => {
+        waits.push(ms);
+        return Promise.resolve();
+      },
+    );
+
+    expect(peek).toEqual(ready);
+    expect(waits).toEqual([PEEK_WAIT_MS, PEEK_WAIT_MS, PEEK_WAIT_MS]);
+  });
+
+  it("answers the request it asked where the digest never lands", async () => {
+    let reads = 0;
+
+    const peek = await readBackPeek(
+      pending,
+      () => {
+        reads += 1;
+        return Promise.resolve([pending]);
+      },
+      () => Promise.resolve(),
+    );
+
+    expect(peek).toEqual(pending);
+    expect(reads).toBe(PEEK_READS);
   });
 });

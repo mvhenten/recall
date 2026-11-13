@@ -99,7 +99,15 @@ import {
   userForEmail,
 } from "./device";
 import { ARTIFACT_SORTS, CURSOR_PARAM, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortInForce } from "./listing";
-import { DEVICE_HEADER, MAX_BODY_BYTES, type Mailbox, ORDERS_HEADER, type Sender, type SendInput } from "./mailbox";
+import {
+  DEVICE_HEADER,
+  MAX_BODY_BYTES,
+  type Mailbox,
+  ORDERS_HEADER,
+  type Outcome,
+  type Sender,
+  type SendInput,
+} from "./mailbox";
 import { render } from "./markdown";
 import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
 import {
@@ -303,9 +311,11 @@ import {
   parseEditArgs,
   parseListArgs,
   parseNameArgs,
+  parsePeekArgs,
   parseSaveArgs,
   parseSearchArgs,
   parseSendArgs,
+  readBackPeek,
   renderMemory,
   resolveTarget,
   SEARCH_LIMIT,
@@ -336,6 +346,7 @@ import {
   sessionHitView,
   sessionView,
   type V2Device,
+  type V2Peek,
   type V2RecordsAccepted,
   type V2RecordsConflict,
   type V2Session,
@@ -2195,6 +2206,31 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return new Response(null, { status: 204 });
   };
 
+  // One peek asked of one session: the row the asker writes, and what the bus made of handing it to
+  // the host the session runs on. A session this account is not running right now is no peek at
+  // all, since the transcript the summariser reads lives on that host.
+  interface AskedPeek {
+    peek: V2Peek;
+    outcome: Outcome;
+  }
+
+  const askPeek = async (env: TenantEnv, userId: string, sessionId: string, now: number): Promise<AskedPeek | null> => {
+    const toDeviceId = await liveSessionDevice(env.DB, userId, sessionId, now);
+    if (toDeviceId === null) return null;
+    const peek = await requestPeek(env.DB, userId, sessionId, crypto.randomUUID(), now);
+    const outcome = await mailboxFor(env, userId).peek({
+      peekId: peek.peekId,
+      sessionId,
+      toDeviceId,
+      requestedAt: now,
+    });
+    return { peek: peekView(peek), outcome };
+  };
+
+  // The wait a read back takes between reads. The Worker has no thread to sleep, so it waits on the
+  // timer src/mailbox.ts already waits on for a receipt.
+  const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
   const runTool = (env: TenantEnv, caller: Caller): RunTool => {
     // Every tool but the two listings and the send one reads or writes a memory, which is a row of
     // this account's own.
@@ -2276,6 +2312,39 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       }
       if (call.name === "recall_devices") {
         return document((await listedDevices(env, caller)).map(deviceDigest));
+      }
+      // A peek asks and then reads back, since the digest is written by the host and never by the
+      // call that asked for it. A peek no host took is an error: nothing is kept for a host that
+      // attaches later, so there is nothing to read back and the caller is told why.
+      if (call.name === "recall_peek") {
+        const asking = parsePeekArgs(args.value);
+        if (!asking.ok) return refused(asking.error);
+        const { session } = asking.value;
+        const at = deps.now();
+        const [devices, sessions, labels] = await Promise.all([
+          listDevices(env.ACCOUNT, userId),
+          listSessions(db, userId, at),
+          readLabels(db, userId),
+        ]);
+        const peeked = resolveTarget(devices, labels, sessions, session);
+        if (!peeked.ok) return refused(peeked.error);
+        const { toSessionId } = peeked.value;
+        if (toSessionId === "") {
+          return refused(
+            `${session} names a host, and a peek asks one session; name a session as recall_sessions shows it`,
+          );
+        }
+        const asked = await askPeek(env, userId, toSessionId, at);
+        if (asked === null) return refused(`no session ${toSessionId} running on this account`);
+        if (asked.outcome.state === "untaken") {
+          return refused(`no host took the peek of ${session}: ${asked.outcome.reason}`);
+        }
+        const peek = await readBackPeek(
+          asked.peek,
+          async () => (await listPeeks(db, userId, toSessionId)).map(peekView),
+          delay,
+        );
+        return document({ sessionId: toSessionId, peek });
       }
       const input = parseSendArgs(args.value);
       if (!input.ok) return refused(input.error);
@@ -2629,19 +2698,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       return json({ peeks: (await listPeeks(db, userId, sessionId)).map(peekView) });
     }
     if (request.method !== "POST") return error(405, "method not allowed");
-    const now = deps.now();
     // A peek reads the tail of a transcript on the host the session runs on, so a session that is
     // over or that this account never had is a 404 and never a request nobody can answer.
-    const toDeviceId = await liveSessionDevice(db, userId, sessionId, now);
-    if (toDeviceId === null) return error(404, `no session ${sessionId} running on this account`);
-    const peek = await requestPeek(db, userId, sessionId, crypto.randomUUID(), now);
-    const outcome = await mailboxFor(env, userId).peek({
-      peekId: peek.peekId,
-      sessionId,
-      toDeviceId,
-      requestedAt: now,
-    });
-    return json({ peek: peekView(peek), outcome }, 201);
+    const asked = await askPeek(env, userId, sessionId, deps.now());
+    if (asked === null) return error(404, `no session ${sessionId} running on this account`);
+    return json(asked, 201);
   };
 
   const v2Sessions = async (
