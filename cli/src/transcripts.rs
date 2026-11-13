@@ -677,7 +677,8 @@ pub struct Archive {
 
 /// One file as a pass left it: the record the archive answered that it waits at, the size and
 /// content hash it was reached over, whether the pass that sent it was the final one, and whether
-/// it stopped with records still to send.
+/// it stopped with records still to send. A file that was not there at all is left at the size
+/// nothing has and under no hash, which is an account no file on disk can match.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Uploaded {
     sha256: String,
@@ -686,6 +687,19 @@ struct Uploaded {
     #[serde(rename = "final")]
     last: bool,
     more: bool,
+}
+
+/// Whether nothing at all sits at a path. A file a session wrote and something then deleted is not
+/// coming back by being asked for again, so it is the one reading that ends a file rather than
+/// failing it. Every other reason a file cannot be read is a reason that may not hold next pass —
+/// a directory chmodded shut, a disk that answered an error — so only not-found is terminal and
+/// everything else stays the loud failure it was.
+fn missing(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 fn sha256(path: &Path) -> Result<String> {
@@ -744,6 +758,12 @@ impl Archive {
     /// the session has gone up. The name is nothing a later pass changes, so answering on every
     /// beat would say the same thing for as long as the session runs and hold back the files the
     /// session is still writing for exactly as long.
+    ///
+    /// A file that is not on this host at all is no failure of the pass: a session whose
+    /// transcript was deleted or rotated under it keeps its record in the registry for as long as
+    /// its Claude process lives, so a pass that failed on the missing file would fail on it again
+    /// every beat until then. The account is left at the size nothing has, and the passes behind
+    /// this one skip the file for as long as there is nothing there.
     pub fn send(&mut self, store: &impl Store, session_id: &str, transcript: &Path, pass: Pass) -> Result<i64> {
         if transcript.as_os_str().is_empty() {
             return Ok(0);
@@ -793,6 +813,11 @@ impl Archive {
     /// many records went up. The place it reaches is kept whether or not the pass that reached it
     /// got to the end of the file, so a file the service will never take whole costs the appends
     /// in front of the record that stops it exactly once.
+    ///
+    /// A file that is not there costs the pass the one reading that says so. The account it is
+    /// left under rests against a path with nothing at it and matches no file on disk, so the
+    /// passes behind this one skip it in silence and the first write back is read as what it is: a
+    /// file at a size and a hash this host has never sent anything under.
     fn file(
         &self,
         store: &impl Store,
@@ -802,6 +827,19 @@ impl Archive {
         uploaded: &mut HashMap<String, Uploaded>,
     ) -> Result<i64> {
         let held = uploaded.get(&source.file).cloned();
+        if missing(&source.path)? {
+            uploaded.insert(
+                source.file.clone(),
+                Uploaded {
+                    sha256: String::new(),
+                    size: source.size,
+                    next: held.map(|held| held.next).unwrap_or(0),
+                    last: pass == Pass::Final,
+                    more: false,
+                },
+            );
+            return Ok(0);
+        }
         if pass == Pass::Open && held.as_ref().is_some_and(|held| held.rests(source)) {
             return Ok(0);
         }
@@ -840,7 +878,8 @@ impl Archive {
 impl Uploaded {
     /// Whether the file stands exactly where this account left it, which is the reading that costs
     /// no hash and opens no reader. A pass cut short leaves a backlog behind that no later write
-    /// announces, so a file that holds more never rests.
+    /// announces, so a file that holds more never rests. A file that is gone was left at the size
+    /// a path with nothing at it has, so it rests for as long as there is nothing there.
     fn rests(&self, source: &Source) -> bool {
         self.size == source.size && !self.more
     }
@@ -1771,6 +1810,49 @@ mod tests {
             "it does not go up as it stands"
         );
         assert_eq!(service.body("tool-results.b374nf1qv"), text, "and reads back as itself");
+    }
+
+    /// A transcript deleted under a session whose Claude process is still running. The registry
+    /// keeps that session's record until the process goes, so every pass until then is handed a
+    /// path with nothing at it while the session writes on in the files it still has.
+    #[test]
+    fn a_file_that_is_gone_stops_being_offered_and_the_session_writing_on_is_unharmed() {
+        let sandbox = Sandbox::new("gone");
+        let transcript = sandbox.transcript("s-1", "one\ntwo\n");
+        sandbox.delegated("s-1", "agent-a", "ay\n");
+        let service = Fake::default();
+        let mut archive = sandbox.archive();
+        archive.send(&service, "s-1", &transcript, Pass::Open).unwrap();
+
+        std::fs::remove_file(&transcript).unwrap();
+
+        let mut turns = String::from("ay\n");
+        for turn in ["bee\n", "cee\n", "dee\n"] {
+            turns.push_str(turn);
+            sandbox.delegated("s-1", "agent-a", &turns);
+            assert_eq!(
+                archive
+                    .send(&service, "s-1", &transcript, Pass::Open)
+                    .expect("the file that is gone is no failure of the passes behind it"),
+                1,
+                "and what the session is still writing goes up as it is written"
+            );
+        }
+        assert_eq!(service.body("agent-a"), turns);
+        assert_eq!(
+            service.body("main"),
+            "one\ntwo\n",
+            "nothing of the file that is gone is offered again"
+        );
+
+        std::fs::write(&transcript, "one\ntwo\nthree\n").unwrap();
+
+        assert_eq!(
+            archive.send(&service, "s-1", &transcript, Pass::Open).unwrap(),
+            1,
+            "a file written back is read as the file at that path now"
+        );
+        assert_eq!(service.body("main"), "one\ntwo\nthree\n");
     }
 
     #[test]
