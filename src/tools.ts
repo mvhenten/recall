@@ -79,6 +79,9 @@ export interface ToolDefinition {
 export const SEARCH_LIMIT = 5;
 const LIST_LIMIT = 20;
 
+// What a tag naming a working copy opens with, as cli/src/repo.rs writes one.
+const REPO_TAG = "repo:";
+
 const text = (description: string): Record<string, unknown> => ({ type: "string", description });
 const strings = (description: string): Record<string, unknown> => ({
   type: "array",
@@ -138,7 +141,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_save",
     description:
-      "Save a new memory. Search first: if a memory on the topic exists, use recall_edit instead of saving a duplicate. user and feedback memories are global by default; project and reference memories need a repo tag, which this connector has none of, so pass global or tags.",
+      "Save a new memory. Search first: if a memory on the topic exists, use recall_edit instead of saving a duplicate. user and feedback memories are global by default; a project or reference memory needs a scope, and this connector reads none off a working copy, so name the repo tag in tags, as repo:github.com/owner/project, or pass global: true.",
     inputSchema: schema(
       {
         name: text("Unique kebab-case name; saving an existing name replaces that memory."),
@@ -254,14 +257,16 @@ const tagList = (value: unknown, field: string): Parsed<string[]> => {
   return parsed.ok ? parsed : fail(`${field}: ${parsed.error}`);
 };
 
+// A memory is saved under a scope: the global tag, or a repo tag naming the working copy it
+// belongs to. The stdio server reads that tag off the directory it runs in; this end has no
+// working copy, so the caller names it in `tags` and a save that names one is scoped by it alone.
 export const saveTags = (type: MemoryType, global: boolean | undefined, extra: string[]): Parsed<string[]> => {
   const scoped = global ?? (type === "user" || type === "feedback");
-  if (!scoped) {
-    return fail(
-      "this connector runs in no repository, so there is no repo tag; pass global: true, or name the repo tag in tags alongside global: true",
-    );
-  }
-  return { ok: true, value: extra.includes(GLOBAL_TAG) ? extra : [...extra, GLOBAL_TAG].sort() };
+  if (scoped) return { ok: true, value: extra.includes(GLOBAL_TAG) ? extra : [...extra, GLOBAL_TAG].sort() };
+  if (extra.some((tag) => tag.startsWith(REPO_TAG))) return { ok: true, value: extra };
+  return fail(
+    `a ${type} memory needs a scope, and this connector runs in no repository: name the repo tag in tags, as ${REPO_TAG}github.com/owner/project, or pass global: true`,
+  );
 };
 
 export const parseSinceArgument = (value: unknown): Parsed<number> => {
