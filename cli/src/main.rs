@@ -236,51 +236,60 @@ enum Command {
         #[arg(long, value_name = "ID", help = "Revoke the device with this id")]
         revoke: Option<String>,
     },
-    #[command(about = "List the live Claude Code sessions on every host signed in as you")]
+    // Each flag names a different thing to do with the sessions, so a clap group refuses two of
+    // them without the command reading any of them. Naming none is the listing, which is why the
+    // group is not required.
+    #[command(
+        about = "List the live Claude Code sessions on every host signed in as you",
+        group(ArgGroup::new("what").multiple(false))
+    )]
     Sessions {
         #[arg(
             long,
             value_name = "ID",
+            group = "what",
             help = "Send this host's record for the session with this id to the service"
         )]
         sync: Option<String>,
-        #[arg(
-            long,
-            value_name = "ID",
-            conflicts_with = "sync",
-            help = "Mark the session with this id gone"
-        )]
+        #[arg(long, value_name = "ID", group = "what", help = "Mark the session with this id gone")]
         end: Option<String>,
         #[arg(
             long,
-            conflicts_with_all = ["sync", "end"],
+            group = "what",
             help = "Write and sync a record for every running session this host's hooks never registered"
         )]
         adopt: bool,
         #[arg(
             long,
-            conflicts_with_all = ["sync", "end", "adopt"],
+            group = "what",
             help = "Send the history and usage of every past session this host holds a transcript for"
         )]
         backfill: bool,
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill"],
+            group = "what",
             help = "Print one session, by its name, its handle or its Claude Code session id"
         )]
         find: Option<String>,
         #[arg(
             long,
             value_name = "QUERY",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find"],
+            group = "what",
             help = "Find sessions on every host by what was said in them"
         )]
         search: Option<String>,
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search"],
+            group = "what",
+            help = "Ask one running session what it is doing, by its name, its handle or its Claude Code session id, and print what its host answers"
+        )]
+        peek: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            group = "what",
             help = "Write a stored session's transcript back onto this host, so claude --resume takes it"
         )]
         restore: Option<String>,
@@ -844,9 +853,26 @@ fn find_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
     report_matches(&stored, target);
     if json {
         print_json(&stored)?;
-    } else {
-        print!("{}", markdown::render_session(&stored.session, &stored.files));
+        return Ok(ExitCode::SUCCESS);
     }
+    print!(
+        "{}",
+        markdown::render_session(&stored.session, &stored.files, &stored.peeks)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Asks one running session what it is doing. The summariser runs on that session's host and
+/// answers in seconds, so the ask is followed by a short read back and never by a wait of its own:
+/// a peek still pending when that runs out prints as pending, and the session's own view shows it
+/// once the host has written it.
+fn peek_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
+    let peeked = api::peek_session(client, target, std::thread::sleep)?;
+    if json {
+        print_json(&peeked)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    print!("{}", markdown::render_peek(&peeked.peek, &peeked.session_id));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -997,6 +1023,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             backfill,
             find,
             search,
+            peek,
             restore,
             cwd,
             limit,
@@ -1018,6 +1045,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if let Some(query) = search {
                 return search_sessions(&client()?, &query, limit, cli.json);
+            }
+            if let Some(target) = peek {
+                require_messaging(&settings::load(&cli.settings)?)?;
+                return peek_session(&client()?, &target, cli.json);
             }
             if let Some(target) = restore {
                 return restore_session(&client()?, &target, cwd.as_deref(), cli.json);

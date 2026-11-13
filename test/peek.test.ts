@@ -139,6 +139,24 @@ describe("peeks", () => {
     ]);
   });
 
+  // The session a caller reads carries its own peeks, so reading what one session was about costs
+  // one call and not a second one behind it.
+  it("carries the peeks on the session they were asked of, newest first", async () => {
+    const { h, laptop, token, sessionId } = await peeking();
+    await listen(h, token, summarising);
+    const { peek: first } = await ask(laptop, sessionId);
+    expect((await write(laptop, sessionId, first.peekId, "running the tenant migration")).status).toBe(204);
+    h.advance(1_000);
+    const { peek: second } = await ask(laptop, sessionId);
+
+    const read = (await (await laptop.v2.session(sessionId)).json()) as { peeks: V2Peek[] };
+
+    expect(read.peeks).toEqual([
+      { ...second, state: "Pending", digest: "" },
+      { ...first, state: "Ready", digest: "running the tenant migration" },
+    ]);
+  });
+
   // A summariser that finishes after its peek fell out of the history has nowhere to write, and is
   // told that rather than left to read a 500 as a host it should try again.
   it("tells a summariser that the peek it answers is not held", async () => {

@@ -15,6 +15,7 @@ const SEARCH_LIMIT: u32 = 5;
 
 const SEND_TOOL: &str = "recall_send";
 const ORDER_TOOL: &str = "recall_order";
+const PEEK_TOOL: &str = "recall_peek";
 
 const INSTRUCTIONS: &str = "recall is the user's durable memory across sessions, hosts and harnesses. Search it before answering from assumptions about the user or the project, and save what will matter in a later conversation. Where the deployment hosts artifacts, recall_publish puts a site of self-contained HTML, a markdown document or a set of audio files at a URL the user can open.";
 
@@ -141,6 +142,15 @@ pub struct OrderParams {
     pub to: String,
     /// The instruction to carry out there.
     pub order: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeekParams {
+    /// The session to ask, named by the handle recall sessions prints, by the name Claude Code
+    /// gave it, or by its session id. A host is not a peek target: one summariser answers for one
+    /// session.
+    pub session: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -349,6 +359,7 @@ impl Recall {
         if !messaging_enabled {
             tool_router.remove_route(SEND_TOOL);
             tool_router.remove_route(ORDER_TOOL);
+            tool_router.remove_route(PEEK_TOOL);
         }
         Recall { tool_router }
     }
@@ -483,6 +494,14 @@ impl Recall {
             }))
         })
         .await
+    }
+
+    #[tool(
+        name = "recall_peek",
+        description = "Ask one Claude Code session on any host signed in as this user what it is working on right now. A side process on that session's host summarises the end of its transcript and writes the digest back: the session is not interrupted, is not messaged, and carries none of this in its context, so a peek costs that session nothing. Returns the peek with state Ready and the digest once its host has answered, which takes a few seconds, and state Pending where it had not answered yet. Use it to see what a session is doing before sending it anything."
+    )]
+    async fn peek(&self, Parameters(params): Parameters<PeekParams>) -> Result<String, String> {
+        blocking(move || to_json(&api::peek_session(&client()?, &params.session, std::thread::sleep)?)).await
     }
 
     #[tool(
@@ -679,9 +698,12 @@ mod tests {
     fn serves_recall_send_only_when_messaging_is_enabled() {
         assert!(names(true).contains(&SEND_TOOL.to_string()));
         assert!(names(true).contains(&ORDER_TOOL.to_string()));
+        assert!(names(true).contains(&PEEK_TOOL.to_string()));
         assert!(!names(false).contains(&ORDER_TOOL.to_string()));
+        assert!(!names(false).contains(&PEEK_TOOL.to_string()));
         assert_eq!(required("recall_send"), ["message", "to"]);
         assert_eq!(required("recall_order"), ["order", "to"]);
+        assert_eq!(required("recall_peek"), ["session"]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::api::{
-    Artifact, Audience, BoardEntry, BoardMessage, HeldFile, Hit, Injected, Memory, PastSession, ScopeCount, Session,
-    SessionHit, Share,
+    Artifact, Audience, BoardEntry, BoardMessage, HeldFile, Hit, Injected, Memory, PastSession, Peek, PeekState,
+    ScopeCount, Session, SessionHit, Share,
 };
 use crate::sessions;
 use jiff::Timestamp;
@@ -304,15 +304,50 @@ fn session_name<'a>(agent_name: &'a str, handle: &'a str) -> &'a str {
     if agent_name.is_empty() { handle } else { agent_name }
 }
 
-/// One stored session: what it is called, where and when it ran, what it was about, and what the
-/// archive holds of it.
-pub fn render_session(session: &PastSession, files: &[HeldFile]) -> String {
+/// What the asker reads back off the peek it just asked for. A peek still pending is the ordinary
+/// answer where the host is slow, so it names the command that prints it once the digest lands
+/// rather than reading as a failure. That command is named by the session id and never by what the
+/// caller typed: `--find` matches a name exactly, so a handle written in capitals answers for
+/// nothing.
+pub fn render_peek(peek: &Peek, session_id: &str) -> String {
+    match peek.state {
+        PeekState::Ready => format!("{}\n", peek.digest.trim()),
+        PeekState::Pending => format!(
+            "pending since {}; recall sessions --find {session_id} prints it once that host has written it\n",
+            iso(peek.requested_at)
+        ),
+    }
+}
+
+/// The peeks of one session, newest first: when each was asked for, and either the digest its host
+/// wrote or that it is still waiting for one.
+pub fn render_peeks(peeks: &[Peek]) -> String {
+    peeks
+        .iter()
+        .map(|peek| {
+            let said = match peek.state {
+                PeekState::Ready => peek.digest.trim().replace('\n', "\n  "),
+                PeekState::Pending => "pending".to_string(),
+            };
+            format!("- {}\n  {said}\n", iso(peek.requested_at))
+        })
+        .collect()
+}
+
+/// One stored session: what it is called, where and when it ran, what it was about, what has been
+/// asked of it, and what the archive holds of it.
+pub fn render_session(session: &PastSession, files: &[HeldFile], peeks: &[Peek]) -> String {
     let held: String = files
         .iter()
         .map(|file| format!("- {} ({} bytes)\n", file.file(), file.bytes()))
         .collect();
+    let asked = if peeks.is_empty() {
+        String::new()
+    } else {
+        format!("\nPeeks:\n\n{}", render_peeks(peeks))
+    };
     format!(
-        "---\nname: {}\nhandle: {}\nsession: {}\nhost: {}\ncwd: {}\nwhere: {}\nstarted: {}\nlast active: {}\nprompts: {}\nstate: {}\n---\n\n{}\n\nTranscript:\n\n{}",
+        "---\nname: {}\nhandle: {}\nsession: {}\nhost: {}\ncwd: {}\nwhere: {}\nstarted: {}\nlast active: {}\nprompts: {}\nstate: {}\n---\n\n{}\n{asked}\nTranscript:\n\n{}",
         session_name(&session.agent_name, &session.name),
         session.name,
         session.session_id,
@@ -641,6 +676,90 @@ mod tests {
             "tower  tower-2  global  3h  idle  draft the release notes\n"
         );
         assert_eq!(render_sessions(&[], now), "");
+    }
+
+    fn peek(state: PeekState, digest: &str, at: i64) -> Peek {
+        Peek {
+            peek_id: "p-1".into(),
+            state,
+            digest: digest.into(),
+            requested_at: at,
+        }
+    }
+
+    /// The asker reads the digest and nothing around it. A peek the host has not answered yet is
+    /// the ordinary case seconds after the ask, so it says when it was asked for and how to read
+    /// it again rather than printing an empty line.
+    #[test]
+    fn a_peek_reads_as_the_digest_or_as_what_to_do_while_it_is_pending() {
+        let ready = peek(PeekState::Ready, "  Reading the planner.\n", 1_762_000_000_000);
+        assert_eq!(render_peek(&ready, "9f8a1b2c"), "Reading the planner.\n");
+
+        let waiting = render_peek(&peek(PeekState::Pending, "", 1_762_000_000_000), "9f8a1b2c");
+        assert_eq!(
+            waiting,
+            "pending since 2025-11-01T12:26:40Z; recall sessions --find 9f8a1b2c prints it once that host has written it\n"
+        );
+    }
+
+    /// The history reads newest first, which is the order the service answers in, and a digest of
+    /// several lines stays under the time it was asked at.
+    #[test]
+    fn a_peek_history_reads_in_the_order_the_service_gave_it() {
+        let history = [
+            peek(PeekState::Pending, "", 1_762_000_060_000),
+            peek(
+                PeekState::Ready,
+                "Reading the planner.\nWaiting on CI.",
+                1_762_000_000_000,
+            ),
+        ];
+        assert_eq!(
+            render_peeks(&history),
+            "- 2025-11-01T12:27:40Z\n  pending\n\
+             - 2025-11-01T12:26:40Z\n  Reading the planner.\n  Waiting on CI.\n"
+        );
+        assert_eq!(render_peeks(&[]), "");
+    }
+
+    /// A session carries its peeks over what the archive holds of it, and one that was never
+    /// peeked prints exactly what it printed before there were peeks at all.
+    #[test]
+    fn a_session_shows_the_peeks_it_was_asked_for_and_nothing_where_it_has_none() {
+        let session = PastSession {
+            session_id: "9f8a1b2c".into(),
+            name: "laptop-9f8a".into(),
+            agent_name: String::new(),
+            host: "laptop".into(),
+            host_label: "laptop".into(),
+            cwd: "/home/you/src/recall".into(),
+            repo: "repo:github.com/mvhenten/recall".into(),
+            branch: "work".into(),
+            started_at: 1_762_000_000_000,
+            last_activity_at: 1_762_000_060_000,
+            prompts: 2,
+            focus: sessions::Focus {
+                first: "list the sessions".into(),
+                latest: String::new(),
+            },
+            running: true,
+        };
+        let asked = render_session(
+            &session,
+            &[],
+            &[peek(PeekState::Ready, "Reading the planner.", 1_762_000_000_000)],
+        );
+
+        assert!(
+            asked.contains(
+                "list the sessions\n\nPeeks:\n\n- 2025-11-01T12:26:40Z\n  Reading the planner.\n\nTranscript:"
+            ),
+            "{asked}"
+        );
+        assert!(
+            render_session(&session, &[], &[]).contains("list the sessions\n\nTranscript:"),
+            "a session that was never peeked carries no section at all"
+        );
     }
 
     #[test]
