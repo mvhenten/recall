@@ -118,7 +118,7 @@ fn tail(session_id: &str, path: &Path) -> Result<String> {
         .with_context(|| format!("reading the end of {}", path.display()))?;
     let read = Collected::default();
     let mut reader = Reader::new(BufReader::new(file), Holds::Turns, Pass::Open);
-    transcripts::send_from(&read, session_id, MAIN, &mut reader, Place::nothing(), usize::MAX)?;
+    transcripts::send_from(&read, session_id, MAIN, &mut reader, &mut Place::nothing(), usize::MAX)?;
     let records = read.records.into_inner();
     if records.is_empty() {
         bail!(

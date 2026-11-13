@@ -289,7 +289,6 @@ impl Place {
 /// to send.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sent {
-    pub next: i64,
     pub records: i64,
     pub dropped: i64,
     pub more: bool,
@@ -591,16 +590,20 @@ pub const MAX_APPENDS_PER_PASS: usize = 32;
 /// worked out for itself costs one append of a single record, which the service refuses with the
 /// place the file really waits at; from there every append carries all it may.
 ///
+/// `place` is where it opens and where it leaves the file, so a pass stopped by a record the
+/// service will never take still hands back the place in front of that record. A caller left with
+/// nothing would open the file from its start on every beat that follows, and every one of those
+/// appends is one the service refuses.
+///
 /// `appends` is how many it offers before it stops and says the file holds more.
 pub fn send_from(
     store: &impl Store,
     session_id: &str,
     file: &str,
     reader: &mut Reader<impl BufRead>,
-    from: Place,
+    place: &mut Place,
     appends: usize,
 ) -> Result<Sent> {
-    let mut place = from;
     let mut records = 0;
     let mut offered = 0;
     let mut more = false;
@@ -618,7 +621,7 @@ pub fn send_from(
         match store.append(session_id, file, place.next, &batch.records, batch.closed)? {
             Appended::Written(next) => {
                 records += batch.records.len() as i64;
-                place = Place::reached(next);
+                *place = Place::reached(next);
             }
             Appended::Refused(next) => {
                 if next <= place.next {
@@ -628,13 +631,12 @@ pub fn send_from(
                     );
                 }
                 reader.restore(batch);
-                place = Place::reached(next);
+                *place = Place::reached(next);
                 reader.skip_to(next)?;
             }
         }
     }
     Ok(Sent {
-        next: place.next,
         records,
         dropped: reader.dropped(),
         more,
@@ -688,14 +690,22 @@ impl Default for Archive {
     }
 }
 
-/// One file as it last went up whole: the hash of its content, the record the archive waits at
-/// after it, and whether the pass that sent it was the final one.
+/// One file as a pass left it: the record the archive answered that it waits at, the hash of the
+/// content that place was reached over, whether the pass that sent it was the final one, and
+/// whether it stopped with records still to send.
+///
+/// The place is what a daemon that has just started opens the file at. It is kept whatever the
+/// pass reached, since a place the service itself answered with is proven whether or not the file
+/// has been written to since; the hash only decides the stronger question of whether the file can
+/// be skipped without being read at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Uploaded {
     sha256: String,
     next: i64,
     #[serde(rename = "final")]
     last: bool,
+    #[serde(default)]
+    more: bool,
 }
 
 fn sha256(path: &Path) -> Result<String> {
@@ -788,62 +798,16 @@ impl Archive {
             .unwrap_or_default();
         let mut sent = 0;
         let mut ends: HashMap<String, Seen> = HashMap::new();
+        let mut stuck: Vec<String> = Vec::new();
         for source in &sources.found {
-            let quiet = pass == Pass::Open
-                && known
-                    .get(&source.file)
-                    .is_some_and(|seen| seen.size == source.size && !seen.more);
-            let hash = match self.uploaded {
-                Some(_) if !quiet => Some(sha256(&source.path)?),
-                _ => None,
-            };
-            let unchanged = hash.as_ref().and_then(|hash| {
-                uploaded
-                    .get(&source.file)
-                    .filter(|was| &was.sha256 == hash && (pass == Pass::Open || was.last))
-            });
-            if let (None, Some(was)) = (known.get(&source.file), unchanged) {
-                ends.insert(
-                    source.file.clone(),
-                    Seen {
-                        place: Place::reached(was.next),
-                        size: source.size,
-                        more: false,
-                    },
-                );
-                continue;
+            let mut at = known.get(&source.file).copied();
+            match self.file(store, session_id, source, pass, &mut at, &mut uploaded) {
+                Ok(records) => sent += records,
+                Err(error) => stuck.push(format!("{}: {error:#}", source.file)),
             }
-            let from = known
-                .get(&source.file)
-                .map(|seen| seen.place)
-                .unwrap_or(Place::nothing());
-            let mut reader = open(source, pass)?;
-            let reached = send_from(store, session_id, &source.file, &mut reader, from, self.appends)?;
-            ends.insert(
-                source.file.clone(),
-                Seen {
-                    place: Place::reached(reached.next),
-                    size: source.size,
-                    more: reached.more,
-                },
-            );
-            match hash {
-                Some(sha256) if !reached.more => {
-                    uploaded.insert(
-                        source.file.clone(),
-                        Uploaded {
-                            sha256,
-                            next: reached.next,
-                            last: pass == Pass::Final,
-                        },
-                    );
-                }
-                _ if quiet => {}
-                _ => {
-                    uploaded.remove(&source.file);
-                }
+            if let Some(seen) = at {
+                ends.insert(source.file.clone(), seen);
             }
-            sent += reached.records;
         }
         self.seen.insert(session_id.to_string(), ends);
         if let Some(dir) = self.uploaded.as_deref() {
@@ -860,7 +824,80 @@ impl Archive {
                 named.join(", ")
             );
         }
+        if !stuck.is_empty() {
+            bail!(
+                "session {session_id} holds files this pass could not send: {}",
+                stuck.join("; ")
+            );
+        }
         Ok(sent)
+    }
+
+    /// One file of one session, caught up with the service as far as this pass goes, answering how
+    /// many records went up.
+    ///
+    /// `at` is where this run left the file when it last looked, and where it leaves it now. It is
+    /// written before any failure is reported, because a file the service will never take whole —
+    /// one holding a record no append can carry, one the service answers 413 for — is read again
+    /// on every beat for as long as the session runs, and a caller handed nothing back would open
+    /// it at its start each time and offer an append the service refuses.
+    fn file(
+        &self,
+        store: &impl Store,
+        session_id: &str,
+        source: &Source,
+        pass: Pass,
+        at: &mut Option<Seen>,
+        uploaded: &mut HashMap<String, Uploaded>,
+    ) -> Result<i64> {
+        let was = *at;
+        let quiet = pass == Pass::Open && was.is_some_and(|seen| seen.size == source.size && !seen.more);
+        let hash = match self.uploaded {
+            Some(_) if !quiet => Some(sha256(&source.path)?),
+            _ => None,
+        };
+        let whole = hash.as_ref().and_then(|hash| {
+            uploaded
+                .get(&source.file)
+                .filter(|held| &held.sha256 == hash && !held.more && (pass == Pass::Open || held.last))
+                .map(|held| held.next)
+        });
+        if let (None, Some(next)) = (was, whole) {
+            *at = Some(Seen {
+                place: Place::reached(next),
+                size: source.size,
+                more: false,
+            });
+            return Ok(0);
+        }
+        // A run with no place of its own takes the one the last run proved, so a daemon that has
+        // just started sends the records a file has grown by rather than probing it from record
+        // nothing.
+        let mut place = was
+            .map(|seen| seen.place)
+            .or_else(|| uploaded.get(&source.file).map(|held| Place::reached(held.next)))
+            .unwrap_or(Place::nothing());
+        let mut reader = open(source, pass)?;
+        let reached = send_from(store, session_id, &source.file, &mut reader, &mut place, self.appends);
+        let more = reached.as_ref().map(|sent| sent.more).unwrap_or(false);
+        *at = Some(Seen {
+            place,
+            size: source.size,
+            more,
+        });
+        let reached = reached?;
+        if let Some(sha256) = hash {
+            uploaded.insert(
+                source.file.clone(),
+                Uploaded {
+                    sha256,
+                    next: place.next,
+                    last: pass == Pass::Final,
+                    more,
+                },
+            );
+        }
+        Ok(reached.records)
     }
 
     /// Forgets the sessions this host no longer holds, so a daemon that runs for weeks does not
@@ -1292,9 +1329,10 @@ mod tests {
         service.append("s-1", MAIN, 0, &ahead, true).unwrap();
 
         let mut reader = open(&source, Pass::Final).unwrap();
-        let sent = send_from(&service, "s-1", MAIN, &mut reader, Place::nothing(), usize::MAX).unwrap();
+        let mut place = Place::nothing();
+        let sent = send_from(&service, "s-1", MAIN, &mut reader, &mut place, usize::MAX).unwrap();
 
-        assert_eq!(sent.next, 40);
+        assert_eq!(place.next, 40);
         assert_eq!(sent.records, 15, "the fifteen the other host had not reached");
         assert_eq!(
             service.body("main"),
@@ -1514,6 +1552,76 @@ mod tests {
         assert_eq!(service.body("main"), "one\n", "and the records in front of it went up");
     }
 
+    /// A session holding one file the service will never take whole still has every other file
+    /// caught up on every beat. Before #160 a pass stopped by such a file stored no place at all,
+    /// so the beat behind it opened every file of that session at record nothing and the probe
+    /// each one sent was refused — for as long as the session ran, at a rate nothing wore down.
+    #[test]
+    fn a_file_the_pass_cannot_send_costs_the_session_none_of_its_places() {
+        let sandbox = Sandbox::new("stuck-place");
+        let transcript = sandbox.transcript("s-1", "one\ntwo\n");
+        sandbox.delegated("s-1", "agent-a", &format!("ay\n{}\n", "x".repeat(MAX_APPEND_BYTES)));
+        let service = Fake::default();
+        let mut archive = Archive::default();
+
+        archive
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .expect_err("the record no append can carry is reported");
+        std::fs::write(&transcript, "one\ntwo\nthree\n").unwrap();
+        let offered = *service.offered.borrow();
+
+        archive
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .expect_err("and is reported again, since the file is no more sendable than it was");
+
+        assert_eq!(
+            *service.offered.borrow(),
+            offered + 1,
+            "the one append the session owes, and no probe of a file already placed"
+        );
+        assert_eq!(service.body("main"), "one\ntwo\nthree\n", "and no record goes up twice");
+        assert_eq!(
+            service.body("agent-a"),
+            "ay\n",
+            "the stuck file stands where it stopped"
+        );
+    }
+
+    /// A daemon restarted has no place of its own, and a file the session is still writing hashes
+    /// differently every time it is looked at, so the hash alone saves nothing. The place the
+    /// service answered with is kept beside it and is what the next run opens the file at.
+    #[test]
+    fn a_restarted_daemon_resumes_at_the_place_the_service_last_answered() {
+        let sandbox = Sandbox::new("restarted");
+        let transcript = sandbox.transcript("s-1", "one\ntwo\n");
+        let uploaded = sandbox.dir.join("uploaded");
+        let service = Fake::default();
+
+        assert_eq!(
+            Archive::at(uploaded.clone())
+                .send(&service, "s-1", &transcript, Pass::Open)
+                .unwrap(),
+            2
+        );
+        std::fs::write(&transcript, "one\ntwo\nthree\n").unwrap();
+        let offered = *service.offered.borrow();
+
+        assert_eq!(
+            Archive::at(uploaded)
+                .send(&service, "s-1", &transcript, Pass::Open)
+                .unwrap(),
+            1,
+            "only the line the session added since goes up"
+        );
+
+        assert_eq!(
+            *service.offered.borrow(),
+            offered + 1,
+            "the one append it owes, and not the probe from record nothing the service refuses"
+        );
+        assert_eq!(service.body("main"), "one\ntwo\nthree\n");
+    }
+
     #[test]
     fn a_backlog_several_times_the_byte_ceiling_goes_up_as_the_appends_it_takes() {
         let sandbox = Sandbox::new("backlog");
@@ -1574,9 +1682,10 @@ mod tests {
         let source = sources(&transcript).unwrap().found.remove(0);
 
         let mut reader = open(&source, Pass::Final).unwrap();
-        let sent = send_from(&raced, "s-1", MAIN, &mut reader, Place::nothing(), usize::MAX).unwrap();
+        let mut place = Place::nothing();
+        let sent = send_from(&raced, "s-1", MAIN, &mut reader, &mut place, usize::MAX).unwrap();
 
-        assert_eq!(sent.next, 2_400, "the pass carried on from the record it was handed");
+        assert_eq!(place.next, 2_400, "the pass carried on from the record it was handed");
         assert_eq!(sent.records, 1_800, "and sent every record the other host had not");
         assert_eq!(
             service.body("main"),
@@ -1612,9 +1721,11 @@ mod tests {
     /// A whole file sent in one pass, which is what a backfill does. It goes through the very
     /// reader the live sender uses, so the only thing that can be proved here is the thing that
     /// matters: where the pass stops is a function of the file and nothing else.
-    fn whole_file(service: &Fake, file: &str, text: &str) -> Sent {
+    fn whole_file(service: &Fake, file: &str, text: &str) -> (Place, Sent) {
         let mut reader = Reader::new(text.as_bytes(), holds_of(file), Pass::Final);
-        send_from(service, "s-1", file, &mut reader, Place::nothing(), usize::MAX).unwrap()
+        let mut place = Place::nothing();
+        let sent = send_from(service, "s-1", file, &mut reader, &mut place, usize::MAX).unwrap();
+        (place, sent)
     }
 
     #[test]
@@ -1626,11 +1737,11 @@ mod tests {
         resumed.append("s-1", MAIN, 0, &halfway[..1_000], true).unwrap();
         resumed.append("s-1", MAIN, 1_000, &halfway[1_000..], true).unwrap();
 
-        let first = whole_file(&whole, MAIN, &text);
-        let rest = whole_file(&resumed, MAIN, &text);
+        let (first, _) = whole_file(&whole, MAIN, &text);
+        let (at, rest) = whole_file(&resumed, MAIN, &text);
 
         assert_eq!(first.next, 2_500);
-        assert_eq!(rest.next, first.next, "a pass resumed mid-way reaches the same record");
+        assert_eq!(at.next, first.next, "a pass resumed mid-way reaches the same record");
         assert_eq!(rest.records, 1_300, "and sends only the records the archive had not");
         assert_eq!(
             whole.body(MAIN),
@@ -1638,8 +1749,8 @@ mod tests {
             "and the two files read back alike"
         );
 
-        let again = whole_file(&whole, MAIN, &text);
-        assert_eq!(again.records, 0, "a second pass over the same file sends nothing");
+        let (again, sent) = whole_file(&whole, MAIN, &text);
+        assert_eq!(sent.records, 0, "a second pass over the same file sends nothing");
         assert_eq!(again.next, 2_500);
         assert_eq!(whole.body(MAIN), text);
     }
@@ -1649,12 +1760,12 @@ mod tests {
         let service = Fake::default();
         let text = "first\n\n\nthe blank lines belong to the record that follows them\n\nlast";
 
-        let sent = whole_file(&service, "tool-results.b374nf1qv", text);
+        let (_, sent) = whole_file(&service, "tool-results.b374nf1qv", text);
 
         assert_eq!(service.body("tool-results.b374nf1qv"), text);
         assert_eq!(sent.records, 3);
         assert_eq!(
-            whole_file(&service, "tool-results.b374nf1qv", text).records,
+            whole_file(&service, "tool-results.b374nf1qv", text).1.records,
             0,
             "and a second pass over it sends nothing"
         );
