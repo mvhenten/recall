@@ -376,6 +376,21 @@ pub fn age(since: i64, now: i64) -> String {
     format!("{seconds}s")
 }
 
+/// What the user typed, of a prompt a focus line holds. Claude Code writes several kinds of entry
+/// as a user turn — a task notification, a system reminder, the expansion of a slash command — and
+/// hooks/messaging.mjs moves the focus on before any of that is known, so one of them reaches a
+/// record as markup. A focus read off a transcript is already clear of them, since adopt::typed
+/// drops the entry outright.
+pub fn user_written(prompt: &str) -> &str {
+    if crate::adopt::ENVELOPES
+        .iter()
+        .any(|envelope| prompt.starts_with(envelope))
+    {
+        return "";
+    }
+    prompt
+}
+
 /// The focus line: the prompt that opened the session, then the latest one.
 pub fn focus_line(focus: &Focus) -> String {
     if focus.first.is_empty() {
@@ -1062,6 +1077,17 @@ mod tests {
         assert_eq!(focus_line(&focus("ship it", "")), "ship it");
         assert_eq!(focus_line(&focus("", "ship it")), "ship it");
         assert_eq!(focus_line(&Focus::default()), "");
+    }
+
+    #[test]
+    fn a_prompt_the_harness_wrote_is_no_focus_line() {
+        assert_eq!(
+            user_written("<task-notification>a subagent finished</task-notification>"),
+            ""
+        );
+        assert_eq!(user_written("<system-reminder>be brief</system-reminder>"), "");
+        assert_eq!(user_written("why is CI red"), "why is CI red");
+        assert_eq!(user_written("<div> renders nothing"), "<div> renders nothing");
     }
 
     #[test]

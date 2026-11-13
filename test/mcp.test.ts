@@ -295,10 +295,20 @@ describe("the connector's tools", () => {
     const { h, email, mcp } = await signedIn();
     const client = h.clientWithToken(await h.login(email, "laptop"));
     expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now() })).status).toBe(204);
+    const named = JSON.stringify({ type: "agent-name", agentName: "kisuvpalas" });
+    expect((await client.v2.records("s-ship", "main", 0, [named])).status).toBe(200);
 
-    const sessions = (await mcp.json("recall_sessions")) as Array<{ name: string; host: string; cwd: string }>;
-    expect(sessions.map((session) => [session.host, session.cwd])).toEqual([["laptop", "/home/you/src/recall"]]);
-    expect(await mcp.json("recall_send", { to: sessions[0]?.name ?? "", message: "ship it" })).toMatchObject({
+    const sessions = (await mcp.json("recall_sessions")) as Array<{
+      name: string;
+      handle: string;
+      host: string;
+      cwd: string;
+      focus: string;
+    }>;
+    expect(sessions.map((session) => [session.name, session.host, session.cwd, session.focus])).toEqual([
+      ["kisuvpalas", "laptop", "/home/you/src/recall", "why is the worker test red"],
+    ]);
+    expect(await mcp.json("recall_send", { to: sessions[0]?.handle ?? "", message: "ship it" })).toMatchObject({
       toSessionId: "s-ship",
     });
 

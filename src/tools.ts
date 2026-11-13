@@ -182,7 +182,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_sessions",
     description:
-      "List the live Claude Code sessions on every host signed in as this user, newest activity first. Each one names the handle recall_send takes, the host it runs on, the directory it works in and what it is working on.",
+      "List the live Claude Code sessions on every host signed in as this user, newest activity first. Each one carries the name it was given, the handle recall_send takes, the host it runs on, the directory it works in and the prompt it is working on.",
     inputSchema: schema({}),
   },
   {
@@ -374,10 +374,11 @@ export const parseSendArgs = (args: Record<string, unknown>): Parsed<SendArgs> =
 };
 
 // What a listing hands the model: the fields its tool description names, and not the whole view
-// the dashboard reads off the same route. `name` is what recall_send takes as its `to`, and `host`
-// is the label the account gave the machine, which recall_send takes as well.
+// the dashboard reads off the same route. `host` is the label the account gave the machine, which
+// recall_send takes as an address, as it takes both of a session's names.
 export interface SessionDigest {
   name: string;
+  handle: string;
   host: string;
   cwd: string;
   focus: string;
@@ -389,8 +390,11 @@ export interface DeviceDigest {
   host: string;
 }
 
+// `name` is what cli/src/markdown.rs prints in its name column: the name Claude Code gave the
+// session, and the handle where it has none.
 export const sessionDigest = (session: V2Session): SessionDigest => ({
-  name: session.name,
+  name: session.agentName === "" ? session.name : session.agentName,
+  handle: session.name,
   host: session.hostLabel,
   cwd: session.cwd,
   focus: session.focus.latest,
