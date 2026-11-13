@@ -308,4 +308,23 @@ describe("the connector's tools", () => {
       .catch((error: Error) => error.message);
     expect(unknown).toContain("no host or session named desktop");
   });
+
+  // What a voice session sends: the transcript capitalises the host, and the answer has to say
+  // where a message addressed to a whole host landed.
+  it("reaches a host however its name is capitalised and counts the sessions it reached", async () => {
+    const { h, email, mcp } = await signedIn();
+    const client = h.clientWithToken(await h.login(email, "sandbox"));
+    for (const sessionId of ["s-one", "s-two"]) {
+      expect((await client.sync(sessionId, { host: "sandbox", lastActivityAt: h.now() })).status).toBe(204);
+    }
+
+    const everywhere = await mcp.json("recall_send", { to: "Sandbox", message: "ship it" });
+    expect(everywhere).toMatchObject({ toSessionId: "", sessions: 2 });
+
+    const sessions = await client.request("GET", "/v2/sessions");
+    const listed = (await sessions.json()) as { sessions: Array<{ sessionId: string; name: string }> };
+    const one = listed.sessions[0];
+    const answered = await mcp.json("recall_send", { to: (one?.name ?? "").toUpperCase(), message: "ship it" });
+    expect(answered).toMatchObject({ toSessionId: one?.sessionId, sessions: 1 });
+  });
 });

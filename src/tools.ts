@@ -406,16 +406,21 @@ export interface SendTarget {
 // A device id, a login name, a host or a host's label reaches every session on that machine; a
 // session handle, an agent name or a session id reaches the one session. api::resolve_target in the
 // CLI reads the same two listings in the same order and resolves a machine's newest login.
+//
+// Case never settles a match: this end is dictated to as often as it is typed at, and a voice
+// transcript capitalises what it hears, so Sandbox has to reach the host called sandbox.
 export const resolveTarget = (
   devices: Device[],
   labels: Labels,
   sessions: Session[],
   to: string,
 ): Parsed<SendTarget> => {
-  const identified = devices.find((device) => device.deviceId === to);
+  const wanted = to.toLowerCase();
+  const names = (value: string | undefined): boolean => value !== undefined && value.toLowerCase() === wanted;
+  const identified = devices.find((device) => names(device.deviceId));
   if (identified !== undefined) return { ok: true, value: { toDeviceId: identified.deviceId, toSessionId: "" } };
   const named = devices.filter(
-    (device) => device.name === to || device.host === to || labels.hosts.get(device.host) === to,
+    (device) => names(device.name) || names(device.host) || names(labels.hosts.get(device.host)),
   );
   const machines = new Set(named.map((device) => device.host));
   if (machines.size > 1) {
@@ -431,7 +436,7 @@ export const resolveTarget = (
     return { ok: true, value: { toDeviceId: newest.deviceId, toSessionId: "" } };
   }
   const addressed = sessions.filter(
-    (session) => session.name === to || session.agentName === to || session.sessionId === to,
+    (session) => names(session.name) || names(session.agentName) || names(session.sessionId),
   );
   const [only] = addressed;
   if (addressed.length === 1 && only !== undefined) {
