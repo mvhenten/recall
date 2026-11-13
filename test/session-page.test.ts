@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { TRANSCRIPT_FOLLOW_MS, TRANSCRIPT_STEP_BYTES } from "../src/dashboard";
-import { MAX_BODY_BYTES, type Message, type NewsFrame, ORDERS, ORDERS_HEADER } from "../src/mailbox";
+import { MAX_BODY_BYTES, type Message, type NewsFrame, ORDERS, ORDERS_HEADER, type PeekFrame } from "../src/mailbox";
 import { SESSION_TTL_MS } from "../src/model";
 import { followedRecords, type Plan, type RecordReach } from "../src/transcript-plan";
 import { type Client, harness } from "./harness";
@@ -114,8 +114,19 @@ const send = async (h: Harness, path: string, assertion: string, body: string): 
   return post(h, path, assertion, { csrf, cookie, body });
 };
 
-// One peek asked of a session, the way a host asks for one. Nothing is listening in these tests,
-// so the row is written and stays pending until a digest is put on it.
+// A host that takes every peek it is handed and summarises none of them, which is what leaves the
+// row pending for a digest to be put on it: a peek no host takes is dropped with its refusal.
+const peekTaking = async (h: Harness, token: string): Promise<void> => {
+  const socket = await attach(h, token);
+  socket.addEventListener("message", (event) => {
+    const frame = JSON.parse(String(event.data)) as PeekFrame;
+    if (frame.type !== "peek") return;
+    socket.send(JSON.stringify({ type: "peek-took", peekId: frame.peek.peekId, token: frame.token }));
+  });
+};
+
+// One peek asked of a session, the way a host asks for one. The row stays pending until a digest
+// is put on it.
 const askPeek = async (client: Client, sessionId: string): Promise<string> => {
   const response = await client.request("POST", `/v2/sessions/${sessionId}/peek`);
   expect(response.status).toBe(201);
@@ -206,6 +217,7 @@ describe("a session page", () => {
     const h = await harness();
     const you = await owner(h);
     expect((await you.laptop.sync("cafe0001")).status).toBe(204);
+    await peekTaking(h, you.token);
     const answered = await askPeek(you.laptop, "cafe0001");
     const written = await you.laptop.request("PUT", `/v2/sessions/cafe0001/peek/${answered}`, {
       digest: "running the tenant migration",

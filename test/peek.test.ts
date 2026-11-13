@@ -99,15 +99,16 @@ describe("peeks", () => {
     expect(await history(laptop, sessionId)).toEqual([asked]);
   });
 
-  // The row is the asker's and the digest is the host's, so a peek nobody takes is still a row the
-  // asker reads back. It says pending, which is what it is.
-  it("keeps the peek it wrote when no host is listening and tells the asker so", async () => {
+  // The row the ask wrote is there for a summariser to answer on, and a peek nobody took has no
+  // summariser coming. Left behind it would be a pending row the asks after it wait on, so it goes
+  // with the refusal and the next ask starts clean.
+  it("drops the peek it wrote when no host is listening and tells the asker so", async () => {
     const { laptop, sessionId } = await peeking();
 
-    const { peek: asked, outcome } = await ask(laptop, sessionId);
+    const { outcome } = await ask(laptop, sessionId);
 
     expect(outcome).toEqual({ state: "untaken", reason: NO_PEEK_LISTENING });
-    expect(await history(laptop, sessionId)).toEqual([{ ...asked, state: "Pending", digest: "" }]);
+    expect(await history(laptop, sessionId)).toEqual([]);
   });
 
   it("takes the first digest a summariser writes and refuses the one behind it", async () => {

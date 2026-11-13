@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { NO_PEEK_LISTENING, ORDERS, ORDERS_HEADER, type PeekFrame, type PeekOrder } from "../src/mailbox";
 import { MCP_PATH } from "../src/mcp";
-import { PEEK_FRESH_MS, PEEK_READS, PEEK_WAIT_MS, readBackPeek, reusablePeek, TOOLS } from "../src/tools";
+import type { Peek } from "../src/model";
+import {
+  PEEK_ATTACH_MS,
+  PEEK_FRESH_MS,
+  PEEK_READS,
+  PEEK_WAIT_MS,
+  readBackPeek,
+  reusablePeek,
+  TOOLS,
+} from "../src/tools";
 import type { V2Peek } from "../src/v2";
 import { type Client, harness, MCP_PROTOCOL_VERSION } from "./harness";
 
@@ -641,39 +650,24 @@ describe("reading a peek back", () => {
 // Which peek on record an ask takes rather than paying a summariser for another.
 describe("reusing a peek the session already holds", () => {
   const NOW = Date.parse("2026-01-01T01:00:00Z");
-  const at = (ago: number): string => new Date(NOW - ago).toISOString();
-  const pending = (ago: number): V2Peek => ({ peekId: `p-${ago}`, state: "Pending", digest: "", requestedAt: at(ago) });
-  const ready = (ago: number): V2Peek => ({ ...pending(ago), state: "Ready", digest: "running the migration" });
+  const pending = (ago: number): Peek => ({ peekId: `p-${ago}`, digest: "", requestedAt: NOW - ago });
+  const ready = (ago: number): Peek => ({ ...pending(ago), digest: "running the migration" });
 
   it("asks for a peek of its own where the session holds none", () => {
-    expect(reusablePeek([], NOW)).toEqual({ kind: "ask" });
+    expect(reusablePeek([], NOW)).toBeNull();
   });
 
-  it("takes a digest younger than the bound and asks where it is older", () => {
-    expect(reusablePeek([ready(PEEK_FRESH_MS - 1)], NOW)).toEqual({ kind: "ready", peek: ready(PEEK_FRESH_MS - 1) });
-    expect(reusablePeek([ready(PEEK_FRESH_MS)], NOW)).toEqual({ kind: "ask" });
+  // A digest a minute old describes a session that has moved on since, and is worth asking again.
+  it("answers off a digest inside the freshness bound and asks where it is older", () => {
+    expect(reusablePeek([ready(PEEK_FRESH_MS - 1)], NOW)).toEqual(ready(PEEK_FRESH_MS - 1));
+    expect(reusablePeek([ready(PEEK_FRESH_MS)], NOW)).toBeNull();
   });
 
-  it("attaches to a request younger than the bound and asks where it is older", () => {
-    expect(reusablePeek([pending(1_000)], NOW)).toEqual({ kind: "attach", peek: pending(1_000) });
-    expect(reusablePeek([pending(PEEK_FRESH_MS)], NOW)).toEqual({ kind: "ask" });
-  });
-
-  // An older peek describes a session further back, so the newest is the only one worth reading,
-  // whatever order the listing came in.
-  it("reads the newest peek and no other", () => {
-    const peeks = [ready(PEEK_FRESH_MS - 1), pending(1_000), ready(PEEK_FRESH_MS - 2)];
-
-    expect(reusablePeek(peeks, NOW)).toEqual({ kind: "attach", peek: pending(1_000) });
-    expect(reusablePeek([ready(1_000), pending(PEEK_FRESH_MS - 1)], NOW)).toEqual({
-      kind: "ready",
-      peek: ready(1_000),
-    });
-  });
-
-  // A host whose clock runs ahead of the service writes a peek dated in the future, and an ask is
-  // not held off by one.
-  it("asks where the newest peek is dated ahead of now", () => {
-    expect(reusablePeek([ready(-1_000)], NOW)).toEqual({ kind: "ask" });
+  // A request is waited on for as long as the summariser handed it has to answer, which outlasts
+  // the bound a digest is read off: a run still going is one no second summarise may double.
+  it("waits on a request inside the summariser's own window and asks where it is past it", () => {
+    expect(reusablePeek([pending(PEEK_FRESH_MS)], NOW)).toEqual(pending(PEEK_FRESH_MS));
+    expect(reusablePeek([pending(PEEK_ATTACH_MS - 1)], NOW)).toEqual(pending(PEEK_ATTACH_MS - 1));
+    expect(reusablePeek([pending(PEEK_ATTACH_MS)], NOW)).toBeNull();
   });
 });

@@ -251,6 +251,7 @@ import {
   deleteMemory,
   describeMemories,
   describeSessions,
+  dropPeek,
   endSession,
   extendLinkShare,
   findSession,
@@ -2211,21 +2212,20 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return new Response(null, { status: 204 });
   };
 
-  // One peek asked of one session: the row the asker writes, and what the bus made of handing it to
-  // the host the session runs on. A session this account is not running right now is no peek at
-  // all, since the transcript the summariser reads lives on that host.
-  interface AskedPeek {
-    peek: V2Peek;
-    outcome: Outcome;
-  }
+  // One peek asked of one session: the row this ask placed and what the bus made of handing it to
+  // the host the session runs on, or the peek the session already held, which cost this ask
+  // nothing and so has no outcome of its own to report. A session this account is not running
+  // right now is no peek at all, since the transcript the summariser reads lives on that host.
+  type AskedPeek = { placed: true; peek: V2Peek; outcome: Outcome } | { placed: false; peek: V2Peek };
 
   const askPeek = async (env: TenantEnv, userId: string, sessionId: string, now: number): Promise<AskedPeek | null> => {
     const toDeviceId = await liveSessionDevice(env.DB, userId, sessionId, now);
     if (toDeviceId === null) return null;
-    // A digest the session already holds is the answer to this ask too, and a request already out
-    // is the one to wait on: either way no second summariser runs over the same transcript.
-    const reuse = reusablePeek((await listPeeks(env.DB, userId, sessionId)).map(peekView), now);
-    if (reuse.kind !== "ask") return { peek: reuse.peek, outcome: { state: "taken", sessionId } };
+    // A digest the session already holds is the answer to this ask too, and a request a summariser
+    // is still working on is the one to wait on: either way nothing summarises that transcript
+    // twice.
+    const held = reusablePeek(await listPeeks(env.DB, userId, sessionId), now);
+    if (held !== null) return { placed: false, peek: peekView(held) };
     const peek = await requestPeek(env.DB, userId, sessionId, crypto.randomUUID(), now);
     const outcome = await mailboxFor(env, userId).peek({
       peekId: peek.peekId,
@@ -2233,7 +2233,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       toDeviceId,
       requestedAt: now,
     });
-    return { peek: peekView(peek), outcome };
+    // Nothing is going to answer a peek no host took, and a pending row is what the next ask waits
+    // on, so the row goes with the refusal rather than holding the asks behind it to a request
+    // that was never summarised.
+    if (outcome.state === "untaken") await dropPeek(env.DB, userId, sessionId, peek.peekId);
+    return { placed: true, peek: peekView(peek), outcome };
   };
 
   // The wait a read back takes between reads. The Worker has no thread to sleep, so it waits on the
@@ -2351,7 +2355,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         }
         const asked = await askPeek(env, userId, toSessionId, at);
         if (asked === null) return refused(`no session ${toSessionId} running on this account`);
-        if (asked.outcome.state === "untaken") {
+        if (asked.placed && asked.outcome.state === "untaken") {
           return refused(`no host took the peek of ${session}: ${asked.outcome.reason}`);
         }
         const peek = await readBackPeek(
@@ -2715,7 +2719,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     // over or that this account never had is a 404 and never a request nobody can answer.
     const asked = await askPeek(env, userId, sessionId, deps.now());
     if (asked === null) return error(404, `no session ${sessionId} running on this account`);
-    return json(asked, 201);
+    // An ask answered off a peek the session already held handed nothing to the bus, so it carries
+    // no outcome; a caller reads the digest or waits on the request, as it does for one it placed.
+    return json(asked.placed ? { peek: asked.peek, outcome: asked.outcome } : { peek: asked.peek }, 201);
   };
 
   // The name its owner gives one session, which every listing then prints over the name Claude Code

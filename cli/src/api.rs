@@ -597,13 +597,9 @@ pub struct Peeked {
     pub peek: Peek,
 }
 
-/// How many times a peek is read back before the caller is told it is still pending. The
-/// summariser runs one Haiku call over the tail of a transcript and answers in seven to thirteen
-/// seconds, the busiest sessions slowest, so the window covers the whole of that spread rather
-/// than the middle of it: a read back that gives up at ten seconds answers pending on the slow
-/// half and pays for a digest nobody reads. A host slower than the whole window is read again by
-/// the next command rather than waited on here. `PEEK_READS` and `PEEK_WAIT_MS` in `src/tools.ts`
-/// are the same two on the connector side.
+/// How many times a peek is read back before the caller is told it is still pending, covering the
+/// whole of what a summariser takes rather than the middle of it; a host slower than the window is
+/// read again by the next command.
 pub const PEEK_READS: usize = 12;
 
 pub const PEEK_WAIT: Duration = Duration::from_secs(2);
