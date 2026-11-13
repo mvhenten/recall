@@ -295,6 +295,7 @@ import {
 } from "./store";
 import type { Tenant } from "./tenant";
 import {
+  deviceDigest,
   editedMemory,
   parseEditArgs,
   parseListArgs,
@@ -305,6 +306,7 @@ import {
   renderMemory,
   resolveTarget,
   SEARCH_LIMIT,
+  sessionDigest,
   TOOLS,
   toolArguments,
 } from "./tools";
@@ -328,8 +330,10 @@ import {
   sendInputOf,
   sessionHitView,
   sessionView,
+  type V2Device,
   type V2RecordsAccepted,
   type V2RecordsConflict,
+  type V2Session,
 } from "./v2";
 
 // How a surface reads the address off a board post. The two differ only there.
@@ -2187,7 +2191,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   };
 
   const runTool = (env: TenantEnv, caller: Caller): RunTool => {
-    // Every tool but the send one reads or writes a memory, which is a row of this account's own.
+    // Every tool but the two listings and the send one reads or writes a memory, which is a row of
+    // this account's own.
     const db = env.DB;
     const { userId } = caller;
     const refused = (reason: string): ToolResult => ({ ok: false, error: `recall: ${reason}` });
@@ -2259,6 +2264,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         await deleteMemory(db, userId, memory.memoryId);
         return document({ deleted: memory.name });
       }
+      // The two listings read what the routes behind `recall sessions` and `recall devices` read,
+      // cut to the fields the tool descriptions name.
+      if (call.name === "recall_sessions") {
+        return document((await listedSessions(db, caller)).map(sessionDigest));
+      }
+      if (call.name === "recall_devices") {
+        return document((await listedDevices(env, caller)).map(deviceDigest));
+      }
       const input = parseSendArgs(args.value);
       if (!input.ok) return refused(input.error);
       const now = deps.now();
@@ -2295,6 +2308,22 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   // A caller is proved once, here, and handed to every handler below with the database it reads.
   // No handler under this branch reaches back into the environment for a binding once the caller
   // is known, which is what lets the whole branch move behind a Durable Object unchanged.
+  const listedDevices = async (env: TenantEnv, caller: Caller): Promise<V2Device[]> => {
+    const [listed, labels] = await Promise.all([
+      listDevices(env.ACCOUNT, caller.userId),
+      readLabels(env.DB, caller.userId),
+    ]);
+    return listed.map((device) => deviceView(device, labels.hosts, caller.deviceId));
+  };
+
+  const listedSessions = async (db: TenantDb, caller: Caller): Promise<V2Session[]> => {
+    const [listed, labels] = await Promise.all([
+      listSessions(db, caller.userId, deps.now()),
+      readLabels(db, caller.userId),
+    ]);
+    return listed.map((session) => sessionView(session, labels.hosts, caller.deviceId));
+  };
+
   const v2Devices = async (
     request: Request,
     env: TenantEnv,
@@ -2303,11 +2332,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   ): Promise<Response> => {
     if (deviceId === undefined) {
       if (request.method !== "GET") return error(405, "method not allowed");
-      const [listed, labels] = await Promise.all([
-        listDevices(env.ACCOUNT, caller.userId),
-        readLabels(env.DB, caller.userId),
-      ]);
-      return json({ devices: listed.map((device) => deviceView(device, labels.hosts, caller.deviceId)) });
+      return json({ devices: await listedDevices(env, caller) });
     }
     // No `current`: a client revokes its own login by reading its row off the listing, where
     // `current` already says which one it is. A path segment that means a different device
@@ -2318,13 +2343,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return new Response(null, { status: 204 });
   };
 
-  const v2SessionsList = async (db: TenantDb, caller: Caller): Promise<Response> => {
-    const [listed, labels] = await Promise.all([
-      listSessions(db, caller.userId, deps.now()),
-      readLabels(db, caller.userId),
-    ]);
-    return json({ sessions: listed.map((session) => sessionView(session, labels.hosts, caller.deviceId)) });
-  };
+  const v2SessionsList = async (db: TenantDb, caller: Caller): Promise<Response> =>
+    json({ sessions: await listedSessions(db, caller) });
 
   // Every file of a session the archive holds, which is the files the records hold and nothing
   // else.
