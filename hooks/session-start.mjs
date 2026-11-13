@@ -92,10 +92,6 @@ function registerSession(input, repoTag) {
 // since `SessionStart` fires again on resume and on compact and a pickup hands a session what it
 // already holds.
 async function run(input) {
-  // A peek summarises one session by running Claude Code over the tail of its transcript, and that
-  // run starts here like any other. Registering it would put the summariser in the session listing
-  // beside the session it was started to describe, and hand it a memory crib it has no use for.
-  if (process.env.RECALL_PEEK) return "peek";
   const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
   const repoTag = repo.ok ? repo.stdout.trim() : "";
   const messaging = registerSession(input, repoTag);

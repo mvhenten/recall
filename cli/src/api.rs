@@ -412,10 +412,15 @@ pub fn append_body(file: &str, from: i64, records: &[String], closed: bool) -> V
         .expect("an append of strings serializes")
 }
 
-/// What a digest crosses as. The peek it lands on is the path, and the state it moves to is the
-/// service's to work out, so the body carries the summary and nothing else.
-pub fn peek_body(digest: &str) -> serde_json::Value {
-    serde_json::json!({ "digest": digest })
+/// What a digest put on a peek did. The service takes one answer per peek, and only from the
+/// device the session runs on, so a peek that already holds a digest and a peek that is no longer
+/// there are both answers to the call rather than faults: the summariser has nothing left to do
+/// either way, and a host that reports them as failures reports a working peek as a broken one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrote {
+    Digest,
+    Held,
+    Gone,
 }
 
 /// An artifact runs to 64 MB, and a long session's transcript to several; neither fits in the
@@ -1333,16 +1338,22 @@ impl Client {
     /// Puts the digest on one peek of one session. The service takes it from the device the
     /// session runs on and from nowhere else, and takes it once: a peek that already holds a
     /// digest is refused rather than written over, so the first answer is the one the asker reads.
-    pub fn write_peek(&self, session_id: &str, peek_id: &str, digest: &str) -> Result<()> {
+    pub fn write_peek(&self, session_id: &str, peek_id: &str, digest: &str) -> Result<Wrote> {
         let path = format!("{}/peek/{}", Self::session_path(session_id), encode(peek_id));
         let response = self
             .authed(self.agent.put(self.url(&path)))
-            .send_json(peek_body(digest))?;
-        check(
-            response,
-            &format!("writing the digest of peek {peek_id} on session {session_id}"),
-        )?;
-        Ok(())
+            .send_json(serde_json::json!({ "digest": digest }))?;
+        match response.status().as_u16() {
+            409 => Ok(Wrote::Held),
+            404 => Ok(Wrote::Gone),
+            _ => {
+                check(
+                    response,
+                    &format!("writing the digest of peek {peek_id} on session {session_id}"),
+                )?;
+                Ok(Wrote::Digest)
+            }
+        }
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {
@@ -1713,16 +1724,6 @@ mod tests {
         assert_eq!(read.started_at, 1_762_000_000_123, "an offset other than Z is read too");
         assert_eq!(read.last_activity_at, 1_762_000_000_000);
         assert_eq!(read.mode, "headless", "and the mode reads in this host's own words");
-    }
-
-    /// A digest is the whole of what a summariser writes back, and the peek it answers is named by
-    /// the path it is put to.
-    #[test]
-    fn a_digest_crosses_as_the_one_field_the_service_takes() {
-        assert_eq!(
-            peek_body("Reading the planner."),
-            serde_json::json!({ "digest": "Reading the planner." })
-        );
     }
 
     /// A message names where it is going in the one `address` every `/v2` endpoint carries: a
