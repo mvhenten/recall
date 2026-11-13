@@ -1,4 +1,21 @@
-import { and, asc, count, desc, eq, getTableName, gt, gte, inArray, lt, lte, ne, or, type SQL, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  getTableName,
+  gt,
+  gte,
+  inArray,
+  lt,
+  lte,
+  ne,
+  notInArray,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import { type SQLiteColumn, type SQLiteTable, union, unionAll } from "drizzle-orm/sqlite-core";
 import {
   type ArtifactFile,
@@ -41,6 +58,8 @@ import {
   type ModelTotals,
   NEVER_RECALLED_AFTER_DAYS,
   type PastSession,
+  PEEK_HISTORY,
+  type Peek,
   type SaveInput,
   SESSION_TTL_MS,
   type Session,
@@ -74,6 +93,7 @@ import {
   sessionHistory,
   sessionIndex,
   sessionOpenChunks,
+  sessionPeeks,
   sessionRecords,
   sessions,
   usageDaily,
@@ -550,6 +570,82 @@ export const listSessions = async (db: TenantDb, userId: string, now: number): P
         .all();
     })
     .map(toSession);
+
+// What one session keeps of what it was asked, newest first: the ones past the twentieth go where
+// the twenty-first is written. Trimming on the write is what keeps the history bounded without a
+// pass of its own, and the peek id settles two asked for in the same millisecond.
+const prunePeeks = (tx: TenantTx, userId: string, sessionId: string): void => {
+  tx.delete(sessionPeeks)
+    .where(
+      and(
+        eq(sessionPeeks.userId, userId),
+        eq(sessionPeeks.sessionId, sessionId),
+        notInArray(
+          sessionPeeks.peekId,
+          tx
+            .select({ peekId: sessionPeeks.peekId })
+            .from(sessionPeeks)
+            .where(and(eq(sessionPeeks.userId, userId), eq(sessionPeeks.sessionId, sessionId)))
+            .orderBy(desc(sessionPeeks.requestedAt), desc(sessionPeeks.peekId))
+            .limit(PEEK_HISTORY),
+        ),
+      ),
+    )
+    .run();
+};
+
+// A peek asked for and not yet answered. The row is written before anything summarises the session,
+// so the asker reads back the peek it is waiting on rather than nothing at all.
+export const requestPeek = async (
+  db: TenantDb,
+  userId: string,
+  sessionId: string,
+  peekId: string,
+  now: number,
+): Promise<Peek> => {
+  const peek: Peek = { peekId, digest: "", requestedAt: now };
+  db.transaction((tx) => {
+    tx.insert(sessionPeeks).values({ userId, sessionId, peekId, digest: peek.digest, requestedAt: now }).run();
+    prunePeeks(tx, userId, sessionId);
+  });
+  return peek;
+};
+
+// The digest lands on the row the request wrote, so a summariser naming a peek this session does
+// not hold is answered false rather than writing a row of its own. The empty digest in the
+// predicate is what makes the first answer the one that stands: a session peeked at once is
+// summarised by one run, and a second arriving late is told it lost rather than overwriting it.
+// RETURNING is what counts the rows an update reached, as `endSession` says.
+export const writePeek = async (
+  db: TenantDb,
+  userId: string,
+  sessionId: string,
+  peekId: string,
+  digest: string,
+): Promise<boolean> => {
+  const written = db
+    .update(sessionPeeks)
+    .set({ digest })
+    .where(
+      and(
+        eq(sessionPeeks.userId, userId),
+        eq(sessionPeeks.sessionId, sessionId),
+        eq(sessionPeeks.peekId, peekId),
+        eq(sessionPeeks.digest, ""),
+      ),
+    )
+    .returning({ peekId: sessionPeeks.peekId })
+    .all();
+  return written.length === 1;
+};
+
+export const listPeeks = async (db: TenantDb, userId: string, sessionId: string): Promise<Peek[]> =>
+  db
+    .select({ peekId: sessionPeeks.peekId, digest: sessionPeeks.digest, requestedAt: sessionPeeks.requestedAt })
+    .from(sessionPeeks)
+    .where(and(eq(sessionPeeks.userId, userId), eq(sessionPeeks.sessionId, sessionId)))
+    .orderBy(desc(sessionPeeks.requestedAt), desc(sessionPeeks.peekId))
+    .all();
 
 // `live` is the moment a session counts as gone.
 const pastSessionsFrom = (db: TenantDb, live: number) =>

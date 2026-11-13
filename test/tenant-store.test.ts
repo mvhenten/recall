@@ -3,19 +3,22 @@ import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { type TenantDb, tenantStoreOf } from "../src/db";
-import type { HistoryInput } from "../src/model";
+import { type HistoryInput, PEEK_HISTORY } from "../src/model";
 import { labels } from "../src/schema/tenant";
 import {
   chunkMatches,
   createArtifact,
   endSession,
   getMemory,
+  listPeeks,
   putSession,
+  requestPeek,
   saveMemory,
   searchArtifacts,
   searchSessionHistory,
   textCandidates,
   vectorCandidates,
+  writePeek,
 } from "../src/store";
 import { TENANT_MIGRATIONS } from "../src/tenant-migrations";
 import { tenantRows } from "./harness";
@@ -181,6 +184,48 @@ describe("the tenant store", () => {
       return { first, again, missing };
     });
     expect(answered).toEqual({ first: true, again: false, missing: false });
+  });
+
+  it("writes a digest onto the session the peek was asked of, once", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    const written = await inStore(userId, async (db) => {
+      await requestPeek(db, userId, "s-1", "peek-1", NOW);
+      await requestPeek(db, userId, "s-2", "peek-2", NOW);
+      const onItsOwn = await writePeek(db, userId, "s-1", "peek-1", "rebasing the branch");
+      const onAnother = await writePeek(db, userId, "s-2", "peek-1", "rebasing the branch");
+      const again = await writePeek(db, userId, "s-1", "peek-1", "running the tests");
+      return { onItsOwn, onAnother, again };
+    });
+    expect(written).toEqual({ onItsOwn: true, onAnother: false, again: false });
+    expect(await inStore(userId, (db) => listPeeks(db, userId, "s-1"))).toEqual([
+      { peekId: "peek-1", digest: "rebasing the branch", requestedAt: NOW },
+    ]);
+    expect(await inStore(userId, (db) => listPeeks(db, userId, "s-2"))).toEqual([
+      { peekId: "peek-2", digest: "", requestedAt: NOW },
+    ]);
+  });
+
+  // Two peeks asked for in the same millisecond, which is the one case the instant cannot order.
+  it("settles two peeks of one instant on the peek id", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    await inStore(userId, async (db) => {
+      for (const peekId of ["peek-a", "peek-b"]) await requestPeek(db, userId, "s-1", peekId, NOW);
+    });
+    const history = await inStore(userId, (db) => listPeeks(db, userId, "s-1"));
+    expect(history.map((peek) => peek.peekId)).toEqual(["peek-b", "peek-a"]);
+  });
+
+  it("drops the oldest peek where the twenty-first is written", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    await inStore(userId, async (db) => {
+      for (let index = 0; index <= PEEK_HISTORY; index += 1) {
+        await requestPeek(db, userId, "s-1", `peek-${index}`, NOW + index * 1000);
+      }
+    });
+    const history = await inStore(userId, (db) => listPeeks(db, userId, "s-1"));
+    expect(history).toHaveLength(PEEK_HISTORY);
+    expect(history.at(0)?.peekId).toBe(`peek-${PEEK_HISTORY}`);
+    expect(history.at(-1)?.peekId).toBe("peek-1");
   });
 
   it("lays its schema down once however many requests reach it", async () => {

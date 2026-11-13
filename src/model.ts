@@ -144,6 +144,19 @@ export interface Session extends SessionInput {
   deviceId: string;
 }
 
+// How many peeks one session keeps. A peek is asked for by hand and read within the minute, so what
+// is kept is a short tail a reader scrolls and never a series anything counts over.
+export const PEEK_HISTORY = 20;
+
+// One peek of a running session. The request is written with no digest at all and a summariser on
+// that session's host writes one, so the asker reads the row it is waiting on rather than nothing
+// at all, and the empty digest is the whole of what makes a peek still pending.
+export interface Peek {
+  peekId: string;
+  digest: string;
+  requestedAt: number;
+}
+
 export interface Live {
   sessions: number;
   busy: number;

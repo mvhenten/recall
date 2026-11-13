@@ -56,6 +56,20 @@ export const sessionHistory = sqliteTable(
   (table) => [primaryKey({ columns: [table.userId, table.sessionId] })],
 );
 
+// WITHOUT ROWID in `migrations/tenant/0005_peeks.sql`, which drizzle's schema cannot say. A peek
+// with an empty digest is one nothing has answered yet.
+export const sessionPeeks = sqliteTable(
+  "session_peeks",
+  {
+    userId: text("user_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    peekId: text("peek_id").notNull(),
+    digest: text("digest").notNull(),
+    requestedAt: integer("requested_at").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.sessionId, table.peekId] })],
+);
+
 export const sessionIndex = sqliteTable(
   "session_index",
   {

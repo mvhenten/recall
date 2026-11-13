@@ -480,6 +480,54 @@
       },
       "required": ["session", "score", "excerpt"]
     },
+    "Peek": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "Peek.json",
+      "type": "object",
+      "properties": {
+        "peekId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "$ref": "PeekState.json"
+        },
+        "digest": {
+          "$ref": "PeekDigest.json"
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["peekId", "state", "digest", "requestedAt"],
+      "description": "One peek a session was asked for. A request is `Pending` and carries no digest; the host's\nsummariser answers it and the peek reads `Ready`. A session that never answers leaves the request\npending until the history drops it. The state is the digest read as one of two words, so the two\ncan never disagree."
+    },
+    "PeekState": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "PeekState.json",
+      "type": "string",
+      "enum": ["Pending", "Ready"]
+    },
+    "PeekDigest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "PeekDigest.json",
+      "type": "string",
+      "maxLength": 2000,
+      "description": "What one session was doing when it was peeked at, in a few sentences. A summariser on that\nsession's host writes it from the tail of the transcript, so the session's own context never\ncarries it."
+    },
+    "WritePeek": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "WritePeek.json",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "$ref": "PeekDigest.json"
+        }
+      },
+      "required": ["digest"],
+      "description": "What a summariser puts back on the peek it was handed."
+    },
     "MessageAddress": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$id": "MessageAddress.json",
