@@ -1390,16 +1390,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const found = await findSession(env.DB, userId, parsed.value, now);
     if (!found) return lost(404, "No such session", `This recall holds no session ${parsed.value}.`);
     const { session } = found;
-    const [deviceId, spend, labels] = await Promise.all([
+    const [deviceId, spend, labels, peeks] = await Promise.all([
       liveSessionDevice(env.DB, userId, session.sessionId, now),
       sessionSpend(env.DB, userId, session.sessionId),
       readLabels(env.DB, userId),
+      listPeeks(env.DB, userId, session.sessionId),
     ]);
     const csrf = pageToken(request);
     const render = async (flash: Flash | null, draft: string, status: number): Promise<Response> => {
       const transcript = await transcriptPlan(env, userId, session.sessionId, url);
       if (transcript instanceof Response) return transcript;
-      const view: SessionView = { session, deviceId, spend, transcript, send: { csrf, draft, flash } };
+      const view: SessionView = { session, deviceId, spend, peeks, transcript, send: { csrf, draft, flash } };
       return sessionPage(email, live, view, labels, now, status);
     };
     if (request.method === "GET") {

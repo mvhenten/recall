@@ -114,6 +114,18 @@ const send = async (h: Harness, path: string, assertion: string, body: string): 
   return post(h, path, assertion, { csrf, cookie, body });
 };
 
+// One peek asked of a session, the way a host asks for one. Nothing is listening in these tests,
+// so the row is written and stays pending until a digest is put on it.
+const askPeek = async (client: Client, sessionId: string): Promise<string> => {
+  const response = await client.request("POST", `/v2/sessions/${sessionId}/peek`);
+  expect(response.status).toBe(201);
+  const asked: { peek: { peekId: string } } = await response.json();
+  return asked.peek.peekId;
+};
+
+const writePeek = (client: Client, sessionId: string, peekId: string, digest: string): Promise<Response> =>
+  client.request("PUT", `/v2/sessions/${sessionId}/peek/${peekId}`, { digest });
+
 const deviceId = async (client: Client): Promise<string> => {
   const response = await client.request("GET", "/v2/devices");
   expect(response.status).toBe(200);
@@ -188,6 +200,38 @@ describe("a session page", () => {
 
     const html = await read(h, "/dashboard/sessions/beefbeef", you.assertion);
     expect(html).toContain("No transcript is archived for this session.");
+  });
+
+  // A peek is asked for from a host and answered on that host, so the page is where the answers
+  // pile up. The one a summariser has not written yet reads as pending, since an asker opening the
+  // page seconds later is reading the row it is waiting on.
+  it("lists the peeks asked of a session, newest first, and says which is still pending", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    expect((await you.laptop.sync("cafe0001")).status).toBe(204);
+    const answered = await askPeek(you.laptop, "cafe0001");
+    expect((await writePeek(you.laptop, "cafe0001", answered, "running the tenant migration")).status).toBe(204);
+    h.advance(60_000);
+    await askPeek(you.laptop, "cafe0001");
+
+    const html = await read(h, "/dashboard/sessions/cafe0001", you.assertion);
+
+    const pending = html.indexOf('<span class="in">Pending</span><span class="iv">0s ago</span>');
+    const ready = html.indexOf('<span class="in">running the tenant migration</span><span class="iv">1m ago</span>');
+    expect(pending).toBeGreaterThan(-1);
+    expect(ready).toBeGreaterThan(pending);
+    expect(html).toContain("2 peeks · last 20 kept");
+  });
+
+  it("draws no peek card for a session nobody has asked about", async () => {
+    const h = await harness();
+    const you = await owner(h);
+    expect((await you.laptop.sync("cafe0002")).status).toBe(204);
+
+    const html = await read(h, "/dashboard/sessions/cafe0002", you.assertion);
+
+    expect(html).not.toContain("Peeks");
+    expect(html).not.toContain("Pending");
   });
 
   it("has no page for a session this account never held", async () => {
