@@ -280,8 +280,7 @@ describe("the connector's tools", () => {
   it("lists the live sessions and the hosts a send can be addressed to", async () => {
     const { h, email, mcp } = await signedIn();
     const client = h.clientWithToken(await h.login(email, "laptop"));
-    const focus = { first: "ship it", latest: "<task-notification>a subagent finished</task-notification>" };
-    expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now(), focus })).status).toBe(204);
+    expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now() })).status).toBe(204);
     const named = JSON.stringify({ type: "agent-name", agentName: "kisuvpalas" });
     expect((await client.v2.records("s-ship", "main", 0, [named])).status).toBe(200);
 
@@ -293,7 +292,7 @@ describe("the connector's tools", () => {
       focus: string;
     }>;
     expect(sessions.map((session) => [session.name, session.host, session.cwd, session.focus])).toEqual([
-      ["kisuvpalas", "laptop", "/home/you/src/recall", "ship it"],
+      ["kisuvpalas", "laptop", "/home/you/src/recall", "why is the worker test red"],
     ]);
     expect(await mcp.json("recall_send", { to: sessions[0]?.handle ?? "", message: "ship it" })).toMatchObject({
       toSessionId: "s-ship",

@@ -261,7 +261,7 @@ pub fn render_sessions(sessions: &[Session], now: i64) -> String {
         .map(|session| {
             vec![
                 host_column(&session.host_label, &session.host),
-                session.name.clone(),
+                session_name(&session.agent_name, &session.name).to_string(),
                 repo_at_branch(&session.repo, &session.branch),
                 sessions::age(session.started_at, now),
                 sessions::state(session.last_activity_at, now).to_string(),
@@ -298,13 +298,10 @@ pub fn render_sessions(sessions: &[Session], now: i64) -> String {
 }
 
 /// The name a session answers to: the one Claude Code gave it where there is one, and the handle
-/// `recall send` takes otherwise.
-fn session_name(session: &PastSession) -> &str {
-    if session.agent_name.is_empty() {
-        &session.name
-    } else {
-        &session.agent_name
-    }
+/// `recall send` takes otherwise. A live session and a stored one are named the same way, so both
+/// listings hand their two names here.
+fn session_name<'a>(agent_name: &'a str, handle: &'a str) -> &'a str {
+    if agent_name.is_empty() { handle } else { agent_name }
 }
 
 /// One stored session: what it is called, where and when it ran, what it was about, and what the
@@ -316,7 +313,7 @@ pub fn render_session(session: &PastSession, files: &[HeldFile]) -> String {
         .collect();
     format!(
         "---\nname: {}\nhandle: {}\nsession: {}\nhost: {}\ncwd: {}\nwhere: {}\nstarted: {}\nlast active: {}\nprompts: {}\nstate: {}\n---\n\n{}\n\nTranscript:\n\n{}",
-        session_name(session),
+        session_name(&session.agent_name, &session.name),
         session.name,
         session.session_id,
         host_column(&session.host_label, &session.host),
@@ -342,7 +339,7 @@ pub fn render_session_hits(hits: &[SessionHit]) -> String {
         .map(|hit| {
             format!(
                 "## {} ({}, score {:.3})\n\n_{} · {} · {}_\n\n> {}\n\n",
-                session_name(&hit.session),
+                session_name(&hit.session.agent_name, &hit.session.name),
                 hit.session.session_id,
                 hit.score,
                 host_column(&hit.session.host_label, &hit.session.host),

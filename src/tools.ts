@@ -11,7 +11,6 @@ import {
   parseTags,
   type Session,
 } from "./model";
-import { machineWritten } from "./turns";
 import type { V2Device, V2Session } from "./v2";
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
@@ -387,13 +386,6 @@ export interface DeviceDigest {
   host: string;
 }
 
-// The focus line a reader can act on: the latest prompt, and the one that opened the session where
-// the latest is markup the harness wrote. Both being markup leaves nothing worth printing.
-const readableFocus = (focus: { first: string; latest: string }): string => {
-  if (!machineWritten(focus.latest)) return focus.latest;
-  return machineWritten(focus.first) ? "" : focus.first;
-};
-
 // `name` is what cli/src/markdown.rs prints in its name column: the name Claude Code gave the
 // session, and the handle where it has none.
 export const sessionDigest = (session: V2Session): SessionDigest => ({
@@ -401,7 +393,7 @@ export const sessionDigest = (session: V2Session): SessionDigest => ({
   handle: session.name,
   host: session.hostLabel,
   cwd: session.cwd,
-  focus: readableFocus(session.focus),
+  focus: session.focus.latest,
 });
 
 export const deviceDigest = (device: V2Device): DeviceDigest => ({

@@ -1194,10 +1194,14 @@ impl Client {
     /// and the dashboard in the clear, so it goes through the same reading every stretch of every
     /// transcript goes through. Both the hooks' sync and the backfill's send the record this way,
     /// so neither route carries one up.
+    ///
+    /// It is also where a prompt the harness wrote rather than the user is dropped, for the same
+    /// reason: every write of a focus line passes through here, whether the record behind it was
+    /// moved on by a hook or read off a transcript.
     pub fn sync_session(&self, session_id: &str, body: &SessionBody) -> Result<()> {
         let focus = crate::sessions::Focus {
-            first: crate::redact::text(&body.focus.first),
-            latest: crate::redact::text(&body.focus.latest),
+            first: crate::redact::text(crate::sessions::user_written(&body.focus.first)),
+            latest: crate::redact::text(crate::sessions::user_written(&body.focus.latest)),
         };
         let response = self
             .authed(self.agent.put(self.url(&Self::session_path(session_id))))
