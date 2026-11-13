@@ -100,8 +100,8 @@ impl UsagePending {
 /// `recall sessions --end` removes it; the daemon only ever reads the directory.
 ///
 /// `pid` is the Claude process that owns the session, whatever the state, so a record outliving a
-/// session that never reached session end is removed on the next pass. `syncStartedAt`, which the
-/// hooks use to throttle their own syncing, is theirs alone and is not read back here, and so are
+/// session that never reached session end is removed on the next pass. `usageCountedAt`, which the
+/// hooks use to throttle their own counting, is theirs alone and is not read back here, and so are
 /// `usageFiles`, `usageHighWater` and `usagePrompts`, which say how far into each of the session's
 /// transcript files the usage this host sent has reached. The archive keeps a mark of its own, on
 /// the service, so neither reading can skip or replay the other.
@@ -274,23 +274,20 @@ pub fn status(dir: &Path) -> Vec<(PathBuf, Status)> {
     scan(dir).live
 }
 
-/// The transcript each record in the registry names, read and nothing more. The sweep that
-/// unlinks the record of a session whose process is gone belongs to one pass; a second pass
-/// sweeping as well would take those records away before the notices they owe the service had
-/// gone out with them.
-pub fn transcript_paths(dir: &Path) -> Vec<(String, PathBuf)> {
+/// Every record the registry holds, read and nothing more. The sweep that unlinks the record of a
+/// session whose process is gone belongs to one pass; a second pass sweeping as well would take
+/// those records away before the notices they owe the service had gone out with them.
+pub fn records(dir: &Path) -> Vec<Status> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut found: Vec<(String, PathBuf)> = entries
+    let mut found: Vec<Status> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
         .filter_map(|path| read(&path))
-        .map(|status| (status.session_id, status.record.transcript_path))
-        .filter(|(_, path)| !path.as_os_str().is_empty())
         .collect();
-    found.sort();
+    found.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     found
 }
 
@@ -1009,7 +1006,7 @@ mod tests {
     fn the_registry_reads_back_the_json_the_hook_writes() {
         const DOCUMENT: &str = r#"{"pid":4242,"cwd":"/src","sessionId":"s-1","host":"laptop",
             "repo":"repo:github.com/mvhenten/recall","branch":"work","commit":"feat: list sessions",
-            "startedAt":1762000000000,"lastActivityAt":1762000060000,"syncStartedAt":1762000060000,"prompts":2,
+            "startedAt":1762000000000,"lastActivityAt":1762000060000,"usageCountedAt":1762000060000,"prompts":2,
             "focus":{"first":"list the sessions","latest":"why is CI red"},"mode":"interactive",
             "permissionMode":"default""#;
         let document = |state: &str| format!("{DOCUMENT},{state}}}");
@@ -1179,7 +1176,7 @@ mod tests {
       "commit": "feat(usage): count what a session spends",
       "startedAt": 1762000000000,
       "lastActivityAt": 1762000060000,
-      "syncStartedAt": 1762000060000,
+      "usageCountedAt": 1762000060000,
       "prompts": 2,
       "focus": { "first": "count the tokens", "latest": "count the tokens" },
       "mode": "interactive",
@@ -1266,7 +1263,7 @@ mod tests {
       "commit": "feat(usage): count what a session spends",
       "startedAt": 1762000000000,
       "lastActivityAt": 1762000060000,
-      "syncStartedAt": 1762000060000,
+      "usageCountedAt": 1762000060000,
       "prompts": 2,
       "focus": { "first": "count the tokens", "latest": "count the tokens" },
       "mode": "interactive",
@@ -1371,7 +1368,7 @@ mod tests {
             written.get("usagePending").is_none(),
             "a delta that landed is not sent again"
         );
-        assert_eq!(written["syncStartedAt"], 1_762_000_060_000_i64);
+        assert_eq!(written["usageCountedAt"], 1_762_000_060_000_i64);
         assert_eq!(
             written["transcriptPath"],
             "/home/you/.claude/projects/recall/s-usage.jsonl"

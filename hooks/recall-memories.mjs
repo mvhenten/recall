@@ -1,4 +1,4 @@
-import { emit, firstLine, logRun, readInput, recall, recallDetached } from "./lib.mjs";
+import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
 import { touch } from "./messaging.mjs";
 import { MIN_SCORE, searchQuery, unseen } from "./query.mjs";
 import { readShown, recordShown } from "./shown.mjs";
@@ -33,9 +33,9 @@ async function repoTagOf(cwd) {
 }
 
 // Every prompt moves the focus line on, including the ones too short to search on. The record and
-// the usage delta the transcript has grown since the last sync are local writes; the sync that
-// carries both is started and left to run, at most once every SYNC_INTERVAL_MS, because this
-// hook's budget belongs to the prompt and not to the dashboard.
+// the usage delta the transcript has grown since the last count are local writes, and the daemon
+// is what carries both to the service: this hook's budget belongs to the prompt, and a hook that
+// sent them started a process that had to find its place in every file of the session first.
 function refresh(input, prompt) {
   if (!input.session_id || !prompt) return "skipped";
   let touched;
@@ -46,9 +46,7 @@ function refresh(input, prompt) {
   }
   if (!touched) return "unregistered";
   if (!touched.due) return "throttled";
-  const usage = countUsage(input.session_id, input.transcript_path);
-  const synced = recallDetached(["sessions", "--sync", input.session_id], input.cwd) ? "syncing" : "not-installed";
-  return `${synced} usage:${usage}`;
+  return `usage:${countUsage(input.session_id, input.transcript_path)}`;
 }
 
 async function memories(input, prompt) {

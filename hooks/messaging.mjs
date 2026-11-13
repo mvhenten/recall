@@ -4,7 +4,7 @@ import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 
 export const FOCUS_PART_CHARS = 72;
-export const SYNC_INTERVAL_MS = 30_000;
+export const USAGE_INTERVAL_MS = 30_000;
 const GIT_TIMEOUT_MS = 2000;
 
 export function configFile(env = process.env) {
@@ -187,8 +187,8 @@ function transcript(stored, transcriptPath) {
 
 // The registry is the one record of what became of a session, so a session the hook passed over
 // gets a file too, carrying the state and no inbox. `recall listen --status` reads them all, the
-// daemon delivers only to the ones carrying a socket, and `recall sessions --sync` sends the rest
-// of the document to the service, whatever the state, so every host's sessions are listed.
+// daemon delivers only to the ones carrying a socket, and it sends the rest of the document to the
+// service, whatever the state, so every host's sessions are listed.
 export function record(sessionId, state, session, env = process.env, uid = process.getuid()) {
   const { cwd, repo, permissionMode, transcriptPath } = session;
   const dir = sessionsDir(env, uid);
@@ -209,7 +209,7 @@ export function record(sessionId, state, session, env = process.env, uid = proce
       ...head(cwd),
       startedAt: now,
       lastActivityAt: now,
-      syncStartedAt: 0,
+      usageCountedAt: 0,
       prompts: 0,
       focus: { first: "", latest: "" },
       mode: invocation(pid),
@@ -244,13 +244,13 @@ function taken(stored, env) {
 
 // Each prompt counts, moves the focus on and marks the session active. The branch, the commit and
 // the permission mode all change under a running session, so they are read again here. `due` says
-// whether the caller should fire a sync: at most one every SYNC_INTERVAL_MS, and the stamp goes in
-// before the spawn, because the hook never learns whether the sync it started arrived.
+// whether the caller should read the transcript for the usage it has grown: at most one reading
+// every USAGE_INTERVAL_MS, since a prompt's budget is the prompt's.
 export function touch(sessionId, prompt, permissionMode, env = process.env, uid = process.getuid()) {
   const stored = readRecord(sessionId, env, uid);
   if (!stored) return undefined;
   const now = Date.now();
-  const due = now - (stored.syncStartedAt ?? 0) >= SYNC_INTERVAL_MS;
+  const due = now - (stored.usageCountedAt ?? 0) >= USAGE_INTERVAL_MS;
   const latest = truncate(prompt);
   writeRecord(
     sessionId,
@@ -259,7 +259,7 @@ export function touch(sessionId, prompt, permissionMode, env = process.env, uid 
       ...taken(stored, env),
       ...head(stored.cwd),
       lastActivityAt: now,
-      syncStartedAt: due ? now : stored.syncStartedAt,
+      usageCountedAt: due ? now : stored.usageCountedAt,
       prompts: (stored.prompts ?? 0) + 1,
       focus: { first: stored.focus?.first || latest, latest },
       permissionMode: permissionMode ?? "",

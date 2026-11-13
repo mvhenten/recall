@@ -500,7 +500,7 @@ fn login(endpoint: Option<String>, name: Option<String>) -> Result<()> {
     }
 }
 
-fn update(cli_settings: &Settings) -> Result<ExitCode> {
+fn update() -> Result<ExitCode> {
     let updater = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("recall-update")))
@@ -515,10 +515,7 @@ fn update(cli_settings: &Settings) -> Result<ExitCode> {
     if !status.success() {
         return Ok(ExitCode::from(1));
     }
-    match settings::load(cli_settings) {
-        Ok(settings) => listen::restart(&settings),
-        Err(error) => listen::log(&format!("listen:restart-failed:{error:#}"), Duration::ZERO),
-    }
+    listen::restart();
     adopt_after_update();
     Ok(ExitCode::SUCCESS)
 }
@@ -658,11 +655,11 @@ fn report_order(sent: &api::Sent, to: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// One sync carries both halves of what a host knows about a session: the document, and the usage
-/// delta the hooks fixed since the last one. Nothing here reads the transcript.
-/// The record, then the delta it carries, then the transcript itself. The archive goes last so
-/// that a file the service holds bytes of is a file whose tokens were counted: the backfill reads
-/// it that way, and sending the bytes first would have it count a stretch twice.
+/// What a host knows about one session, sent by hand: the document, and the usage delta its record
+/// still carries. The daemon carries both for a live session, and that session's transcript
+/// besides, so this is for a session the daemon has not reached and for the pass behind `--adopt`.
+/// Nothing here reads the transcript: a process that just started holds no place in the session's
+/// files, so finding one would mean probing every file of the session from its start.
 fn sync_session(session_id: &str) -> Result<()> {
     let dir = listen::sessions_dir();
     let Some(record) = sessions::record(&dir, session_id) else {
@@ -681,17 +678,6 @@ fn sync_session(session_id: &str) -> Result<()> {
         )?;
         sessions::commit_usage(&dir, session_id, pending)?;
         println!("sent {sent} usage deltas for {session_id}");
-    }
-    // A sync says nothing about the session being over, so the record half written at the end of
-    // a file waits for the pass that holds the whole of it.
-    let archived = transcripts::Archive::at(listen::uploaded_dir()).send(
-        &client,
-        session_id,
-        &record.transcript_path,
-        Pass::Open,
-    )?;
-    if archived > 0 {
-        println!("archived {archived} transcript records for {session_id}");
     }
     Ok(())
 }
@@ -1036,7 +1022,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let client = || -> Result<Client> { Ok(Client::new(config::load()?)) };
     match cli.command {
         Command::Login { endpoint, name } => login(endpoint, name)?,
-        Command::Update => return update(&cli.settings),
+        Command::Update => return update(),
         Command::Config { action } => run_config(&cli.settings, cli.json, action)?,
         Command::Mcp => mcp::serve(settings::load(&cli.settings)?.messaging_enabled())?,
         Command::Listen { ensure, status } => {

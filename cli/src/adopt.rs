@@ -609,7 +609,7 @@ fn take_on(scope: &Scope, claim: &Claim) -> Result<Adoption> {
             at => at,
         },
         "lastActivityAt": millis(claim.transcript.modified),
-        "syncStartedAt": 0,
+        "usageCountedAt": 0,
         "prompts": reading.prompts,
         "focus": reading.focus,
         "mode": claim.process.mode,
@@ -896,7 +896,7 @@ mod tests {
         let held = sandbox.scope.sessions.join("s-live.json");
         let mut owned = first.clone();
         owned["usagePending"] = json!({ "seq": 1200, "events": [{ "model": "claude-opus-4" }] });
-        owned["syncStartedAt"] = json!(1_762_000_060_000_i64);
+        owned["usageCountedAt"] = json!(1_762_000_060_000_i64);
         std::fs::write(&held, serde_json::to_string(&owned).unwrap()).unwrap();
 
         assert_eq!(
@@ -927,7 +927,7 @@ mod tests {
             second["usagePending"], owned["usagePending"],
             "a delta the hooks fixed is still waiting after the pass"
         );
-        assert_eq!(second["syncStartedAt"], 1_762_000_060_000_i64);
+        assert_eq!(second["usageCountedAt"], 1_762_000_060_000_i64);
         assert_eq!(second["prompts"], 3);
         assert_eq!(second["focus"]["latest"], "and now the dashboard");
         assert_eq!(

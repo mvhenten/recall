@@ -10,9 +10,11 @@ use crate::ws::{self, Ended, Peeked, Reply};
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -501,13 +503,79 @@ async fn wake_loop(every: Duration, debounce: Duration, wake: &mut UnboundedRece
 
 /// The directories the live sessions are writing in. A session whose record carries no transcript
 /// names none, and neither does one whose directories are not there to be watched.
-fn watched(live: &[(String, PathBuf)]) -> BTreeMap<PathBuf, watch::Depth> {
-    live.iter().flat_map(|(_, path)| transcripts::dirs(path)).collect()
+fn watched(live: &[sessions::Status]) -> BTreeMap<PathBuf, watch::Depth> {
+    live.iter()
+        .flat_map(|status| transcripts::dirs(&status.record.transcript_path))
+        .collect()
 }
 
-/// The transcripts of the sessions still running. A session works for minutes between prompts and
-/// writes the whole time, while the hook that would carry its lines up only fires on a prompt, so
-/// without this a long turn reaches the archive only once it is over.
+/// What the service was last told about a session, so a pass sends a record that moved and leaves
+/// the rest alone. Only a prompt moves one, and a prompt wakes the watch by writing the transcript,
+/// so the list is as fresh as the session is busy without a pass costing a write per session.
+fn carried(record: &sessions::Record) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    record.host.hash(&mut hasher);
+    record.cwd.hash(&mut hasher);
+    record.repo.hash(&mut hasher);
+    record.branch.hash(&mut hasher);
+    record.commit.hash(&mut hasher);
+    record.started_at.hash(&mut hasher);
+    record.last_activity_at.hash(&mut hasher);
+    record.prompts.hash(&mut hasher);
+    record.focus.first.hash(&mut hasher);
+    record.focus.latest.hash(&mut hasher);
+    record.mode.hash(&mut hasher);
+    record.permission_mode.hash(&mut hasher);
+    record.pid.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The document a host knows about one session, and the usage delta the hooks counted into its
+/// record. The hooks write both and send neither: a hook is a new process whose archive knows
+/// nothing of what this run already sent, so carrying lines from there probed every file of the
+/// session from its start. The record goes before the delta, and the delta before the transcript,
+/// so a file the service holds bytes of is a file whose tokens were counted.
+fn carry(client: &Client, sent: &Mutex<HashMap<String, u64>>, dir: &Path, status: &sessions::Status) {
+    let id = &status.session_id;
+    let moved = carried(&status.record);
+    if remembered(sent).get(id).copied() != Some(moved) {
+        let started = Instant::now();
+        match client.sync_record(id, &status.record) {
+            Ok(()) => {
+                remembered(sent).insert(id.clone(), moved);
+                log(&format!("sessions:synced:{id}"), started.elapsed());
+            }
+            Err(error) => log(&format!("sessions:sync-failed:{id}:{error:#}"), started.elapsed()),
+        }
+    }
+    let Some(pending) = status.record.usage_pending.as_ref() else {
+        return;
+    };
+    let started = Instant::now();
+    let outcome = match client.post_usage(
+        id,
+        &status.record.host,
+        &status.record.repo,
+        &pending.files_read(),
+        &pending.events,
+    ) {
+        Ok(sent) => match sessions::commit_usage(dir, id, pending) {
+            Ok(()) => format!("sessions:usage:{id}:{sent}"),
+            Err(error) => format!("sessions:usage-failed:{id}:{error:#}"),
+        },
+        Err(error) => format!("sessions:usage-failed:{id}:{error:#}"),
+    };
+    log(&outcome, started.elapsed());
+}
+
+fn remembered(sent: &Mutex<HashMap<String, u64>>) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+    sent.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Everything a live session owes the service: its record, the usage delta the hooks counted, and
+/// the lines it has written since the last pass. A session works for minutes between prompts and
+/// writes the whole time, so a carrier that fired on prompts alone reached the service only once a
+/// long turn was over.
 ///
 /// The beat is `archive.interval.seconds` and not the registry sweep's: the sweep ends dead
 /// sessions and runs adoption, which a host wanting its newest lines sooner has no reason to
@@ -521,8 +589,9 @@ async fn archive_loop(
     mut watch: Option<watch::Watch>,
     mut wake: UnboundedReceiver<()>,
 ) {
+    let sent = Arc::new(Mutex::new(HashMap::new()));
     wake_loop(every, debounce(every), &mut wake, async || {
-        let live = sessions::transcript_paths(&sessions_dir);
+        let live = sessions::records(&sessions_dir);
         if let Some(watch) = watch.as_mut() {
             for unwatched in watch.sync(&watched(&live)) {
                 log(
@@ -533,14 +602,28 @@ async fn archive_loop(
         }
         let client = Arc::clone(&client);
         let held_at = Arc::clone(&held_at);
+        let sent = Arc::clone(&sent);
+        let dir = sessions_dir.clone();
         let beaten = tokio::task::spawn_blocking(move || {
             let mut pass = held(&held_at);
-            pass.retain(&live.iter().map(|(session_id, _)| session_id.as_str()).collect());
-            for (session_id, path) in &live {
+            pass.retain(&live.iter().map(|status| status.session_id.as_str()).collect());
+            for status in &live {
+                carry(&client, &sent, &dir, status);
+                let transcript = &status.record.transcript_path;
+                if transcript.as_os_str().is_empty() {
+                    continue;
+                }
                 // Every session here is still running, so a record half written at the end of one
                 // of its files waits for the pass that holds the whole of it.
-                archive(&mut pass, &client, session_id, path, transcripts::Pass::Open);
+                archive(
+                    &mut pass,
+                    &client,
+                    &status.session_id,
+                    transcript,
+                    transcripts::Pass::Open,
+                );
             }
+            remembered(&sent).retain(|session_id, _| live.iter().any(|status| &status.session_id == session_id));
         })
         .await;
         if let Err(error) = beaten {
@@ -595,9 +678,12 @@ fn adopt_running(client: &Arc<Client>, scope: &Arc<adopt::Scope>, running: &Arc<
     });
 }
 
-async fn serve(archive_every: Duration) -> Result<()> {
+/// The daemon runs on every host, because it is what carries this host's sessions to the service:
+/// their records, their usage and their transcripts. Messaging is the inbox alone, so a host that
+/// opted out of it keeps the carrier and holds no socket open.
+async fn serve(archive_every: Duration, messaging: bool) -> Result<()> {
     let config = config::load()?;
-    let url = ws::listen_url(&config.endpoint)?;
+    let url = messaging.then(|| ws::listen_url(&config.endpoint)).transpose()?;
     let sessions_dir = sessions_dir();
     let client = Arc::new(Client::new(config.clone()));
     let scope = adopt::Scope::here().map(Arc::new);
@@ -617,7 +703,12 @@ async fn serve(archive_every: Duration) -> Result<()> {
     let mut seen = Seen::load(&seen_path());
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).context("listening for SIGTERM")?;
-    let work = reconnect_loop(&url, &config.token, &sessions_dir, &mut seen);
+    let work = async {
+        match url.as_deref() {
+            Some(url) => reconnect_loop(url, &config.token, &sessions_dir, &mut seen).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::pin!(work);
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
@@ -736,10 +827,6 @@ pub fn status(settings: &Settings) -> Result<Report> {
 }
 
 pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
-    if !settings.messaging_enabled() {
-        eprintln!("recall: {MESSAGING_OFF}");
-        return Ok(());
-    }
     let path = lock_path();
     if ensure_only {
         if ensure(&path, spawn_daemon)? {
@@ -753,7 +840,7 @@ pub fn run(settings: &Settings, ensure_only: bool) -> Result<()> {
     };
     let _ = std::fs::write(pid_path(), format!("{}\n", std::process::id()));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let outcome = runtime.block_on(serve(settings.archive_interval()));
+    let outcome = runtime.block_on(serve(settings.archive_interval(), settings.messaging_enabled()));
     log(
         &match &outcome {
             Ok(()) => "listen:stopped".to_string(),
@@ -812,13 +899,9 @@ fn stop(lock: &Path, pid_file: &Path, procfs: &Path, limit: Duration) -> bool {
 /// daemon that goes on running the code it started with: it holds the lock, so nothing newer can
 /// take over, and its tick is what keeps every adopted session's last activity moving. Nothing
 /// here may fail the update, so the hooks log is where it reports.
-pub fn restart(settings: &Settings) {
+pub fn restart() {
     let started = Instant::now();
-    let stopped = stop(&lock_path(), &pid_path(), Path::new(PROCFS), HANDOVER);
-    if !settings.messaging_enabled() {
-        log(&format!("listen:stopped-for-update:{stopped}"), started.elapsed());
-        return;
-    }
+    stop(&lock_path(), &pid_path(), Path::new(PROCFS), HANDOVER);
     let outcome = match ensure(&lock_path(), spawn_daemon) {
         Ok(true) => "listen:restarted".to_string(),
         Ok(false) => "listen:still-running".to_string(),
@@ -880,6 +963,32 @@ mod tests {
                 state,
             },
         }
+    }
+
+    #[test]
+    fn a_record_is_only_sent_again_once_a_prompt_has_moved_it() {
+        let session = status("s-live", "/src/recall", sessions::State::Off);
+        assert_eq!(carried(&session.record), carried(&session.record.clone()));
+
+        let mut counted = session.record.clone();
+        counted.usage_pending = Some(sessions::UsagePending {
+            seq: 1,
+            high_water: 4096,
+            prompts: 2,
+            files: BTreeMap::new(),
+            events: vec![serde_json::json!({ "model": "claude-opus-4" })],
+        });
+        assert_eq!(
+            carried(&counted),
+            carried(&session.record),
+            "a delta waiting in the record is not a document the service has yet to see"
+        );
+
+        let mut prompted = session.record.clone();
+        prompted.prompts += 1;
+        prompted.last_activity_at += 1_000;
+        prompted.focus.latest = "and now the dashboard".to_string();
+        assert_ne!(carried(&prompted), carried(&session.record));
     }
 
     #[test]
