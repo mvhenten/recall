@@ -398,9 +398,12 @@ export const deviceDigest = (device: V2Device): DeviceDigest => ({
   host: device.hostLabel,
 });
 
+// `handles` is what the send reaches: the live sessions listed on that host at send time, or the
+// one session the target named. The message is written once either way, to the host's mailbox.
 export interface SendTarget {
   toDeviceId: string;
   toSessionId: string;
+  handles: string[];
 }
 
 // A device id, a login name, a host or a host's label reaches every session on that machine; a
@@ -417,8 +420,13 @@ export const resolveTarget = (
 ): Parsed<SendTarget> => {
   const wanted = to.toLowerCase();
   const names = (value: string | undefined): boolean => value !== undefined && value.toLowerCase() === wanted;
+  const onHost = (toDeviceId: string): SendTarget => ({
+    toDeviceId,
+    toSessionId: "",
+    handles: sessions.filter((session) => session.deviceId === toDeviceId).map((session) => session.name),
+  });
   const identified = devices.find((device) => names(device.deviceId));
-  if (identified !== undefined) return { ok: true, value: { toDeviceId: identified.deviceId, toSessionId: "" } };
+  if (identified !== undefined) return { ok: true, value: onHost(identified.deviceId) };
   const named = devices.filter(
     (device) => names(device.name) || names(device.host) || names(labels.hosts.get(device.host)),
   );
@@ -433,14 +441,14 @@ export const resolveTarget = (
   const [first] = named;
   if (first !== undefined) {
     const newest = named.reduce((best, device) => (device.lastUsedAt > best.lastUsedAt ? device : best), first);
-    return { ok: true, value: { toDeviceId: newest.deviceId, toSessionId: "" } };
+    return { ok: true, value: onHost(newest.deviceId) };
   }
   const addressed = sessions.filter(
     (session) => names(session.name) || names(session.agentName) || names(session.sessionId),
   );
   const [only] = addressed;
   if (addressed.length === 1 && only !== undefined) {
-    return { ok: true, value: { toDeviceId: only.deviceId, toSessionId: only.sessionId } };
+    return { ok: true, value: { toDeviceId: only.deviceId, toSessionId: only.sessionId, handles: [only.name] } };
   }
   if (addressed.length === 0) {
     return fail(

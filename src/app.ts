@@ -2294,17 +2294,12 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         body: input.value.message,
       };
       const sent = await mailboxFor(env, userId).publish(message, sender, now);
-      // A send to a host names no session, so `toSessionId` is empty and the answer said nothing
-      // about where the message went. `sessions` is how many live sessions it was written into.
-      const reached =
-        target.value.toSessionId === ""
-          ? sessions.filter((session) => session.deviceId === target.value.toDeviceId).length
-          : 1;
       return document({
         messageId: sent.message.messageId,
         toDeviceId: sent.message.toDeviceId,
         toSessionId: sent.message.toSessionId,
-        sessions: reached,
+        sessions: target.value.handles.length,
+        handles: target.value.handles,
       });
     };
   };
