@@ -42,6 +42,7 @@ import {
   type PastSession,
   PEEK_HISTORY,
   type Peek,
+  pending,
   REPO_TAG,
   type RepoHours,
   type Session,
@@ -1533,10 +1534,7 @@ const sendCard = (view: SessionView): string => {
   );
 };
 
-// What this session has been asked, newest first. A peek with no digest is one the summariser on
-// its host has not written yet, and it is printed as the pending row it is: a reader opening the
-// page seconds after asking is reading the row it is waiting on. A session nobody has peeked draws
-// no card, since the asking is done from a host and never from here.
+// A session nobody has peeked draws no card, since the asking is done from a host and never here.
 const peeksCard = (peeks: Peek[], now: number): string => {
   if (peeks.length === 0) return "";
   return insightCard(
@@ -1544,7 +1542,7 @@ const peeksCard = (peeks: Peek[], now: number): string => {
     `${peeks.length} ${peeks.length === 1 ? "peek" : "peeks"} · last ${PEEK_HISTORY} kept`,
     insightList(
       peeks.map((peek) => ({
-        name: peek.digest === "" ? "Pending" : peek.digest,
+        name: pending(peek) ? "Pending" : peek.digest,
         value: `${age(peek.requestedAt, now)} ago`,
         warn: false,
       })),

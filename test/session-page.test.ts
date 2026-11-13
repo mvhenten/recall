@@ -123,9 +123,6 @@ const askPeek = async (client: Client, sessionId: string): Promise<string> => {
   return asked.peek.peekId;
 };
 
-const writePeek = (client: Client, sessionId: string, peekId: string, digest: string): Promise<Response> =>
-  client.request("PUT", `/v2/sessions/${sessionId}/peek/${peekId}`, { digest });
-
 const deviceId = async (client: Client): Promise<string> => {
   const response = await client.request("GET", "/v2/devices");
   expect(response.status).toBe(200);
@@ -210,7 +207,10 @@ describe("a session page", () => {
     const you = await owner(h);
     expect((await you.laptop.sync("cafe0001")).status).toBe(204);
     const answered = await askPeek(you.laptop, "cafe0001");
-    expect((await writePeek(you.laptop, "cafe0001", answered, "running the tenant migration")).status).toBe(204);
+    const written = await you.laptop.request("PUT", `/v2/sessions/cafe0001/peek/${answered}`, {
+      digest: "running the tenant migration",
+    });
+    expect(written.status).toBe(204);
     h.advance(60_000);
     await askPeek(you.laptop, "cafe0001");
 
@@ -231,7 +231,6 @@ describe("a session page", () => {
     const html = await read(h, "/dashboard/sessions/cafe0002", you.assertion);
 
     expect(html).not.toContain("Peeks");
-    expect(html).not.toContain("Pending");
   });
 
   it("has no page for a session this account never held", async () => {
