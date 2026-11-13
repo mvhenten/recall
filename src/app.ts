@@ -2298,6 +2298,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         messageId: sent.message.messageId,
         toDeviceId: sent.message.toDeviceId,
         toSessionId: sent.message.toSessionId,
+        sessions: target.value.handles.length,
+        handles: target.value.handles,
       });
     };
   };

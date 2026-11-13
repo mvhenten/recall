@@ -308,4 +308,25 @@ describe("the connector's tools", () => {
       .catch((error: Error) => error.message);
     expect(unknown).toContain("no host or session named desktop");
   });
+
+  it("reaches a host however its name is capitalised and names the sessions it reached", async () => {
+    const { h, email, mcp } = await signedIn();
+    const client = h.clientWithToken(await h.login(email, "sandbox"));
+    for (const sessionId of ["s-one", "s-two"]) {
+      expect((await client.sync(sessionId, { host: "sandbox", lastActivityAt: h.now() })).status).toBe(204);
+    }
+    const sessions = await client.request("GET", "/v2/sessions");
+    const listed = (await sessions.json()) as { sessions: Array<{ sessionId: string; name: string }> };
+
+    const everywhere = await mcp.json("recall_send", { to: "Sandbox", message: "ship it" });
+    expect(everywhere).toMatchObject({
+      toSessionId: "",
+      sessions: 2,
+      handles: listed.sessions.map((session) => session.name),
+    });
+
+    const one = listed.sessions[0];
+    const answered = await mcp.json("recall_send", { to: (one?.name ?? "").toUpperCase(), message: "ship it" });
+    expect(answered).toMatchObject({ toSessionId: one?.sessionId, sessions: 1, handles: [one?.name] });
+  });
 });

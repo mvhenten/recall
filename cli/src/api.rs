@@ -859,6 +859,9 @@ impl Target {
 /// behind it — but it is the best of them the service holds. Two distinct hosts answering to one
 /// name or label is the real ambiguity: that names them all rather than picking one, and only the
 /// device id settles it on its own.
+///
+/// Case never settles a match, here or in the connector's own resolve: a name read aloud or handed
+/// over by a harness comes back capitalised, and Sandbox has to reach the host called sandbox.
 pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<Session>>, to: &str) -> Result<Target> {
     let host = |device_id: &str| {
         Ok(Target {
@@ -866,12 +869,14 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
             session_id: String::new(),
         })
     };
-    if devices.iter().any(|device| device.device_id == to) {
-        return host(to);
+    let wanted = to.to_lowercase();
+    let names = |value: &str| value.to_lowercase() == wanted;
+    if let Some(device) = devices.iter().find(|device| names(&device.device_id)) {
+        return host(&device.device_id);
     }
     let named: Vec<&Device> = devices
         .iter()
-        .filter(|device| device.name == to || device.host == to || device.host_label == to)
+        .filter(|device| names(&device.name) || names(&device.host) || names(&device.host_label))
         .collect();
     let mut machines: Vec<&str> = named.iter().map(|device| device.host.as_str()).collect();
     machines.sort_unstable();
@@ -900,7 +905,7 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
     let listed = sessions()?;
     let addressed: Vec<&Session> = listed
         .iter()
-        .filter(|session| session.name == to || session.agent_name == to || session.session_id == to)
+        .filter(|session| names(&session.name) || names(&session.agent_name) || names(&session.session_id))
         .collect();
     match addressed.as_slice() {
         [session] => Ok(Target {
@@ -1810,6 +1815,7 @@ mod tests {
         let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
 
         assert_eq!(resolve_target(&devices, refuse, "desktop").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, refuse, "Desktop").unwrap(), host("d-2"));
         assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
         let error = resolve_target(&devices, || Ok(Vec::new()), "deskstop")
             .unwrap_err()
@@ -1833,6 +1839,10 @@ mod tests {
 
         assert_eq!(
             resolve_target(&devices, sessions, "desktop-9f8a").unwrap(),
+            desktop_session
+        );
+        assert_eq!(
+            resolve_target(&devices, sessions, "DESKTOP-9F8A").unwrap(),
             desktop_session
         );
         assert_eq!(resolve_target(&devices, sessions, "9f8a1b2c").unwrap(), desktop_session);
