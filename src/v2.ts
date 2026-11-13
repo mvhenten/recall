@@ -135,16 +135,16 @@ export const hostLabelOf = (labels: Map<string, string>, host: string): string =
   return label === undefined || label === "" ? host : label;
 };
 
-// The label its owner gave one session, read by session id, and nothing where it carries none. A
-// session is named three deep — this label, the name Claude Code gave it, then the handle — so the
-// raw label travels and each reader puts the three in that order.
-export const sessionLabelOf = (labels: Labels, sessionId: string): string => labels.sessions.get(sessionId) ?? "";
-
-// The name to print for a session: the label its owner gave it, the name Claude Code gave it where
-// it carries none, and the handle `recall send` takes where it carries neither. session_name in
-// cli/src/markdown.rs reads the same three in the same order.
-export const sessionNameOf = (session: { label: string; agentName: string; name: string }): string => {
-  if (session.label !== "") return session.label;
+// The name to print for a session, resolved here as a host's is: the label its owner gave it, the
+// name Claude Code gave it where it carries none, and the handle `recall send` takes where it
+// carries neither. It is never empty, so no reader picks between three names of its own accord and
+// no two of them can disagree about which one wins.
+export const sessionNameOf = (
+  labels: Labels,
+  session: { sessionId: string; agentName: string; name: string },
+): string => {
+  const label = labels.sessions.get(session.sessionId);
+  if (label !== undefined && label !== "") return label;
   return session.agentName === "" ? session.name : session.agentName;
 };
 
@@ -162,7 +162,7 @@ export const sessionView = (session: Session, labels: Labels, callerDeviceId: st
   sessionId: session.sessionId,
   name: session.name,
   agentName: session.agentName,
-  label: sessionLabelOf(labels, session.sessionId),
+  label: sessionNameOf(labels, session),
   deviceId: session.deviceId,
   host: session.host,
   hostLabel: hostLabelOf(labels.hosts, session.host),
@@ -184,7 +184,7 @@ export const pastSessionView = (session: PastSession, labels: Labels): V2PastSes
   sessionId: session.sessionId,
   name: session.name,
   agentName: session.agentName,
-  label: sessionLabelOf(labels, session.sessionId),
+  label: sessionNameOf(labels, session),
   host: session.host,
   hostLabel: hostLabelOf(labels.hosts, session.host),
   cwd: session.cwd,

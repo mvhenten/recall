@@ -974,17 +974,19 @@ impl Target {
 }
 
 /// `to` is a device id, a host's name or the label it carries, any of which reach every session on
-/// that host, or a session handle, the name Claude Code gave a session, the label its owner gave it
-/// or a session id, any of which reach that one session. A device answers
-/// first, so `sessions` is called only for a target no device claims and an ordinary host send
-/// costs no listing.
+/// that host, or a session handle, a session id or the name the service resolved for a session,
+/// any of which reach that one session. A device id is exact and answers before either listing is
+/// read; every other name is weighed against both, since a host and a session are named by the
+/// same owner out of the same vocabulary.
 ///
 /// A machine signing in more than once holds a login per sign-in, all under the one host, so they
 /// collapse to the most recently used rather than reading as a crowd. That is a last-seen mark and
 /// not a liveness signal — a token baked into a container goes on moving it without a daemon
 /// behind it — but it is the best of them the service holds. Two distinct hosts answering to one
 /// name or label is the real ambiguity: that names them all rather than picking one, and only the
-/// device id settles it on its own.
+/// device id settles it on its own. A host and a session answering to one name is the same
+/// ambiguity across the two listings, and is named the same way: a session labelled after a host
+/// would otherwise be unreachable for as long as that host is signed in.
 ///
 /// Case never settles a match, here or in the connector's own resolve: a name read aloud or handed
 /// over by a harness comes back capitalised, and Sandbox has to reach the host called sandbox.
@@ -1007,6 +1009,28 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
     let mut machines: Vec<&str> = named.iter().map(|device| device.host.as_str()).collect();
     machines.sort_unstable();
     machines.dedup();
+    let listed = sessions()?;
+    let addressed: Vec<&Session> = listed
+        .iter()
+        .filter(|session| names(&session.name) || names(&session.label) || names(&session.session_id))
+        .collect();
+    if !named.is_empty() && !addressed.is_empty() {
+        let mut found: Vec<String> = named
+            .iter()
+            .map(|device| format!("{} ({})", device.name, device.device_id))
+            .collect();
+        found.extend(
+            addressed
+                .iter()
+                .map(|session| format!("{} ({})", session.name, session.session_id)),
+        );
+        bail!(
+            "ambiguous target {to}: it names {} hosts and {} sessions; pass one of these ids instead: {}",
+            machines.len(),
+            addressed.len(),
+            found.join(", ")
+        )
+    }
     match machines.as_slice() {
         [_] => {
             let newest = named
@@ -1028,13 +1052,6 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
             )
         }
     }
-    let listed = sessions()?;
-    let addressed: Vec<&Session> = listed
-        .iter()
-        .filter(|session| {
-            names(&session.name) || names(&session.agent_name) || names(&session.label) || names(&session.session_id)
-        })
-        .collect();
     match addressed.as_slice() {
         [session] => Ok(Target {
             device_id: session.device_id.clone(),
@@ -2083,16 +2100,13 @@ mod tests {
     }
 
     #[test]
-    fn a_host_resolves_by_device_name_without_listing_the_sessions() {
+    fn a_host_resolves_by_its_device_name_whatever_case_it_is_typed_in() {
         let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
-        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+        let none = || Ok(Vec::new());
 
-        assert_eq!(resolve_target(&devices, refuse, "desktop").unwrap(), host("d-2"));
-        assert_eq!(resolve_target(&devices, refuse, "Desktop").unwrap(), host("d-2"));
-        assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
-        let error = resolve_target(&devices, || Ok(Vec::new()), "deskstop")
-            .unwrap_err()
-            .to_string();
+        assert_eq!(resolve_target(&devices, none, "desktop").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, none, "Desktop").unwrap(), host("d-2"));
+        let error = resolve_target(&devices, none, "deskstop").unwrap_err().to_string();
         assert!(error.contains("no host or session named deskstop"), "{error}");
     }
 
@@ -2135,7 +2149,6 @@ mod tests {
             Ok(vec![
                 Session {
                     label: "deal sync".to_string(),
-                    agent_name: "planner".to_string(),
                     ..session("9f8a1b2c", "desktop-9f8a", "d-2")
                 },
                 session("c4e21a99", "laptop-c4e2", "d-1"),
@@ -2148,17 +2161,20 @@ mod tests {
 
         assert_eq!(resolve_target(&devices, sessions, "deal sync").unwrap(), labelled);
         assert_eq!(resolve_target(&devices, sessions, "Deal Sync").unwrap(), labelled);
-        assert_eq!(resolve_target(&devices, sessions, "planner").unwrap(), labelled);
-        assert_eq!(resolve_target(&devices, sessions, "desktop-9f8a").unwrap(), labelled);
     }
 
     #[test]
     fn a_label_reaches_the_host_that_carries_it() {
         let devices = [labelled_device("d-1", "ip-10-0-7-31", "core"), device("d-2", "desktop")];
-        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
 
-        assert_eq!(resolve_target(&devices, refuse, "core").unwrap(), host("d-1"));
-        assert_eq!(resolve_target(&devices, refuse, "ip-10-0-7-31").unwrap(), host("d-1"));
+        assert_eq!(
+            resolve_target(&devices, || Ok(Vec::new()), "core").unwrap(),
+            host("d-1")
+        );
+        assert_eq!(
+            resolve_target(&devices, || Ok(Vec::new()), "ip-10-0-7-31").unwrap(),
+            host("d-1")
+        );
     }
 
     #[test]
@@ -2167,11 +2183,11 @@ mod tests {
             relogin("d-1", "core-box", "core-box", 10, "core"),
             relogin("d-2", "core-box-2", "core-box", 20, "core"),
         ];
-        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
+        let none = || Ok(Vec::new());
 
-        assert_eq!(resolve_target(&devices, refuse, "core").unwrap(), host("d-2"));
-        assert_eq!(resolve_target(&devices, refuse, "core-box").unwrap(), host("d-2"));
-        assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
+        assert_eq!(resolve_target(&devices, none, "core").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, none, "core-box").unwrap(), host("d-2"));
+        assert_eq!(resolve_target(&devices, none, "d-1").unwrap(), host("d-1"));
     }
 
     #[test]
@@ -2204,11 +2220,26 @@ mod tests {
         assert_eq!(resolve_target(&devices, refuse, "d-1").unwrap(), host("d-1"));
     }
 
+    /// A name its owner gave a session that a host already answers to names both, and neither is
+    /// the obvious one: letting the host win leaves the session with no address at all for as long
+    /// as that host is signed in. Both are named, as two hosts answering to one label are.
     #[test]
-    fn a_device_answers_before_a_session_handle_that_reads_the_same() {
-        let devices = [device("d-1", "laptop"), device("d-2", "laptop-c4e2")];
-        let refuse = || -> Result<Vec<Session>> { panic!("a host send must not cost a session listing") };
-        assert_eq!(resolve_target(&devices, refuse, "laptop-c4e2").unwrap(), host("d-2"));
+    fn a_name_that_answers_in_both_listings_is_refused_and_names_what_it_found() {
+        let devices = [device("d-1", "laptop"), labelled_device("d-2", "tower", "core")];
+        let sessions = || {
+            Ok(vec![Session {
+                label: "core".to_string(),
+                ..session("9f8a1b2c", "laptop-9f8a", "d-1")
+            }])
+        };
+
+        let error = resolve_target(&devices, sessions, "Core").unwrap_err().to_string();
+
+        assert!(
+            error.contains("ambiguous target Core: it names 1 hosts and 1 sessions"),
+            "{error}"
+        );
+        assert!(error.contains("tower (d-2), laptop-9f8a (9f8a1b2c)"), "{error}");
     }
 
     #[test]

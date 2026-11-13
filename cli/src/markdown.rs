@@ -261,7 +261,7 @@ pub fn render_sessions(sessions: &[Session], now: i64) -> String {
         .map(|session| {
             vec![
                 host_column(&session.host_label, &session.host),
-                session_name(&session.label, &session.agent_name, &session.name).to_string(),
+                session_name(&session.label, &session.name).to_string(),
                 repo_at_branch(&session.repo, &session.branch),
                 sessions::age(session.started_at, now),
                 sessions::state(session.last_activity_at, now).to_string(),
@@ -297,15 +297,11 @@ pub fn render_sessions(sessions: &[Session], now: i64) -> String {
         .collect()
 }
 
-/// The name a session answers to: the label its owner gave it, the one Claude Code gave it where
-/// there is no label, and the handle `recall send` takes where there is neither. A live session
-/// and a stored one are named the same way, so both listings hand their three names here, and
-/// sessionNameOf in src/v2.ts reads the same three in the same order.
-fn session_name<'a>(label: &'a str, agent_name: &'a str, handle: &'a str) -> &'a str {
-    if !label.is_empty() {
-        return label;
-    }
-    if agent_name.is_empty() { handle } else { agent_name }
+/// The name a session answers to, which the service resolves out of the label its owner gave it,
+/// the name Claude Code gave it and the handle. A service too old to resolve one answers with
+/// nothing, and the handle stands in, exactly as `host_column` stands a host in for its label.
+fn session_name<'a>(name: &'a str, handle: &'a str) -> &'a str {
+    if name.is_empty() { handle } else { name }
 }
 
 /// What the asker reads back off the peek it just asked for. A peek still pending is the ordinary
@@ -352,7 +348,7 @@ pub fn render_session(session: &PastSession, files: &[HeldFile], peeks: &[Peek])
     };
     format!(
         "---\nname: {}\nhandle: {}\nsession: {}\nhost: {}\ncwd: {}\nwhere: {}\nstarted: {}\nlast active: {}\nprompts: {}\nstate: {}\n---\n\n{}\n{asked}\nTranscript:\n\n{}",
-        session_name(&session.label, &session.agent_name, &session.name),
+        session_name(&session.label, &session.name),
         session.name,
         session.session_id,
         host_column(&session.host_label, &session.host),
@@ -378,7 +374,7 @@ pub fn render_session_hits(hits: &[SessionHit]) -> String {
         .map(|hit| {
             format!(
                 "## {} ({}, score {:.3})\n\n_{} · {} · {}_\n\n> {}\n\n",
-                session_name(&hit.session.label, &hit.session.agent_name, &hit.session.name),
+                session_name(&hit.session.label, &hit.session.name),
                 hit.session.session_id,
                 hit.score,
                 host_column(&hit.session.host_label, &hit.session.host),
@@ -681,48 +677,14 @@ mod tests {
             "tower  tower-2  global  3h  idle  draft the release notes\n"
         );
         assert_eq!(render_sessions(&[], now), "");
-    }
 
-    /// The name column prints one of three names, and the owner's own leads: a session Claude Code
-    /// named `planner` reads as `deal sync` once its owner says so, and clearing that label puts
-    /// the agent's name back.
-    #[test]
-    fn the_name_column_prints_the_label_its_owner_gave_the_session() {
-        let now = 1_762_000_000_000;
-        let named = |label: &str, agent_name: &str| Session {
-            session_id: "s-laptop".to_string(),
-            name: "laptop-2".to_string(),
-            agent_name: agent_name.to_string(),
-            label: label.to_string(),
-            device_id: "d-laptop".to_string(),
-            host: "laptop".to_string(),
-            host_label: String::new(),
-            cwd: "/home/you/src/recall".to_string(),
-            repo: String::new(),
-            branch: String::new(),
-            commit: String::new(),
-            started_at: now - 720_000,
-            last_activity_at: now - 60_000,
-            prompts: 3,
-            focus: sessions::Focus::default(),
-            mode: "interactive".to_string(),
-            permission_mode: "default".to_string(),
-            pid: 4242,
-            current: false,
+        // The name column prints the name the service resolved; the handle stands in above only
+        // because a service too old to resolve one answers with nothing.
+        let named = Session {
+            label: "deal sync".to_string(),
+            ..session("tower", "", "", now - 10_800_000, now - 3_600_000, ["", ""])
         };
-
-        assert_eq!(
-            render_sessions(&[named("deal sync", "planner")], now),
-            "laptop  deal sync  global  12m  busy\n"
-        );
-        assert_eq!(
-            render_sessions(&[named("", "planner")], now),
-            "laptop  planner  global  12m  busy\n"
-        );
-        assert_eq!(
-            render_sessions(&[named("", "")], now),
-            "laptop  laptop-2  global  12m  busy\n"
-        );
+        assert_eq!(render_sessions(&[named], now), "tower  deal sync  global  3h  idle\n");
     }
 
     fn peek(state: PeekState, digest: &str, at: i64) -> Peek {

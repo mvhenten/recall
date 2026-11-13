@@ -140,10 +140,9 @@ describe("sessions", () => {
     expect(await listed(stranger)).toHaveLength(1);
   });
 
-  // A session carries three names and its owner's own is one of them, beside the handle and the
-  // name Claude Code gave it rather than over either: the listing answers with all three and every
-  // reader puts the owner's first. Writing an empty one clears it, as emptying a host's field on
-  // the Labels tab clears that host's.
+  // The listing answers with the name it resolved, which is the owner's over Claude Code's over
+  // the handle, and the raw names beside it. Writing an empty one clears the owner's, as emptying
+  // a host's field on the Labels tab clears that host's, and the next name down takes over.
   it("takes the name its owner gives a session, and clears it on an empty one", async () => {
     const h = await harness();
     const { laptop } = await account(h);
@@ -161,10 +160,9 @@ describe("sessions", () => {
     expect((await listed(laptop)).map((session) => session.label)).toEqual(["trade sync"]);
 
     expect((await label("")).status).toBe(204);
-    expect((await listed(laptop)).map((session) => session.label)).toEqual([""]);
+    expect((await listed(laptop)).map((session) => session.label)).toEqual(["kisuvpalas"]);
 
     expect((await laptop.request("PUT", "/v2/sessions/s-gone/label", { label: "x" })).status).toBe(404);
-    expect((await laptop.request("GET", "/v2/sessions/9f8a1b2c/label")).status).toBe(405);
   });
 
   it("refuses a document it cannot put on one line", async () => {

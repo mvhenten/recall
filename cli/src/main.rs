@@ -1095,10 +1095,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return restore_session(&client()?, &target, cwd.as_deref(), cli.json);
             }
             if let Some(target) = label {
-                let Some(text) = label_as else {
-                    bail!("pass --as with the name the session answers to, or --as '' to clear it");
-                };
-                return label_session(&client()?, &target, text.trim(), cli.json);
+                let text = label_as.expect("clap requires --as with --label");
+                return label_session(&client()?, &target, &text, cli.json);
             }
             let client = client()?;
             let listed = client.sessions()?;

@@ -439,11 +439,10 @@ export interface DeviceDigest {
   host: string;
 }
 
-// `name` is what cli/src/markdown.rs prints in its name column: the label its owner gave the
-// session, the name Claude Code gave it where it carries none, and the handle where it carries
-// neither.
+// `name` is the name the service resolved for the session, which is what cli/src/markdown.rs
+// prints in its name column and what the dashboard puts on every row.
 export const sessionDigest = (session: V2Session): SessionDigest => ({
-  name: sessionNameOf(session),
+  name: session.label,
   handle: session.name,
   host: session.hostLabel,
   cwd: session.cwd,
@@ -465,9 +464,13 @@ export interface SendTarget {
 }
 
 // A device id, a login name, a host or a host's label reaches every session on that machine; a
-// session handle, an agent name, a session id or the label its owner gave the session reaches the
-// one session. api::resolve_target in the CLI reads the same two listings in the same order and
+// session handle, a session id or the name the service resolved for the session reaches the one
+// session. api::resolve_target in the CLI reads the same two listings in the same order and
 // resolves a machine's newest login.
+//
+// Hosts and sessions are named by their owner out of one vocabulary, so a name that answers in
+// both is refused and names what it found rather than letting the host win and leaving the session
+// unreachable. A device id is exact and answers before any of it.
 //
 // Case never settles a match: this end is dictated to as often as it is typed at, and a voice
 // transcript capitalises what it hears, so Sandbox has to reach the host called sandbox.
@@ -489,7 +492,19 @@ export const resolveTarget = (
   const named = devices.filter(
     (device) => names(device.name) || names(device.host) || names(labels.hosts.get(device.host)),
   );
+  const addressed = sessions.filter(
+    (session) => names(session.name) || names(session.sessionId) || names(sessionNameOf(labels, session)),
+  );
   const machines = new Set(named.map((device) => device.host));
+  if (named.length > 0 && addressed.length > 0) {
+    const found = [
+      ...named.map((device) => `${device.name} (${device.deviceId})`),
+      ...addressed.map((session) => `${session.name} (${session.sessionId})`),
+    ];
+    return fail(
+      `ambiguous target ${to}: it names ${machines.size} hosts and ${addressed.length} sessions; pass one of these ids instead: ${found.join(", ")}`,
+    );
+  }
   if (machines.size > 1) {
     return fail(
       `ambiguous target ${to}: it names ${machines.size} hosts; pass one of these device ids instead: ${named
@@ -502,13 +517,6 @@ export const resolveTarget = (
     const newest = named.reduce((best, device) => (device.lastUsedAt > best.lastUsedAt ? device : best), first);
     return { ok: true, value: onHost(newest.deviceId) };
   }
-  const addressed = sessions.filter(
-    (session) =>
-      names(session.name) ||
-      names(session.agentName) ||
-      names(session.sessionId) ||
-      names(labels.sessions.get(session.sessionId)),
-  );
   const [only] = addressed;
   if (addressed.length === 1 && only !== undefined) {
     return { ok: true, value: { toDeviceId: only.deviceId, toSessionId: only.sessionId, handles: [only.name] } };

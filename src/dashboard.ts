@@ -62,6 +62,7 @@ import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE, sizeText, T
 import { MAX_EMAIL_SHARES, SHARE_DAYS, type ShareView, shareTimeLeft } from "./shares";
 import { type Follow, gapsInSpans, listedSpans, type Plan, type RecordSpan, type SpanListing } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
+import { sessionNameOf } from "./v2";
 
 export interface Tab {
   path: string;
@@ -540,7 +541,7 @@ const sessionRow = (session: Session, labels: Labels, now: number): string => {
   const busy = isBusy(session, now);
   const state = busy ? "busy" : `idle ${age(session.lastActivityAt, now)}`;
   const focus = focusHtml(session.focus);
-  return `<li class="srow${busy ? "" : " idle"}"><p class="h">${handleLink(session.sessionId, session.name)} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span></p>
+  return `<li class="srow${busy ? "" : " idle"}"><p class="h">${handleLink(session.sessionId, sessionNameOf(labels, session))} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span></p>
 <p class="${busy ? "state busy" : "state"}"><span class="dot"></span>${state}</p>
 <p class="fc">${focus}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${age(session.startedAt, now)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
@@ -648,7 +649,7 @@ const dayHead = (group: DayGroup): string =>
 
 const historyRow = (session: PastSession, labels: Labels): string =>
   `<li class="srow hrow"><p class="tm">${clock(session.startedAt)}–${clock(session.lastActivityAt)}</p>
-<p class="h">${handleLink(session.sessionId, session.name)} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
+<p class="h">${handleLink(session.sessionId, sessionNameOf(labels, session))} <span class="host">${escapeHtml(labelled(labels.hosts, session.host))}</span>${session.running ? ' <span class="run">running</span>' : ""}</p>
 <p class="fc">${focusHtml(session.focus)}</p>
 <p class="smeta"><span class="rp">${escapeHtml(repoAtBranch(session.repo, session.branch))}</span><span class="ag">${span(session.lastActivityAt - session.startedAt)}</span><span class="pr">${session.prompts}<span class="unit"> ${session.prompts === 1 ? "prompt" : "prompts"}</span></span></p></li>`;
 
@@ -1499,7 +1500,11 @@ const factsCard = (view: SessionView, labels: Labels, now: number): string => {
     view.spend.length > 0
       ? ""
       : '<p class="callout">No usage is on record for this session. A raw reading is kept for two weeks after the server took it, and longer only where it was read back out of the transcript.</p>';
-  return insightCard(session.name, repoAtBranch(session.repo, session.branch), `${insightList(facts)}${unmetered}`);
+  return insightCard(
+    sessionNameOf(labels, session),
+    repoAtBranch(session.repo, session.branch),
+    `${insightList(facts)}${unmetered}`,
+  );
 };
 
 // The bus reaches a session for as long as its host holds it, which is a day after its last
@@ -1683,7 +1688,7 @@ export const sessionPage = (
     email,
     SESSIONS_TAB,
     live,
-    session.name,
+    sessionNameOf(labels, session),
     `${labelled(labels.hosts, session.host)} · ${sessionState(session, now)}`,
     `<p class="lede">${focusHtml(session.focus)}</p>
 <div class="charts duo">${factsCard(view, labels, now)}${sendCard(view)}</div>

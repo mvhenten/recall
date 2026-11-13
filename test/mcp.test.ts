@@ -389,6 +389,23 @@ describe("the connector's tools", () => {
     });
   });
 
+  // A host and a session are named by the same owner out of one vocabulary, so a name that answers
+  // in both is refused and names what it found. Letting the host win would leave the session with
+  // no address at all for as long as that host is signed in.
+  it("refuses a name that answers for a host and for a session alike", async () => {
+    const { h, email, mcp } = await signedIn();
+    const client = h.clientWithToken(await h.login(email, "laptop"));
+    expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now() })).status).toBe(204);
+    expect((await client.request("PUT", "/v2/sessions/s-ship/label", { label: "laptop" })).status).toBe(204);
+
+    const refused = await mcp
+      .tool("recall_send", { to: "Laptop", message: "ship it" })
+      .catch((error: Error) => error.message);
+
+    expect(refused).toContain("ambiguous target Laptop: it names 1 hosts and 1 sessions");
+    expect(refused).toContain("(s-ship)");
+  });
+
   it("sends a message to a host and never reads as one itself", async () => {
     const { h, email, mcp } = await signedIn();
     const token = await h.login(email, "laptop");
