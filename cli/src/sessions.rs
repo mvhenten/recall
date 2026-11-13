@@ -176,7 +176,10 @@ pub struct Fanout {
     pub pruned: usize,
 }
 
-fn alive(pid: i32) -> bool {
+/// Whether the Claude process a record names is still there. A record outlives its process until a
+/// sweep unlinks it, so this is what tells a session still running from one the registry has not
+/// caught up with.
+pub fn alive(pid: i32) -> bool {
     let procfs = Path::new("/proc");
     if procfs.is_dir() {
         return procfs.join(pid.to_string()).is_dir();

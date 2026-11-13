@@ -153,12 +153,11 @@ pub async fn connect(url: &str, token: &str) -> Result<Socket> {
 
 /// Reads the mailbox until it closes, handing every message to `on_message` and every peek to
 /// `on_peek`, and writing back the receipt each asks for, quoting the claim it arrived under. News
-/// asks for none. A peek is answered either way, so it never reaches `on_message` and never
-/// becomes a message a session is handed.
+/// asks for none.
 pub async fn pump(
     socket: &mut Socket,
     mut on_message: impl AsyncFnMut(Message) -> Option<Reply>,
-    mut on_peek: impl AsyncFnMut(Peek) -> Peeked,
+    mut on_peek: impl FnMut(Peek) -> Peeked,
 ) -> Result<Ended> {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.tick().await;
@@ -182,7 +181,7 @@ pub async fn pump(
                 Incoming::Ignored => continue,
                 Incoming::Peek { peek, token } => {
                     let peek_id = peek.peek_id.clone();
-                    let peeked = on_peek(*peek).await;
+                    let peeked = on_peek(*peek);
                     socket
                         .send(Frame::text(peek_receipt(&peek_id, &token, &peeked)))
                         .await
@@ -215,10 +214,6 @@ mod tests {
     const MESSAGE: &str = r#"{"type":"message","message":{"messageId":"m-1","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"ship it","createdAt":1,"expiresAt":1}}"#;
     const ORDER: &str = r#"{"type":"order","token":"t-order","message":{"messageId":"m-2","kind":"order","toDeviceId":"d-here","toSessionId":"","fromDeviceId":"d-there","body":"rerun the migration","createdAt":1,"expiresAt":1}}"#;
     const PEEK: &str = r#"{"type":"peek","token":"t-peek","peek":{"peekId":"p-1","sessionId":"s-9f8a","toDeviceId":"d-here","requestedAt":1}}"#;
-
-    async fn no_peek(_: Peek) -> Peeked {
-        Peeked::NoSession
-    }
 
     #[test]
     fn the_endpoint_becomes_the_listen_url() {
@@ -302,7 +297,7 @@ mod tests {
                 delivered.push(message.body);
                 None
             },
-            no_peek,
+            |_| Peeked::NoSession,
         )
         .await
         .unwrap();
@@ -350,7 +345,7 @@ mod tests {
                     _ => Reply::NoTaker,
                 })
             },
-            no_peek,
+            |_| Peeked::NoSession,
         )
         .await
         .unwrap();
@@ -407,7 +402,7 @@ mod tests {
                 delivered.push(message.message_id);
                 None
             },
-            async |peek: Peek| {
+            |peek: Peek| {
                 assert_eq!(peek.session_id, "s-9f8a");
                 asked += 1;
                 match asked {
@@ -456,7 +451,9 @@ mod tests {
         let mut socket = connect(&format!("ws://127.0.0.1:{port}/v2/messages/listen"), "t-token")
             .await
             .unwrap();
-        let ended = pump(&mut socket, async |_: Message| None, no_peek).await.unwrap();
+        let ended = pump(&mut socket, async |_: Message| None, |_| Peeked::NoSession)
+            .await
+            .unwrap();
         assert!(matches!(ended, Ended::Revoked));
     }
 }
