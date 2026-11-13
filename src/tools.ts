@@ -11,6 +11,7 @@ import {
   parseTags,
   type Session,
 } from "./model";
+import type { V2Device, V2Session } from "./v2";
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
 // its own from #[tool] macros, so the two sets are maintained separately and the wording differs
@@ -367,6 +368,35 @@ export const parseSendArgs = (args: Record<string, unknown>): Parsed<SendArgs> =
   if (!message.ok) return message;
   return { ok: true, value: { to: to.value, message: message.value } };
 };
+
+// What a listing hands the model: the fields its tool description names, and not the whole view
+// the dashboard reads off the same route. `name` is what recall_send takes as its `to`, and `host`
+// is the label the account gave the machine, which recall_send takes as well.
+export interface SessionDigest {
+  name: string;
+  host: string;
+  cwd: string;
+  focus: string;
+}
+
+export interface DeviceDigest {
+  deviceId: string;
+  name: string;
+  host: string;
+}
+
+export const sessionDigest = (session: V2Session): SessionDigest => ({
+  name: session.name,
+  host: session.hostLabel,
+  cwd: session.cwd,
+  focus: session.focus.latest,
+});
+
+export const deviceDigest = (device: V2Device): DeviceDigest => ({
+  deviceId: device.deviceId,
+  name: device.name,
+  host: device.hostLabel,
+});
 
 export interface SendTarget {
   toDeviceId: string;

@@ -282,14 +282,14 @@ describe("the connector's tools", () => {
     const client = h.clientWithToken(await h.login(email, "laptop"));
     expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now() })).status).toBe(204);
 
-    const sessions = (await mcp.json("recall_sessions")) as Array<{ sessionId: string; host: string; name: string }>;
-    expect(sessions.map((session) => [session.sessionId, session.host])).toEqual([["s-ship", "laptop"]]);
+    const sessions = (await mcp.json("recall_sessions")) as Array<{ name: string; host: string; cwd: string }>;
+    expect(sessions.map((session) => [session.host, session.cwd])).toEqual([["laptop", "/home/you/src/recall"]]);
     expect(await mcp.json("recall_send", { to: sessions[0]?.name ?? "", message: "ship it" })).toMatchObject({
       toSessionId: "s-ship",
     });
 
-    const devices = (await mcp.json("recall_devices")) as Array<{ name: string; hostLabel: string }>;
-    expect(devices.map((device) => [device.name, device.hostLabel])).toEqual([["laptop", "laptop"]]);
+    const devices = (await mcp.json("recall_devices")) as Array<{ name: string; host: string }>;
+    expect(devices.map((device) => [device.name, device.host])).toEqual([["laptop", "laptop"]]);
   });
 
   it("sends a message to a host and never reads as one itself", async () => {
