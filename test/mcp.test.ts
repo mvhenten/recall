@@ -416,6 +416,9 @@ describe("peeking from the connector", () => {
     expect(first.sessionId).toBe(sessionId);
     expect(first.peek).toMatchObject({ state: "Ready", digest: "running the tenant migration" });
 
+    // The history reads newest first, and two peeks asked in the same millisecond are ordered by an
+    // id neither this test nor the store picked, so the second is asked a second later.
+    h.advance(1_000);
     const second = (await mcp.json("recall_peek", { session: sessionId })) as { sessionId: string; peek: V2Peek };
     expect(second.peek).toMatchObject({ state: "Ready", digest: "reading the transcript" });
     expect(second.peek.peekId).not.toBe(first.peek.peekId);
