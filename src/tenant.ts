@@ -24,6 +24,17 @@ import {
 } from "./store";
 import { TENANT_MIGRATIONS } from "./tenant-migrations";
 
+// The embedder comes over as a function, which RPC hands this object as a live capability back
+// into the Worker's request. Held past the answer it keeps the session open until the request that
+// owns it ends, and workerd books every such invocation a client disconnect, so the capability goes
+// back the moment the call is answered. In process there is no stub and nothing to give back.
+const release = (call: TenantCall): void => {
+  const embed: unknown = call.embed;
+  if (typeof embed !== "function" || !(Symbol.dispose in embed)) return;
+  const dispose = embed[Symbol.dispose];
+  if (typeof dispose === "function") dispose.call(embed);
+};
+
 // One account's own rows, in one object addressed by its user id. The Worker proves who is asking
 // and then calls in here; everything below the device token runs against this object's SQLite,
 // which no other account can reach.
@@ -44,16 +55,28 @@ export class Tenant extends DurableObject<Env> {
     });
   }
 
-  api(request: Request, caller: Caller, call: TenantCall): Promise<Response> {
-    return this.half(call).api(request, this.store(), caller);
+  async api(request: Request, caller: Caller, call: TenantCall): Promise<Response> {
+    try {
+      return await this.half(call).api(request, this.store(), caller);
+    } finally {
+      release(call);
+    }
   }
 
-  dashboard(request: Request, userId: string, email: string, call: TenantCall): Promise<Response> {
-    return this.half(call).dashboard(request, this.store(), userId, email);
+  async dashboard(request: Request, userId: string, email: string, call: TenantCall): Promise<Response> {
+    try {
+      return await this.half(call).dashboard(request, this.store(), userId, email);
+    } finally {
+      release(call);
+    }
   }
 
-  tool(made: ToolCall, caller: Caller, call: TenantCall): Promise<ToolResult> {
-    return this.half(call).tool(made, this.store(), caller);
+  async tool(made: ToolCall, caller: Caller, call: TenantCall): Promise<ToolResult> {
+    try {
+      return await this.half(call).tool(made, this.store(), caller);
+    } finally {
+      release(call);
+    }
   }
 
   // The artifact rows, which the Worker reads rather than the object's own halves. The collection
