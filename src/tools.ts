@@ -13,7 +13,7 @@ import {
   REPO_TAG,
   type Session,
 } from "./model";
-import type { V2Device, V2Peek, V2Session } from "./v2";
+import { sessionNameOf, type V2Device, type V2Peek, type V2Session } from "./v2";
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
 // its own from #[tool] macros, so the two sets are maintained separately and the wording differs
@@ -202,7 +202,7 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: schema(
       {
         to: text(
-          "The session to reach, named by the handle recall_sessions shows, or a host to reach every session on it.",
+          "The session to reach, named by the handle or the name recall_sessions shows, or a host to reach every session on it.",
         ),
         message: text("The message to deliver there."),
       },
@@ -216,7 +216,7 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: schema(
       {
         session: text(
-          "The session to ask, named by the handle recall_sessions shows, by the name Claude Code gave it, or by its session id. A host is not a peek target: one summariser answers for one session.",
+          "The session to ask, named by the handle or the name recall_sessions shows, or by its session id. A host is not a peek target: one summariser answers for one session.",
         ),
       },
       ["session"],
@@ -439,10 +439,11 @@ export interface DeviceDigest {
   host: string;
 }
 
-// `name` is what cli/src/markdown.rs prints in its name column: the name Claude Code gave the
-// session, and the handle where it has none.
+// `name` is what cli/src/markdown.rs prints in its name column: the label its owner gave the
+// session, the name Claude Code gave it where it carries none, and the handle where it carries
+// neither.
 export const sessionDigest = (session: V2Session): SessionDigest => ({
-  name: session.agentName === "" ? session.name : session.agentName,
+  name: sessionNameOf(session),
   handle: session.name,
   host: session.hostLabel,
   cwd: session.cwd,
@@ -464,8 +465,9 @@ export interface SendTarget {
 }
 
 // A device id, a login name, a host or a host's label reaches every session on that machine; a
-// session handle, an agent name or a session id reaches the one session. api::resolve_target in the
-// CLI reads the same two listings in the same order and resolves a machine's newest login.
+// session handle, an agent name, a session id or the label its owner gave the session reaches the
+// one session. api::resolve_target in the CLI reads the same two listings in the same order and
+// resolves a machine's newest login.
 //
 // Case never settles a match: this end is dictated to as often as it is typed at, and a voice
 // transcript capitalises what it hears, so Sandbox has to reach the host called sandbox.
@@ -501,7 +503,11 @@ export const resolveTarget = (
     return { ok: true, value: onHost(newest.deviceId) };
   }
   const addressed = sessions.filter(
-    (session) => names(session.name) || names(session.agentName) || names(session.sessionId),
+    (session) =>
+      names(session.name) ||
+      names(session.agentName) ||
+      names(session.sessionId) ||
+      names(labels.sessions.get(session.sessionId)),
   );
   const [only] = addressed;
   if (addressed.length === 1 && only !== undefined) {

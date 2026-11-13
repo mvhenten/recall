@@ -755,6 +755,10 @@ pub struct Session {
     /// session whose transcript the service has not read a name out of yet.
     #[serde(default)]
     pub agent_name: String,
+    /// The name its owner gave the session with `recall sessions --label`, which leads the other
+    /// two. Empty for a session carrying none, and from a service too old to answer with one.
+    #[serde(default)]
+    pub label: String,
     pub device_id: String,
     pub host: String,
     /// The name to print for that host: its label where it carries one, and the host itself
@@ -787,6 +791,8 @@ pub struct PastSession {
     pub name: String,
     #[serde(default)]
     pub agent_name: String,
+    #[serde(default)]
+    pub label: String,
     pub host: String,
     pub host_label: String,
     pub cwd: String,
@@ -968,8 +974,8 @@ impl Target {
 }
 
 /// `to` is a device id, a host's name or the label it carries, any of which reach every session on
-/// that host, or a session handle, the name Claude Code gave a session or a session id, any of
-/// which reach that one session. A device answers
+/// that host, or a session handle, the name Claude Code gave a session, the label its owner gave it
+/// or a session id, any of which reach that one session. A device answers
 /// first, so `sessions` is called only for a target no device claims and an ordinary host send
 /// costs no listing.
 ///
@@ -1025,7 +1031,9 @@ pub fn resolve_target(devices: &[Device], sessions: impl FnOnce() -> Result<Vec<
     let listed = sessions()?;
     let addressed: Vec<&Session> = listed
         .iter()
-        .filter(|session| names(&session.name) || names(&session.agent_name) || names(&session.session_id))
+        .filter(|session| {
+            names(&session.name) || names(&session.agent_name) || names(&session.label) || names(&session.session_id)
+        })
         .collect();
     match addressed.as_slice() {
         [session] => Ok(Target {
@@ -1239,6 +1247,20 @@ impl Client {
         let response = self.authed(self.agent.get(self.url("/v2/sessions"))).call()?;
         let listed: Sessions = check(response, "listing sessions")?.body_mut().read_json()?;
         Ok(listed.sessions)
+    }
+
+    /// Names one session, as the dashboard's Labels tab names a host. A label of no characters
+    /// clears the one on record; `false` is a session this account does not hold.
+    pub fn label_session(&self, session_id: &str, label: &str) -> Result<bool> {
+        let path = format!("{}/label", Self::session_path(session_id));
+        let response = self
+            .authed(self.agent.put(self.url(&path)))
+            .send_json(serde_json::json!({ "label": label }))?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        check(response, &format!("labelling session {session_id}"))?;
+        Ok(true)
     }
 
     /// Every session this account has on record, read to the last page. A host sending its past
@@ -1931,6 +1953,7 @@ mod tests {
             session_id: session_id.to_string(),
             name: name.to_string(),
             agent_name: String::new(),
+            label: String::new(),
             device_id: device_id.to_string(),
             host: "laptop".to_string(),
             host_label: String::new(),
@@ -2100,6 +2123,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no host or session named desktop-9f8b"), "{error}");
+    }
+
+    /// A session its owner named answers to that name wherever a session is addressed, so a send
+    /// and a peek both take what the listing prints. Case settles nothing here either: the name is
+    /// read aloud as often as it is typed.
+    #[test]
+    fn the_label_its_owner_gave_a_session_reaches_that_session() {
+        let devices = [device("d-1", "laptop"), device("d-2", "desktop")];
+        let sessions = || {
+            Ok(vec![
+                Session {
+                    label: "deal sync".to_string(),
+                    agent_name: "planner".to_string(),
+                    ..session("9f8a1b2c", "desktop-9f8a", "d-2")
+                },
+                session("c4e21a99", "laptop-c4e2", "d-1"),
+            ])
+        };
+        let labelled = Target {
+            device_id: "d-2".to_string(),
+            session_id: "9f8a1b2c".to_string(),
+        };
+
+        assert_eq!(resolve_target(&devices, sessions, "deal sync").unwrap(), labelled);
+        assert_eq!(resolve_target(&devices, sessions, "Deal Sync").unwrap(), labelled);
+        assert_eq!(resolve_target(&devices, sessions, "planner").unwrap(), labelled);
+        assert_eq!(resolve_target(&devices, sessions, "desktop-9f8a").unwrap(), labelled);
     }
 
     #[test]

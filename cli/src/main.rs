@@ -300,6 +300,21 @@ enum Command {
             help = "Restore under this working directory instead of the one the session ran in"
         )]
         cwd: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            group = "what",
+            requires = "label_as",
+            help = "Name the session with this name, handle or Claude Code session id, as --as says"
+        )]
+        label: Option<String>,
+        #[arg(
+            long = "as",
+            value_name = "LABEL",
+            requires = "label",
+            help = "The name --label's session answers to and every listing prints; empty clears it"
+        )]
+        label_as: Option<String>,
         #[arg(long, default_value_t = 10, help = "How many sessions --search answers with")]
         limit: u32,
     },
@@ -876,6 +891,30 @@ fn peek_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Names one session, which every listing then prints over the name Claude Code gave it and over
+/// the handle. The session is named by any of the names that reach it, exactly as a send names one,
+/// so a label already on it renames it too. A label of no characters clears the one on record.
+fn label_session(client: &Client, target: &str, label: &str, json: bool) -> Result<ExitCode> {
+    let found = api::resolve_target(&client.devices()?, || client.sessions(), target)?;
+    if found.session_id.is_empty() {
+        bail!("{target} names a host, and a label names one session; name a session as recall sessions prints it");
+    }
+    if !client.label_session(&found.session_id, label)? {
+        eprintln!("recall: no session {}", found.session_id);
+        return Ok(ExitCode::from(1));
+    }
+    if json {
+        print_json(&serde_json::json!({ "sessionId": found.session_id, "label": label }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if label.is_empty() {
+        println!("cleared the label on {}", found.session_id);
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("labelled {} {label}", found.session_id);
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The sessions whose transcripts answer a query, on every host signed in as this user.
 fn search_sessions(client: &Client, query: &str, limit: u32, json: bool) -> Result<ExitCode> {
     let hits = client.search_sessions(query, limit)?;
@@ -1026,6 +1065,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             peek,
             restore,
             cwd,
+            label,
+            label_as,
             limit,
         } => {
             if let Some(id) = sync {
@@ -1052,6 +1093,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if let Some(target) = restore {
                 return restore_session(&client()?, &target, cwd.as_deref(), cli.json);
+            }
+            if let Some(target) = label {
+                let Some(text) = label_as else {
+                    bail!("pass --as with the name the session answers to, or --as '' to clear it");
+                };
+                return label_session(&client()?, &target, text.trim(), cli.json);
             }
             let client = client()?;
             let listed = client.sessions()?;

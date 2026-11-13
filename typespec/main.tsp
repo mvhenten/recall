@@ -193,6 +193,7 @@ model Session {
 
   name: SessionText;
   agentName: SessionText;
+  label: SessionText;
 
   @minLength(1)
   deviceId: string;
@@ -222,6 +223,7 @@ model PastSession {
 
   name: SessionText;
   agentName: SessionText;
+  label: SessionText;
   host: SessionText;
   hostLabel: SessionText;
   cwd: SessionText;
@@ -273,6 +275,15 @@ model Peek {
 model WritePeek {
   @minLength(1)
   digest: PeekDigest;
+}
+
+@doc("""
+  The name its owner gives one session, which every listing prints over the name Claude Code gave
+  it. A label of no characters clears the one on record, exactly as an emptied field on the Labels
+  tab clears a host's.
+  """)
+model WriteLabel {
+  label: SessionText;
 }
 
 model MessageAddress {

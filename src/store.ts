@@ -960,7 +960,7 @@ export const readLabels = async (db: TenantDb, userId: string): Promise<Labels> 
     .all();
   const of = (kind: LabelKind): Map<string, string> =>
     new Map(results.filter((row) => row.kind === kind).map((row) => [row.value, row.label]));
-  return { hosts: of("host"), accounts: of("account") };
+  return { hosts: of("host"), accounts: of("account"), sessions: of("session") };
 };
 
 // Every host and account the user has on record, live or past, plus the ones already labelled, so a

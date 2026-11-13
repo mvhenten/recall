@@ -31,6 +31,7 @@ import {
   type SessionSchema,
   SessionSyncSchema,
   UsageDeltaSchema,
+  WriteLabelSchema,
   WritePeekSchema,
 } from "../typespec/generated/schemas";
 import type { Device } from "./device";
@@ -39,6 +40,7 @@ import {
   DEFAULT_PAGE_ROWS,
   fail,
   type InjectInput,
+  type Labels,
   type ListInput,
   type Memory,
   type MemoryHit,
@@ -75,6 +77,7 @@ export type V2SearchResults = z.infer<typeof SearchResultsSchema>;
 export type V2InjectedMemory = z.infer<typeof InjectedMemorySchema>;
 export type V2Peek = z.infer<typeof PeekSchema>;
 export type V2WritePeek = z.infer<typeof WritePeekSchema>;
+export type V2WriteLabel = z.infer<typeof WriteLabelSchema>;
 
 // The three things a session's mode can be. `/v1` said "the host could not tell" with an empty
 // string, which reads as a missing field rather than as an answer.
@@ -132,6 +135,19 @@ export const hostLabelOf = (labels: Map<string, string>, host: string): string =
   return label === undefined || label === "" ? host : label;
 };
 
+// The label its owner gave one session, read by session id, and nothing where it carries none. A
+// session is named three deep — this label, the name Claude Code gave it, then the handle — so the
+// raw label travels and each reader puts the three in that order.
+export const sessionLabelOf = (labels: Labels, sessionId: string): string => labels.sessions.get(sessionId) ?? "";
+
+// The name to print for a session: the label its owner gave it, the name Claude Code gave it where
+// it carries none, and the handle `recall send` takes where it carries neither. session_name in
+// cli/src/markdown.rs reads the same three in the same order.
+export const sessionNameOf = (session: { label: string; agentName: string; name: string }): string => {
+  if (session.label !== "") return session.label;
+  return session.agentName === "" ? session.name : session.agentName;
+};
+
 export const deviceView = (device: Device, labels: Map<string, string>, callerDeviceId: string): V2Device => ({
   deviceId: device.deviceId,
   name: device.name,
@@ -142,13 +158,14 @@ export const deviceView = (device: Device, labels: Map<string, string>, callerDe
   current: device.deviceId === callerDeviceId,
 });
 
-export const sessionView = (session: Session, labels: Map<string, string>, callerDeviceId: string): V2Session => ({
+export const sessionView = (session: Session, labels: Labels, callerDeviceId: string): V2Session => ({
   sessionId: session.sessionId,
   name: session.name,
   agentName: session.agentName,
+  label: sessionLabelOf(labels, session.sessionId),
   deviceId: session.deviceId,
   host: session.host,
-  hostLabel: hostLabelOf(labels, session.host),
+  hostLabel: hostLabelOf(labels.hosts, session.host),
   cwd: session.cwd,
   repo: session.repo,
   branch: session.branch,
@@ -163,12 +180,13 @@ export const sessionView = (session: Session, labels: Map<string, string>, calle
   current: session.deviceId === callerDeviceId,
 });
 
-export const pastSessionView = (session: PastSession, labels: Map<string, string>): V2PastSession => ({
+export const pastSessionView = (session: PastSession, labels: Labels): V2PastSession => ({
   sessionId: session.sessionId,
   name: session.name,
   agentName: session.agentName,
+  label: sessionLabelOf(labels, session.sessionId),
   host: session.host,
-  hostLabel: hostLabelOf(labels, session.host),
+  hostLabel: hostLabelOf(labels.hosts, session.host),
   cwd: session.cwd,
   repo: session.repo,
   branch: session.branch,
@@ -179,7 +197,7 @@ export const pastSessionView = (session: PastSession, labels: Map<string, string
   running: session.running,
 });
 
-export const sessionHitView = (hit: SessionHit, labels: Map<string, string>): V2SessionHit => ({
+export const sessionHitView = (hit: SessionHit, labels: Labels): V2SessionHit => ({
   session: pastSessionView(hit.session, labels),
   score: hit.score,
   excerpt: { speaker: hit.excerpt.speaker, text: hit.excerpt.text, at: isoOf(hit.excerpt.at) },
@@ -247,6 +265,8 @@ const validated = <T extends Record<string, unknown>>(schema: z.ZodType<T>, body
 export const parseAppendRecords = (body: unknown): Parsed<V2AppendRecords> => validated(AppendRecordsSchema, body);
 
 export const parseWritePeek = (body: unknown): Parsed<V2WritePeek> => validated(WritePeekSchema, body);
+
+export const parseWriteLabel = (body: unknown): Parsed<V2WriteLabel> => validated(WriteLabelSchema, body);
 
 // What one call of the session copy is told. It is a body rather than a query string because both
 // of its fields are the run's own state carried between calls, and a contract is what says so.

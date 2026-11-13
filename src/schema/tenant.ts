@@ -174,7 +174,7 @@ export const labels = sqliteTable(
   "labels",
   {
     userId: text("user_id").notNull(),
-    kind: text("kind", { enum: ["host", "account"] }).notNull(),
+    kind: text("kind", { enum: ["host", "account", "session"] }).notNull(),
     value: text("value").notNull(),
     label: text("label").notNull(),
   },

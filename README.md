@@ -256,7 +256,11 @@ recall sessions --peek kisuvpalas                  # ask one running session wha
 recall sessions --find kisuvpalas                  # one stored session, wherever it ran
 recall sessions --search "the r2 offset protocol"  # stored sessions, by what was said in them
 recall sessions --restore kisuvpalas               # put one back here for claude --resume
+recall sessions --label laptop-9f8a --as "deal sync"  # name it yourself
+recall sessions --label "deal sync" --as ""           # and clear that name
 ```
+
+The name column prints one of three names: the one you gave the session, the name Claude Code gave it where you gave none, and the handle where it has neither. Your own name is an address as well, so `recall send "deal sync"`, `recall sessions --peek "Deal Sync"` and the connector's `recall_send` all reach that session, whatever case it is typed in. It is a label like a host's, held beside the session under its id, so `--as ""` clears it and puts the other names back.
 
 ```
 laptop  laptop-9f8a  repo:github.com/mvhenten/recall@feat/sessions-list  12m  busy  list every host's sessions → why is the worker test red
@@ -480,6 +484,7 @@ The routes under `/v2` need `Authorization: Bearer <device token>`, apart from t
 | `GET`    | `/v2/sessions/:name`                             | one session by its session id, its handle or the name Claude Code gave it, with the transcript files the archive holds and how many sessions the name answered for                                                                                                                                          |
 | `GET`    | `/v2/sessions`                                   | the live sessions, newest activity first, each with the `hostLabel` its host carries                                                                                                                                                                                                                        |
 | `DELETE` | `/v2/sessions/:sessionId`                        | the session is over; the chunks its last turns were still filling close, and every host stops listing it                                                                                                                                                                                                    |
+| `PUT`    | `/v2/sessions/:sessionId/label`                  | `{label}`; the name its owner gives that session, which every listing prints over the name Claude Code gave it and over the handle. A label of no characters clears the one on record                                                                                                                       |
 | `POST`   | `/v2/sessions/:sessionId/records`                | `{file, from, records, closed}`; appends whole redacted JSONL records, the record at index `i` carrying ordinal `from + i`, and indexes the prose before answering. An ordinal that is not the one the file waits for answers 409 with the real `next`                                                      |
 | `GET`    | `/v2/sessions/:sessionId/files`                  | every file of a session the archive holds, whichever path wrote it, with how much of each it holds and how far into each it reaches, beside the files a usage delta has already counted                                                                                                                     |
 | `GET`    | `/v2/sessions/:sessionId/transcript?file=`       | one file read back whole, off the records it is stored as                                                                                                                                                                                                                                                   |
