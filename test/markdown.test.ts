@@ -90,6 +90,17 @@ describe("the markdown renderer", () => {
     expect(html).not.toContain("<strong>");
   });
 
+  it("reads emphasis in a link's own text, under a base it may never read", () => {
+    const base = "/link/TyMwx1l2hC19kPLN5FQ__sLnu6N-rryD9PAPizBjW04";
+    const html = render("[__bold__](./a.md)\n", base);
+    expect(html).toBe(`<p><a href="${base}/f/a.md"><strong>bold</strong></a></p>`);
+  });
+
+  it("keeps a code span inside an image's alt text", () => {
+    const html = rendered("![the `npm ci` output](/shot.png)\n");
+    expect(html).toBe(`<p><img src="${BASE}/f/shot.png" alt="the <code>npm ci</code> output"></p>`);
+  });
+
   it("holds a hard break and drops a single newline", () => {
     expect(rendered("one  \ntwo\n")).toBe("<p>one<br>two</p>");
     expect(rendered("one\ntwo\n")).toBe("<p>one two</p>");

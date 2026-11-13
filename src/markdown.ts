@@ -63,7 +63,7 @@ const inline = (text: string, base: string): string => {
   const marked = escapeHtml(spans)
     .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (whole, alt: string, src: string) => {
       const url = resolveUrl(src, base);
-      return url === null ? whole : `<img src="${hold(url)}" alt="${hold(alt)}">`;
+      return url === null ? whole : `<img src="${hold(url)}" alt="${alt}">`;
     })
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label: string, href: string) => {
       const url = resolveUrl(href, base);
