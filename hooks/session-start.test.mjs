@@ -15,7 +15,7 @@ if (args[0] === "repo") process.stdout.write(\`\${process.env.STUB_REPO}\\n\`);
 if (args[0] === "config") process.stdout.write(\`\${process.env.STUB_MODE}\\n\`);
 `;
 
-function sessionStart(mode, repo = REPO) {
+function runHook(mode, repo = REPO, extra = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "recall-session-start-"));
   const stub = path.join(dir, "recall");
   writeFileSync(stub, STUB);
@@ -32,9 +32,14 @@ function sessionStart(mode, repo = REPO) {
       XDG_CONFIG_HOME: path.join(dir, "config"),
       XDG_RUNTIME_DIR: path.join(dir, "run"),
       XDG_STATE_HOME: path.join(dir, "state"),
+      ...extra,
     },
   });
-  return JSON.parse(stdout).hookSpecificOutput.additionalContext;
+  return { stdout, dir };
+}
+
+function sessionStart(mode, repo = REPO) {
+  return JSON.parse(runHook(mode, repo).stdout).hookSpecificOutput.additionalContext;
 }
 
 test("hook mode names the CLI as the memory path and no local store", () => {
@@ -57,6 +62,13 @@ test("tools mode keeps naming the tools, with the CLI beside them", () => {
 
 test("outside a repo a search still covers everything and a save is global", () => {
   assert.match(sessionStart("hook", ""), /Searches cover every memory\. No repo here, so a save is tagged global\./);
+});
+
+test("a peek's own summariser run registers no session and is handed no context", () => {
+  const { stdout, dir } = runHook("hook", REPO, { RECALL_PEEK: "1" });
+
+  assert.equal(stdout, "", "the summariser gets no memory crib");
+  assert.equal(existsSync(path.join(dir, "run", "recall", "sessions")), false, "and lands in no listing");
 });
 
 test("the plugin registers no mcp server", () => {

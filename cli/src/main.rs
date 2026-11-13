@@ -5,6 +5,7 @@ mod config;
 mod listen;
 mod markdown;
 mod mcp;
+mod peek;
 mod redact;
 mod repo;
 mod restore;
@@ -988,7 +989,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 listen::run(&settings, ensure)?;
             }
         }
-        Command::PeekRun { session, peek } => listen::peek_run(&session, &peek)?,
+        Command::PeekRun { session, peek } => peek::run(&session, &peek)?,
         Command::Sessions {
             sync,
             end,
