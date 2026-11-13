@@ -40,6 +40,9 @@ import {
   memoryTypes,
   monthsBetween,
   type PastSession,
+  PEEK_HISTORY,
+  type Peek,
+  pending,
   REPO_TAG,
   type RepoHours,
   type Session,
@@ -1454,6 +1457,8 @@ export interface SessionView {
   /// The device the session is live on, and null once its host has let the session go.
   deviceId: string | null;
   spend: SessionSpend[];
+  /// The peeks asked of this session, newest first, as the store keeps them.
+  peeks: Peek[];
   transcript: TranscriptPlan;
   send: SessionSend;
 }
@@ -1526,6 +1531,22 @@ const sendCard = (view: SessionView): string => {
 <input type="hidden" name="csrf" value="${escapeHtml(view.send.csrf)}">
 <textarea name="body" rows="4" required placeholder="What should this session read next?" aria-label="Message to this session">${escapeHtml(view.send.draft)}</textarea>
 <button type="submit">Send</button></form>`,
+  );
+};
+
+// A session nobody has peeked draws no card, since the asking is done from a host and never here.
+const peeksCard = (peeks: Peek[], now: number): string => {
+  if (peeks.length === 0) return "";
+  return insightCard(
+    "Peeks",
+    `${peeks.length} ${peeks.length === 1 ? "peek" : "peeks"} · last ${PEEK_HISTORY} kept`,
+    insightList(
+      peeks.map((peek) => ({
+        name: pending(peek) ? "Pending" : peek.digest,
+        value: `${age(peek.requestedAt, now)} ago`,
+        warn: false,
+      })),
+    ),
   );
 };
 
@@ -1666,7 +1687,7 @@ export const sessionPage = (
     `${labelled(labels.hosts, session.host)} · ${sessionState(session, now)}`,
     `<p class="lede">${focusHtml(session.focus)}</p>
 <div class="charts duo">${factsCard(view, labels, now)}${sendCard(view)}</div>
-${transcriptCard(view)}
+${peeksCard(view.peeks, now)}${transcriptCard(view)}
 <p class="more"><a href="${SESSIONS_TAB.path}">Back to the sessions</a></p>`,
     { "set-cookie": cookies, "content-security-policy": SCRIPT_CSP },
     status,

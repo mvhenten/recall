@@ -157,6 +157,8 @@ export interface Peek {
   requestedAt: number;
 }
 
+export const pending = (peek: Peek): boolean => peek.digest === "";
+
 export interface Live {
   sessions: number;
   busy: number;

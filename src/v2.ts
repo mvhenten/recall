@@ -47,6 +47,7 @@ import {
   type Parsed,
   type PastSession,
   type Peek,
+  pending,
   type SaveInput,
   type SearchInput,
   type SearchResults,
@@ -189,7 +190,7 @@ export const sessionHitView = (hit: SessionHit, labels: Map<string, string>): V2
 // reads as. Nothing stores the state, so nothing can store one the digest disagrees with.
 export const peekView = (peek: Peek): V2Peek => ({
   peekId: peek.peekId,
-  state: peek.digest === "" ? "Pending" : "Ready",
+  state: pending(peek) ? "Pending" : "Ready",
   digest: peek.digest,
   requestedAt: isoOf(peek.requestedAt),
 });
