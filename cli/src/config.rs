@@ -10,7 +10,9 @@ pub struct Config {
     pub token: String,
 }
 
-const AUTH_KEYS: [&str; 4] = [
+/// What this host is signed in with, wherever it is read from. A login writes these and a process
+/// this one starts has them taken back out of its environment.
+pub const AUTH_KEYS: [&str; 4] = [
     "RECALL_ENDPOINT",
     "RECALL_TOKEN",
     "RECALL_CLIENT_ID",

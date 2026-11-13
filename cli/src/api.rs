@@ -412,6 +412,17 @@ pub fn append_body(file: &str, from: i64, records: &[String], closed: bool) -> V
         .expect("an append of strings serializes")
 }
 
+/// What a digest put on a peek did. The service takes one answer per peek, and only from the
+/// device the session runs on, so a peek that already holds a digest and a peek that is no longer
+/// there are both answers to the call rather than faults: the summariser has nothing left to do
+/// either way, and a host that reports them as failures reports a working peek as a broken one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrote {
+    Digest,
+    Held,
+    Gone,
+}
+
 /// An artifact runs to 64 MB, and a long session's transcript to several; neither fits in the
 /// twenty seconds every other call gets.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1322,6 +1333,27 @@ impl Client {
             .body_mut()
             .read_json()?;
         Ok(Appended::Written(waiting.next))
+    }
+
+    /// Puts the digest on one peek of one session. The service takes it from the device the
+    /// session runs on and from nowhere else, and takes it once: a peek that already holds a
+    /// digest is refused rather than written over, so the first answer is the one the asker reads.
+    pub fn write_peek(&self, session_id: &str, peek_id: &str, digest: &str) -> Result<Wrote> {
+        let path = format!("{}/peek/{}", Self::session_path(session_id), encode(peek_id));
+        let response = self
+            .authed(self.agent.put(self.url(&path)))
+            .send_json(serde_json::json!({ "digest": digest }))?;
+        match response.status().as_u16() {
+            409 => Ok(Wrote::Held),
+            404 => Ok(Wrote::Gone),
+            _ => {
+                check(
+                    response,
+                    &format!("writing the digest of peek {peek_id} on session {session_id}"),
+                )?;
+                Ok(Wrote::Digest)
+            }
+        }
     }
 
     pub fn end_session(&self, session_id: &str) -> Result<bool> {

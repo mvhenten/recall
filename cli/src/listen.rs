@@ -339,16 +339,6 @@ fn peek(exe: &Path, asked: &ws::Peek, sessions_dir: &Path) -> Peeked {
     }
 }
 
-/// The other half of the detached run, which the release after this one fills in. It writes
-/// nothing to the service, so a peek it was started for is left with the empty digest the asker
-/// already reads back.
-pub fn peek_run(session_id: &str, peek_id: &str) -> Result<()> {
-    log(&format!("peek:{peek_id}:{session_id}:no-summariser"), Duration::ZERO);
-    bail!(
-        "this recall reads a peek but cannot summarise one yet, so the peek keeps no digest; update recall on this host"
-    )
-}
-
 async fn session(url: &str, token: &str, sessions_dir: &Path, seen: &mut Seen) -> Result<Ended> {
     let exe = std::env::current_exe().context("finding the recall binary")?;
     let mut socket = ws::connect(url, token).await?;
