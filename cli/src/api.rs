@@ -598,10 +598,13 @@ pub struct Peeked {
 }
 
 /// How many times a peek is read back before the caller is told it is still pending. The
-/// summariser runs one Haiku call over the tail of a transcript, which answers in seconds, so this
-/// covers the ordinary peek; a host slower than that is read again by the next command rather than
-/// waited on here.
-pub const PEEK_READS: usize = 5;
+/// summariser runs one Haiku call over the tail of a transcript and answers in seven to thirteen
+/// seconds, the busiest sessions slowest, so the window covers the whole of that spread rather
+/// than the middle of it: a read back that gives up at ten seconds answers pending on the slow
+/// half and pays for a digest nobody reads. A host slower than the whole window is read again by
+/// the next command rather than waited on here. `PEEK_READS` and `PEEK_WAIT_MS` in `src/tools.ts`
+/// are the same two on the connector side.
+pub const PEEK_READS: usize = 12;
 
 pub const PEEK_WAIT: Duration = Duration::from_secs(2);
 
@@ -617,13 +620,18 @@ pub fn taken(asked: Asked, to: &str) -> Result<Peek> {
 
 /// Reads one peek back until it holds a digest, at most `PEEK_READS` times. The wait comes first
 /// each time, since the host starts the summariser as it reads the frame and the digest is never
-/// there the instant the ask answers. The peek the ask wrote is what this gives back where the
-/// digest never lands, so a request still pending reads as the request it is.
+/// there the instant the ask answers. The one ask that answers with a digest already is the one
+/// the service answered off a peek the session already held, and that is read back without
+/// waiting at all. The peek the ask wrote is what this gives back where the digest never lands, so
+/// a request still pending reads as the request it is.
 pub fn read_back(
     asked: Peek,
     mut peeks: impl FnMut() -> Result<Vec<Peek>>,
     mut wait: impl FnMut(Duration),
 ) -> Result<Peek> {
+    if asked.state == PeekState::Ready {
+        return Ok(asked);
+    }
     let mut held = asked;
     for _ in 0..PEEK_READS {
         wait(PEEK_WAIT);
@@ -644,7 +652,10 @@ pub fn read_back(
 /// refused here rather than at the service.
 ///
 /// The peek this gives back is the digest where the host wrote one within the read back, and the
-/// pending request where it did not.
+/// pending request where it did not. The ask answers off a peek the session already holds where it
+/// has one young enough, so a peek of a session someone peeked a moment ago costs no summarise and
+/// no wait, and one asked while a summariser is still working waits on that run rather than
+/// starting a second.
 pub fn peek_session(client: &Client, to: &str, wait: impl FnMut(Duration)) -> Result<Peeked> {
     let target = resolve_target(&client.devices()?, || client.sessions(), to)?;
     if target.session_id.is_empty() {
@@ -2006,8 +2017,8 @@ mod tests {
     }
 
     /// A host that never answers leaves the peek pending, and the read back is bounded so the
-    /// asker is told that rather than held: five reads two seconds apart, and the request the ask
-    /// wrote comes back so the caller prints when it was asked for.
+    /// asker is told that rather than held: twelve reads two seconds apart, and the request the
+    /// ask wrote comes back so the caller prints when it was asked for.
     #[test]
     fn the_read_back_stops_once_the_bound_is_spent_and_gives_the_pending_peek_back() {
         let reads = std::cell::Cell::new(0);
@@ -2050,6 +2061,28 @@ mod tests {
 
         assert_eq!(reads.get(), 2);
         assert_eq!(read.digest, "Reading the planner.");
+    }
+
+    /// An ask the service answered off a digest the session already held is already the answer,
+    /// so the read back neither waits nor reads.
+    #[test]
+    fn the_read_back_gives_a_digest_the_ask_already_answered_with_straight_back() {
+        let reads = std::cell::Cell::new(0);
+        let waited = std::cell::Cell::new(Duration::ZERO);
+
+        let read = read_back(
+            peek(PeekState::Ready, "Rebasing the branch."),
+            || {
+                reads.set(reads.get() + 1);
+                Ok(vec![peek(PeekState::Pending, "")])
+            },
+            |over| waited.set(waited.get() + over),
+        )
+        .unwrap();
+
+        assert_eq!(reads.get(), 0);
+        assert_eq!(waited.get(), Duration::ZERO);
+        assert_eq!(read.digest, "Rebasing the branch.");
     }
 
     /// A peek no host took is the end of the ask: the mailbox says why it reached nobody, and that

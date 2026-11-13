@@ -396,21 +396,51 @@ export const parsePeekArgs = (args: Record<string, unknown>): Parsed<PeekArgs> =
 };
 
 // How many times a peek is read back before the caller is told it is still pending, and how long
-// the read back waits each time. The summariser runs one Haiku call over the tail of a transcript,
-// which answers in seconds; a host slower than that is read again by the next call rather than
-// waited on here. api::PEEK_READS and api::PEEK_WAIT are the same two on the stdio side.
-export const PEEK_READS = 5;
+// the read back waits each time. The summariser runs one Haiku call over the tail of a transcript
+// and answers in seven to thirteen seconds, the busiest sessions slowest, so the window covers the
+// whole of that spread rather than the middle of it: a read back that gives up at ten seconds
+// answers Pending on the slow half and pays for a digest nobody reads. A host slower than the
+// whole window is read again by the next call rather than waited on here. api::PEEK_READS and
+// api::PEEK_WAIT are the same two on the stdio side.
+export const PEEK_READS = 12;
 export const PEEK_WAIT_MS = 2_000;
+
+// How young a peek on record has to be for the next call to take it rather than ask for another.
+// A digest this old still describes what the session is doing, and a request this young is one the
+// summariser is still answering. api::PEEK_FRESH is the same bound on the stdio side.
+export const PEEK_FRESH_MS = 60_000;
+
+// What a peek of a session does about the peeks it already holds: take the digest one of them
+// holds, wait on a request already placed, or ask for one of its own.
+export type PeekReuse = { kind: "ready"; peek: V2Peek } | { kind: "attach"; peek: V2Peek } | { kind: "ask" };
+
+// A summarise costs a Haiku call, so a peek spends one only where the session holds no answer and
+// no question young enough to count. The newest peek is the only one worth reading: an older one
+// describes a session further back. A pending peek within the bound is waited on rather than
+// doubled, which is what makes the digest a timed out call paid for collectable — the next call
+// reads it off the session instead of asking again.
+export const reusablePeek = (peeks: V2Peek[], now: number): PeekReuse => {
+  const newest = peeks.reduce<V2Peek | null>(
+    (held, peek) => (held === null || Date.parse(peek.requestedAt) > Date.parse(held.requestedAt) ? peek : held),
+    null,
+  );
+  if (newest === null) return { kind: "ask" };
+  const age = now - Date.parse(newest.requestedAt);
+  if (age < 0 || age >= PEEK_FRESH_MS) return { kind: "ask" };
+  return newest.state === "Ready" ? { kind: "ready", peek: newest } : { kind: "attach", peek: newest };
+};
 
 // Reads one peek back until it holds a digest, at most PEEK_READS times. The wait comes first each
 // time, since the host starts the summariser as it reads the frame and the digest is never there
-// the instant the ask answers. The peek the ask wrote is what this gives back where the digest
-// never lands, so a request still pending reads as the request it is.
+// the instant the ask answers — except where the ask answered with a digest already on record,
+// which is read back without waiting at all. The peek the ask wrote is what this gives back where
+// the digest never lands, so a request still pending reads as the request it is.
 export const readBackPeek = async (
   asked: V2Peek,
   read: () => Promise<V2Peek | null>,
   wait: (ms: number) => Promise<void>,
 ): Promise<V2Peek> => {
+  if (asked.state === "Ready") return asked;
   let held = asked;
   for (let taken = 0; taken < PEEK_READS; taken += 1) {
     await wait(PEEK_WAIT_MS);

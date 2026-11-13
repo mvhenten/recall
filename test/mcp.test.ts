@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { NO_PEEK_LISTENING, ORDERS, ORDERS_HEADER, type PeekFrame, type PeekOrder } from "../src/mailbox";
 import { MCP_PATH } from "../src/mcp";
-import { PEEK_READS, PEEK_WAIT_MS, readBackPeek, TOOLS } from "../src/tools";
+import { PEEK_FRESH_MS, PEEK_READS, PEEK_WAIT_MS, readBackPeek, reusablePeek, TOOLS } from "../src/tools";
 import type { V2Peek } from "../src/v2";
 import { type Client, harness, MCP_PROTOCOL_VERSION } from "./harness";
 
@@ -56,6 +56,15 @@ const summarising = async (h: Harness, token: string, host: Client, digests: str
     );
   });
   return summariser;
+};
+
+// One peek asked of a session the way a host asks for one, which answers with the row the service
+// gave the ask and waits for no digest.
+const ask = async (host: Client, sessionId: string): Promise<V2Peek> => {
+  const response = await host.request("POST", `/v2/sessions/${sessionId}/peek`);
+  expect(response.status).toBe(201);
+  const asked: { peek: V2Peek } = await response.json();
+  return asked.peek;
 };
 
 const history = async (host: Client, sessionId: string): Promise<V2Peek[]> => {
@@ -446,8 +455,8 @@ describe("the connector's tools", () => {
 });
 
 describe("peeking from the connector", () => {
-  // Each call asks once and reads the answer back, so two calls are two peeks and the history holds
-  // what each one answered with.
+  // Each call past the freshness bound asks once and reads the answer back, so two such calls are
+  // two peeks and the history holds what each one answered with.
   it("asks one session and answers the digest its host wrote", async () => {
     const { h, mcp, laptop, token, sessionId } = await peekable();
     const host = await summarising(h, token, laptop, ["running the tenant migration", "reading the transcript"]);
@@ -460,9 +469,9 @@ describe("peeking from the connector", () => {
     expect(first.sessionId).toBe(sessionId);
     expect(first.peek).toMatchObject({ state: "Ready", digest: "running the tenant migration" });
 
-    // The history reads newest first, and two peeks asked in the same millisecond are ordered by an
-    // id neither this test nor the store picked, so the second is asked a second later.
-    h.advance(1_000);
+    // A second ask inside the freshness bound reads the first digest back, so the one that is to
+    // cost a summarise of its own is asked once the bound has passed.
+    h.advance(PEEK_FRESH_MS);
     const second = (await mcp.json("recall_peek", { session: sessionId })) as { sessionId: string; peek: V2Peek };
     expect(second.peek).toMatchObject({ state: "Ready", digest: "reading the transcript" });
     expect(second.peek.peekId).not.toBe(first.peek.peekId);
@@ -471,6 +480,48 @@ describe("peeking from the connector", () => {
     expect(written.map((response) => response.status)).toEqual([204, 204]);
     expect(host.handed.map((peek) => peek.peekId)).toEqual([first.peek.peekId, second.peek.peekId]);
     expect(await history(laptop, sessionId)).toEqual([second.peek, first.peek]);
+  }, 30_000);
+
+  // A summarise costs a Haiku call, so a session that already holds an answer from the last minute
+  // is handed that one: the host is asked nothing, and the digest comes back with no wait at all.
+  it("answers a fresh digest off the session rather than paying for a second summarise", async () => {
+    const { h, mcp, laptop, token, sessionId } = await peekable();
+    const host = await summarising(h, token, laptop, ["running the tenant migration"]);
+
+    const first = (await mcp.json("recall_peek", { session: sessionId })) as { peek: V2Peek };
+    expect(first.peek).toMatchObject({ state: "Ready", digest: "running the tenant migration" });
+
+    h.advance(PEEK_FRESH_MS - 1);
+    const second = (await mcp.json("recall_peek", { session: sessionId })) as { peek: V2Peek };
+
+    expect(second.peek).toEqual(first.peek);
+    expect(host.handed).toHaveLength(1);
+    expect(await history(laptop, sessionId)).toEqual([first.peek]);
+  }, 30_000);
+
+  // The summariser was handed one peek and writes onto that row whenever it finishes, so a caller
+  // told Pending has left something behind: the next ask attaches to the same run rather than
+  // starting a second, and the one after it collects the digest that run paid for.
+  it("attaches to the summarise already running and collects the digest it leaves", async () => {
+    const { h, laptop, token, sessionId } = await peekable();
+    const host = await summarising(h, token, laptop, []);
+
+    const asked = await ask(laptop, sessionId);
+    h.advance(PEEK_FRESH_MS - 1);
+    const again = await ask(laptop, sessionId);
+
+    expect(asked.state).toBe("Pending");
+    expect(again).toEqual(asked);
+    expect(host.handed).toHaveLength(1);
+
+    const written = await laptop.request("PUT", `/v2/sessions/${sessionId}/peek/${asked.peekId}`, {
+      digest: "rebasing the branch",
+    });
+    expect(written.status).toBe(204);
+    const collected = await ask(laptop, sessionId);
+
+    expect(collected).toMatchObject({ peekId: asked.peekId, state: "Ready", digest: "rebasing the branch" });
+    expect(host.handed).toHaveLength(1);
   }, 30_000);
 
   // A peek reads the same address book a send does, so a session its owner named is peeked at by
@@ -562,5 +613,67 @@ describe("reading a peek back", () => {
     );
 
     expect(peek).toEqual(pending);
+  });
+
+  // An ask answered off a digest the session already held is the answer, so there is nothing to
+  // wait for and nothing to read.
+  it("answers a digest the ask already carried without waiting", async () => {
+    let reads = 0;
+    let waits = 0;
+
+    const peek = await readBackPeek(
+      ready,
+      () => {
+        reads += 1;
+        return Promise.resolve(pending);
+      },
+      () => {
+        waits += 1;
+        return Promise.resolve();
+      },
+    );
+
+    expect(peek).toEqual(ready);
+    expect([reads, waits]).toEqual([0, 0]);
+  });
+});
+
+// Which peek on record an ask takes rather than paying a summariser for another.
+describe("reusing a peek the session already holds", () => {
+  const NOW = Date.parse("2026-01-01T01:00:00Z");
+  const at = (ago: number): string => new Date(NOW - ago).toISOString();
+  const pending = (ago: number): V2Peek => ({ peekId: `p-${ago}`, state: "Pending", digest: "", requestedAt: at(ago) });
+  const ready = (ago: number): V2Peek => ({ ...pending(ago), state: "Ready", digest: "running the migration" });
+
+  it("asks for a peek of its own where the session holds none", () => {
+    expect(reusablePeek([], NOW)).toEqual({ kind: "ask" });
+  });
+
+  it("takes a digest younger than the bound and asks where it is older", () => {
+    expect(reusablePeek([ready(PEEK_FRESH_MS - 1)], NOW)).toEqual({ kind: "ready", peek: ready(PEEK_FRESH_MS - 1) });
+    expect(reusablePeek([ready(PEEK_FRESH_MS)], NOW)).toEqual({ kind: "ask" });
+  });
+
+  it("attaches to a request younger than the bound and asks where it is older", () => {
+    expect(reusablePeek([pending(1_000)], NOW)).toEqual({ kind: "attach", peek: pending(1_000) });
+    expect(reusablePeek([pending(PEEK_FRESH_MS)], NOW)).toEqual({ kind: "ask" });
+  });
+
+  // An older peek describes a session further back, so the newest is the only one worth reading,
+  // whatever order the listing came in.
+  it("reads the newest peek and no other", () => {
+    const peeks = [ready(PEEK_FRESH_MS - 1), pending(1_000), ready(PEEK_FRESH_MS - 2)];
+
+    expect(reusablePeek(peeks, NOW)).toEqual({ kind: "attach", peek: pending(1_000) });
+    expect(reusablePeek([ready(1_000), pending(PEEK_FRESH_MS - 1)], NOW)).toEqual({
+      kind: "ready",
+      peek: ready(1_000),
+    });
+  });
+
+  // A host whose clock runs ahead of the service writes a peek dated in the future, and an ask is
+  // not held off by one.
+  it("asks where the newest peek is dated ahead of now", () => {
+    expect(reusablePeek([ready(-1_000)], NOW)).toEqual({ kind: "ask" });
   });
 });

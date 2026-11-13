@@ -319,6 +319,7 @@ import {
   readBackPeek,
   renderMemory,
   resolveTarget,
+  reusablePeek,
   SEARCH_LIMIT,
   type SendTarget,
   sessionDigest,
@@ -2221,6 +2222,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const askPeek = async (env: TenantEnv, userId: string, sessionId: string, now: number): Promise<AskedPeek | null> => {
     const toDeviceId = await liveSessionDevice(env.DB, userId, sessionId, now);
     if (toDeviceId === null) return null;
+    // A digest the session already holds is the answer to this ask too, and a request already out
+    // is the one to wait on: either way no second summariser runs over the same transcript.
+    const reuse = reusablePeek((await listPeeks(env.DB, userId, sessionId)).map(peekView), now);
+    if (reuse.kind !== "ask") return { peek: reuse.peek, outcome: { state: "taken", sessionId } };
     const peek = await requestPeek(env.DB, userId, sessionId, crypto.randomUUID(), now);
     const outcome = await mailboxFor(env, userId).peek({
       peekId: peek.peekId,
