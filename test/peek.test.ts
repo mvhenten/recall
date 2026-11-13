@@ -8,6 +8,7 @@ import {
   type PeekOrder,
   type Receipt,
 } from "../src/mailbox";
+import { PEEK_FRESH_MS } from "../src/tools";
 import type { V2Peek } from "../src/v2";
 import { type Client, harness } from "./harness";
 
@@ -98,15 +99,16 @@ describe("peeks", () => {
     expect(await history(laptop, sessionId)).toEqual([asked]);
   });
 
-  // The row is the asker's and the digest is the host's, so a peek nobody takes is still a row the
-  // asker reads back. It says pending, which is what it is.
-  it("keeps the peek it wrote when no host is listening and tells the asker so", async () => {
+  // The row the ask wrote is there for a summariser to answer on, and a peek nobody took has no
+  // summariser coming. Left behind it would be a pending row the asks after it wait on, so it goes
+  // with the refusal and the next ask starts clean.
+  it("drops the peek it wrote when no host is listening and tells the asker so", async () => {
     const { laptop, sessionId } = await peeking();
 
-    const { peek: asked, outcome } = await ask(laptop, sessionId);
+    const { outcome } = await ask(laptop, sessionId);
 
     expect(outcome).toEqual({ state: "untaken", reason: NO_PEEK_LISTENING });
-    expect(await history(laptop, sessionId)).toEqual([{ ...asked, state: "Pending", digest: "" }]);
+    expect(await history(laptop, sessionId)).toEqual([]);
   });
 
   it("takes the first digest a summariser writes and refuses the one behind it", async () => {
@@ -128,7 +130,9 @@ describe("peeks", () => {
     await listen(h, token, summarising);
     const { peek: first } = await ask(laptop, sessionId);
     expect((await write(laptop, sessionId, first.peekId, "running the tenant migration")).status).toBe(204);
-    h.advance(1_000);
+    // An ask inside the freshness bound is answered off the digest already on record, so the
+    // second peek of this history is asked for once that bound has passed.
+    h.advance(PEEK_FRESH_MS);
     const { peek: second } = await ask(laptop, sessionId);
 
     const read = await history(laptop, sessionId);
@@ -146,7 +150,7 @@ describe("peeks", () => {
     await listen(h, token, summarising);
     const { peek: first } = await ask(laptop, sessionId);
     expect((await write(laptop, sessionId, first.peekId, "running the tenant migration")).status).toBe(204);
-    h.advance(1_000);
+    h.advance(PEEK_FRESH_MS);
     const { peek: second } = await ask(laptop, sessionId);
 
     const read = (await (await laptop.v2.session(sessionId)).json()) as { peeks: V2Peek[] };

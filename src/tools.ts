@@ -9,7 +9,9 @@ import {
   memoryTypes,
   modes,
   type Parsed,
+  type Peek,
   parseTags,
+  pending,
   REPO_TAG,
   type Session,
 } from "./model";
@@ -396,21 +398,47 @@ export const parsePeekArgs = (args: Record<string, unknown>): Parsed<PeekArgs> =
 };
 
 // How many times a peek is read back before the caller is told it is still pending, and how long
-// the read back waits each time. The summariser runs one Haiku call over the tail of a transcript,
-// which answers in seconds; a host slower than that is read again by the next call rather than
-// waited on here. api::PEEK_READS and api::PEEK_WAIT are the same two on the stdio side.
-export const PEEK_READS = 5;
+// the read back waits each time. The summariser runs one Haiku call over the tail of a transcript
+// and answers in seven to thirteen seconds, the busiest sessions slowest, so the window covers the
+// whole of that spread rather than the middle of it: a read back that gives up at ten seconds
+// answers Pending on the slow half and pays for a digest nobody reads. A host slower than the
+// whole window is read again by the next call rather than waited on here. api::PEEK_READS and
+// api::PEEK_WAIT are the same two on the stdio side.
+export const PEEK_READS = 12;
 export const PEEK_WAIT_MS = 2_000;
+
+// How young a digest has to be for the next ask to be answered off it rather than pay a summariser
+// for another. A minute on, the session has moved and what it is doing is worth asking again.
+export const PEEK_FRESH_MS = 60_000;
+
+// How young a request has to be for an ask to wait on it rather than start a second summarise over
+// the same transcript. The bound is the run's own: a host gives its summariser two minutes
+// (`TIMEOUT` in cli/src/peek.rs) and writes the digest whenever it lands inside that, so a request
+// younger than that is a run still going and an older one is a run that is never answering.
+export const PEEK_ATTACH_MS = 120_000;
+
+// The peek an ask takes rather than paying a summariser for another: a digest the session answered
+// with a moment ago, or a request a summariser is still working on. Taking the pending one is what
+// makes the digest a timed out call paid for collectable — the summariser writes onto that row and
+// the next ask reads it off the session. The listing is newest first, and an older peek describes
+// a session further back, so the newest is the only one worth reading.
+export const reusablePeek = (peeks: Peek[], now: number): Peek | null => {
+  const newest = peeks[0];
+  if (newest === undefined) return null;
+  return now - newest.requestedAt < (pending(newest) ? PEEK_ATTACH_MS : PEEK_FRESH_MS) ? newest : null;
+};
 
 // Reads one peek back until it holds a digest, at most PEEK_READS times. The wait comes first each
 // time, since the host starts the summariser as it reads the frame and the digest is never there
-// the instant the ask answers. The peek the ask wrote is what this gives back where the digest
-// never lands, so a request still pending reads as the request it is.
+// the instant the ask answers — except where the ask answered with a digest already on record,
+// which is read back without waiting at all. The peek the ask wrote is what this gives back where
+// the digest never lands, so a request still pending reads as the request it is.
 export const readBackPeek = async (
   asked: V2Peek,
   read: () => Promise<V2Peek | null>,
   wait: (ms: number) => Promise<void>,
 ): Promise<V2Peek> => {
+  if (asked.state === "Ready") return asked;
   let held = asked;
   for (let taken = 0; taken < PEEK_READS; taken += 1) {
     await wait(PEEK_WAIT_MS);

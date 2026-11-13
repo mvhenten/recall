@@ -657,6 +657,14 @@ export const listPeeks = async (db: TenantDb, userId: string, sessionId: string)
     .orderBy(desc(sessionPeeks.requestedAt), desc(sessionPeeks.peekId))
     .all();
 
+// A peek no host took, taken off the session. Nothing is going to write a digest onto it, and a
+// pending row is what the next ask waits on, so the refusal takes the row with it.
+export const dropPeek = async (db: TenantDb, userId: string, sessionId: string, peekId: string): Promise<void> => {
+  db.delete(sessionPeeks)
+    .where(peekNamed(userId, sessionId, peekId))
+    .run();
+};
+
 // The one peek a read back is waiting on, which is the row it already knows the id of.
 export const readPeek = async (db: TenantDb, userId: string, sessionId: string, peekId: string): Promise<Peek | null> =>
   db
