@@ -1,4 +1,4 @@
-import { emit, firstLine, logRun, readInput, recall, recallDetached } from "./lib.mjs";
+import { emit, firstLine, logRun, readInput, recall } from "./lib.mjs";
 import { messagingEnabled, record, register } from "./messaging.mjs";
 
 const TIMEOUT_MS = 3000;
@@ -81,9 +81,9 @@ function registerSession(input, repoTag) {
 }
 
 // The repo tag is part of the record, so it is read before the session is written rather than
-// beside it. Every session syncs, registered or not, since a host with messaging off still belongs
-// in the list `recall sessions` prints; the sync is left to run, because an unreachable service
-// must not keep the session waiting for its memory context.
+// beside it. Every session brings the daemon up, registered or not: it is what carries this host's
+// sessions to the service, and a host with messaging off still belongs in the list
+// `recall sessions` prints.
 //
 // This is also where a session picks up its board messages: the injected context is the only hook
 // that runs at start, so what the pickup took leads the context and the memory crib follows it. A
@@ -95,15 +95,12 @@ async function run(input) {
   const repo = await recall(["repo"], { cwd: input.cwd, timeout: TIMEOUT_MS });
   const repoTag = repo.ok ? repo.stdout.trim() : "";
   const messaging = registerSession(input, repoTag);
-  if (input.session_id) recallDetached(["sessions", "--sync", input.session_id], input.cwd);
   const listening = messaging === "registered";
   const work = [
     recall(["config", "get", "mode"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
     listening ? recall(["pickup", "--session", input.session_id], { cwd: input.cwd, timeout: TIMEOUT_MS }) : null,
+    recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }),
   ];
-  if (listening) {
-    work.push(recall(["listen", "--ensure"], { cwd: input.cwd, timeout: TIMEOUT_MS }));
-  }
   const [config, picked] = await Promise.all(work);
   if (!config.ok && config.error.includes("recall CLI not found")) {
     sessionContext(INSTALL_HINT);

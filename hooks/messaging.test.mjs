@@ -12,11 +12,11 @@ import {
   register,
   registryPath,
   runtimeDir,
-  SYNC_INTERVAL_MS,
   sessionPid,
   sessionsDir,
   touch,
   truncate,
+  USAGE_INTERVAL_MS,
   unregister,
   writeRecord,
 } from "./messaging.mjs";
@@ -97,7 +97,7 @@ test("a session registers one document the daemon and recall sessions both read"
     commit: "feat(sessions): list every host's sessions",
     startedAt: stored.startedAt,
     lastActivityAt: stored.startedAt,
-    syncStartedAt: 0,
+    usageCountedAt: 0,
     prompts: 0,
     focus: { first: "", latest: "" },
     mode: stored.mode,
@@ -164,14 +164,14 @@ test("each prompt counts, moves the focus on and reads the head again", () => {
   const read = () => JSON.parse(readFileSync(registryPath("s-1", env), "utf8"));
   const started = read().startedAt;
 
-  assert.deepEqual(touch("s-1", first, "default", env), { due: true }, "the first prompt owes a sync");
+  assert.deepEqual(touch("s-1", first, "default", env), { due: true }, "the first prompt owes a count");
   assert.equal(read().focus.first, truncate(first));
   assert.equal(read().focus.latest, truncate(first));
   assert.equal(read().prompts, 1);
-  assert.equal(read().syncStartedAt >= started, true);
+  assert.equal(read().usageCountedAt >= started, true);
 
   repository(cwd, "fix(sessions): keep the first prompt");
-  assert.deepEqual(touch("s-1", "why is CI red", "plan", env), { due: false }, "a sync has just gone out");
+  assert.deepEqual(touch("s-1", "why is CI red", "plan", env), { due: false }, "the transcript was just counted");
   const stored = read();
   assert.equal(stored.focus.first, truncate(first));
   assert.equal(stored.focus.latest, "why is CI red");
@@ -185,7 +185,7 @@ test("each prompt counts, moves the focus on and reads the head again", () => {
 
   writeFileSync(
     registryPath("s-1", env),
-    JSON.stringify({ ...stored, syncStartedAt: Date.now() - SYNC_INTERVAL_MS - 1 }),
+    JSON.stringify({ ...stored, usageCountedAt: Date.now() - USAGE_INTERVAL_MS - 1 }),
   );
   assert.deepEqual(touch("s-1", "ship it", "plan", env), { due: true }, "the throttle window has passed");
 
