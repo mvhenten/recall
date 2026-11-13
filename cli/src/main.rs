@@ -360,6 +360,13 @@ enum Command {
         )]
         status: bool,
     },
+    #[command(about = "Summarise one session of this host for a peek; the listener starts this detached")]
+    PeekRun {
+        #[arg(value_name = "SESSION", help = "The session to read")]
+        session: String,
+        #[arg(value_name = "PEEK", help = "The peek the digest lands on")]
+        peek: String,
+    },
     #[command(about = "Update recall to the latest release")]
     Update,
     #[command(about = "Show the settings, or get or set one")]
@@ -981,6 +988,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 listen::run(&settings, ensure)?;
             }
         }
+        Command::PeekRun { session, peek } => listen::peek_run(&session, &peek)?,
         Command::Sessions {
             sync,
             end,
