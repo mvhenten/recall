@@ -250,22 +250,30 @@ describe("the connector's tools", () => {
 
   it("scopes a save by the repo tag it names, by global, and refuses one that names neither", async () => {
     const { mcp } = await signedIn();
-    const project = { description: "d", type: "project", body: "b" };
     const refused = await mcp
-      .tool("recall_save", { name: "deploy-steps", ...project })
+      .tool("recall_save", { name: "deploy-steps", description: "d", type: "project", body: "b" })
       .catch((error: Error) => error.message);
     expect(refused).toContain("a project memory needs a scope");
 
+    const prefix = await mcp
+      .tool("recall_save", { name: "deploy-steps", description: "d", type: "project", body: "b", tags: ["repo:"] })
+      .catch((error: Error) => error.message);
+    expect(prefix).toContain("a project memory needs a scope");
+
     const inRepo = (await mcp.json("recall_save", {
       name: "deploy-steps",
-      ...project,
+      description: "d",
+      type: "project",
+      body: "b",
       tags: ["repo:github.com/acme/widget", "mcp"],
     })) as { tags: string[] };
     expect(inRepo.tags).toEqual(["mcp", "repo:github.com/acme/widget"]);
 
     const scoped = (await mcp.json("recall_save", {
       name: "release-steps",
-      ...project,
+      description: "d",
+      type: "project",
+      body: "b",
       global: true,
       tags: ["repo:github.com/acme/widget"],
     })) as { tags: string[] };

@@ -6,6 +6,13 @@ export const modes = ["hybrid", "vector", "text"] as const;
 // The tag a memory carries when it belongs to no repository.
 export const GLOBAL_TAG = "global";
 
+// What a tag naming a working copy opens with, and the shape cli/src/repo.rs gives one: the
+// remote's host, a slash and a path under it. The prefix on its own names no repository.
+export const REPO_TAG = "repo:";
+const REPO_TAG_SHAPE = /^repo:[^/]+\/.+$/;
+
+export const isRepoTag = (tag: string): boolean => REPO_TAG_SHAPE.test(tag);
+
 export type MemoryType = (typeof memoryTypes)[number];
 export type Mode = (typeof modes)[number];
 

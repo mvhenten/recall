@@ -1,6 +1,7 @@
 import type { Device } from "./device";
 import {
   GLOBAL_TAG,
+  isRepoTag,
   type Labels,
   type Memory,
   type MemoryType,
@@ -9,6 +10,7 @@ import {
   modes,
   type Parsed,
   parseTags,
+  REPO_TAG,
   type Session,
 } from "./model";
 import type { V2Device, V2Session } from "./v2";
@@ -78,9 +80,6 @@ export interface ToolDefinition {
 // carries the whole memory, so this is spent straight out of the agent's context window.
 export const SEARCH_LIMIT = 5;
 const LIST_LIMIT = 20;
-
-// What a tag naming a working copy opens with, as cli/src/repo.rs writes one.
-const REPO_TAG = "repo:";
 
 const text = (description: string): Record<string, unknown> => ({ type: "string", description });
 const strings = (description: string): Record<string, unknown> => ({
@@ -261,9 +260,9 @@ const tagList = (value: unknown, field: string): Parsed<string[]> => {
 // belongs to. The stdio server reads that tag off the directory it runs in; this end has no
 // working copy, so the caller names it in `tags` and a save that names one is scoped by it alone.
 export const saveTags = (type: MemoryType, global: boolean | undefined, extra: string[]): Parsed<string[]> => {
-  const scoped = global ?? (type === "user" || type === "feedback");
-  if (scoped) return { ok: true, value: extra.includes(GLOBAL_TAG) ? extra : [...extra, GLOBAL_TAG].sort() };
-  if (extra.some((tag) => tag.startsWith(REPO_TAG))) return { ok: true, value: extra };
+  const isGlobal = global ?? (type === "user" || type === "feedback");
+  if (isGlobal) return { ok: true, value: extra.includes(GLOBAL_TAG) ? extra : [...extra, GLOBAL_TAG].sort() };
+  if (extra.some(isRepoTag)) return { ok: true, value: extra };
   return fail(
     `a ${type} memory needs a scope, and this connector runs in no repository: name the repo tag in tags, as ${REPO_TAG}github.com/owner/project, or pass global: true`,
   );

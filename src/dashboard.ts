@@ -40,6 +40,7 @@ import {
   memoryTypes,
   monthsBetween,
   type PastSession,
+  REPO_TAG,
   type RepoHours,
   type Session,
   type SessionSpend,
@@ -897,7 +898,12 @@ const modelLabel = (model: string): string => {
   return version.length === 0 ? name : `${name} ${version.join(".")}`;
 };
 
-const repoLabel = (repo: string): string => (repo === "" ? "global" : repo.replace(/^repo:github\.com\//, ""));
+const GITHUB_TAG = `${REPO_TAG}github.com/`;
+
+const repoLabel = (repo: string): string => {
+  if (repo === "") return "global";
+  return repo.startsWith(GITHUB_TAG) ? repo.slice(GITHUB_TAG.length) : repo;
+};
 
 const NOTHING: TokenCounts = {
   prompts: 0,
