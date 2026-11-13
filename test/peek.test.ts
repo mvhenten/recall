@@ -8,6 +8,7 @@ import {
   type PeekOrder,
   type Receipt,
 } from "../src/mailbox";
+import { PEEK_FRESH_MS } from "../src/tools";
 import type { V2Peek } from "../src/v2";
 import { type Client, harness } from "./harness";
 
@@ -128,7 +129,9 @@ describe("peeks", () => {
     await listen(h, token, summarising);
     const { peek: first } = await ask(laptop, sessionId);
     expect((await write(laptop, sessionId, first.peekId, "running the tenant migration")).status).toBe(204);
-    h.advance(1_000);
+    // An ask inside the freshness bound is answered off the digest already on record, so the
+    // second peek of this history is asked for once that bound has passed.
+    h.advance(PEEK_FRESH_MS);
     const { peek: second } = await ask(laptop, sessionId);
 
     const read = await history(laptop, sessionId);
@@ -146,7 +149,7 @@ describe("peeks", () => {
     await listen(h, token, summarising);
     const { peek: first } = await ask(laptop, sessionId);
     expect((await write(laptop, sessionId, first.peekId, "running the tenant migration")).status).toBe(204);
-    h.advance(1_000);
+    h.advance(PEEK_FRESH_MS);
     const { peek: second } = await ask(laptop, sessionId);
 
     const read = (await (await laptop.v2.session(sessionId)).json()) as { peeks: V2Peek[] };
