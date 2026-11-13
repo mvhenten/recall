@@ -2,6 +2,8 @@ import { z } from "zod";
 
 export const SessionModeSchema = z.enum(["Interactive", "Headless", "Unknown"]);
 
+export const PeekStateSchema = z.enum(["Pending", "Ready"]);
+
 export const MemoryTypeSchema = z.enum(["User", "Feedback", "Project", "Reference"]);
 
 export const SearchModeSchema = z.enum(["Hybrid", "Vector", "Text"]);
@@ -117,6 +119,21 @@ export const SessionHitSchema = z.object({
   session: PastSessionSchema,
   score: z.number(),
   excerpt: SessionExcerptSchema,
+});
+
+export const PeekSchema = z.object({
+  peekId: z.string().min(1),
+  state: PeekStateSchema,
+  digest: z.string().max(2000),
+  requestedAt: z.string().datetime({ offset: true }),
+});
+
+export const WritePeekSchema = z.object({
+  digest: z.string().max(2000),
+});
+
+export const PeekHistorySchema = z.object({
+  peeks: z.array(PeekSchema).max(20),
 });
 
 export const MessageAddressSchema = z.object({

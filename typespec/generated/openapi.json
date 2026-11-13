@@ -352,6 +352,50 @@
           }
         }
       },
+      "Peek": {
+        "type": "object",
+        "required": ["peekId", "state", "digest", "requestedAt"],
+        "properties": {
+          "peekId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "state": {
+            "$ref": "#/components/schemas/PeekState"
+          },
+          "digest": {
+            "$ref": "#/components/schemas/PeekDigest"
+          },
+          "requestedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "One peek a session was asked for. A request is `Pending` and carries no digest; the host's\nsummariser answers it and the peek reads `Ready`. A session that never answers leaves the request\npending until the history drops it."
+      },
+      "PeekDigest": {
+        "type": "string",
+        "maxLength": 2000,
+        "description": "What one session was doing when it was peeked at, in a few sentences. A summariser on that\nsession's host writes it from the tail of the transcript, so the session's own context never\ncarries it."
+      },
+      "PeekHistory": {
+        "type": "object",
+        "required": ["peeks"],
+        "properties": {
+          "peeks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Peek"
+            },
+            "maxItems": 20
+          }
+        },
+        "description": "The peeks one session holds, newest first. A new peek drops the oldest past the twentieth."
+      },
+      "PeekState": {
+        "type": "string",
+        "enum": ["Pending", "Ready"]
+      },
       "PromptCount": {
         "type": "integer",
         "format": "int32",
@@ -820,6 +864,16 @@
             "maxItems": 500
           }
         }
+      },
+      "WritePeek": {
+        "type": "object",
+        "required": ["digest"],
+        "properties": {
+          "digest": {
+            "$ref": "#/components/schemas/PeekDigest"
+          }
+        },
+        "description": "What a summariser puts back on the peek it was handed."
       }
     }
   }

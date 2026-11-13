@@ -3,19 +3,22 @@ import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { type TenantDb, tenantStoreOf } from "../src/db";
-import type { HistoryInput } from "../src/model";
+import { type HistoryInput, PEEK_HISTORY } from "../src/model";
 import { labels } from "../src/schema/tenant";
 import {
   chunkMatches,
   createArtifact,
   endSession,
   getMemory,
+  listPeeks,
   putSession,
+  requestPeek,
   saveMemory,
   searchArtifacts,
   searchSessionHistory,
   textCandidates,
   vectorCandidates,
+  writePeek,
 } from "../src/store";
 import { TENANT_MIGRATIONS } from "../src/tenant-migrations";
 import { tenantRows } from "./harness";
@@ -181,6 +184,55 @@ describe("the tenant store", () => {
       return { first, again, missing };
     });
     expect(answered).toEqual({ first: true, again: false, missing: false });
+  });
+
+  it("writes a digest onto the session the peek was asked of", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    const written = await inStore(userId, async (db) => {
+      await requestPeek(db, userId, "s-1", "peek-1", NOW);
+      await requestPeek(db, userId, "s-2", "peek-2", NOW);
+      const onItsOwn = await writePeek(db, userId, "s-1", "peek-1", "rebasing the branch");
+      const onAnother = await writePeek(db, userId, "s-2", "peek-1", "rebasing the branch");
+      return { onItsOwn, onAnother };
+    });
+    expect(written).toEqual({ onItsOwn: true, onAnother: false });
+    expect(await inStore(userId, (db) => listPeeks(db, userId, "s-1"))).toEqual([
+      { peekId: "peek-1", state: "ready", digest: "rebasing the branch", requestedAt: NOW },
+    ]);
+    expect(await inStore(userId, (db) => listPeeks(db, userId, "s-2"))).toEqual([
+      { peekId: "peek-2", state: "pending", digest: "", requestedAt: NOW },
+    ]);
+  });
+
+  it("reads a session's peeks newest first", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    const asked = ["peek-a", "peek-b", "peek-c"];
+    await inStore(userId, async (db) => {
+      for (const [index, peekId] of asked.entries()) await requestPeek(db, userId, "s-1", peekId, NOW + index * 1000);
+    });
+    const history = await inStore(userId, (db) => listPeeks(db, userId, "s-1"));
+    expect(history.map((peek) => peek.peekId)).toEqual([...asked].reverse());
+  });
+
+  // The rows are counted off the table rather than through the reader, which is bounded by the same
+  // number and would answer twenty whether or not the trim ever deleted anything.
+  it("drops the oldest peek where the twenty-first is written", async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    await inStore(userId, async (db) => {
+      for (let index = 0; index <= PEEK_HISTORY; index += 1) {
+        await requestPeek(db, userId, "s-1", `peek-${index}`, NOW + index * 1000);
+      }
+    });
+    const kept = await tenantRows<{ peek_id: string }>(
+      userId,
+      "SELECT peek_id FROM session_peeks WHERE user_id = ?",
+      userId,
+    );
+    expect(kept).toHaveLength(PEEK_HISTORY);
+    expect(kept.map((row) => row.peek_id)).not.toContain("peek-0");
+    const history = await inStore(userId, (db) => listPeeks(db, userId, "s-1"));
+    expect(history.at(0)?.peekId).toBe(`peek-${PEEK_HISTORY}`);
+    expect(history.at(-1)?.peekId).toBe("peek-1");
   });
 
   it("lays its schema down once however many requests reach it", async () => {
