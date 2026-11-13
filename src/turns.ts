@@ -25,6 +25,13 @@ const ENVELOPES = [
   "<task-notification>",
 ];
 
+// A user turn the harness wrote rather than the user: the expansion of a slash command, a system
+// reminder, the note a finished subagent leaves. The hook that keeps a session's focus line reads
+// the prompt before any of this is known, so one of these reaches the record as the focus and a
+// reader has to know it for markup.
+export const machineWritten = (prompt: string): boolean =>
+  ENVELOPES.some((envelope) => prompt.trimStart().startsWith(envelope));
+
 interface Entry {
   type?: unknown;
   message?: { content?: unknown };
@@ -76,7 +83,7 @@ const typed = (entry: Entry): string => {
   if (prompt === "") return "";
   const kind = entry.origin?.kind;
   if (typeof kind === "string") return kind === "human" ? prompt : "";
-  return ENVELOPES.some((envelope) => prompt.startsWith(envelope)) ? "" : prompt;
+  return machineWritten(prompt) ? "" : prompt;
 };
 
 const stamp = (entry: Entry): number => {
