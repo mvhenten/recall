@@ -233,8 +233,17 @@ fn summarise(mut command: Command, tail: String, within: Duration) -> Result<Str
         answered.read_to_string(&mut answer).map(|_| answer)
     });
     let mut handed = child.stdin.take().expect("the summariser's input is a pipe");
-    let writing = std::thread::spawn(move || handed.write_all(tail.as_bytes()));
+    // A run that stopped reading its input closes the pipe, which is where the rest of the tail
+    // goes. It is the end of the handover and not a fault: that run has already decided the
+    // outcome, and its exit status is what says which one.
+    let writing = std::thread::spawn(move || match handed.write_all(tail.as_bytes()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        handed => handed,
+    });
     let status = waited(&mut child, within)?;
+    if !status.success() {
+        bail!("{CLAUDE} exited with {status} and wrote no digest");
+    }
     writing
         .join()
         .map_err(|_| anyhow!("handing the transcript tail to {CLAUDE} failed"))?
@@ -243,9 +252,6 @@ fn summarise(mut command: Command, tail: String, within: Duration) -> Result<Str
         .join()
         .map_err(|_| anyhow!("reading what {CLAUDE} answered failed"))?
         .with_context(|| format!("reading what {CLAUDE} answered"))?;
-    if !status.success() {
-        bail!("{CLAUDE} exited with {status} and wrote no digest");
-    }
     digest(&answer)
 }
 
@@ -374,14 +380,16 @@ mod tests {
     }
 
     /// A run that fails, a run that hangs and a Claude Code that is not installed all leave the
-    /// peek pending, and each says which it was.
+    /// peek pending, and each says which it was. The failing one is handed more than a pipe
+    /// carries and reads none of it, so the handover ends on a closed pipe: what this host reports
+    /// is the status that run exited with and never the pipe that closed under it.
     #[test]
     fn a_summariser_that_fails_or_hangs_writes_no_digest() {
         let dir = crate::scratch("peek-failing");
 
         let failed = summarise(
             stub(&dir, "fails", "printf 'no model\\n' >&2; exit 3"),
-            "turns".to_string(),
+            "x".repeat(200 * 1024),
             Duration::from_secs(30),
         )
         .unwrap_err();
