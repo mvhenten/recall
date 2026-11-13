@@ -553,6 +553,89 @@ pub struct Sent {
     pub outcome: Option<Outcome>,
 }
 
+/// Whether a peek holds the digest its host was asked for. The state is the digest read as one of
+/// two words, so the two can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeekState {
+    Pending,
+    Ready,
+}
+
+/// One peek of one session. A request carries no digest and reads `Pending`; the summariser on the
+/// host that session runs on writes the digest, and the peek reads `Ready` from then on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Peek {
+    pub peek_id: String,
+    pub state: PeekState,
+    pub digest: String,
+    #[serde(with = "iso")]
+    pub requested_at: i64,
+}
+
+/// What asking for a peek answered: the peek the service wrote, and what the bus made of handing it
+/// to the host. `outcome` is absent from a service that predates peeks.
+#[derive(Debug, Deserialize)]
+pub struct Asked {
+    pub peek: Peek,
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+}
+
+#[derive(Deserialize)]
+struct Peeks {
+    peeks: Vec<Peek>,
+}
+
+/// How many times a peek is read back before the caller is told it is still pending. The
+/// summariser runs one Haiku call over the tail of a transcript, which answers in seconds, so this
+/// covers the ordinary peek; a host slower than that is read again by the next command rather than
+/// waited on here.
+pub const PEEK_READS: usize = 5;
+
+pub const PEEK_WAIT: Duration = Duration::from_secs(2);
+
+/// Reads one peek back until it holds a digest, at most `PEEK_READS` times. The wait comes first
+/// each time, since the summariser is started by the host as it reads the frame and the digest is
+/// never there the instant the ask answers. A peek the history no longer holds reads as `None`.
+pub fn read_back(
+    peek_id: &str,
+    mut peeks: impl FnMut() -> Result<Vec<Peek>>,
+    mut wait: impl FnMut(Duration),
+) -> Result<Option<Peek>> {
+    let mut last = None;
+    for _ in 0..PEEK_READS {
+        wait(PEEK_WAIT);
+        let read = peeks()?.into_iter().find(|peek| peek.peek_id == peek_id);
+        if read.as_ref().is_some_and(|peek| peek.state == PeekState::Ready) {
+            return Ok(read);
+        }
+        last = read;
+    }
+    Ok(last)
+}
+
+/// Asks one session what it is doing and reads the answer back. `to` names a session the way
+/// `recall send` names one: its handle, the name Claude Code gave it, or its session id. A host
+/// reaches every session on it, which is not a question one summariser can answer, so it is
+/// refused here rather than at the service.
+///
+/// The peek this gives back is the digest where the host wrote one within the read back, and the
+/// pending request where it did not. A peek no host took is the mailbox's own reason and an error:
+/// nothing is left behind for a host that starts listening later.
+pub fn peek_session(client: &Client, to: &str, wait: impl FnMut(Duration)) -> Result<Peek> {
+    let target = resolve_target(&client.devices()?, || client.sessions(), to)?;
+    if target.session_id.is_empty() {
+        bail!("{to} names a host, and a peek asks one session; name a session as recall sessions prints it");
+    }
+    let asked = client.ask_peek(&target.session_id)?;
+    if let Some(Outcome::Untaken { reason }) = &asked.outcome {
+        bail!("no host took the peek of {to}: {reason}");
+    }
+    let read = read_back(&asked.peek.peek_id, || client.peeks(&target.session_id), wait)?;
+    Ok(read.unwrap_or(asked.peek))
+}
+
 /// What `recall post` resolves an address to. The vocabulary is `recall send`'s, with the one word
 /// the bus has no use for: the fleet, which is every host signed in as this user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1335,6 +1418,27 @@ impl Client {
         Ok(Appended::Written(waiting.next))
     }
 
+    /// Asks the host running one session what that session is doing. The service writes the peek
+    /// before it hands it over, so the row the summariser answers on is there the moment that host
+    /// reads the frame, and answers with the peek and what the bus made of it.
+    pub fn ask_peek(&self, session_id: &str) -> Result<Asked> {
+        let path = format!("{}/peek", Self::session_path(session_id));
+        let response = self.authed(self.agent.post(self.url(&path))).send_empty()?;
+        Ok(check(response, &format!("asking session {session_id} for a peek"))?
+            .body_mut()
+            .read_json()?)
+    }
+
+    /// Every peek one session holds, newest first.
+    pub fn peeks(&self, session_id: &str) -> Result<Vec<Peek>> {
+        let path = format!("{}/peek", Self::session_path(session_id));
+        let response = self.authed(self.agent.get(self.url(&path))).call()?;
+        let read: Peeks = check(response, &format!("reading the peeks of session {session_id}"))?
+            .body_mut()
+            .read_json()?;
+        Ok(read.peeks)
+    }
+
     /// Puts the digest on one peek of one session. The service takes it from the device the
     /// session runs on and from nowhere else, and takes it once: a peek that already holds a
     /// digest is refused rather than written over, so the first answer is the one the asker reads.
@@ -1824,6 +1928,68 @@ mod tests {
             device_id: device_id.to_string(),
             session_id: String::new(),
         }
+    }
+
+    fn peek(state: PeekState, digest: &str) -> Peek {
+        Peek {
+            peek_id: "p-1".to_string(),
+            state,
+            digest: digest.to_string(),
+            requested_at: 1_762_000_000_000,
+        }
+    }
+
+    /// A host that never answers leaves the peek pending, and the read back is bounded so the
+    /// asker is told that rather than held: five reads two seconds apart, and the pending request
+    /// itself comes back so the caller prints when it was asked for.
+    #[test]
+    fn the_read_back_stops_once_the_bound_is_spent_and_gives_the_pending_peek_back() {
+        let reads = std::cell::Cell::new(0);
+        let waited = std::cell::Cell::new(Duration::ZERO);
+
+        let read = read_back(
+            "p-1",
+            || {
+                reads.set(reads.get() + 1);
+                Ok(vec![peek(PeekState::Pending, "")])
+            },
+            |over| waited.set(waited.get() + over),
+        )
+        .unwrap();
+
+        assert_eq!(reads.get(), PEEK_READS);
+        assert_eq!(waited.get(), PEEK_WAIT * PEEK_READS as u32);
+        assert_eq!(read.unwrap().state, PeekState::Pending);
+    }
+
+    /// The ordinary peek answers in seconds, and the read back stops the moment it does rather
+    /// than spending the rest of its bound.
+    #[test]
+    fn the_read_back_stops_on_the_digest_the_host_wrote() {
+        let reads = std::cell::Cell::new(0);
+
+        let read = read_back(
+            "p-1",
+            || {
+                reads.set(reads.get() + 1);
+                Ok(match reads.get() {
+                    1 => vec![peek(PeekState::Pending, "")],
+                    _ => vec![peek(PeekState::Ready, "Reading the planner.")],
+                })
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(reads.get(), 2);
+        assert_eq!(read.unwrap().digest, "Reading the planner.");
+    }
+
+    /// A peek the history dropped is neither an answer nor a pending request, and the caller is
+    /// told so rather than printing an empty digest as one.
+    #[test]
+    fn a_peek_the_history_no_longer_holds_reads_as_nothing() {
+        assert_eq!(read_back("p-1", || Ok(Vec::new()), |_| {}).unwrap(), None);
     }
 
     #[test]

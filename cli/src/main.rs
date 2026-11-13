@@ -281,6 +281,13 @@ enum Command {
             long,
             value_name = "NAME",
             conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search"],
+            help = "Ask one running session what it is doing, by its name, its handle or its Claude Code session id, and print what its host answers"
+        )]
+        peek: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search", "peek"],
             help = "Write a stored session's transcript back onto this host, so claude --resume takes it"
         )]
         restore: Option<String>,
@@ -844,9 +851,24 @@ fn find_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
     report_matches(&stored, target);
     if json {
         print_json(&stored)?;
-    } else {
-        print!("{}", markdown::render_session(&stored.session, &stored.files));
+        return Ok(ExitCode::SUCCESS);
     }
+    let peeks = client.peeks(&stored.session.session_id)?;
+    print!("{}", markdown::render_session(&stored.session, &stored.files, &peeks));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Asks one running session what it is doing. The summariser runs on that session's host and
+/// answers in seconds, so the ask is followed by a short read back and never by a wait of its own:
+/// a peek still pending when that runs out prints as pending, and the session's own view shows it
+/// once the host has written it.
+fn peek_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
+    let peek = api::peek_session(client, target, std::thread::sleep)?;
+    if json {
+        print_json(&peek)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    print!("{}", markdown::render_peek(&peek, target));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -997,6 +1019,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             backfill,
             find,
             search,
+            peek,
             restore,
             cwd,
             limit,
@@ -1018,6 +1041,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if let Some(query) = search {
                 return search_sessions(&client()?, &query, limit, cli.json);
+            }
+            if let Some(target) = peek {
+                require_messaging(&settings::load(&cli.settings)?)?;
+                return peek_session(&client()?, &target, cli.json);
             }
             if let Some(target) = restore {
                 return restore_session(&client()?, &target, cwd.as_deref(), cli.json);
@@ -1472,6 +1499,29 @@ mod tests {
     #[test]
     fn the_cli_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// A peek names one session and does one thing, so it is taken on its own and refused beside
+    /// any of the other work `recall sessions` does.
+    #[test]
+    fn a_peek_names_one_session_and_is_refused_beside_the_other_session_work() {
+        let Ok(Cli {
+            command: Command::Sessions { peek, .. },
+            ..
+        }) = parse(&["sessions", "--peek", "LAPTOP-9F8A"])
+        else {
+            panic!("a peek of one session was refused");
+        };
+        assert_eq!(peek.as_deref(), Some("LAPTOP-9F8A"));
+
+        for beside in ["--find", "--search", "--restore", "--sync", "--end"] {
+            assert!(
+                parse(&["sessions", "--peek", "laptop-9f8a", beside, "laptop-9f8a"]).is_err(),
+                "{beside}"
+            );
+        }
+        assert!(parse(&["sessions", "--peek", "laptop-9f8a", "--adopt"]).is_err());
+        assert!(parse(&["sessions", "--peek"]).is_err());
     }
 
     #[test]

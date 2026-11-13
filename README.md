@@ -105,7 +105,7 @@ Both modes add matching memories to each prompt.
 
 ### MCP over stdio
 
-`recall mcp` serves the operations as MCP tools for a harness that speaks MCP and has no shell of its own: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`, plus `recall_send` and `recall_order` while messaging is on. They tag like the CLI, from the directory the harness runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`. Register it where you want it; the Claude Code plugin does not.
+`recall mcp` serves the operations as MCP tools for a harness that speaks MCP and has no shell of its own: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`, plus `recall_send`, `recall_order` and `recall_peek` while messaging is on. They tag like the CLI, from the directory the harness runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`. Register it where you want it; the Claude Code plugin does not.
 
 ## Settings
 
