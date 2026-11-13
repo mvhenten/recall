@@ -147,8 +147,47 @@ fn detached(command: &mut Command) {
     }
 }
 
-fn spawn_daemon() -> Result<()> {
+/// What a replaced binary reads back as on Linux: `/proc/self/exe` still points at the inode this
+/// process is running, and the kernel marks the name it no longer answers to.
+const DELETED: &str = " (deleted)";
+
+/// A file on PATH this host can start, which a name it merely holds a file under is not.
+fn runnable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|found| found.is_file() && found.permissions().mode() & 0o111 != 0)
+}
+
+/// Where the binary now installed sits. An update writes a new file over the one this process was
+/// started from, so the path `current_exe` answers with is a name nothing can be started under any
+/// more; the same path without the marker is where the installer wrote the new binary, and
+/// `recall` on PATH is what answers when even that is gone.
+fn installed() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("finding the recall binary")?;
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    let replaced = exe
+        .to_str()
+        .and_then(|path| path.strip_suffix(DELETED))
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    if let Some(replaced) = replaced {
+        return Ok(replaced);
+    }
+    let found = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("recall"))
+            .find(|path| runnable(path))
+    });
+    found.with_context(|| {
+        format!(
+            "the recall binary {} was replaced and no recall on PATH took its place",
+            exe.display()
+        )
+    })
+}
+
+fn spawn_daemon() -> Result<()> {
+    let exe = installed()?;
     let mut command = Command::new(&exe);
     command.arg("listen");
     detached(&mut command);
@@ -606,7 +645,6 @@ async fn archive_loop(
         let dir = sessions_dir.clone();
         let beaten = tokio::task::spawn_blocking(move || {
             let mut pass = held(&held_at);
-            pass.retain(&live.iter().map(|status| status.session_id.as_str()).collect());
             for status in &live {
                 carry(&client, &sent, &dir, status);
                 let transcript = &status.record.transcript_path;
@@ -895,19 +933,27 @@ fn stop(lock: &Path, pid_file: &Path, procfs: &Path, limit: Duration) -> bool {
     false
 }
 
-/// Hands the listener over to the binary now installed. An update replaces the binary under a
-/// daemon that goes on running the code it started with: it holds the lock, so nothing newer can
-/// take over, and its tick is what keeps every adopted session's last activity moving. Nothing
-/// here may fail the update, so the hooks log is where it reports.
-pub fn restart() {
+/// Hands the listener over to the binary now installed, answering whether this host has one. An
+/// update replaces the binary under a daemon that goes on running the code it started with: it
+/// holds the lock, so nothing newer can take over, and its tick is what keeps every adopted
+/// session's last activity moving.
+///
+/// Nothing here may fail the update, so the hooks log is where it reports — and a host left with
+/// no listener archives nothing at all until something runs `recall listen --ensure`, so the
+/// caller is told as well.
+pub fn restart() -> bool {
     let started = Instant::now();
-    stop(&lock_path(), &pid_path(), Path::new(PROCFS), HANDOVER);
-    let outcome = match ensure(&lock_path(), spawn_daemon) {
-        Ok(true) => "listen:restarted".to_string(),
-        Ok(false) => "listen:still-running".to_string(),
-        Err(error) => format!("listen:restart-failed:{error:#}"),
+    let stopped = stop(&lock_path(), &pid_path(), Path::new(PROCFS), HANDOVER);
+    let (outcome, listening) = match ensure(&lock_path(), spawn_daemon) {
+        Ok(true) => ("listen:restarted".to_string(), true),
+        Ok(false) if stopped => ("listen:still-running".to_string(), true),
+        // Nothing was stopped and the lock is held, so what holds it is the daemon this call meant
+        // to replace, still running the binary the update wrote over.
+        Ok(false) => ("listen:handover-failed".to_string(), false),
+        Err(error) => (format!("listen:restart-failed:{error:#}"), false),
     };
     log(&outcome, started.elapsed());
+    listening
 }
 
 #[cfg(test)]

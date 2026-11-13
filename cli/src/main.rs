@@ -515,7 +515,12 @@ fn update() -> Result<ExitCode> {
     if !status.success() {
         return Ok(ExitCode::from(1));
     }
-    listen::restart();
+    if !listen::restart() {
+        eprintln!(
+            "recall updated, but the listener did not start again; this host archives nothing until you run recall listen --ensure (see {})",
+            listen::state_dir().join("hooks.log").display()
+        );
+    }
     adopt_after_update();
     Ok(ExitCode::SUCCESS)
 }
