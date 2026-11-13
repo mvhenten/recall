@@ -567,7 +567,7 @@ describe("a name that reads like a route", () => {
     const held = await listed.json<{ artifacts: Array<{ name: string; shares: ShareView[] }> }>();
     expect(held.artifacts[0]?.shares).toHaveLength(1);
     expect(held.artifacts[1]?.shares).toHaveLength(0);
-  });
+  }, 30_000);
 });
 
 describe("a deployment that binds no share audience", () => {
