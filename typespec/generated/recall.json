@@ -501,7 +501,7 @@
         }
       },
       "required": ["peekId", "state", "digest", "requestedAt"],
-      "description": "One peek a session was asked for. A request is `Pending` and carries no digest; the host's\nsummariser answers it and the peek reads `Ready`. A session that never answers leaves the request\npending until the history drops it."
+      "description": "One peek a session was asked for. A request is `Pending` and carries no digest; the host's\nsummariser answers it and the peek reads `Ready`. A session that never answers leaves the request\npending until the history drops it. The state is the digest read as one of two words, so the two\ncan never disagree."
     },
     "PeekState": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -527,22 +527,6 @@
       },
       "required": ["digest"],
       "description": "What a summariser puts back on the peek it was handed."
-    },
-    "PeekHistory": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "$id": "PeekHistory.json",
-      "type": "object",
-      "properties": {
-        "peeks": {
-          "type": "array",
-          "items": {
-            "$ref": "Peek.json"
-          },
-          "maxItems": 20
-        }
-      },
-      "required": ["peeks"],
-      "description": "The peeks one session holds, newest first. A new peek drops the oldest past the twentieth."
     },
     "MessageAddress": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

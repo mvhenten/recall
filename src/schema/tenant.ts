@@ -56,16 +56,14 @@ export const sessionHistory = sqliteTable(
   (table) => [primaryKey({ columns: [table.userId, table.sessionId] })],
 );
 
-// Every peek one session has been asked for. The request is written before anything summarises it,
-// so the asker has a row to read back, and the digest lands on that same row. WITHOUT ROWID and the
-// newest-first index are in `migrations/tenant/0005_peeks.sql`.
+// WITHOUT ROWID in `migrations/tenant/0005_peeks.sql`, which drizzle's schema cannot say. A peek
+// with an empty digest is one nothing has answered yet.
 export const sessionPeeks = sqliteTable(
   "session_peeks",
   {
     userId: text("user_id").notNull(),
     sessionId: text("session_id").notNull(),
     peekId: text("peek_id").notNull(),
-    state: text("state", { enum: ["pending", "ready"] }).notNull(),
     digest: text("digest").notNull(),
     requestedAt: integer("requested_at").notNull(),
   },

@@ -571,13 +571,6 @@ export const listSessions = async (db: TenantDb, userId: string, now: number): P
     })
     .map(toSession);
 
-const PEEK_FIELDS = {
-  peekId: sessionPeeks.peekId,
-  state: sessionPeeks.state,
-  digest: sessionPeeks.digest,
-  requestedAt: sessionPeeks.requestedAt,
-};
-
 // What one session keeps of what it was asked, newest first: the ones past the twentieth go where
 // the twenty-first is written. Trimming on the write is what keeps the history bounded without a
 // pass of its own, and the peek id settles two asked for in the same millisecond.
@@ -610,19 +603,19 @@ export const requestPeek = async (
   peekId: string,
   now: number,
 ): Promise<Peek> => {
-  const peek: Peek = { peekId, state: "pending", digest: "", requestedAt: now };
+  const peek: Peek = { peekId, digest: "", requestedAt: now };
   db.transaction((tx) => {
-    tx.insert(sessionPeeks)
-      .values({ userId, sessionId, peekId, state: peek.state, digest: peek.digest, requestedAt: now })
-      .run();
+    tx.insert(sessionPeeks).values({ userId, sessionId, peekId, digest: peek.digest, requestedAt: now }).run();
     prunePeeks(tx, userId, sessionId);
   });
   return peek;
 };
 
 // The digest lands on the row the request wrote, so a summariser naming a peek this session does
-// not hold is answered false rather than writing a row of its own. RETURNING is what counts the
-// rows an update reached, as `endSession` says.
+// not hold is answered false rather than writing a row of its own. The empty digest in the
+// predicate is what makes the first answer the one that stands: a session peeked at once is
+// summarised by one run, and a second arriving late is told it lost rather than overwriting it.
+// RETURNING is what counts the rows an update reached, as `endSession` says.
 export const writePeek = async (
   db: TenantDb,
   userId: string,
@@ -632,8 +625,15 @@ export const writePeek = async (
 ): Promise<boolean> => {
   const written = db
     .update(sessionPeeks)
-    .set({ state: "ready", digest })
-    .where(and(eq(sessionPeeks.userId, userId), eq(sessionPeeks.sessionId, sessionId), eq(sessionPeeks.peekId, peekId)))
+    .set({ digest })
+    .where(
+      and(
+        eq(sessionPeeks.userId, userId),
+        eq(sessionPeeks.sessionId, sessionId),
+        eq(sessionPeeks.peekId, peekId),
+        eq(sessionPeeks.digest, ""),
+      ),
+    )
     .returning({ peekId: sessionPeeks.peekId })
     .all();
   return written.length === 1;
@@ -641,11 +641,10 @@ export const writePeek = async (
 
 export const listPeeks = async (db: TenantDb, userId: string, sessionId: string): Promise<Peek[]> =>
   db
-    .select(PEEK_FIELDS)
+    .select({ peekId: sessionPeeks.peekId, digest: sessionPeeks.digest, requestedAt: sessionPeeks.requestedAt })
     .from(sessionPeeks)
     .where(and(eq(sessionPeeks.userId, userId), eq(sessionPeeks.sessionId, sessionId)))
     .orderBy(desc(sessionPeeks.requestedAt), desc(sessionPeeks.peekId))
-    .limit(PEEK_HISTORY)
     .all();
 
 // `live` is the moment a session counts as gone.

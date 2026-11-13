@@ -144,18 +144,15 @@ export interface Session extends SessionInput {
   deviceId: string;
 }
 
-export type PeekState = "pending" | "ready";
-
 // How many peeks one session keeps. A peek is asked for by hand and read within the minute, so what
 // is kept is a short tail a reader scrolls and never a series anything counts over.
 export const PEEK_HISTORY = 20;
 
-// One peek of a running session. A request is written `pending` and holds no digest until a
-// summariser on that session's host answers it, so the asker reads the row it is waiting on rather
-// than nothing at all.
+// One peek of a running session. The request is written with no digest at all and a summariser on
+// that session's host writes one, so the asker reads the row it is waiting on rather than nothing
+// at all, and the empty digest is the whole of what makes a peek still pending.
 export interface Peek {
   peekId: string;
-  state: PeekState;
   digest: string;
   requestedAt: number;
 }

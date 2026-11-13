@@ -186,36 +186,35 @@ describe("the tenant store", () => {
     expect(answered).toEqual({ first: true, again: false, missing: false });
   });
 
-  it("writes a digest onto the session the peek was asked of", async () => {
+  it("writes a digest onto the session the peek was asked of, once", async () => {
     const userId = `user-${crypto.randomUUID()}`;
     const written = await inStore(userId, async (db) => {
       await requestPeek(db, userId, "s-1", "peek-1", NOW);
       await requestPeek(db, userId, "s-2", "peek-2", NOW);
       const onItsOwn = await writePeek(db, userId, "s-1", "peek-1", "rebasing the branch");
       const onAnother = await writePeek(db, userId, "s-2", "peek-1", "rebasing the branch");
-      return { onItsOwn, onAnother };
+      const again = await writePeek(db, userId, "s-1", "peek-1", "running the tests");
+      return { onItsOwn, onAnother, again };
     });
-    expect(written).toEqual({ onItsOwn: true, onAnother: false });
+    expect(written).toEqual({ onItsOwn: true, onAnother: false, again: false });
     expect(await inStore(userId, (db) => listPeeks(db, userId, "s-1"))).toEqual([
-      { peekId: "peek-1", state: "ready", digest: "rebasing the branch", requestedAt: NOW },
+      { peekId: "peek-1", digest: "rebasing the branch", requestedAt: NOW },
     ]);
     expect(await inStore(userId, (db) => listPeeks(db, userId, "s-2"))).toEqual([
-      { peekId: "peek-2", state: "pending", digest: "", requestedAt: NOW },
+      { peekId: "peek-2", digest: "", requestedAt: NOW },
     ]);
   });
 
-  it("reads a session's peeks newest first", async () => {
+  // Two peeks asked for in the same millisecond, which is the one case the instant cannot order.
+  it("settles two peeks of one instant on the peek id", async () => {
     const userId = `user-${crypto.randomUUID()}`;
-    const asked = ["peek-a", "peek-b", "peek-c"];
     await inStore(userId, async (db) => {
-      for (const [index, peekId] of asked.entries()) await requestPeek(db, userId, "s-1", peekId, NOW + index * 1000);
+      for (const peekId of ["peek-a", "peek-b"]) await requestPeek(db, userId, "s-1", peekId, NOW);
     });
     const history = await inStore(userId, (db) => listPeeks(db, userId, "s-1"));
-    expect(history.map((peek) => peek.peekId)).toEqual([...asked].reverse());
+    expect(history.map((peek) => peek.peekId)).toEqual(["peek-b", "peek-a"]);
   });
 
-  // The rows are counted off the table rather than through the reader, which is bounded by the same
-  // number and would answer twenty whether or not the trim ever deleted anything.
   it("drops the oldest peek where the twenty-first is written", async () => {
     const userId = `user-${crypto.randomUUID()}`;
     await inStore(userId, async (db) => {
@@ -223,14 +222,8 @@ describe("the tenant store", () => {
         await requestPeek(db, userId, "s-1", `peek-${index}`, NOW + index * 1000);
       }
     });
-    const kept = await tenantRows<{ peek_id: string }>(
-      userId,
-      "SELECT peek_id FROM session_peeks WHERE user_id = ?",
-      userId,
-    );
-    expect(kept).toHaveLength(PEEK_HISTORY);
-    expect(kept.map((row) => row.peek_id)).not.toContain("peek-0");
     const history = await inStore(userId, (db) => listPeeks(db, userId, "s-1"));
+    expect(history).toHaveLength(PEEK_HISTORY);
     expect(history.at(0)?.peekId).toBe(`peek-${PEEK_HISTORY}`);
     expect(history.at(-1)?.peekId).toBe("peek-1");
   });

@@ -24,7 +24,6 @@ const maxSearchResults = 25;
 const maxInjectHits = 10;
 const maxListRows = 100;
 const maxPeekDigest = 2000;
-const maxPeekHistory = 20;
 
 @doc("""
   One line of a transcript file, redacted, under the ordinal it holds in that file. A line that is
@@ -255,7 +254,8 @@ enum PeekState {
 @doc("""
   One peek a session was asked for. A request is `Pending` and carries no digest; the host's
   summariser answers it and the peek reads `Ready`. A session that never answers leaves the request
-  pending until the history drops it.
+  pending until the history drops it. The state is the digest read as one of two words, so the two
+  can never disagree.
   """)
 model Peek {
   @minLength(1)
@@ -269,12 +269,6 @@ model Peek {
 @doc("What a summariser puts back on the peek it was handed.")
 model WritePeek {
   digest: PeekDigest;
-}
-
-@doc("The peeks one session holds, newest first. A new peek drops the oldest past the twentieth.")
-model PeekHistory {
-  @maxItems(maxPeekHistory)
-  peeks: Peek[];
 }
 
 model MessageAddress {

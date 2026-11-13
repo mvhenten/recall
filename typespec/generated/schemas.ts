@@ -132,10 +132,6 @@ export const WritePeekSchema = z.object({
   digest: z.string().max(2000),
 });
 
-export const PeekHistorySchema = z.object({
-  peeks: z.array(PeekSchema).max(20),
-});
-
 export const MessageAddressSchema = z.object({
   scope: z.union([z.literal("host"), z.literal("session")]),
   target: z.string().min(1),

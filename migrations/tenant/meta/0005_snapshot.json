@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "81f0f270-3275-446d-af14-ab51c310e177",
+  "id": "d6140e31-c056-4d83-9123-fad775bad501",
   "prevId": "c0703d7b-fbbd-41fb-8a80-8f436a6c4929",
   "tables": {
     "artifact_revisions": {
@@ -870,13 +870,6 @@
         },
         "peek_id": {
           "name": "peek_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "state": {
-          "name": "state",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
