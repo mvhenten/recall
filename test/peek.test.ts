@@ -8,37 +8,26 @@ import {
   type PeekOrder,
   type Receipt,
 } from "../src/mailbox";
+import type { V2Peek } from "../src/v2";
 import { type Client, harness } from "./harness";
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
 const OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
-interface V2Peek {
-  peekId: string;
-  state: string;
-  digest: string;
-  requestedAt: string;
-}
-
 interface Asked {
   peek: V2Peek;
   outcome: Outcome;
 }
 
-interface Host {
-  peeks: PeekOrder[];
-}
-
 // What a host writes back about each peek it is handed, standing in for the daemon starting the
-// summariser: the session it is running, or that it has none by that name. A host that writes
+// summariser: that it is running the session, or that it has none by that name. A host that writes
 // nothing leaves the ask to give up when its window closes.
 type Answer = (frame: PeekFrame) => Receipt | null;
 
 const summarising: Answer = (frame) => ({
-  type: "took",
+  type: "peek-took",
   peekId: frame.peek.peekId,
-  sessionId: frame.peek.sessionId,
   token: frame.token,
 });
 
@@ -52,10 +41,11 @@ const peeking = async () => {
   const laptop = h.clientWithToken(token, userId);
   const sessionId = `laptop-${crypto.randomUUID()}`;
   expect((await laptop.v2.sync(sessionId)).status).toBe(204);
-  return { h, userId, laptop, token, sessionId };
+  return { h, userId, email, laptop, token, sessionId };
 };
 
-const listen = async (h: Harness, token: string, answer: Answer): Promise<Host> => {
+// The peeks one listening host is handed, in the order they reached it.
+const listen = async (h: Harness, token: string, answer: Answer): Promise<PeekOrder[]> => {
   const response = await h.send("/v2/messages/listen", {
     headers: { authorization: `Bearer ${token}`, upgrade: "websocket", [ORDERS_HEADER]: ORDERS },
   });
@@ -63,22 +53,19 @@ const listen = async (h: Harness, token: string, answer: Answer): Promise<Host> 
   const socket = response.webSocket;
   if (!socket) throw new Error("the listen upgrade carried no socket");
   socket.accept();
-  const host: Host = { peeks: [] };
+  const handed: PeekOrder[] = [];
   socket.addEventListener("message", (event) => {
     const frame: PeekFrame = JSON.parse(String(event.data));
     if (frame.type !== "peek") return;
-    host.peeks.push(frame.peek);
+    handed.push(frame.peek);
     const reply = answer(frame);
     if (reply !== null) socket.send(JSON.stringify(reply));
   });
-  return host;
+  return handed;
 };
 
-const peek = (client: Client, sessionId: string): Promise<Response> =>
-  client.request("POST", `/v2/sessions/${sessionId}/peek`);
-
 const ask = async (client: Client, sessionId: string): Promise<Asked> => {
-  const response = await peek(client, sessionId);
+  const response = await client.request("POST", `/v2/sessions/${sessionId}/peek`);
   expect(response.status).toBe(201);
   return await response.json();
 };
@@ -96,7 +83,7 @@ const history = async (client: Client, sessionId: string): Promise<V2Peek[]> => 
 describe("peeks", () => {
   it("writes the peek pending and hands the host one naming the session to summarise", async () => {
     const { h, laptop, token, sessionId } = await peeking();
-    const host = await listen(h, token, summarising);
+    const handed = await listen(h, token, summarising);
 
     const { peek: asked, outcome } = await ask(laptop, sessionId);
 
@@ -104,10 +91,10 @@ describe("peeks", () => {
     expect(asked.digest).toBe("");
     expect(asked.requestedAt).toMatch(OFFSET);
     expect(outcome).toEqual({ state: "taken", sessionId });
-    expect(host.peeks).toHaveLength(1);
-    expect(host.peeks[0]?.peekId).toBe(asked.peekId);
-    expect(host.peeks[0]?.sessionId).toBe(sessionId);
-    expect(host.peeks[0]?.requestedAt).toBe(h.now());
+    expect(handed).toHaveLength(1);
+    expect(handed[0]?.peekId).toBe(asked.peekId);
+    expect(handed[0]?.sessionId).toBe(sessionId);
+    expect(handed[0]?.requestedAt).toBe(h.now());
     expect(await history(laptop, sessionId)).toEqual([asked]);
   });
 
@@ -162,6 +149,20 @@ describe("peeks", () => {
     expect(refused.status).toBe(404);
     const { error }: { error: string } = await refused.json();
     expect(error).toContain("no peek");
+  });
+
+  // The summariser reads a transcript that lives on one host. Another device signed in to the same
+  // account holds none of it, so what it would write is not a summary of that session.
+  it("takes the digest from the device the session runs on and from no other", async () => {
+    const { h, laptop, token, sessionId, email } = await peeking();
+    await listen(h, token, summarising);
+    const { peek: asked } = await ask(laptop, sessionId);
+    const desktop = h.clientWithToken(await h.login(email, "desktop"));
+
+    const refused = await write(desktop, sessionId, asked.peekId, "running the tenant migration");
+
+    expect(refused.status).toBe(404);
+    expect(await history(laptop, sessionId)).toEqual([{ ...asked, state: "Pending", digest: "" }]);
   });
 
   it("refuses a digest of no characters, which would leave the peek reading pending", async () => {

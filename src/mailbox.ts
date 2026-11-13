@@ -136,18 +136,11 @@ export interface NoTakerFrame {
   token: string;
 }
 
-// A peek is answered the way an order is, quoting the peek it was handed rather than a message.
-// The session is named back so a host answering for one it is not running is read as the refusal
-// it is rather than as a summary of something else.
-export interface PeekTookFrame {
-  type: "took";
-  peekId: string;
-  sessionId: string;
-  token: string;
-}
-
-export interface PeekNoneFrame {
-  type: "none";
+// A peek is answered the way an order is, under a word of its own: the kind of thing a receipt
+// answers is what it says it is, never which fields it carries. It names no session, because the
+// peek named one when it went out.
+export interface PeekReceiptFrame {
+  type: "peek-took" | "peek-none";
   peekId: string;
   token: string;
 }
@@ -155,7 +148,11 @@ export interface PeekNoneFrame {
 // What a host says about an order or a peek: the session that took it, or that it has none that
 // could. News is never answered, so these are the only frames a socket ever writes back. A host
 // that writes neither leaves the send to give up when its window closes.
-export type Receipt = TookFrame | NoTakerFrame | PeekTookFrame | PeekNoneFrame;
+export type Receipt = TookFrame | NoTakerFrame | PeekReceiptFrame;
+
+// Which of the two a receipt answers, read off the word it leads with and off nothing else.
+const peeked = (receipt: Receipt): receipt is PeekReceiptFrame =>
+  receipt.type === "peek-took" || receipt.type === "peek-none";
 
 // `orders` is what the socket declared on the upgrade: whether the daemon behind it reads the kind
 // of a message. A socket attached before the mailbox asked declares nothing and gets no order.
@@ -165,13 +162,15 @@ interface Attachment {
 }
 
 // The one order or peek a caller is waiting on: the claim it went out under, which the receipt has
-// to quote, the call to resolve, and what the caller is told where the host takes it back. The map
-// lives in the same isolate as the call, which is the whole of the mailbox's in-flight state.
+// to quote, the call to resolve, and what the receipt answering it means. Only the caller knows
+// that last part, since a taken order answers with the session the host named and a taken peek
+// with the session it asked about. The map lives in the same isolate as the call, which is the
+// whole of the mailbox's in-flight state.
 interface Pending {
   token: string;
   resolve: (outcome: Outcome) => void;
+  settled: (receipt: Receipt) => Outcome;
   lapse: ReturnType<typeof setTimeout>;
-  refused: string;
 }
 
 const readJson = (raw: string): unknown => {
@@ -182,31 +181,23 @@ const readJson = (raw: string): unknown => {
   }
 };
 
-// The session a receipt names, and nothing where it names none. A session id is never empty, so
-// the one answer stands for a frame that named no session and for one that named a thing no
-// session could be called.
-const sessionNamed = (value: unknown): string => {
-  if (typeof value !== "string") return "";
-  const named = parseSessionId(value);
-  return named.ok ? named.value : "";
-};
-
-// A receipt answers one claim, which it names: a message id for an order and a peek id for a peek.
+// What a receipt answers is read off the word it leads with, and the claim it names follows from
+// that: a peek receipt names a peek and an order's names a message.
 const parseReceipt = (raw: string): Receipt | null => {
   const frame = readJson(raw);
   if (typeof frame !== "object" || frame === null || Array.isArray(frame)) return null;
   const { type, messageId, peekId, sessionId, token } = frame as Record<string, unknown>;
   if (typeof token !== "string" || token.length < 1) return null;
-  const took = sessionNamed(sessionId);
-  if (typeof peekId === "string" && peekId.length > 0) {
-    if (type === "none") return { type: "none", peekId, token };
-    if (type !== "took" || took === "") return null;
-    return { type: "took", peekId, sessionId: took, token };
+  if (type === "peek-took" || type === "peek-none") {
+    if (typeof peekId !== "string" || peekId.length < 1) return null;
+    return { type, peekId, token };
   }
   if (typeof messageId !== "string" || messageId.length < 1) return null;
   if (type === "none") return { type: "none", messageId, token };
-  if (type !== "took" || took === "") return null;
-  return { type: "took", messageId, sessionId: took, token };
+  if (type !== "took" || typeof sessionId !== "string") return null;
+  const took = parseSessionId(sessionId);
+  if (!took.ok) return null;
+  return { type: "took", messageId, sessionId: took.value, token };
 };
 
 const attached = (socket: WebSocket): Attachment | null => {
@@ -296,7 +287,11 @@ export class Mailbox extends DurableObject {
   async peek(order: PeekOrder): Promise<Outcome> {
     const token = this.hand(order.toDeviceId, (claim) => peekFrame(order, claim));
     if (token === null) return { state: "untaken", reason: NO_PEEK_LISTENING };
-    return await this.taker(order.peekId, token, PEEK_NOT_TAKEN, NOT_SUMMARISED);
+    return await this.taker(order.peekId, token, PEEK_NOT_TAKEN, (receipt) =>
+      receipt.type === "peek-took"
+        ? { state: "taken", sessionId: order.sessionId }
+        : { state: "untaken", reason: NOT_SUMMARISED },
+    );
   }
 
   // News is published to whoever is attached and nothing is waited on: the push is the whole of
@@ -309,7 +304,11 @@ export class Mailbox extends DurableObject {
     }
     const token = this.hand(message.toDeviceId, (claim) => orderFrame(message, claim));
     if (token === null) return { state: "untaken", reason: NOTHING_LISTENING };
-    return await this.taker(message.messageId, token, NOT_TAKEN, NO_SESSION_TOOK_IT);
+    return await this.taker(message.messageId, token, NOT_TAKEN, (receipt) =>
+      receipt.type === "took"
+        ? { state: "taken", sessionId: receipt.sessionId }
+        : { state: "untaken", reason: NO_SESSION_TOOK_IT },
+    );
   }
 
   private broadcast(message: Message): void {
@@ -332,28 +331,29 @@ export class Mailbox extends DurableObject {
     return null;
   }
 
-  private taker(claim: string, token: string, dropped: string, refused: string): Promise<Outcome> {
+  private taker(
+    claim: string,
+    token: string,
+    dropped: string,
+    settled: (receipt: Receipt) => Outcome,
+  ): Promise<Outcome> {
     return new Promise<Outcome>((resolve) => {
       const lapse = setTimeout(() => {
         this.waiting.delete(claim);
         resolve({ state: "untaken", reason: dropped });
       }, TAKER_WINDOW_MS);
-      this.waiting.set(claim, { token, resolve, lapse, refused });
+      this.waiting.set(claim, { token, resolve, settled, lapse });
     });
   }
 
   // A receipt settles the order or peek it names only if it quotes the claim that one went out
   // under, so a daemon quoting an id it has seen before cannot answer for one it was never handed.
   private settle(receipt: Receipt): void {
-    const claim = "peekId" in receipt ? receipt.peekId : receipt.messageId;
+    const claim = peeked(receipt) ? receipt.peekId : receipt.messageId;
     const pending = this.waiting.get(claim);
     if (pending === undefined || pending.token !== receipt.token) return;
     clearTimeout(pending.lapse);
     this.waiting.delete(claim);
-    pending.resolve(
-      receipt.type === "took"
-        ? { state: "taken", sessionId: receipt.sessionId }
-        : { state: "untaken", reason: pending.refused },
-    );
+    pending.resolve(pending.settled(receipt));
   }
 }

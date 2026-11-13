@@ -2608,14 +2608,14 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (peekId === null) return error(400, "the peek id is not a valid path segment");
       const written = parseWritePeek(await readJson(request));
       if (!written.ok) return error(400, written.error);
-      if (await writePeek(db, userId, sessionId, peekId, written.value.digest)) {
-        return new Response(null, { status: 204 });
+      // The digest is the host's to write, and the host is the device the session runs on. Another
+      // device of the same account holds no transcript of it and so has nothing to summarise from.
+      if (!(await sessionOnDevice(db, userId, sessionId, caller.deviceId, deps.now()))) {
+        return error(404, `no session ${sessionId} running on this device`);
       }
-      // The write lands on a pending row or on nothing, and which of the two it was is what the
-      // summariser is told: a peek the history has dropped is gone, and one already answered keeps
-      // the answer that got there first.
-      const held = (await listPeeks(db, userId, sessionId)).find((peek) => peek.peekId === peekId);
-      if (held === undefined) return error(404, `no peek ${peekId} on session ${sessionId}`);
+      const landed = await writePeek(db, userId, sessionId, peekId, written.value.digest);
+      if (landed === "written") return new Response(null, { status: 204 });
+      if (landed === "missing") return error(404, `no peek ${peekId} on session ${sessionId}`);
       return error(409, `peek ${peekId} already holds a digest`);
     }
     if (request.method === "GET") {
@@ -2648,7 +2648,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   ): Promise<Response> => {
     const bucket = env.TRANSCRIPTS;
     const db = env.DB;
+    // One peek of a session is the only address below a subresource here, so every deeper one is
+    // nothing this collection answers.
     const [subresource, rawPeekId] = rest;
+    if (rest.length > 2 || (rest.length === 2 && subresource !== "peek")) return error(404, "not found");
     if (rawSessionId === undefined) {
       return request.method === "GET" ? v2SessionsList(db, caller) : error(405, "method not allowed");
     }
@@ -3482,10 +3485,9 @@ export const createApp = (deps: Deps): App => {
     if (rest.length > 0 && collection !== "sessions" && collection !== "artifacts" && collection !== "memories") {
       return error(404, "not found");
     }
-    // One peek of a session is addressed under the session's own peek collection, which is the
-    // only address below a subresource outside an artifact's file paths.
-    const peeked = collection === "sessions" && rest.length === 2 && rest[0] === "peek";
-    if (rest.length > 1 && collection !== "artifacts" && !peeked) return error(404, "not found");
+    if (rest.length > 1 && collection !== "artifacts" && collection !== "sessions") {
+      return error(404, "not found");
+    }
     // The device grant is RFC 8628 and its snake_case is the standard rather than a slip, so it is
     // carried over as it stands.
     if (collection === "device") {

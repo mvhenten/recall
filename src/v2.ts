@@ -245,15 +245,7 @@ const validated = <T extends Record<string, unknown>>(schema: z.ZodType<T>, body
 
 export const parseAppendRecords = (body: unknown): Parsed<V2AppendRecords> => validated(AppendRecordsSchema, body);
 
-// What a summariser puts back on the peek it was handed. A digest of no characters is what a
-// pending row already holds, so one written would answer a peek with the state it is already in
-// and leave the asker waiting for ever.
-export const parseWritePeek = (body: unknown): Parsed<V2WritePeek> => {
-  const read = validated(WritePeekSchema, body);
-  if (!read.ok) return read;
-  if (read.value.digest === "") return fail("digest must hold at least one character");
-  return read;
-};
+export const parseWritePeek = (body: unknown): Parsed<V2WritePeek> => validated(WritePeekSchema, body);
 
 // What one call of the session copy is told. It is a body rather than a query string because both
 // of its fields are the run's own state carried between calls, and a contract is what says so.

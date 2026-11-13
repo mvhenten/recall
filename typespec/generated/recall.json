@@ -522,11 +522,12 @@
       "type": "object",
       "properties": {
         "digest": {
-          "$ref": "PeekDigest.json"
+          "$ref": "PeekDigest.json",
+          "minLength": 1
         }
       },
       "required": ["digest"],
-      "description": "What a summariser puts back on the peek it was handed."
+      "description": "What a summariser puts back on the peek it was handed. A digest of no characters is what a\npending peek already holds, so one is refused rather than taken for an answer."
     },
     "MessageAddress": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

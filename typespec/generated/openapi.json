@@ -856,10 +856,15 @@
         "required": ["digest"],
         "properties": {
           "digest": {
-            "$ref": "#/components/schemas/PeekDigest"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PeekDigest"
+              }
+            ],
+            "minLength": 1
           }
         },
-        "description": "What a summariser puts back on the peek it was handed."
+        "description": "What a summariser puts back on the peek it was handed. A digest of no characters is what a\npending peek already holds, so one is refused rather than taken for an answer."
       }
     }
   }

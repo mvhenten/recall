@@ -129,7 +129,7 @@ export const PeekSchema = z.object({
 });
 
 export const WritePeekSchema = z.object({
-  digest: z.string().max(2000),
+  digest: z.string().min(1).max(2000),
 });
 
 export const MessageAddressSchema = z.object({
