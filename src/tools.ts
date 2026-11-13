@@ -13,7 +13,7 @@ import {
   REPO_TAG,
   type Session,
 } from "./model";
-import type { V2Device, V2Peek, V2Session } from "./v2";
+import { sessionNameOf, type V2Device, type V2Peek, type V2Session } from "./v2";
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
 // its own from #[tool] macros, so the two sets are maintained separately and the wording differs
@@ -202,7 +202,7 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: schema(
       {
         to: text(
-          "The session to reach, named by the handle recall_sessions shows, or a host to reach every session on it.",
+          "The session to reach, named by the handle or the name recall_sessions shows, or a host to reach every session on it.",
         ),
         message: text("The message to deliver there."),
       },
@@ -216,7 +216,7 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: schema(
       {
         session: text(
-          "The session to ask, named by the handle recall_sessions shows, by the name Claude Code gave it, or by its session id. A host is not a peek target: one summariser answers for one session.",
+          "The session to ask, named by the handle or the name recall_sessions shows, or by its session id. A host is not a peek target: one summariser answers for one session.",
         ),
       },
       ["session"],
@@ -439,10 +439,10 @@ export interface DeviceDigest {
   host: string;
 }
 
-// `name` is what cli/src/markdown.rs prints in its name column: the name Claude Code gave the
-// session, and the handle where it has none.
+// `name` is the name the service resolved for the session, which is what cli/src/markdown.rs
+// prints in its name column and what the dashboard puts on every row.
 export const sessionDigest = (session: V2Session): SessionDigest => ({
-  name: session.agentName === "" ? session.name : session.agentName,
+  name: session.label,
   handle: session.name,
   host: session.hostLabel,
   cwd: session.cwd,
@@ -464,8 +464,13 @@ export interface SendTarget {
 }
 
 // A device id, a login name, a host or a host's label reaches every session on that machine; a
-// session handle, an agent name or a session id reaches the one session. api::resolve_target in the
-// CLI reads the same two listings in the same order and resolves a machine's newest login.
+// session handle, a session id or the name the service resolved for the session reaches the one
+// session. api::resolve_target in the CLI reads the same two listings in the same order and
+// resolves a machine's newest login.
+//
+// Hosts and sessions are named by their owner out of one vocabulary, so a name that answers in
+// both is refused and names what it found rather than letting the host win and leaving the session
+// unreachable. A device id is exact and answers before any of it.
 //
 // Case never settles a match: this end is dictated to as often as it is typed at, and a voice
 // transcript capitalises what it hears, so Sandbox has to reach the host called sandbox.
@@ -487,7 +492,19 @@ export const resolveTarget = (
   const named = devices.filter(
     (device) => names(device.name) || names(device.host) || names(labels.hosts.get(device.host)),
   );
+  const addressed = sessions.filter(
+    (session) => names(session.name) || names(session.sessionId) || names(sessionNameOf(labels, session)),
+  );
   const machines = new Set(named.map((device) => device.host));
+  if (named.length > 0 && addressed.length > 0) {
+    const found = [
+      ...named.map((device) => `${device.name} (${device.deviceId})`),
+      ...addressed.map((session) => `${session.name} (${session.sessionId})`),
+    ];
+    return fail(
+      `ambiguous target ${to}: it names ${machines.size} hosts and ${addressed.length} sessions; pass one of these ids instead: ${found.join(", ")}`,
+    );
+  }
   if (machines.size > 1) {
     return fail(
       `ambiguous target ${to}: it names ${machines.size} hosts; pass one of these device ids instead: ${named
@@ -500,9 +517,6 @@ export const resolveTarget = (
     const newest = named.reduce((best, device) => (device.lastUsedAt > best.lastUsedAt ? device : best), first);
     return { ok: true, value: onHost(newest.deviceId) };
   }
-  const addressed = sessions.filter(
-    (session) => names(session.name) || names(session.agentName) || names(session.sessionId),
-  );
   const [only] = addressed;
   if (addressed.length === 1 && only !== undefined) {
     return { ok: true, value: { toDeviceId: only.deviceId, toSessionId: only.sessionId, handles: [only.name] } };

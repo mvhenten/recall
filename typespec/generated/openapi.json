@@ -296,6 +296,7 @@
           "sessionId",
           "name",
           "agentName",
+          "label",
           "host",
           "hostLabel",
           "cwd",
@@ -316,6 +317,9 @@
             "$ref": "#/components/schemas/SessionText"
           },
           "agentName": {
+            "$ref": "#/components/schemas/SessionText"
+          },
+          "label": {
             "$ref": "#/components/schemas/SessionText"
           },
           "host": {
@@ -554,6 +558,7 @@
           "sessionId",
           "name",
           "agentName",
+          "label",
           "deviceId",
           "host",
           "hostLabel",
@@ -579,6 +584,9 @@
             "$ref": "#/components/schemas/SessionText"
           },
           "agentName": {
+            "$ref": "#/components/schemas/SessionText"
+          },
+          "label": {
             "$ref": "#/components/schemas/SessionText"
           },
           "deviceId": {
@@ -850,6 +858,16 @@
             "maxItems": 500
           }
         }
+      },
+      "WriteLabel": {
+        "type": "object",
+        "required": ["label"],
+        "properties": {
+          "label": {
+            "$ref": "#/components/schemas/SessionText"
+          }
+        },
+        "description": "The name its owner gives one session, which every listing prints over the name Claude Code gave\nit. A label of no characters clears the one on record, exactly as an emptied field on the Labels\ntab clears a host's."
       },
       "WritePeek": {
         "type": "object",

@@ -209,7 +209,11 @@ export interface HistoryInput {
   query: string;
 }
 
-export const labelKinds = ["host", "account"] as const;
+export const labelKinds = ["host", "account", "session"] as const;
+
+// The kinds the Labels tab draws a field for. A session is named through its own route, which
+// proves the account holds it, so the form takes the two kinds it lists and skips the rest.
+export const formLabelKinds = ["host", "account"] as const;
 
 export type LabelKind = (typeof labelKinds)[number];
 
@@ -219,11 +223,13 @@ export interface Label {
   label: string;
 }
 
-// The friendly name a user gave a raw host or account, looked up by the raw value. A value with no
-// label is absent rather than held as a blank, so every page falls back to the raw value.
+// The friendly name a user gave a raw host, account or session, looked up by the raw value, which
+// for a session is its session id. A value with no label is absent rather than held as a blank, so
+// every page falls back to the raw value.
 export interface Labels {
   hosts: Map<string, string>;
   accounts: Map<string, string>;
+  sessions: Map<string, string>;
 }
 
 export interface LabelTargets {
@@ -528,7 +534,7 @@ export const parseLabels = (form: URLSearchParams): Parsed<Label[]> => {
   for (const [field, text] of form) {
     const colon = field.indexOf(":");
     const kind = colon === -1 ? "" : field.slice(0, colon);
-    if (!isOneOf(labelKinds, kind)) continue;
+    if (!isOneOf(formLabelKinds, kind)) continue;
     const value = field.slice(colon + 1);
     if (value.length < 1 || value.length > MAX_SESSION_TEXT_CHARS) {
       return fail(`a ${kind} must hold 1 to ${MAX_SESSION_TEXT_CHARS} characters`);

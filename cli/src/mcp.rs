@@ -125,9 +125,10 @@ pub struct EditParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SendParams {
-    /// The session to reach, named by the handle recall sessions shows, or a host to reach every
-    /// session on it, named either by the label its owner gave it or by the name recall devices
-    /// shows. A message that arrived here names in its header the handle to answer on.
+    /// The session to reach, named by the handle recall sessions shows or by the label its owner
+    /// gave it, or a host to reach every session on it, named either by the label its owner gave it
+    /// or by the name recall devices shows. A message that arrived here names in its header the
+    /// handle to answer on.
     pub to: String,
     /// The message to deliver there.
     pub message: String,
@@ -147,9 +148,9 @@ pub struct OrderParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PeekParams {
-    /// The session to ask, named by the handle recall sessions prints, by the name Claude Code
-    /// gave it, or by its session id. A host is not a peek target: one summariser answers for one
-    /// session.
+    /// The session to ask, named by the handle recall sessions prints, by the label its owner gave
+    /// it, by the name Claude Code gave it, or by its session id. A host is not a peek target: one
+    /// summariser answers for one session.
     pub session: String,
 }
 

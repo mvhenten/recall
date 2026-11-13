@@ -6,6 +6,7 @@ type Harness = Awaited<ReturnType<typeof harness>>;
 
 interface ListedSession extends Session {
   hostLabel: string;
+  label: string;
   current: boolean;
 }
 
@@ -137,6 +138,31 @@ describe("sessions", () => {
 
     h.tick(-(SESSION_TTL_MS + 1000));
     expect(await listed(stranger)).toHaveLength(1);
+  });
+
+  // The listing answers with the name it resolved, which is the owner's over Claude Code's over
+  // the handle, and the raw names beside it. Writing an empty one clears the owner's, as emptying
+  // a host's field on the Labels tab clears that host's, and the next name down takes over.
+  it("takes the name its owner gives a session, and clears it on an empty one", async () => {
+    const h = await harness();
+    const { laptop } = await account(h);
+    await laptop.sync("9f8a1b2c", { lastActivityAt: h.now() });
+    const named = JSON.stringify({ type: "agent-name", agentName: "kisuvpalas" });
+    expect((await laptop.v2.records("9f8a1b2c", "main", 0, [named])).status).toBe(200);
+    const label = (text: string) => laptop.request("PUT", "/v2/sessions/9f8a1b2c/label", { label: text });
+
+    expect((await label(" deal sync ")).status).toBe(204);
+    expect((await listed(laptop)).map((session) => [session.name, session.agentName, session.label])).toEqual([
+      ["laptop-9f8a", "kisuvpalas", "deal sync"],
+    ]);
+
+    expect((await label("trade sync")).status).toBe(204);
+    expect((await listed(laptop)).map((session) => session.label)).toEqual(["trade sync"]);
+
+    expect((await label("")).status).toBe(204);
+    expect((await listed(laptop)).map((session) => session.label)).toEqual(["kisuvpalas"]);
+
+    expect((await laptop.request("PUT", "/v2/sessions/s-gone/label", { label: "x" })).status).toBe(404);
   });
 
   it("refuses a document it cannot put on one line", async () => {

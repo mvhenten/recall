@@ -370,6 +370,42 @@ describe("the connector's tools", () => {
     expect(devices.map((device) => [device.name, device.host])).toEqual([["laptop", "laptop"]]);
   });
 
+  // The listing hands the model one name per session, and the one its owner gave it leads the name
+  // Claude Code gave it. That name is an address too, so the model sends to what it was shown.
+  it("names a session by the label its owner gave it, and takes that label as an address", async () => {
+    const { h, email, mcp } = await signedIn();
+    const client = h.clientWithToken(await h.login(email, "laptop"));
+    expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now() })).status).toBe(204);
+    const named = JSON.stringify({ type: "agent-name", agentName: "kisuvpalas" });
+    expect((await client.v2.records("s-ship", "main", 0, [named])).status).toBe(200);
+    expect((await client.request("PUT", "/v2/sessions/s-ship/label", { label: "deal sync" })).status).toBe(204);
+
+    const sessions = (await mcp.json("recall_sessions")) as Array<{ name: string; handle: string }>;
+    expect(sessions.map((session) => session.name)).toEqual(["deal sync"]);
+    expect(sessions[0]?.handle).not.toBe("deal sync");
+
+    expect(await mcp.json("recall_send", { to: "Deal Sync", message: "ship it" })).toMatchObject({
+      toSessionId: "s-ship",
+    });
+  });
+
+  // A host and a session are named by the same owner out of one vocabulary, so a name that answers
+  // in both is refused and names what it found. Letting the host win would leave the session with
+  // no address at all for as long as that host is signed in.
+  it("refuses a name that answers for a host and for a session alike", async () => {
+    const { h, email, mcp } = await signedIn();
+    const client = h.clientWithToken(await h.login(email, "laptop"));
+    expect((await client.sync("s-ship", { host: "laptop", lastActivityAt: h.now() })).status).toBe(204);
+    expect((await client.request("PUT", "/v2/sessions/s-ship/label", { label: "laptop" })).status).toBe(204);
+
+    const refused = await mcp
+      .tool("recall_send", { to: "Laptop", message: "ship it" })
+      .catch((error: Error) => error.message);
+
+    expect(refused).toContain("ambiguous target Laptop: it names 1 hosts and 1 sessions");
+    expect(refused).toContain("(s-ship)");
+  });
+
   it("sends a message to a host and never reads as one itself", async () => {
     const { h, email, mcp } = await signedIn();
     const token = await h.login(email, "laptop");
@@ -435,6 +471,19 @@ describe("peeking from the connector", () => {
     expect(written.map((response) => response.status)).toEqual([204, 204]);
     expect(host.handed.map((peek) => peek.peekId)).toEqual([first.peek.peekId, second.peek.peekId]);
     expect(await history(laptop, sessionId)).toEqual([second.peek, first.peek]);
+  }, 30_000);
+
+  // A peek reads the same address book a send does, so a session its owner named is peeked at by
+  // that name, in whatever case it was dictated in.
+  it("asks the session its owner labelled, however the label is capitalised", async () => {
+    const { h, mcp, laptop, token, sessionId } = await peekable();
+    await summarising(h, token, laptop, ["running the tenant migration"]);
+    expect((await laptop.request("PUT", `/v2/sessions/${sessionId}/label`, { label: "deal sync" })).status).toBe(204);
+
+    const peeked = (await mcp.json("recall_peek", { session: "Deal Sync" })) as { sessionId: string; peek: V2Peek };
+
+    expect(peeked.sessionId).toBe(sessionId);
+    expect(peeked.peek).toMatchObject({ state: "Ready", digest: "running the tenant migration" });
   }, 30_000);
 
   // Nothing is kept for a host that attaches later, so a peek nobody took has nothing to read back

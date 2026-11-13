@@ -76,6 +76,7 @@ export const SessionSchema = z.object({
   sessionId: z.string().min(1),
   name: z.string().max(500),
   agentName: z.string().max(500),
+  label: z.string().max(500),
   deviceId: z.string().min(1),
   host: z.string().max(500),
   hostLabel: z.string().max(500),
@@ -97,6 +98,7 @@ export const PastSessionSchema = z.object({
   sessionId: z.string().min(1),
   name: z.string().max(500),
   agentName: z.string().max(500),
+  label: z.string().max(500),
   host: z.string().max(500),
   hostLabel: z.string().max(500),
   cwd: z.string().max(500),
@@ -130,6 +132,10 @@ export const PeekSchema = z.object({
 
 export const WritePeekSchema = z.object({
   digest: z.string().min(1).max(2000),
+});
+
+export const WriteLabelSchema = z.object({
+  label: z.string().max(500),
 });
 
 export const MessageAddressSchema = z.object({

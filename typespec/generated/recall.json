@@ -301,6 +301,9 @@
         "agentName": {
           "$ref": "SessionText.json"
         },
+        "label": {
+          "$ref": "SessionText.json"
+        },
         "deviceId": {
           "type": "string",
           "minLength": 1
@@ -355,6 +358,7 @@
         "sessionId",
         "name",
         "agentName",
+        "label",
         "deviceId",
         "host",
         "hostLabel",
@@ -385,6 +389,9 @@
           "$ref": "SessionText.json"
         },
         "agentName": {
+          "$ref": "SessionText.json"
+        },
+        "label": {
           "$ref": "SessionText.json"
         },
         "host": {
@@ -424,6 +431,7 @@
         "sessionId",
         "name",
         "agentName",
+        "label",
         "host",
         "hostLabel",
         "cwd",
@@ -528,6 +536,18 @@
       },
       "required": ["digest"],
       "description": "What a summariser puts back on the peek it was handed. A digest of no characters is what a\npending peek already holds, so one is refused rather than taken for an answer."
+    },
+    "WriteLabel": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "WriteLabel.json",
+      "type": "object",
+      "properties": {
+        "label": {
+          "$ref": "SessionText.json"
+        }
+      },
+      "required": ["label"],
+      "description": "The name its owner gives one session, which every listing prints over the name Claude Code gave\nit. A label of no characters clears the one on record, exactly as an emptied field on the Labels\ntab clears a host's."
     },
     "MessageAddress": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

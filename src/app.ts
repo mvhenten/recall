@@ -340,6 +340,7 @@ import {
   parseSessionSync,
   parseUsageDelta,
   parseV2Send,
+  parseWriteLabel,
   parseWritePeek,
   pastSessionView,
   peekView,
@@ -2404,7 +2405,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       listSessions(db, caller.userId, deps.now()),
       readLabels(db, caller.userId),
     ]);
-    return listed.map((session) => sessionView(session, labels.hosts, caller.deviceId));
+    return listed.map((session) => sessionView(session, labels, caller.deviceId));
   };
 
   const v2Devices = async (
@@ -2443,7 +2444,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       listPeeks(db, caller.userId, found.session.sessionId),
     ]);
     return json({
-      session: pastSessionView(found.session, labels.hosts),
+      session: pastSessionView(found.session, labels),
       matches: found.matches,
       files,
       peeks: peeks.map(peekView),
@@ -2712,6 +2713,18 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return json(asked, 201);
   };
 
+  // The name its owner gives one session, which every listing then prints over the name Claude Code
+  // gave it. It is the row the Labels tab writes for a host, kept under the session id, so the two
+  // are cleared the same way: a label of no characters removes the one on record.
+  const v2Label = async (request: Request, db: TenantDb, caller: Caller, sessionId: string): Promise<Response> => {
+    if (request.method !== "PUT") return error(405, "method not allowed");
+    const written = parseWriteLabel(await readJson(request));
+    if (!written.ok) return error(400, written.error);
+    if (!(await sessionOnRecord(db, caller.userId, sessionId))) return error(404, `no session ${sessionId}`);
+    await writeLabels(db, caller.userId, [{ kind: "session", value: sessionId, label: written.value.label.trim() }]);
+    return new Response(null, { status: 204 });
+  };
+
   const v2Sessions = async (
     request: Request,
     url: URL,
@@ -2735,6 +2748,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (subresource === "records") return v2Records(request, bucket, db, caller, sessionId.value);
     if (subresource === "files") return v2Files(request, bucket, db, caller, sessionId.value);
     if (subresource === "peek") return v2Peek(request, env, caller, sessionId.value, rawPeekId);
+    if (subresource === "label") return v2Label(request, db, caller, sessionId.value);
     if (subresource === "transcript") {
       return v2Transcript(request, url, bucket, db, caller, sessionId.value);
     }
@@ -2764,7 +2778,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const hits = await sessionSearchHits(url, db, userId);
     if (!hits.ok) return error(400, hits.error);
     const labels = await readLabels(db, userId);
-    return json({ hits: hits.value.map((hit) => sessionHitView(hit, labels.hosts)) });
+    return json({ hits: hits.value.map((hit) => sessionHitView(hit, labels)) });
   };
 
   const v2SendMessage = async (request: Request, env: TenantEnv, caller: Caller): Promise<Response> => {
