@@ -11,7 +11,9 @@ import { FILE_SEGMENT } from "./shares";
 
 // Inline code is lifted out before anything else runs over the text, so emphasis and link
 // syntax inside a code span stays literal. A publisher's markdown may hold the marker itself, so
-// `render` strips both markers from the source before a line of it is read.
+// `render` strips both markers from the source before a line of it is read. An address the
+// renderer resolves is lifted out the same way: a share token holds underscores, so a link written
+// back into the text would otherwise be read as emphasis and come out with a tag inside it.
 const HELD = "\u0000";
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:/i;
@@ -55,25 +57,23 @@ const resolveUrl = (raw: string, base: string): string | null => {
 };
 
 const inline = (text: string, base: string): string => {
-  const codes: string[] = [];
-  const spans = text.replace(/`([^`]+)`/g, (_whole, code: string) => {
-    codes.push(`<code>${escapeHtml(code)}</code>`);
-    return `${HELD}${codes.length - 1}${HELD}`;
-  });
+  const held: string[] = [];
+  const hold = (value: string): string => `${HELD}${held.push(value) - 1}${HELD}`;
+  const spans = text.replace(/`([^`]+)`/g, (_whole, code: string) => hold(`<code>${escapeHtml(code)}</code>`));
   const marked = escapeHtml(spans)
     .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (whole, alt: string, src: string) => {
       const url = resolveUrl(src, base);
-      return url === null ? whole : `<img src="${url}" alt="${alt}">`;
+      return url === null ? whole : `<img src="${hold(url)}" alt="${hold(alt)}">`;
     })
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label: string, href: string) => {
       const url = resolveUrl(href, base);
-      return url === null ? whole : `<a href="${url}">${label}</a>`;
+      return url === null ? whole : `<a href="${hold(url)}">${label}</a>`;
     })
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/__([^_]+)__/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>")
     .replace(/(^|[^\w_])_([^_]+)_/g, "$1<em>$2</em>");
-  return marked.replace(new RegExp(`${HELD}(\\d+)${HELD}`, "g"), (whole, at: string) => codes[Number(at)] ?? whole);
+  return marked.replace(new RegExp(`${HELD}(\\d+)${HELD}`, "g"), (whole, at: string) => held[Number(at)] ?? whole);
 };
 
 // A line ending in two spaces is a break the author asked for and a single newline is not, so the

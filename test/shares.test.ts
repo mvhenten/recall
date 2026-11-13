@@ -548,7 +548,8 @@ describe("a name that reads like a route", () => {
 
   // SQLite binds at most a hundred parameters per statement, and the largest page the listing
   // takes is a hundred rows. Reading the shares of that page by one parameter per name was two
-  // over, so the biggest page an account could ask for failed outright.
+  // over, so the biggest page an account could ask for failed outright. Publishing the hundred
+  // artifacts is the fixture and takes seconds, so this test takes a timeout of its own.
   it("reads the shares of the largest page the listing takes", async () => {
     const o = await owner();
     const names = Array.from({ length: 100 }, (_one, at) => `plan-${String(at).padStart(3, "0")}`);
@@ -567,7 +568,7 @@ describe("a name that reads like a route", () => {
     const held = await listed.json<{ artifacts: Array<{ name: string; shares: ShareView[] }> }>();
     expect(held.artifacts[0]?.shares).toHaveLength(1);
     expect(held.artifacts[1]?.shares).toHaveLength(0);
-  });
+  }, 30_000);
 });
 
 describe("a deployment that binds no share audience", () => {

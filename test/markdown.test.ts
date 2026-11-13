@@ -82,6 +82,14 @@ describe("the markdown renderer", () => {
     expect(refused).toContain("[bad]");
   });
 
+  it("writes a base holding two underscores whole rather than reading it back as bold", () => {
+    const base = "/link/TyMwx1l2hC19kPLN5FQ__sLnu6N-rryD9PAPizBjW04";
+    const html = render("A [link](./appendix.md) and an image: ![cover](/cover.png)\n", base);
+    expect(html).toContain(`href="${base}/f/appendix.md"`);
+    expect(html).toContain(`src="${base}/f/cover.png"`);
+    expect(html).not.toContain("<strong>");
+  });
+
   it("holds a hard break and drops a single newline", () => {
     expect(rendered("one  \ntwo\n")).toBe("<p>one<br>two</p>");
     expect(rendered("one\ntwo\n")).toBe("<p>one two</p>");
