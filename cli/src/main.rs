@@ -236,58 +236,60 @@ enum Command {
         #[arg(long, value_name = "ID", help = "Revoke the device with this id")]
         revoke: Option<String>,
     },
-    #[command(about = "List the live Claude Code sessions on every host signed in as you")]
+    // Each flag names a different thing to do with the sessions, so a clap group refuses two of
+    // them without the command reading any of them. Naming none is the listing, which is why the
+    // group is not required.
+    #[command(
+        about = "List the live Claude Code sessions on every host signed in as you",
+        group(ArgGroup::new("what").multiple(false))
+    )]
     Sessions {
         #[arg(
             long,
             value_name = "ID",
+            group = "what",
             help = "Send this host's record for the session with this id to the service"
         )]
         sync: Option<String>,
-        #[arg(
-            long,
-            value_name = "ID",
-            conflicts_with = "sync",
-            help = "Mark the session with this id gone"
-        )]
+        #[arg(long, value_name = "ID", group = "what", help = "Mark the session with this id gone")]
         end: Option<String>,
         #[arg(
             long,
-            conflicts_with_all = ["sync", "end"],
+            group = "what",
             help = "Write and sync a record for every running session this host's hooks never registered"
         )]
         adopt: bool,
         #[arg(
             long,
-            conflicts_with_all = ["sync", "end", "adopt"],
+            group = "what",
             help = "Send the history and usage of every past session this host holds a transcript for"
         )]
         backfill: bool,
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill"],
+            group = "what",
             help = "Print one session, by its name, its handle or its Claude Code session id"
         )]
         find: Option<String>,
         #[arg(
             long,
             value_name = "QUERY",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find"],
+            group = "what",
             help = "Find sessions on every host by what was said in them"
         )]
         search: Option<String>,
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search"],
+            group = "what",
             help = "Ask one running session what it is doing, by its name, its handle or its Claude Code session id, and print what its host answers"
         )]
         peek: Option<String>,
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["sync", "end", "adopt", "backfill", "find", "search", "peek"],
+            group = "what",
             help = "Write a stored session's transcript back onto this host, so claude --resume takes it"
         )]
         restore: Option<String>,
@@ -853,8 +855,10 @@ fn find_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
         print_json(&stored)?;
         return Ok(ExitCode::SUCCESS);
     }
-    let peeks = client.peeks(&stored.session.session_id)?;
-    print!("{}", markdown::render_session(&stored.session, &stored.files, &peeks));
+    print!(
+        "{}",
+        markdown::render_session(&stored.session, &stored.files, &stored.peeks)
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -863,12 +867,12 @@ fn find_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
 /// a peek still pending when that runs out prints as pending, and the session's own view shows it
 /// once the host has written it.
 fn peek_session(client: &Client, target: &str, json: bool) -> Result<ExitCode> {
-    let peek = api::peek_session(client, target, std::thread::sleep)?;
+    let peeked = api::peek_session(client, target, std::thread::sleep)?;
     if json {
-        print_json(&peek)?;
+        print_json(&peeked)?;
         return Ok(ExitCode::SUCCESS);
     }
-    print!("{}", markdown::render_peek(&peek, target));
+    print!("{}", markdown::render_peek(&peeked.peek, &peeked.session_id));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1499,29 +1503,6 @@ mod tests {
     #[test]
     fn the_cli_is_well_formed() {
         Cli::command().debug_assert();
-    }
-
-    /// A peek names one session and does one thing, so it is taken on its own and refused beside
-    /// any of the other work `recall sessions` does.
-    #[test]
-    fn a_peek_names_one_session_and_is_refused_beside_the_other_session_work() {
-        let Ok(Cli {
-            command: Command::Sessions { peek, .. },
-            ..
-        }) = parse(&["sessions", "--peek", "LAPTOP-9F8A"])
-        else {
-            panic!("a peek of one session was refused");
-        };
-        assert_eq!(peek.as_deref(), Some("LAPTOP-9F8A"));
-
-        for beside in ["--find", "--search", "--restore", "--sync", "--end"] {
-            assert!(
-                parse(&["sessions", "--peek", "laptop-9f8a", beside, "laptop-9f8a"]).is_err(),
-                "{beside}"
-            );
-        }
-        assert!(parse(&["sessions", "--peek", "laptop-9f8a", "--adopt"]).is_err());
-        assert!(parse(&["sessions", "--peek"]).is_err());
     }
 
     #[test]

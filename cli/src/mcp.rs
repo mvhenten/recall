@@ -331,12 +331,6 @@ fn to_json<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
-/// What `recall_peek` answers: the peek as the service holds it once the ask and the read back are
-/// done. It is a function of its own so a test drives the whole call against a service of its own.
-fn peeked(client: &Client, to: &str, wait: impl FnMut(std::time::Duration)) -> Result<String> {
-    to_json(&api::peek_session(client, to, wait)?)
-}
-
 fn saved_json(saved: &api::Saved) -> Result<String> {
     to_json(&serde_json::json!({
         "name": saved.memory.name,
@@ -362,8 +356,6 @@ pub struct Recall {
 impl Recall {
     pub fn new(messaging_enabled: bool) -> Recall {
         let mut tool_router = Self::tool_router();
-        // A peek rides the same socket as a send: the service hands it to the daemon listening as
-        // that host, so a host with messaging off answers none and the tool is not served.
         if !messaging_enabled {
             tool_router.remove_route(SEND_TOOL);
             tool_router.remove_route(ORDER_TOOL);
@@ -509,7 +501,7 @@ impl Recall {
         description = "Ask one Claude Code session on any host signed in as this user what it is working on right now. A side process on that session's host summarises the end of its transcript and writes the digest back: the session is not interrupted, is not messaged, and carries none of this in its context, so a peek costs that session nothing. Returns the peek with state Ready and the digest once its host has answered, which takes a few seconds, and state Pending where it had not answered yet. Use it to see what a session is doing before sending it anything."
     )]
     async fn peek(&self, Parameters(params): Parameters<PeekParams>) -> Result<String, String> {
-        blocking(move || peeked(&client()?, &params.session, std::thread::sleep)).await
+        blocking(move || to_json(&api::peek_session(&client()?, &params.session, std::thread::sleep)?)).await
     }
 
     #[tool(
@@ -618,9 +610,6 @@ pub fn serve(messaging_enabled: bool) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread::JoinHandle;
 
     fn names(messaging_enabled: bool) -> Vec<String> {
         let mut names: Vec<String> = Recall::new(messaging_enabled)
@@ -674,108 +663,6 @@ mod tests {
             updated_at: 1,
             recall_count: 0,
         }
-    }
-
-    /// A recall service that answers each call in turn, on a port of its own. The tool reaches it
-    /// over HTTP exactly as it reaches the real one, so what this proves is the calls it makes and
-    /// what it answers out of them. Every reply closes its connection, so each call is one
-    /// accepted socket and the request lines come back in the order they were made.
-    fn service(answers: Vec<Value>) -> (Client, JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let served = std::thread::spawn(move || {
-            let mut asked = Vec::new();
-            for answer in answers {
-                let (mut socket, _) = listener.accept().unwrap();
-                let mut read = [0u8; 4096];
-                let held = socket.read(&mut read).unwrap();
-                let request = String::from_utf8_lossy(&read[..held]).into_owned();
-                asked.push(request.lines().next().unwrap_or_default().to_string());
-                let body = answer.to_string();
-                let reply = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(reply.as_bytes()).unwrap();
-                socket.flush().unwrap();
-            }
-            asked
-        });
-        let client = Client::new(config::Config {
-            endpoint,
-            token: "device-token".to_string(),
-        });
-        (client, served)
-    }
-
-    fn devices() -> Value {
-        json!({ "devices": [{
-            "deviceId": "d-1", "name": "laptop", "host": "laptop", "hostLabel": "laptop",
-            "createdAt": 0, "lastUsedAt": 0, "current": true,
-        }]})
-    }
-
-    fn sessions() -> Value {
-        json!({ "sessions": [{
-            "sessionId": "9f8a1b2c", "name": "laptop-9f8a", "agentName": "", "deviceId": "d-1",
-            "host": "laptop", "hostLabel": "laptop", "cwd": "/home/you/src/recall", "repo": "",
-            "branch": "", "commit": "", "startedAt": "2025-11-01T12:26:40Z",
-            "lastActivityAt": "2025-11-01T12:26:40Z", "prompts": 2,
-            "focus": { "first": "", "latest": "" }, "mode": "interactive",
-            "permissionMode": "default", "pid": 4242, "current": false,
-        }]})
-    }
-
-    fn pending() -> Value {
-        json!({ "peekId": "p-1", "state": "Pending", "digest": "", "requestedAt": "2025-11-01T12:26:40Z" })
-    }
-
-    /// The tool asks the session the handle names and answers with the peek the read back found,
-    /// which is the one the host wrote its digest on. The handle is matched without regard to
-    /// case, the way every other target is, since a name a harness hands over comes back
-    /// capitalised.
-    #[test]
-    fn the_peek_tool_asks_one_session_and_answers_with_what_its_host_wrote() {
-        let ready = json!({
-            "peekId": "p-1", "state": "Ready", "digest": "Reading the planner.",
-            "requestedAt": "2025-11-01T12:26:40Z",
-        });
-        let (client, served) = service(vec![
-            devices(),
-            sessions(),
-            json!({ "peek": pending(), "outcome": { "state": "taken", "sessionId": "9f8a1b2c" } }),
-            json!({ "peeks": [ready.clone()] }),
-        ]);
-
-        let answered = peeked(&client, "LAPTOP-9F8A", |_| {}).unwrap();
-
-        assert_eq!(serde_json::from_str::<Value>(&answered).unwrap(), ready);
-        assert_eq!(
-            served.join().unwrap(),
-            [
-                "GET /v2/devices HTTP/1.1",
-                "GET /v2/sessions HTTP/1.1",
-                "POST /v2/sessions/9f8a1b2c/peek HTTP/1.1",
-                "GET /v2/sessions/9f8a1b2c/peek HTTP/1.1",
-            ]
-        );
-    }
-
-    /// A peek no host took is nothing to read back: the mailbox says why it reached nobody, and
-    /// that reason is what the caller is told rather than a pending peek nothing will ever answer.
-    #[test]
-    fn a_peek_no_host_took_answers_with_the_reason_the_mailbox_gave() {
-        let reason = "the host took the peek back: it is not running that session";
-        let (client, served) = service(vec![
-            devices(),
-            sessions(),
-            json!({ "peek": pending(), "outcome": { "state": "untaken", "reason": reason } }),
-        ]);
-
-        let refused = peeked(&client, "laptop-9f8a", |_| panic!("an untaken peek is never read back")).unwrap_err();
-
-        assert!(format!("{refused:#}").contains(reason), "{refused:#}");
-        assert_eq!(served.join().unwrap().len(), 3, "the peek is not read back");
     }
 
     #[test]

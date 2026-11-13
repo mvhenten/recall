@@ -306,12 +306,14 @@ fn session_name<'a>(agent_name: &'a str, handle: &'a str) -> &'a str {
 
 /// What the asker reads back off the peek it just asked for. A peek still pending is the ordinary
 /// answer where the host is slow, so it names the command that prints it once the digest lands
-/// rather than reading as a failure.
-pub fn render_peek(peek: &Peek, target: &str) -> String {
+/// rather than reading as a failure. That command is named by the session id and never by what the
+/// caller typed: `--find` matches a name exactly, so a handle written in capitals answers for
+/// nothing.
+pub fn render_peek(peek: &Peek, session_id: &str) -> String {
     match peek.state {
         PeekState::Ready => format!("{}\n", peek.digest.trim()),
         PeekState::Pending => format!(
-            "pending since {}; recall sessions --find {target} prints it once that host has written it\n",
+            "pending since {}; recall sessions --find {session_id} prints it once that host has written it\n",
             iso(peek.requested_at)
         ),
     }
@@ -691,12 +693,12 @@ mod tests {
     #[test]
     fn a_peek_reads_as_the_digest_or_as_what_to_do_while_it_is_pending() {
         let ready = peek(PeekState::Ready, "  Reading the planner.\n", 1_762_000_000_000);
-        assert_eq!(render_peek(&ready, "laptop-9f8a"), "Reading the planner.\n");
+        assert_eq!(render_peek(&ready, "9f8a1b2c"), "Reading the planner.\n");
 
-        let waiting = render_peek(&peek(PeekState::Pending, "", 1_762_000_000_000), "laptop-9f8a");
+        let waiting = render_peek(&peek(PeekState::Pending, "", 1_762_000_000_000), "9f8a1b2c");
         assert_eq!(
             waiting,
-            "pending since 2025-11-01T12:26:40Z; recall sessions --find laptop-9f8a prints it once that host has written it\n"
+            "pending since 2025-11-01T12:26:40Z; recall sessions --find 9f8a1b2c prints it once that host has written it\n"
         );
     }
 

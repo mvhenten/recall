@@ -2361,11 +2361,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   const v2Session = async (bucket: R2Bucket, db: TenantDb, caller: Caller, target: string): Promise<Response> => {
     const found = await findSession(db, caller.userId, target, deps.now());
     if (!found) return error(404, `no session named ${target}`);
-    const [files, labels] = await Promise.all([
+    const [files, labels, peeks] = await Promise.all([
       v2FilesOf(bucket, caller.userId, found.session.sessionId),
       readLabels(db, caller.userId),
+      listPeeks(db, caller.userId, found.session.sessionId),
     ]);
-    return json({ session: pastSessionView(found.session, labels.hosts), matches: found.matches, files });
+    return json({
+      session: pastSessionView(found.session, labels.hosts),
+      matches: found.matches,
+      files,
+      peeks: peeks.map(peekView),
+    });
   };
 
   // The transcript files a session has on record. One path, one shape.
