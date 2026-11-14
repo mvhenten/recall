@@ -15,6 +15,11 @@
 //! of the archive could then say which byte of the file it had reached. An ordinal is a place
 //! redaction cannot move, which is why there is one number here and not two.
 //!
+//! A record longer than any append may carry is the one record that cannot cross. A small marker
+//! goes up under its ordinal in its place, naming how long the line was and what it hashed to, so
+//! the records behind it keep the places the file gives them and the rest of the file is archived
+//! rather than every line past the fat one being lost with it.
+//!
 //! Every record is redacted on its way out, so a secret a session printed is never sent at all. A
 //! run of records is redacted as the stretch of the file it is — one reading, not one per line —
 //! because a private key block runs across the lines it is written on and no reading of a single
@@ -74,6 +79,11 @@ const NEWLINE: u8 = b'\n';
 pub const BINARY_RECORD: &str = "\0base64:";
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// What the marker standing in for a record no append can carry says it is. The key is what a
+/// reading of the archive finds the gap by, and the value is what it says about it.
+pub const GAP_RECORD: &str = "recallGap";
+const GAP_REASON: &str = "record too large to archive";
 
 /// What a file of a session holds. A file of turns is what the usage readers parse; a tool output
 /// is bytes a turn pointed at, which they never read and which no token was ever spent on.
@@ -478,11 +488,11 @@ impl<R: BufRead> Reader<R> {
         let held_back = complete < first;
         records.truncate(fitting(file, self.at, &records).min(limit));
         if records.is_empty() {
-            // Nothing of the batch can go up. Either the redactor held the first record back, and
-            // only the bytes that finish the secret let it through — which a batch at its ceiling
-            // is never going to be given — or the record is longer than one append may carry and
-            // no later pass reads it any shorter. Both stop the file rather than reading it for
-            // ever with nothing to show.
+            // Nothing of the batch can go up as it stands. Either the redactor held the first
+            // record back, and only the bytes that finish the secret let it through — which a
+            // batch at its ceiling is never going to be given, so it stops the file rather than
+            // reading it for ever with nothing to show — or the record is longer than one append
+            // may carry, and a marker crosses under its ordinal in its place.
             if held_back {
                 if bytes >= MAX_APPEND_BYTES || groups.len() >= MAX_RECORDS {
                     bail!(
@@ -493,10 +503,7 @@ impl<R: BufRead> Reader<R> {
                 self.restore_lines(lines);
                 return Ok(None);
             }
-            bail!(
-                "{file} holds a record at {} that no append can carry, so nothing of it past there can be archived",
-                self.at
-            );
+            return Ok(Some(self.substitute(lines, first)));
         }
         let read: usize = groups[..records.len()].iter().sum();
         let rest = lines.split_off(read);
@@ -511,6 +518,32 @@ impl<R: BufRead> Reader<R> {
             closed: ends,
             lines,
         }))
+    }
+
+    /// The first record of a batch, which no append can carry, as the marker that goes up in its
+    /// place. The marker takes that record's ordinal, so every record behind it keeps the place
+    /// the file gives it and nothing past the fat line is lost with it; the lines of the rest of
+    /// the batch go back on the queue for the append after this one.
+    ///
+    /// It names the record it stands for by the bytes the file holds it as and what they hashed
+    /// to, so a reading of the archive says what is missing and the line is still findable in the
+    /// file on disk.
+    fn substitute(&mut self, mut lines: Vec<Line>, first: usize) -> Batch {
+        let rest = lines.split_off(first);
+        self.restore_lines(rest);
+        let record = lines
+            .iter()
+            .map(|line| line.bytes.as_slice())
+            .collect::<Vec<&[u8]>>()
+            .join(&NEWLINE);
+        let closed = lines.last().is_some_and(|line| line.closed);
+        self.at += 1;
+        self.before = Some(NEWLINE);
+        Batch {
+            records: vec![gap(&record)],
+            closed,
+            lines,
+        }
     }
 
     fn restore_lines(&mut self, lines: Vec<Line>) {
@@ -555,6 +588,19 @@ fn written(record: &[u8]) -> String {
         Ok(text) if !text.starts_with(BINARY_RECORD) => text.to_string(),
         _ => format!("{BINARY_RECORD}{}", BASE64.encode(record)),
     }
+}
+
+/// What goes up where a record is longer than one append may carry: one short line saying a record
+/// was dropped for its length, under the ordinal that record holds. It carries the length of the
+/// line and what it hashed to and nothing of its prose, so it is a record of the gap rather than
+/// part of what stood there.
+fn gap(record: &[u8]) -> String {
+    serde_json::json!({
+        GAP_RECORD: GAP_REASON,
+        "bytes": record.len(),
+        "sha256": hex(&Sha256::digest(record)),
+    })
+    .to_string()
 }
 
 /// How many of a batch's records fit the body one append may hold. The ceiling is on the body the
@@ -702,6 +748,10 @@ fn missing(path: &Path) -> Result<bool> {
     }
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn sha256(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -714,7 +764,7 @@ fn sha256(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(hex(&hasher.finalize()))
 }
 
 fn uploaded_path(dir: &Path, session_id: &str) -> PathBuf {
@@ -1524,33 +1574,123 @@ mod tests {
         );
     }
 
+    /// The longest record one append may carry: the ceiling, less the body the records are written
+    /// inside, less the two quotes and the break the record itself costs on the wire.
+    fn longest_record(file: &str, from: i64) -> usize {
+        MAX_APPEND_BYTES - crate::api::append_body(file, from, &[], false).len() - 3
+    }
+
     #[test]
-    fn a_record_longer_than_an_append_stops_the_file_rather_than_being_read_for_ever() {
-        let sandbox = Sandbox::new("stuck");
-        let transcript = sandbox.transcript("s-1", &format!("one\n{}\ntwo\n", "x".repeat(MAX_APPEND_BYTES)));
+    fn a_record_longer_than_an_append_goes_up_as_a_gap_marker_and_the_file_carries_on() {
+        let sandbox = Sandbox::new("oversized");
+        let fat = "x".repeat(longest_record(MAIN, 1) + 1);
+        let transcript = sandbox.transcript("s-1", &format!("one\n{fat}\ntwo\n"));
         let service = Fake::default();
 
-        let refused = sandbox.archive().send(&service, "s-1", &transcript, Pass::Open);
+        let sent = sandbox
+            .archive()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
 
-        let error = format!(
-            "{:#}",
-            refused.expect_err("a record no append can carry is not a record a later pass carries either")
+        assert_eq!(
+            sent, 3,
+            "the marker stands where the record stood, so the file is three"
         );
-        assert!(error.contains("no append can carry"), "{error}");
-        assert_eq!(service.body("main"), "one\n", "and the records in front of it went up");
+        let records = service.records("main");
+        assert_eq!(records[0], "one");
+        assert_eq!(
+            records[2], "two",
+            "the records behind the fat one went up rather than being lost with it"
+        );
+        let marker: serde_json::Value = serde_json::from_str(&records[1]).unwrap();
+        assert_eq!(marker[GAP_RECORD].as_str(), Some(GAP_REASON));
+        assert_eq!(
+            marker["bytes"].as_u64(),
+            Some(fat.len() as u64),
+            "and it names the line it stands for"
+        );
+        assert_eq!(marker["sha256"].as_str(), Some(hex(&Sha256::digest(&fat)).as_str()));
+    }
+
+    #[test]
+    fn a_record_that_just_fits_one_append_goes_up_as_itself() {
+        let sandbox = Sandbox::new("brimming");
+        let fat = "x".repeat(longest_record(MAIN, 1));
+        let transcript = sandbox.transcript("s-1", &format!("one\n{fat}\ntwo\n"));
+        let service = Fake::default();
+
+        let sent = sandbox
+            .archive()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
+
+        assert_eq!(sent, 3);
+        assert_eq!(
+            service.records("main")[1],
+            fat,
+            "a record the ceiling takes crosses as itself, and no marker stands in for it"
+        );
+    }
+
+    /// A host left stuck at a fat record kept the place in front of it, so the pass that follows
+    /// opens there. Nothing rewrites that account: the marker goes up at the ordinal it names.
+    #[test]
+    fn a_session_parked_at_a_record_no_append_could_carry_carries_on_from_it() {
+        let sandbox = Sandbox::new("parked");
+        let fat = "x".repeat(longest_record(MAIN, 1) + 1);
+        let text = format!("one\n{fat}\ntwo\n");
+        let transcript = sandbox.transcript("s-1", &text);
+        let service = Fake::default();
+        service.append("s-1", MAIN, 0, &["one".to_string()], true).unwrap();
+        write_uploaded(
+            &sandbox.dir.join("uploaded"),
+            "s-1",
+            &HashMap::from([(
+                MAIN.to_string(),
+                Uploaded {
+                    sha256: sha256(&transcript).unwrap(),
+                    size: text.len() as i64,
+                    next: 1,
+                    last: false,
+                    more: true,
+                },
+            )]),
+        )
+        .unwrap();
+
+        let sent = sandbox
+            .archive()
+            .send(&service, "s-1", &transcript, Pass::Open)
+            .unwrap();
+
+        assert_eq!(sent, 2, "the marker and the record behind it, and nothing sent twice");
+        let records = service.records("main");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[2], "two");
+    }
+
+    /// A private key block a file opens and never closes, written across more lines than one
+    /// append carries records. The redactor cannot write out a match it has not seen the end of,
+    /// and no pass is ever handed the bytes that would finish this one.
+    fn unfinished_key() -> String {
+        let mut block = String::from("-----BEGIN RSA PRIVATE KEY-----\n");
+        for _ in 0..MAX_RECORDS {
+            block.push_str("Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFy\n");
+        }
+        block
     }
 
     #[test]
     fn a_file_the_pass_cannot_send_costs_the_session_none_of_its_places() {
         let sandbox = Sandbox::new("stuck-place");
         let transcript = sandbox.transcript("s-1", "one\ntwo\n");
-        sandbox.delegated("s-1", "agent-a", &format!("ay\n{}\n", "x".repeat(MAX_APPEND_BYTES)));
+        sandbox.delegated("s-1", "agent-a", &format!("ay\n{}", unfinished_key()));
         let service = Fake::default();
         let mut archive = sandbox.archive();
 
         archive
             .send(&service, "s-1", &transcript, Pass::Open)
-            .expect_err("the record no append can carry is reported");
+            .expect_err("the secret no append can carry is reported");
         std::fs::write(&transcript, "one\ntwo\nthree\n").unwrap();
         let offered = *service.offered.borrow();
 
