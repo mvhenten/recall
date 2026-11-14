@@ -417,13 +417,6 @@ fn registered(dir: &Path) -> Vec<Registered> {
         .collect()
 }
 
-/// A frame Claude cannot place a client platform on is classified as peer traffic, and a peer turn
-/// arrives wrapped in several paragraphs telling the reader a machine wrote it. The platforms
-/// Claude reads as a person are `ios`, `android`, `web_claude_ai` and `desktop_app`; the message
-/// already names its sender in the header recall puts on the body, so the turn is delivered as
-/// what it is, a person writing from another device.
-const DELIVERED_PLATFORM: &str = "desktop_app";
-
 /// The registry file name is the session id Claude reports on the hook's stdin, and the delivered
 /// frame carries it back, so a registration that outlived its session is dropped by Claude instead
 /// of landing in whatever session now owns the socket.
@@ -433,7 +426,6 @@ fn frames(registered: &Registered, body: &str) -> String {
         "type": "user",
         "message": { "role": "user", "content": body },
         "session_id": registered.session_id,
-        "client_platform": DELIVERED_PLATFORM,
     });
     format!("{auth}\n{user}\n")
 }
@@ -720,10 +712,6 @@ mod tests {
         assert_eq!(
             frames[1]["message"],
             serde_json::json!({ "role": "user", "content": "ship it" })
-        );
-        assert_eq!(
-            frames[1]["client_platform"], "desktop_app",
-            "a frame Claude cannot place a client platform on is presented as peer traffic"
         );
         assert!(
             frames[1]["session_id"] == "s-parent" || frames[1]["session_id"] == "s-child",
