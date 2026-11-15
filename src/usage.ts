@@ -96,58 +96,86 @@ export const cacheHit = (counts: TokenCounts): number => {
 
 export const keyOf = (totals: ModelTotals): string => `${totals.provider} ${totals.model}`;
 
-export const byModel = (rows: ModelTotals[]): ModelTotals[] => {
-  const merged = new Map<string, ModelTotals[]>();
-  for (const row of rows) merged.set(keyOf(row), [...(merged.get(keyOf(row)) ?? []), row]);
-  return [...merged.values()]
-    .flatMap((group) => {
+// Rows under the key each one falls on, in the order the keys first appear.
+export const groupBy = <T>(rows: T[], key: (row: T) => string): Array<[string, T[]]> => {
+  const merged = new Map<string, T[]>();
+  for (const row of rows) {
+    const held = merged.get(key(row));
+    if (held === undefined) merged.set(key(row), [row]);
+    else held.push(row);
+  }
+  return [...merged];
+};
+
+export const byModel = (rows: ModelTotals[]): ModelTotals[] =>
+  groupBy(rows, keyOf)
+    .flatMap(([, group]) => {
       const first = group[0];
       return first ? [{ provider: first.provider, model: first.model, ...totalled(group) }] : [];
     })
     .sort((left, right) => (costOf(right) ?? -1) - (costOf(left) ?? -1));
-};
 
 // The four token classes a reading is kept in, never folded into one number: a cache read costs a
 // tenth of fresh input, so the mix is what a price comparison turns on and a lone total hides it.
-// `cost` is null where readings were found and no model in them carries a price, so an unpriced
-// model never reads as free; a window that holds no readings at all costs nothing and says 0.
-// `costIsFloor` marks a mix of priced and unpriced, which is what the dashboard draws as "≈ $x".
-export interface TokenReport {
+export interface TokenSplit {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   totalTokens: number;
   cacheHitRate: number;
+}
+
+const ROUNDED = 10_000;
+
+const rounded = (value: number): number => Math.round(value * ROUNDED) / ROUNDED;
+
+const tokenSplit = (counts: TokenCounts): TokenSplit => ({
+  inputTokens: counts.inputTokens,
+  outputTokens: counts.outputTokens,
+  cacheReadTokens: counts.cacheReadTokens,
+  cacheWriteTokens: counts.cacheWriteTokens,
+  totalTokens: countedTokens(counts),
+  cacheHitRate: rounded(cacheHit(counts)),
+});
+
+// One model's reading. The price table either names that model or it does not, so the cost is one
+// number or null and there is nothing for a floor to mark.
+export interface ModelReport extends TokenSplit {
+  provider: string;
+  model: string;
+  cost: number | null;
+}
+
+// A reading over several models. `cost` is null where readings were found and none of their models
+// carries a price, so an unpriced model never reads as free; a window holding no readings at all
+// costs nothing and says 0. `costIsFloor` marks a mix of priced and unpriced models, which is what
+// the dashboard draws as "≈ $x", and `unpricedModels` names the ones left out of the money.
+export interface TokenReport extends TokenSplit {
   cost: number | null;
   costIsFloor: boolean;
   unpricedModels: string[];
 }
 
-const ROUNDED = 10_000;
-
 export const tokenReport = (rows: ModelTotals[]): TokenReport => {
-  const counts = totalled(rows);
   const priced = pricedIn(rows);
   return {
-    inputTokens: counts.inputTokens,
-    outputTokens: counts.outputTokens,
-    cacheReadTokens: counts.cacheReadTokens,
-    cacheWriteTokens: counts.cacheWriteTokens,
-    totalTokens: countedTokens(counts),
-    cacheHitRate: Math.round(cacheHit(counts) * ROUNDED) / ROUNDED,
-    cost: priced === 0 && rows.length > 0 ? null : Math.round(spent(rows) * ROUNDED) / ROUNDED,
+    ...tokenSplit(totalled(rows)),
+    cost: priced === 0 && rows.length > 0 ? null : rounded(spent(rows)),
     costIsFloor: priced > 0 && priced < rows.length,
     unpricedModels: unpricedIn(rows),
   };
 };
 
-export interface ModelReport extends TokenReport {
-  provider: string;
-  model: string;
-}
-
 export const modelReports = (rows: ModelTotals[]): ModelReport[] =>
-  byModel(rows).map((model) => ({ provider: model.provider, model: model.model, ...tokenReport([model]) }));
+  byModel(rows).map((model) => {
+    const cost = costOf(model);
+    return {
+      provider: model.provider,
+      model: model.model,
+      ...tokenSplit(model),
+      cost: cost === null ? null : rounded(cost),
+    };
+  });
 
 export const turnsIn = (rows: TokenCounts[]): number => totalled(rows).prompts;

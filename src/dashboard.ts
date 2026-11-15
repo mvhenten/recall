@@ -43,8 +43,8 @@ import {
   PEEK_HISTORY,
   type Peek,
   pending,
-  REPO_TAG,
   type RepoHours,
+  repoLabel,
   type Session,
   type SessionSpend,
   STALE_AFTER_DAYS,
@@ -844,13 +844,6 @@ const modelLabel = (model: string): string => {
   if (!family) return model;
   const name = `${family.charAt(0).toUpperCase()}${family.slice(1)}`;
   return version.length === 0 ? name : `${name} ${version.join(".")}`;
-};
-
-const GITHUB_TAG = `${REPO_TAG}github.com/`;
-
-const repoLabel = (repo: string): string => {
-  if (repo === "") return "global";
-  return repo.startsWith(GITHUB_TAG) ? repo.slice(GITHUB_TAG.length) : repo;
 };
 
 const within = (rows: ModelBucket[], from: string, to: string): ModelBucket[] =>

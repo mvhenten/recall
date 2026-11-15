@@ -1053,33 +1053,39 @@ const toModelTotals = (row: ModelRow): ModelTotals => ({
   ...toCounts(row),
 });
 
+// The bucket a reading falls in at each grain, written once and read by every usage query, so the
+// day a page draws, the month the long horizon draws and the grain a tool asks for can never be
+// spelled two ways. A month is the month of the UTC day the rollup already keyed the delta under,
+// and a week is the Monday that day opens on.
+const BUCKETS: Record<UsagePeriod, SQL<string>> = {
+  day: sql<string>`${usageDaily.day}`,
+  week: sql<string>`date(${usageDaily.day}, '-' || ((CAST(strftime('%w', ${usageDaily.day}) AS INTEGER) + 6) % 7) || ' days')`,
+  month: sql<string>`substr(${usageDaily.day}, 1, 7)`,
+};
+
 // Every window the pages draw reads the daily rollup and nothing else: the counters land in
 // usage_daily on the same write that records the raw event, so the current day is already live
 // there and no window ever touches usage_events.
 const usageDays = (db: TenantTx, userId: string, fromDay: string) =>
   db
     .select({
-      bucket: usageDaily.day,
+      bucket: BUCKETS.day,
       provider: usageDaily.provider,
       model: usageDaily.model,
       ...countSums(usageDaily),
     })
     .from(usageDaily)
     .where(and(eq(usageDaily.userId, userId), gte(usageDaily.day, fromDay)))
-    .groupBy(usageDaily.day, usageDaily.provider, usageDaily.model)
+    .groupBy(BUCKETS.day, usageDaily.provider, usageDaily.model)
     .orderBy(asc(usageDaily.day), asc(usageDaily.provider), asc(usageDaily.model));
 
-// The month a delta falls in is the month of the UTC day the rollup already keyed it under, so the
-// long horizon reads the same column the windows do and the two can never disagree.
-const usageMonths = (db: TenantTx, userId: string) => {
-  const month = sql<string>`substr(${usageDaily.day}, 1, 7)`;
-  return db
-    .select({ bucket: month, provider: usageDaily.provider, model: usageDaily.model, ...countSums(usageDaily) })
+const usageMonths = (db: TenantTx, userId: string) =>
+  db
+    .select({ bucket: BUCKETS.month, provider: usageDaily.provider, model: usageDaily.model, ...countSums(usageDaily) })
     .from(usageDaily)
     .where(eq(usageDaily.userId, userId))
-    .groupBy(month, usageDaily.provider, usageDaily.model)
-    .orderBy(month, asc(usageDaily.provider), asc(usageDaily.model));
-};
+    .groupBy(BUCKETS.month, usageDaily.provider, usageDaily.model)
+    .orderBy(BUCKETS.month, asc(usageDaily.provider), asc(usageDaily.model));
 
 const usageSplit = (db: TenantTx, userId: string, fromDay: string, field: UsageSplitField, value: SQLiteColumn) =>
   db
@@ -1229,15 +1235,6 @@ export const readStats = async (db: TenantDb, userId: string, windows: StatsWind
     };
   });
 
-// The bucket a day falls in at each grain. A week is the Monday it opens on, worked out off the
-// day column itself so the rollup is never read twice for the same reading, and a month is the
-// first seven characters usageMonths already groups by.
-const BUCKETS: Record<UsagePeriod, (day: SQLiteColumn) => SQL<string>> = {
-  day: (day) => sql<string>`${day}`,
-  week: (day) => sql<string>`date(${day}, '-' || ((CAST(strftime('%w', ${day}) AS INTEGER) + 6) % 7) || ' days')`,
-  month: (day) => sql<string>`substr(${day}, 1, 7)`,
-};
-
 // Every repository the rollup holds a reading for, which is what a repo filter is resolved
 // against: the connector is told a name a person uses and has to find the tag it was recorded as.
 export const usageRepos = async (db: TenantDb, userId: string): Promise<string[]> =>
@@ -1249,11 +1246,11 @@ export const usageRepos = async (db: TenantDb, userId: string): Promise<string[]
     .all()
     .map((row) => row.repo);
 
-// The usage tools read the same rollup the stats page draws, under a window and a repo the caller
-// names rather than the three fixed windows the page holds. The rows come back per bucket, repo
-// and model, and the caller folds them into whichever of the three breakdowns it is answering.
+// The usage tools read the same rollup the stats page draws, under a window, a grain and a repo
+// the caller names rather than the fixed windows the page holds. The rows come back per bucket,
+// repo and model, and the caller folds them into whichever breakdown it is answering.
 export const readUsage = async (db: TenantDb, userId: string, query: UsageQuery): Promise<UsageRow[]> => {
-  const bucket = BUCKETS[query.period](usageDaily.day);
+  const bucket = BUCKETS[query.period];
   const results = db
     .select({
       bucket,
@@ -1266,9 +1263,9 @@ export const readUsage = async (db: TenantDb, userId: string, query: UsageQuery)
     .where(
       and(
         eq(usageDaily.userId, userId),
-        gte(usageDaily.day, query.from),
-        lte(usageDaily.day, query.to),
-        query.repo === "" ? undefined : eq(usageDaily.repo, query.repo),
+        gte(usageDaily.day, query.window.from),
+        lte(usageDaily.day, query.window.to),
+        query.repo === null ? undefined : eq(usageDaily.repo, query.repo),
       ),
     )
     .groupBy(bucket, usageDaily.repo, usageDaily.provider, usageDaily.model)
@@ -1278,9 +1275,9 @@ export const readUsage = async (db: TenantDb, userId: string, query: UsageQuery)
 };
 
 // What each session in a window spent. The sessions are read the way the history tab reads them
-// and the spend off the raw events, which are the only rows that hold a session together; a
-// session whose events have been swept comes back with no spend rather than being left out, so a
-// caller sees the session and the gap rather than a silent short list.
+// and the spend off the raw events; a session whose events have been swept comes back with no
+// spend rather than being left out, so a caller sees the session and the gap rather than a silent
+// short list.
 export const readSessionUsage = async (
   db: TenantDb,
   userId: string,
@@ -1291,10 +1288,10 @@ export const readSessionUsage = async (
     .where(
       and(
         eq(sessionHistory.userId, userId),
-        query.repo === "" ? undefined : eq(sessionHistory.repo, query.repo),
+        query.repo === null ? undefined : eq(sessionHistory.repo, query.repo),
         query.sessionId === "" ? undefined : eq(sessionHistory.sessionId, query.sessionId),
-        gte(sessionHistory.lastActivityAt, query.since),
-        lte(sessionHistory.startedAt, query.until),
+        gte(sessionHistory.lastActivityAt, query.window.since),
+        lte(sessionHistory.startedAt, query.window.until),
       ),
     )
     .orderBy(desc(sessionHistory.lastActivityAt), desc(sessionHistory.sessionId))
@@ -1302,33 +1299,13 @@ export const readSessionUsage = async (
     .all();
   const sessions = found.map(toPastSession);
   if (sessions.length === 0) return [];
-  const spend = db
-    .select({
-      sessionId: usageEvents.sessionId,
-      account: usageEvents.account,
-      provider: usageEvents.provider,
-      model: usageEvents.model,
-      ...countSums(usageEvents),
-    })
-    .from(usageEvents)
-    .where(
-      and(
-        eq(usageEvents.userId, userId),
-        inArray(
-          usageEvents.sessionId,
-          sessions.map((session) => session.sessionId),
-        ),
-      ),
-    )
-    .groupBy(usageEvents.sessionId, usageEvents.account, usageEvents.provider, usageEvents.model)
-    .orderBy(asc(usageEvents.account), asc(usageEvents.provider), asc(usageEvents.model))
-    .all();
-  return sessions.map((session) => ({
-    session,
-    spend: spend
-      .filter((row) => row.sessionId === session.sessionId)
-      .map((row) => ({ account: row.account, ...toModelTotals(row) })),
-  }));
+  const spend = await sessionSpend(
+    db,
+    userId,
+    sessions.map((session) => session.sessionId),
+    query.window,
+  );
+  return sessions.map((session) => ({ session, spend: spend.get(session.sessionId) ?? [] }));
 };
 
 // The Insights page, off one round trip. The sessions, the usage, the repositories and the memory
@@ -1411,24 +1388,48 @@ export const sessionOnDevice = async (
   now: number,
 ): Promise<boolean> => (await liveSessionDevice(db, userId, sessionId, now)) === deviceId;
 
-// What one session spent, and on whose account. The rollup cannot answer either: it is keyed by
-// day, host, repo and account and never by session, so the raw events are the only reading that
-// holds a session together. They are swept at two weeks unless the reading was taken from the
-// transcript, and the page says that rather than printing an old session's spend as nothing.
-export const sessionSpend = async (db: TenantDb, userId: string, sessionId: string): Promise<SessionSpend[]> => {
+// What these sessions spent, and on whose account. The rollup cannot answer either: it is keyed
+// by day, host, repo and account and never by session, so the raw events are the only reading
+// that holds a session together. They are swept at two weeks unless the reading was taken from
+// the transcript, and the page says that rather than printing an old session's spend as nothing.
+//
+// `window` bounds the readings to the days it covers, so a session picked for overlapping a
+// window reports what it spent inside it and reconciles with the rollup over the same days.
+// Naming none takes a session's whole life, which is what the session page shows.
+export const sessionSpend = async (
+  db: TenantDb,
+  userId: string,
+  sessionIds: string[],
+  window: DayWindow | null,
+): Promise<Map<string, SessionSpend[]>> => {
+  if (sessionIds.length === 0) return new Map();
   const results = db
     .select({
+      sessionId: usageEvents.sessionId,
       account: usageEvents.account,
       provider: usageEvents.provider,
       model: usageEvents.model,
       ...countSums(usageEvents),
     })
     .from(usageEvents)
-    .where(and(eq(usageEvents.userId, userId), eq(usageEvents.sessionId, sessionId)))
-    .groupBy(usageEvents.account, usageEvents.provider, usageEvents.model)
+    .where(
+      and(
+        eq(usageEvents.userId, userId),
+        inArray(usageEvents.sessionId, sessionIds),
+        window === null ? undefined : gte(usageEvents.at, window.since),
+        window === null ? undefined : lte(usageEvents.at, window.until),
+      ),
+    )
+    .groupBy(usageEvents.sessionId, usageEvents.account, usageEvents.provider, usageEvents.model)
     .orderBy(asc(usageEvents.account), asc(usageEvents.provider), asc(usageEvents.model))
     .all();
-  return results.map((row) => ({ account: row.account, ...toModelTotals(row) }));
+  const spend = new Map<string, SessionSpend[]>();
+  for (const row of results) {
+    const held = spend.get(row.sessionId) ?? [];
+    held.push({ account: row.account, ...toModelTotals(row) });
+    spend.set(row.sessionId, held);
+  }
+  return spend;
 };
 
 // Whether this account has the session at all, running or long over. A transcript outlives the

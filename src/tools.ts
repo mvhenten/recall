@@ -1,6 +1,7 @@
 import type { Device } from "./device";
 import {
-  DAY_MS,
+  type DayWindow,
+  daysBetween,
   dayWindow,
   GLOBAL_TAG,
   isRepoTag,
@@ -17,15 +18,18 @@ import {
   parseTags,
   pending,
   REPO_TAG,
+  repoLabel,
   type Session,
   type SessionUsage,
+  type SessionUsageQuery,
   USAGE_MONTH_DAYS,
   type UsagePeriod,
+  type UsageQuery,
   type UsageRow,
   usageDay,
   usagePeriods,
 } from "./model";
-import { type ModelReport, modelReports, type TokenReport, tokenReport, turnsIn } from "./usage";
+import { groupBy, type ModelReport, modelReports, type TokenReport, tokenReport, turnsIn } from "./usage";
 import { sessionNameOf, type V2Device, type V2Peek, type V2Session } from "./v2";
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
@@ -80,25 +84,10 @@ export interface PeekArgs {
   session: string;
 }
 
-// A window asked for in two vocabularies at once: the UTC days the rollup is keyed by, and the
-// epoch bounds the session tables are keyed by. Both are derived from the one pair of dates, so
-// the two usage tools can never read different windows off the same arguments.
-export interface UsageWindow {
-  from: string;
-  to: string;
-  since: number;
-  until: number;
-}
-
-export interface UsageArgs extends UsageWindow {
-  repo: string;
-  period: UsagePeriod;
-}
-
-export interface SessionUsageArgs extends UsageWindow {
+// What a per-session call asks for: the read's own query, plus the session it was asked about by
+// whatever name the caller had for it, which is resolved to an id before the read.
+export interface SessionUsageArgs extends Omit<SessionUsageQuery, "sessionId"> {
   session: string;
-  repo: string;
-  limit: number;
 }
 
 export interface ToolSchema {
@@ -276,9 +265,11 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "recall_session_usage",
     description:
-      "What each session spent, newest activity first: the same four token classes and cost as recall_usage, plus the turn count, the models that answered, the accounts billed, the start and end time, the repository, the working directory and the host. Name one session by its id or by the handle recall_sessions shows, or take every session whose life overlaps the window, narrowed by repository. Per-session detail comes from the raw events, which are swept after two weeks unless the reading was taken from a transcript, so an older session can report less than it spent and one whose events are gone reports zero rather than dropping out of the list. Same price table and the same subagent caveat as recall_usage. Read-only.",
+      "What each session spent, newest activity first: the same four token classes and cost as recall_usage, plus the turn count, the models that answered, the accounts billed, the start and end time, the repository, the working directory and the host. Name one session by the name or the handle a listing shows it under, or by its session id, or take every session whose life overlaps the window, narrowed by repository. What a session spent is bounded by the window too, so the two tools reconcile over the same days. Per-session detail comes from the raw events, which are swept after two weeks unless the reading was taken from a transcript, so an older session can report less than it spent and one whose events are gone reports zero rather than dropping out of the list. Same price table and the same subagent caveat as recall_usage. Read-only.",
     inputSchema: schema({
-      session: text("One session, by its id or by the handle recall_sessions shows. Omit to take every session."),
+      session: text(
+        "One session, by the name or the handle a listing shows it under, or by its session id. Omit to take every session.",
+      ),
       from: text(
         "Count sessions active at or after this ISO 8601 date or time, or epoch ms. Defaults to 30 days back.",
       ),
@@ -355,15 +346,20 @@ export const saveTags = (type: MemoryType, global: boolean | undefined, extra: s
   );
 };
 
-export const parseSinceArgument = (value: unknown): Parsed<number> => {
+// Every tool that takes an instant takes it in the three forms a model writes one in. The field
+// is named by its caller, so a bad `to` is refused as `to` and not as the first field that ever
+// took an instant.
+export const parseSinceArgument = (value: unknown, field = "since"): Parsed<number> => {
   if (value === undefined) return { ok: true, value: 0 };
   if (typeof value === "number") {
-    return Number.isInteger(value) && value >= 0 ? { ok: true, value } : fail("since must be epoch milliseconds");
+    return Number.isInteger(value) && value >= 0 ? { ok: true, value } : fail(`${field} must be epoch milliseconds`);
   }
-  if (typeof value !== "string") return fail("since must be an ISO 8601 time, date or epoch ms");
+  if (typeof value !== "string") return fail(`${field} must be an ISO 8601 time, date or epoch ms`);
   if (/^\d+$/.test(value)) return { ok: true, value: Number(value) };
   const parsed = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00Z` : value);
-  return Number.isNaN(parsed) ? fail(`since ${value} is neither epoch ms nor ISO 8601`) : { ok: true, value: parsed };
+  return Number.isNaN(parsed)
+    ? fail(`${field} ${value} is neither epoch ms nor ISO 8601`)
+    : { ok: true, value: parsed };
 };
 
 // No scope means every memory. A search that quietly covered global alone answered a question
@@ -465,40 +461,44 @@ export const parsePeekArgs = (args: Record<string, unknown>): Parsed<PeekArgs> =
   return session.ok ? { ok: true, value: { session: session.value } } : session;
 };
 
-// How far back a usage call reaches when it names no window, which is the window the stats page
-// opens on.
 const USAGE_SESSION_LIMIT = 20;
 
 // A date argument names a UTC day, whichever of the three forms it arrives in: the rollup is keyed
-// by day, so a time of day inside one is the day it falls in and the window closes at the end of
-// the day named rather than at midnight opening it.
-const usageWindow = (args: Record<string, unknown>, now: number): Parsed<UsageWindow> => {
+// by day, so a time of day inside one is the day it falls in, and a window names its two ends.
+const usageWindow = (args: Record<string, unknown>, now: number): Parsed<DayWindow> => {
   const span = dayWindow(now, USAGE_MONTH_DAYS);
-  const from = parseSinceArgument(args.from);
+  const from = parseSinceArgument(args.from, "from");
   if (!from.ok) return from;
-  const to = parseSinceArgument(args.to);
+  const to = parseSinceArgument(args.to, "to");
   if (!to.ok) return to;
   const first = args.from === undefined ? span.from : usageDay(from.value);
   const last = args.to === undefined ? span.to : usageDay(to.value);
   if (first > last) return fail(`from ${first} falls after to ${last}`);
-  const since = Date.parse(`${first}T00:00:00Z`);
-  return { ok: true, value: { from: first, to: last, since, until: Date.parse(`${last}T00:00:00Z`) + DAY_MS - 1 } };
+  return { ok: true, value: daysBetween(first, last) };
 };
 
-export const parseUsageArgs = (args: Record<string, unknown>, now: number): Parsed<UsageArgs> => {
+// A repository the caller never named is null, which counts every one of them. The empty tag is a
+// repository of its own — a reading taken outside a working copy — so the two can never be the
+// same value.
+const askedRepo = (args: Record<string, unknown>): Parsed<string | null> => {
+  const repo = optionalText(args.repo, "repo", MAX_SESSION_TEXT_CHARS);
+  return repo.ok ? { ok: true, value: repo.value ?? null } : repo;
+};
+
+export const parseUsageArgs = (args: Record<string, unknown>, now: number): Parsed<UsageQuery> => {
   const window = usageWindow(args, now);
   if (!window.ok) return window;
-  const repo = optionalText(args.repo, "repo", MAX_SESSION_TEXT_CHARS);
+  const repo = askedRepo(args);
   if (!repo.ok) return repo;
   const period = args.period === undefined ? "day" : usagePeriods.find((known) => known === args.period);
   if (period === undefined) return fail(`period must be one of ${usagePeriods.join(", ")}`);
-  return { ok: true, value: { ...window.value, repo: repo.value ?? "", period } };
+  return { ok: true, value: { window: window.value, repo: repo.value, period } };
 };
 
 export const parseSessionUsageArgs = (args: Record<string, unknown>, now: number): Parsed<SessionUsageArgs> => {
   const window = usageWindow(args, now);
   if (!window.ok) return window;
-  const repo = optionalText(args.repo, "repo", MAX_SESSION_TEXT_CHARS);
+  const repo = askedRepo(args);
   if (!repo.ok) return repo;
   const session = optionalText(args.session, "session", MAX_SESSION_TEXT_CHARS);
   if (!session.ok) return session;
@@ -506,12 +506,11 @@ export const parseSessionUsageArgs = (args: Record<string, unknown>, now: number
   if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100) {
     return fail("limit must be a whole number from 1 to 100");
   }
-  return { ok: true, value: { ...window.value, repo: repo.value ?? "", session: session.value ?? "", limit } };
+  return { ok: true, value: { window: window.value, repo: repo.value, session: session.value ?? "", limit } };
 };
 
-const GLOBAL_REPO = ["global", "none", ""];
-
-const repoLabel = (repo: string): string => (repo.startsWith(REPO_TAG) ? repo.slice(REPO_TAG.length) : repo);
+// What a caller may call the repository recorded outside any working copy.
+const GLOBAL_REPO = ["global", "none"];
 
 // A repository is recorded as the tag the host read off its working copy, and a person names it by
 // whatever tail of that they think of it as. One unambiguous tail resolves; a name that answers for
@@ -522,13 +521,15 @@ export const matchRepo = (repos: string[], wanted: string): Parsed<string> => {
     return repos.includes("") ? { ok: true, value: "" } : fail("no usage is recorded outside a repository");
   }
   const found = repos.filter((repo) => {
-    const label = repoLabel(repo).toLowerCase();
-    return repo.toLowerCase() === name || label === name || label.endsWith(`/${name}`);
+    const tag = (repo.startsWith(REPO_TAG) ? repo.slice(REPO_TAG.length) : repo).toLowerCase();
+    return repo.toLowerCase() === name || tag === name || tag.endsWith(`/${name}`);
   });
   const [only] = found;
   if (only === undefined) {
     return fail(
-      `no repository named ${wanted}; usage is recorded for ${repos.map((repo) => repoLabel(repo) || "global").join(", ")}`,
+      repos.length === 0
+        ? "no usage is recorded for this account yet"
+        : `no repository named ${wanted}; usage is recorded for ${repos.map(repoLabel).join(", ")}`,
     );
   }
   return found.length === 1
@@ -557,39 +558,25 @@ export interface UsageReport {
   from: string;
   to: string;
   period: UsagePeriod;
-  repo: string;
+  repo: string | null;
   totals: UsageTotals;
   buckets: UsageBucketReport[];
   repos: UsageRepoReport[];
   models: ModelReport[];
 }
 
-const grouped = <T>(
-  rows: UsageRow[],
-  key: (row: UsageRow) => string,
-  shape: (key: string, rows: UsageRow[]) => T,
-): T[] => {
-  const merged = new Map<string, UsageRow[]>();
-  for (const row of rows) merged.set(key(row), [...(merged.get(key(row)) ?? []), row]);
-  return [...merged.entries()].map(([value, found]) => shape(value, found));
-};
-
-export const usageReport = (query: UsageArgs, rows: UsageRow[]): UsageReport => ({
-  from: query.from,
-  to: query.to,
+export const usageReport = (query: UsageQuery, rows: UsageRow[]): UsageReport => ({
+  from: query.window.from,
+  to: query.window.to,
   period: query.period,
   repo: query.repo,
   totals: usageTotals(rows),
-  buckets: grouped(
-    rows,
-    (row) => row.bucket,
-    (bucket, found) => ({ bucket, ...usageTotals(found) }),
-  ).sort((left, right) => (left.bucket < right.bucket ? -1 : 1)),
-  repos: grouped(
-    rows,
-    (row) => row.repo,
-    (repo, found) => ({ repo, ...usageTotals(found) }),
-  ).sort((left, right) => right.totalTokens - left.totalTokens),
+  buckets: groupBy(rows, (row) => row.bucket)
+    .map(([bucket, found]) => ({ bucket, ...usageTotals(found) }))
+    .sort((left, right) => (left.bucket < right.bucket ? -1 : 1)),
+  repos: groupBy(rows, (row) => row.repo)
+    .map(([repo, found]) => ({ repo, ...usageTotals(found) }))
+    .sort((left, right) => right.totalTokens - left.totalTokens),
   models: modelReports(rows),
 });
 

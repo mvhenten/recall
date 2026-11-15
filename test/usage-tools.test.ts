@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { SessionUsageReport, UsageReport } from "../src/tools";
+import { matchRepo, type SessionUsageReport, type UsageReport } from "../src/tools";
 import { harness } from "./harness";
 
 const DAY_ONE = Date.UTC(2026, 10, 1, 12, 0);
@@ -94,7 +94,7 @@ describe("usage tools", () => {
     const { mcp } = await spending();
     const report = await usage(mcp);
 
-    expect([report.from, report.to, report.period, report.repo]).toEqual(["2026-10-04", "2026-11-02", "day", ""]);
+    expect([report.from, report.to, report.period, report.repo]).toEqual(["2026-10-04", "2026-11-02", "day", null]);
     expect(report.totals).toEqual({
       inputTokens: 1_250_000,
       outputTokens: 130_000,
@@ -136,16 +136,22 @@ describe("usage tools", () => {
         totalTokens: 60_000,
         cacheHitRate: 0,
         cost: null,
-        costIsFloor: false,
-        unpricedModels: ["glm-5.3"],
       },
     ]);
     expect(report.totals.cost).toBeNull();
     expect(report.totals.costIsFloor).toBe(false);
   });
 
-  it("buckets a window by month and narrows it by day", async () => {
+  // The fixture straddles a week end: 2026-11-01 is a Sunday, which belongs to the week opening on
+  // Monday 2026-10-26, and 2026-11-02 opens the next one.
+  it("buckets a window by week, by month and by one day", async () => {
     const { mcp } = await spending();
+
+    const weekly = await usage(mcp, { period: "week" });
+    expect(weekly.buckets.map((bucket) => [bucket.bucket, bucket.cost])).toEqual([
+      ["2026-10-26", 10.75],
+      ["2026-11-02", 1.14],
+    ]);
 
     const monthly = await usage(mcp, { period: "month" });
     expect(monthly.buckets.map((bucket) => [bucket.bucket, bucket.cost])).toEqual([["2026-11", 11.89]]);
@@ -155,6 +161,18 @@ describe("usage tools", () => {
     expect(firstDay.totals.cost).toBe(10.75);
   });
 
+  // A name is resolved against the repositories on record, so one that answers for two is refused
+  // naming both rather than reporting one of them as the whole truth.
+  it("resolves a repository by any unambiguous tail of its tag", () => {
+    const repos = [RECALL, READER, "repo:gitlab.com/remit-mail/reader"];
+    expect(matchRepo(repos, "recall")).toEqual({ ok: true, value: RECALL });
+    expect(matchRepo(repos, "github.com/remit-mail/reader")).toEqual({ ok: true, value: READER });
+    expect(matchRepo(repos, "reader")).toEqual({
+      ok: false,
+      error: `reader names 2 repositories: ${READER}, repo:gitlab.com/remit-mail/reader`,
+    });
+  });
+
   it("refuses a repository it holds no reading for, and a window that runs backwards", async () => {
     const { mcp } = await spending();
 
@@ -162,10 +180,18 @@ describe("usage tools", () => {
     expect(missing).toContain("no repository named ledger");
     expect(missing).toContain("github.com/remit-mail/reader");
 
+    // Asking for the readings taken outside a working copy must never fall back to every
+    // repository, which is what an empty tag standing for "no filter" would have done.
+    const global = await mcp.tool("recall_usage", { repo: "global" }).catch((error: Error) => error.message);
+    expect(global).toBe("recall: no usage is recorded outside a repository");
+
     const backwards = await mcp
       .tool("recall_usage", { from: "2026-11-02", to: "2026-11-01" })
       .catch((error: Error) => error.message);
     expect(backwards).toBe("recall: from 2026-11-02 falls after to 2026-11-01");
+
+    const dated = await mcp.tool("recall_usage", { to: "nope" }).catch((error: Error) => error.message);
+    expect(dated).toBe("recall: to nope is neither epoch ms nor ISO 8601");
   });
 
   it("answers what each session spent, where it ran and how many turns it took", async () => {
@@ -196,5 +222,38 @@ describe("usage tools", () => {
     };
     expect(one.sessions.map((session) => session.sessionId)).toEqual(["s-reader"]);
     expect(one.sessions[0]?.cost).toBeNull();
+  });
+
+  // A session is named by the handle every listing shows it under, not by its id alone.
+  it("takes the handle a listing shows, and says so when nothing answers to a name", async () => {
+    const { mcp } = await spending();
+    const listed = (await mcp.json("recall_sessions")) as Array<{ handle: string; cwd: string }>;
+    const handle = listed.find((session) => session.cwd.endsWith("recall"))?.handle ?? "";
+    expect(handle).not.toBe("");
+
+    const named = (await mcp.json("recall_session_usage", { session: handle })) as {
+      sessions: SessionUsageReport[];
+    };
+    expect(named.sessions.map((session) => session.sessionId)).toEqual(["s-recall"]);
+
+    const missing = await mcp
+      .tool("recall_session_usage", { session: "laptop-zzzz" })
+      .catch((error: Error) => error.message);
+    expect(missing).toBe("recall: no session named laptop-zzzz");
+  });
+
+  // The window bounds the spend as well as picking the sessions, so a session that ran across the
+  // window reports what it spent inside it and reconciles with the rollup over the same days.
+  it("counts only the spend that falls inside the window", async () => {
+    const { mcp } = await spending();
+    const day = (await mcp.json("recall_session_usage", { from: "2026-11-02", to: "2026-11-02" })) as {
+      sessions: SessionUsageReport[];
+    };
+    const recall = day.sessions.find((session) => session.sessionId === "s-recall");
+    expect(recall?.cost).toBe(1.14);
+    expect(recall?.models.map((model) => model.model)).toEqual(["claude-sonnet-4"]);
+
+    const rollup = await usage(mcp, { from: "2026-11-02", to: "2026-11-02", repo: "recall" });
+    expect(rollup.totals.cost).toBe(recall?.cost);
   });
 });
