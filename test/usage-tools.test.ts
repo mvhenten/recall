@@ -176,9 +176,12 @@ describe("usage tools", () => {
   it("refuses a repository it holds no reading for, and a window that runs backwards", async () => {
     const { mcp } = await spending();
 
+    // The refusal names the repositories the way a person reads them, which is the label the
+    // dashboard prints and not the tag they are recorded under.
     const missing = await mcp.tool("recall_usage", { repo: "ledger" }).catch((error: Error) => error.message);
-    expect(missing).toContain("no repository named ledger");
-    expect(missing).toContain("github.com/remit-mail/reader");
+    expect(missing).toBe(
+      "recall: no repository named ledger; usage is recorded for mvhenten/recall, remit-mail/reader",
+    );
 
     // Asking for the readings taken outside a working copy must never fall back to every
     // repository, which is what an empty tag standing for "no filter" would have done.
