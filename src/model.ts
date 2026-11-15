@@ -349,6 +349,43 @@ export interface SessionSpend extends ModelTotals {
   account: string;
 }
 
+// The grain a usage read is bucketed at. The rollup is keyed by UTC day, so a week is the Monday
+// it opens on and a month the first seven characters of that same day.
+export const usagePeriods = ["day", "week", "month"] as const;
+
+export type UsagePeriod = (typeof usagePeriods)[number];
+
+// What a usage read covers: a closed range of UTC days, one repo or every repo, at one grain.
+export interface UsageQuery {
+  from: string;
+  to: string;
+  repo: string;
+  period: UsagePeriod;
+}
+
+// One row of the rollup under that query: the bucket it falls in and the repo it was spent on.
+export interface UsageRow extends ModelBucket {
+  repo: string;
+}
+
+// Which sessions a per-session read covers. A session counts when its life overlaps the window,
+// the same test the repo ranking applies, so one that opened last week and ran into today answers
+// for today.
+export interface SessionUsageQuery {
+  sessionId: string;
+  repo: string;
+  since: number;
+  until: number;
+  limit: number;
+}
+
+// One session and what it spent, which no rollup can answer: usage_daily is keyed by day, host,
+// repo and account and never by session.
+export interface SessionUsage {
+  session: PastSession;
+  spend: SessionSpend[];
+}
+
 export interface DaySessions {
   day: string;
   sessions: number;

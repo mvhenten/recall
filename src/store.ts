@@ -65,6 +65,8 @@ import {
   type Session,
   type SessionInput,
   type SessionSpend,
+  type SessionUsage,
+  type SessionUsageQuery,
   STALE_AFTER_DAYS,
   type Stats,
   type StatsWindows,
@@ -73,6 +75,9 @@ import {
   USAGE_MONTH_DAYS,
   USAGE_RETENTION_MS,
   type UsageInput,
+  type UsagePeriod,
+  type UsageQuery,
+  type UsageRow,
   type UsageSplitField,
   usageDay,
   usageDayStart,
@@ -1223,6 +1228,108 @@ export const readStats = async (db: TenantDb, userId: string, windows: StatsWind
       sessions: perDay.map((row) => ({ day: row.day, sessions: row.sessions })),
     };
   });
+
+// The bucket a day falls in at each grain. A week is the Monday it opens on, worked out off the
+// day column itself so the rollup is never read twice for the same reading, and a month is the
+// first seven characters usageMonths already groups by.
+const BUCKETS: Record<UsagePeriod, (day: SQLiteColumn) => SQL<string>> = {
+  day: (day) => sql<string>`${day}`,
+  week: (day) => sql<string>`date(${day}, '-' || ((CAST(strftime('%w', ${day}) AS INTEGER) + 6) % 7) || ' days')`,
+  month: (day) => sql<string>`substr(${day}, 1, 7)`,
+};
+
+// Every repository the rollup holds a reading for, which is what a repo filter is resolved
+// against: the connector is told a name a person uses and has to find the tag it was recorded as.
+export const usageRepos = async (db: TenantDb, userId: string): Promise<string[]> =>
+  db
+    .selectDistinct({ repo: usageDaily.repo })
+    .from(usageDaily)
+    .where(eq(usageDaily.userId, userId))
+    .orderBy(asc(usageDaily.repo))
+    .all()
+    .map((row) => row.repo);
+
+// The usage tools read the same rollup the stats page draws, under a window and a repo the caller
+// names rather than the three fixed windows the page holds. The rows come back per bucket, repo
+// and model, and the caller folds them into whichever of the three breakdowns it is answering.
+export const readUsage = async (db: TenantDb, userId: string, query: UsageQuery): Promise<UsageRow[]> => {
+  const bucket = BUCKETS[query.period](usageDaily.day);
+  const results = db
+    .select({
+      bucket,
+      repo: usageDaily.repo,
+      provider: usageDaily.provider,
+      model: usageDaily.model,
+      ...countSums(usageDaily),
+    })
+    .from(usageDaily)
+    .where(
+      and(
+        eq(usageDaily.userId, userId),
+        gte(usageDaily.day, query.from),
+        lte(usageDaily.day, query.to),
+        query.repo === "" ? undefined : eq(usageDaily.repo, query.repo),
+      ),
+    )
+    .groupBy(bucket, usageDaily.repo, usageDaily.provider, usageDaily.model)
+    .orderBy(bucket, asc(usageDaily.repo), asc(usageDaily.provider), asc(usageDaily.model))
+    .all();
+  return results.map((row) => ({ bucket: row.bucket, repo: row.repo, ...toModelTotals(row) }));
+};
+
+// What each session in a window spent. The sessions are read the way the history tab reads them
+// and the spend off the raw events, which are the only rows that hold a session together; a
+// session whose events have been swept comes back with no spend rather than being left out, so a
+// caller sees the session and the gap rather than a silent short list.
+export const readSessionUsage = async (
+  db: TenantDb,
+  userId: string,
+  query: SessionUsageQuery,
+  now: number,
+): Promise<SessionUsage[]> => {
+  const found = await pastSessionsFrom(db, now - SESSION_TTL_MS)
+    .where(
+      and(
+        eq(sessionHistory.userId, userId),
+        query.repo === "" ? undefined : eq(sessionHistory.repo, query.repo),
+        query.sessionId === "" ? undefined : eq(sessionHistory.sessionId, query.sessionId),
+        gte(sessionHistory.lastActivityAt, query.since),
+        lte(sessionHistory.startedAt, query.until),
+      ),
+    )
+    .orderBy(desc(sessionHistory.lastActivityAt), desc(sessionHistory.sessionId))
+    .limit(query.limit)
+    .all();
+  const sessions = found.map(toPastSession);
+  if (sessions.length === 0) return [];
+  const spend = db
+    .select({
+      sessionId: usageEvents.sessionId,
+      account: usageEvents.account,
+      provider: usageEvents.provider,
+      model: usageEvents.model,
+      ...countSums(usageEvents),
+    })
+    .from(usageEvents)
+    .where(
+      and(
+        eq(usageEvents.userId, userId),
+        inArray(
+          usageEvents.sessionId,
+          sessions.map((session) => session.sessionId),
+        ),
+      ),
+    )
+    .groupBy(usageEvents.sessionId, usageEvents.account, usageEvents.provider, usageEvents.model)
+    .orderBy(asc(usageEvents.account), asc(usageEvents.provider), asc(usageEvents.model))
+    .all();
+  return sessions.map((session) => ({
+    session,
+    spend: spend
+      .filter((row) => row.sessionId === session.sessionId)
+      .map((row) => ({ account: row.account, ...toModelTotals(row) })),
+  }));
+};
 
 // The Insights page, off one round trip. The sessions, the usage, the repositories and the memory
 // counters are all this account's own rows, so the whole page is one transaction against its own

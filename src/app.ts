@@ -278,7 +278,9 @@ import {
   readInsights,
   readLabels,
   readPeek,
+  readSessionUsage,
   readStats,
+  readUsage,
   recall,
   recordReach,
   recordShareUse,
@@ -302,6 +304,7 @@ import {
   startCursor,
   tagsOfMemories,
   textCandidates,
+  usageRepos,
   vectorCandidates,
   writeLabels,
   writePeek,
@@ -310,6 +313,7 @@ import type { Tenant } from "./tenant";
 import {
   deviceDigest,
   editedMemory,
+  matchRepo,
   parseEditArgs,
   parseListArgs,
   parseNameArgs,
@@ -317,6 +321,8 @@ import {
   parseSaveArgs,
   parseSearchArgs,
   parseSendArgs,
+  parseSessionUsageArgs,
+  parseUsageArgs,
   readBackPeek,
   renderMemory,
   resolveTarget,
@@ -324,8 +330,10 @@ import {
   SEARCH_LIMIT,
   type SendTarget,
   sessionDigest,
+  sessionUsageReport,
   TOOLS,
   toolArguments,
+  usageReport,
 } from "./tools";
 import type { RecordReach } from "./transcript-plan";
 import { agentName, readTurns } from "./turns";
@@ -2255,6 +2263,13 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     return resolveTarget(devices, labels, sessions, to);
   };
 
+  // A live session is addressed by the handle or the name a send and a peek take; one that has
+  // ended answers to its id alone, which is what every listing shows beside it.
+  const namedSession = async (env: TenantEnv, userId: string, to: string, now: number): Promise<string> => {
+    const found = await addressed(env, userId, to, now);
+    return found.ok && found.value.toSessionId !== "" ? found.value.toSessionId : to;
+  };
+
   const runTool = (env: TenantEnv, caller: Caller): RunTool => {
     // Every tool but the two listings and the send one reads or writes a memory, which is a row of
     // this account's own.
@@ -2268,6 +2283,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       const written = await saveMemory(db, userId, name, input, quantize(vector), deps.now());
       return document({ name: written.memory.name, created: written.created, tags: written.memory.tags });
     };
+    // A usage call names a repository by a tail of the tag it was recorded under, so the name is
+    // resolved against the ones on record before anything is counted; naming none counts them all.
+    const forRepo = async (wanted: string): Promise<Parsed<string>> =>
+      wanted === "" ? { ok: true, value: "" } : matchRepo(await usageRepos(db, userId), wanted);
     return async (call: ToolCall): Promise<ToolResult> => {
       const definition = TOOLS.find((tool) => tool.name === call.name);
       if (definition === undefined) return refused(`no tool named ${call.name}`);
@@ -2367,6 +2386,28 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
           delay,
         );
         return document({ sessionId: toSessionId, peek });
+      }
+      // The two usage tools read what the stats page and the session page read, under a window
+      // the caller names rather than the fixed ones those pages hold.
+      if (call.name === "recall_usage") {
+        const asked = parseUsageArgs(args.value, deps.now());
+        if (!asked.ok) return refused(asked.error);
+        const repo = await forRepo(asked.value.repo);
+        if (!repo.ok) return refused(repo.error);
+        const query = { ...asked.value, repo: repo.value };
+        return document(usageReport(query, await readUsage(db, userId, query)));
+      }
+      if (call.name === "recall_session_usage") {
+        const asked = parseSessionUsageArgs(args.value, deps.now());
+        if (!asked.ok) return refused(asked.error);
+        const repo = await forRepo(asked.value.repo);
+        if (!repo.ok) return refused(repo.error);
+        const { from, to, session, since, until, limit } = asked.value;
+        const sessionId = session === "" ? "" : await namedSession(env, userId, session, deps.now());
+        const query = { sessionId, repo: repo.value, since, until, limit };
+        const found = await readSessionUsage(db, userId, query, deps.now());
+        if (session !== "" && found.length === 0) return refused(`no session named ${session} in this window`);
+        return document({ from, to, repo: repo.value, sessions: found.map(sessionUsageReport) });
       }
       const input = parseSendArgs(args.value);
       if (!input.ok) return refused(input.error);
