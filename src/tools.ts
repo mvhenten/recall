@@ -1,11 +1,16 @@
 import type { Device } from "./device";
 import {
+  type DayWindow,
+  daysBetween,
+  dayWindow,
   GLOBAL_TAG,
   isRepoTag,
   type Labels,
+  MAX_SESSION_TEXT_CHARS,
   type Memory,
   type MemoryType,
   type Mode,
+  type ModelTotals,
   memoryTypes,
   modes,
   type Parsed,
@@ -13,8 +18,18 @@ import {
   parseTags,
   pending,
   REPO_TAG,
+  repoLabel,
   type Session,
+  type SessionUsage,
+  type SessionUsageQuery,
+  USAGE_MONTH_DAYS,
+  type UsagePeriod,
+  type UsageQuery,
+  type UsageRow,
+  usageDay,
+  usagePeriods,
 } from "./model";
+import { groupBy, type ModelReport, modelReports, type TokenReport, tokenReport, turnsIn } from "./usage";
 import { sessionNameOf, type V2Device, type V2Peek, type V2Session } from "./v2";
 
 // The tool names cli/src/mcp.rs serves, with their schemas written out here. The Rust side derives
@@ -66,6 +81,12 @@ export interface SendArgs {
 }
 
 export interface PeekArgs {
+  session: string;
+}
+
+// What a per-session call asks for: the read's own query, plus the session it was asked about by
+// whatever name the caller had for it, which is resolved to an id before the read.
+export interface SessionUsageArgs extends Omit<SessionUsageQuery, "sessionId"> {
   session: string;
 }
 
@@ -224,6 +245,44 @@ export const TOOLS: ToolDefinition[] = [
       ["session"],
     ),
   },
+  {
+    name: "recall_usage",
+    description:
+      "What the user's Claude Code sessions have spent, off the same rollup the dashboard's stats page draws. Input, output, cache-read and cache-write tokens are each kept apart — a cache read costs a tenth of fresh input, so the mix is the whole of a price comparison — alongside a total, the cache-hit rate, the turn count and the cost at Anthropic's list prices. One window at day, week or month grain, optionally narrowed to one repository, returned broken down three ways over the same rows: by bucket, by repository and by model. A model with no entry in the price table reports cost null and is named in unpricedModels, never counted as free; a breakdown mixing priced and unpriced models marks costIsFloor. Figures cover what the hosts have flushed: a session's subagent transcripts are counted alongside its main one from recall v0.9.0 (issue #58), so a host still on an older release reports only its main thread and reads low. Read-only.",
+    inputSchema: schema({
+      from: text("First UTC day to count, as an ISO 8601 date or time, or epoch ms. Defaults to 30 days back."),
+      to: text("Last UTC day to count, inclusive. Defaults to today."),
+      period: {
+        type: "string",
+        enum: [...usagePeriods],
+        description: "Bucket grain: day (default), week starting Monday, or month.",
+      },
+      repo: text(
+        "Count only this repository, named as recorded (repo:github.com/owner/project) or by any unambiguous tail of it, such as owner/project or project. Omit to count every repository.",
+      ),
+    }),
+  },
+  {
+    name: "recall_session_usage",
+    description:
+      "What each session spent, newest activity first: the same four token classes and cost as recall_usage, plus the turn count, the models that answered, the accounts billed, the start and end time, the repository, the working directory and the host. Name one session by the name or the handle a listing shows it under, or by its session id, or take every session whose life overlaps the window, narrowed by repository. What a session spent is bounded by the window too, so the two tools reconcile over the same days. Per-session detail comes from the raw events, which are swept after two weeks unless the reading was taken from a transcript, so an older session can report less than it spent and one whose events are gone reports zero rather than dropping out of the list. Same price table and the same subagent caveat as recall_usage. Read-only.",
+    inputSchema: schema({
+      session: text(
+        "One session, by the name or the handle a listing shows it under, or by its session id. Omit to take every session.",
+      ),
+      from: text(
+        "Count sessions active at or after this ISO 8601 date or time, or epoch ms. Defaults to 30 days back.",
+      ),
+      to: text("Count sessions that opened on or before this UTC day, inclusive. Defaults to today."),
+      repo: text("Only sessions in this repository, named the way recall_usage takes it."),
+      limit: {
+        type: "integer",
+        minimum: 1,
+        maximum: 100,
+        description: "At most this many sessions, newest activity first (default 20).",
+      },
+    }),
+  },
 ];
 
 const fail = <T>(error: string): Parsed<T> => ({ ok: false, error });
@@ -287,15 +346,20 @@ export const saveTags = (type: MemoryType, global: boolean | undefined, extra: s
   );
 };
 
-export const parseSinceArgument = (value: unknown): Parsed<number> => {
+// Every tool that takes an instant takes it in the three forms a model writes one in. The field
+// is named by its caller, so a bad `to` is refused as `to` and not as the first field that ever
+// took an instant.
+export const parseSinceArgument = (value: unknown, field = "since"): Parsed<number> => {
   if (value === undefined) return { ok: true, value: 0 };
   if (typeof value === "number") {
-    return Number.isInteger(value) && value >= 0 ? { ok: true, value } : fail("since must be epoch milliseconds");
+    return Number.isInteger(value) && value >= 0 ? { ok: true, value } : fail(`${field} must be epoch milliseconds`);
   }
-  if (typeof value !== "string") return fail("since must be an ISO 8601 time, date or epoch ms");
+  if (typeof value !== "string") return fail(`${field} must be an ISO 8601 time, date or epoch ms`);
   if (/^\d+$/.test(value)) return { ok: true, value: Number(value) };
   const parsed = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00Z` : value);
-  return Number.isNaN(parsed) ? fail(`since ${value} is neither epoch ms nor ISO 8601`) : { ok: true, value: parsed };
+  return Number.isNaN(parsed)
+    ? fail(`${field} ${value} is neither epoch ms nor ISO 8601`)
+    : { ok: true, value: parsed };
 };
 
 // No scope means every memory. A search that quietly covered global alone answered a question
@@ -395,6 +459,161 @@ export const parseSendArgs = (args: Record<string, unknown>): Parsed<SendArgs> =
 export const parsePeekArgs = (args: Record<string, unknown>): Parsed<PeekArgs> => {
   const session = requiredText(args.session, "session", 500);
   return session.ok ? { ok: true, value: { session: session.value } } : session;
+};
+
+const USAGE_SESSION_LIMIT = 20;
+
+// A date argument names a UTC day, whichever of the three forms it arrives in: the rollup is keyed
+// by day, so a time of day inside one is the day it falls in, and a window names its two ends.
+const usageWindow = (args: Record<string, unknown>, now: number): Parsed<DayWindow> => {
+  const span = dayWindow(now, USAGE_MONTH_DAYS);
+  const from = parseSinceArgument(args.from, "from");
+  if (!from.ok) return from;
+  const to = parseSinceArgument(args.to, "to");
+  if (!to.ok) return to;
+  const first = args.from === undefined ? span.from : usageDay(from.value);
+  const last = args.to === undefined ? span.to : usageDay(to.value);
+  if (first > last) return fail(`from ${first} falls after to ${last}`);
+  return { ok: true, value: daysBetween(first, last) };
+};
+
+// A repository the caller never named is null, which counts every one of them. The empty tag is a
+// repository of its own — a reading taken outside a working copy — so the two can never be the
+// same value.
+const askedRepo = (args: Record<string, unknown>): Parsed<string | null> => {
+  const repo = optionalText(args.repo, "repo", MAX_SESSION_TEXT_CHARS);
+  return repo.ok ? { ok: true, value: repo.value ?? null } : repo;
+};
+
+export const parseUsageArgs = (args: Record<string, unknown>, now: number): Parsed<UsageQuery> => {
+  const window = usageWindow(args, now);
+  if (!window.ok) return window;
+  const repo = askedRepo(args);
+  if (!repo.ok) return repo;
+  const period = args.period === undefined ? "day" : usagePeriods.find((known) => known === args.period);
+  if (period === undefined) return fail(`period must be one of ${usagePeriods.join(", ")}`);
+  return { ok: true, value: { window: window.value, repo: repo.value, period } };
+};
+
+export const parseSessionUsageArgs = (args: Record<string, unknown>, now: number): Parsed<SessionUsageArgs> => {
+  const window = usageWindow(args, now);
+  if (!window.ok) return window;
+  const repo = askedRepo(args);
+  if (!repo.ok) return repo;
+  const session = optionalText(args.session, "session", MAX_SESSION_TEXT_CHARS);
+  if (!session.ok) return session;
+  const limit = args.limit ?? USAGE_SESSION_LIMIT;
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return fail("limit must be a whole number from 1 to 100");
+  }
+  return { ok: true, value: { window: window.value, repo: repo.value, session: session.value ?? "", limit } };
+};
+
+// What a caller may call the repository recorded outside any working copy.
+const GLOBAL_REPO = ["global", "none"];
+
+// A repository is recorded as the tag the host read off its working copy, and a person names it by
+// whatever tail of that they think of it as. One unambiguous tail resolves; a name that answers for
+// two repositories is refused naming both, rather than reporting one of them as the whole truth.
+export const matchRepo = (repos: string[], wanted: string): Parsed<string> => {
+  const name = wanted.trim().toLowerCase();
+  if (GLOBAL_REPO.includes(name)) {
+    return repos.includes("") ? { ok: true, value: "" } : fail("no usage is recorded outside a repository");
+  }
+  const found = repos.filter((repo) => {
+    const tag = (repo.startsWith(REPO_TAG) ? repo.slice(REPO_TAG.length) : repo).toLowerCase();
+    return repo.toLowerCase() === name || tag === name || tag.endsWith(`/${name}`);
+  });
+  const [only] = found;
+  if (only === undefined) {
+    return fail(
+      repos.length === 0
+        ? "no usage is recorded for this account yet"
+        : `no repository named ${wanted}; usage is recorded for ${repos.map(repoLabel).join(", ")}`,
+    );
+  }
+  return found.length === 1
+    ? { ok: true, value: only }
+    : fail(`${wanted} names ${found.length} repositories: ${found.join(", ")}`);
+};
+
+// A reading at one grain: the four token classes, the cost, and the turns that bought them. Turns
+// are counted at this grain alone and never per model — a delta carries the whole stretch's prompt
+// count on the first model that answered in it, so splitting it by model would invent a number.
+export interface UsageTotals extends TokenReport {
+  turns: number;
+}
+
+const usageTotals = (rows: ModelTotals[]): UsageTotals => ({ ...tokenReport(rows), turns: turnsIn(rows) });
+
+export interface UsageBucketReport extends UsageTotals {
+  bucket: string;
+}
+
+export interface UsageRepoReport extends UsageTotals {
+  repo: string;
+}
+
+export interface UsageReport {
+  from: string;
+  to: string;
+  period: UsagePeriod;
+  repo: string | null;
+  totals: UsageTotals;
+  buckets: UsageBucketReport[];
+  repos: UsageRepoReport[];
+  models: ModelReport[];
+}
+
+export const usageReport = (query: UsageQuery, rows: UsageRow[]): UsageReport => ({
+  from: query.window.from,
+  to: query.window.to,
+  period: query.period,
+  repo: query.repo,
+  totals: usageTotals(rows),
+  buckets: groupBy(rows, (row) => row.bucket)
+    .map(([bucket, found]) => ({ bucket, ...usageTotals(found) }))
+    .sort((left, right) => (left.bucket < right.bucket ? -1 : 1)),
+  repos: groupBy(rows, (row) => row.repo)
+    .map(([repo, found]) => ({ repo, ...usageTotals(found) }))
+    .sort((left, right) => right.totalTokens - left.totalTokens),
+  models: modelReports(rows),
+});
+
+export interface SessionUsageReport extends TokenReport {
+  sessionId: string;
+  name: string;
+  agentName: string;
+  host: string;
+  cwd: string;
+  repo: string;
+  startedAt: string;
+  lastActivityAt: string;
+  running: boolean;
+  turns: number;
+  accounts: string[];
+  models: ModelReport[];
+}
+
+// `turns` is the session's own prompt count and not a sum over its spend: a session whose events
+// have been swept still knows how many turns it took.
+export const sessionUsageReport = (usage: SessionUsage): SessionUsageReport => {
+  const { session, spend } = usage;
+  return {
+    sessionId: session.sessionId,
+    name: session.name,
+    agentName: session.agentName,
+    host: session.host,
+    cwd: session.cwd,
+    repo: session.repo,
+    startedAt: new Date(session.startedAt).toISOString(),
+    lastActivityAt: new Date(session.lastActivityAt).toISOString(),
+    running: session.running,
+    turns: session.prompts,
+    accounts: [...new Set(spend.map((row) => row.account))].filter((account) => account !== "").sort(),
+    models: modelReports(spend),
+    ...tokenReport(spend),
+  };
 };
 
 // How many times a peek is read back before the caller is told it is still pending, and how long

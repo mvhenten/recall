@@ -109,7 +109,9 @@ describe("the connector handshake", () => {
       "recall_save",
       "recall_search",
       "recall_send",
+      "recall_session_usage",
       "recall_sessions",
+      "recall_usage",
     ]);
     expect(tools.every((tool) => tool.inputSchema !== undefined)).toBe(true);
   });

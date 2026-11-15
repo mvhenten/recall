@@ -278,7 +278,9 @@ import {
   readInsights,
   readLabels,
   readPeek,
+  readSessionUsage,
   readStats,
+  readUsage,
   recall,
   recordReach,
   recordShareUse,
@@ -302,6 +304,7 @@ import {
   startCursor,
   tagsOfMemories,
   textCandidates,
+  usageRepos,
   vectorCandidates,
   writeLabels,
   writePeek,
@@ -310,6 +313,7 @@ import type { Tenant } from "./tenant";
 import {
   deviceDigest,
   editedMemory,
+  matchRepo,
   parseEditArgs,
   parseListArgs,
   parseNameArgs,
@@ -317,6 +321,8 @@ import {
   parseSaveArgs,
   parseSearchArgs,
   parseSendArgs,
+  parseSessionUsageArgs,
+  parseUsageArgs,
   readBackPeek,
   renderMemory,
   resolveTarget,
@@ -324,8 +330,10 @@ import {
   SEARCH_LIMIT,
   type SendTarget,
   sessionDigest,
+  sessionUsageReport,
   TOOLS,
   toolArguments,
+  usageReport,
 } from "./tools";
 import type { RecordReach } from "./transcript-plan";
 import { agentName, readTurns } from "./turns";
@@ -1393,12 +1401,13 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const found = await findSession(env.DB, userId, parsed.value, now);
     if (!found) return lost(404, "No such session", `This recall holds no session ${parsed.value}.`);
     const { session } = found;
-    const [deviceId, spend, labels, peeks] = await Promise.all([
+    const [deviceId, spent, labels, peeks] = await Promise.all([
       liveSessionDevice(env.DB, userId, session.sessionId, now),
-      sessionSpend(env.DB, userId, session.sessionId),
+      sessionSpend(env.DB, userId, [session.sessionId], null),
       readLabels(env.DB, userId),
       listPeeks(env.DB, userId, session.sessionId),
     ]);
+    const spend = spent.get(session.sessionId) ?? [];
     const csrf = pageToken(request);
     const render = async (flash: Flash | null, draft: string, status: number): Promise<Response> => {
       const transcript = await transcriptPlan(env, userId, session.sessionId, url);
@@ -2268,6 +2277,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       const written = await saveMemory(db, userId, name, input, quantize(vector), deps.now());
       return document({ name: written.memory.name, created: written.created, tags: written.memory.tags });
     };
+    // A usage call names a repository by a tail of the tag it was recorded under, so the name is
+    // resolved against the ones on record before anything is counted.
+    const forRepo = async (wanted: string): Promise<Parsed<string>> => matchRepo(await usageRepos(db, userId), wanted);
     return async (call: ToolCall): Promise<ToolResult> => {
       const definition = TOOLS.find((tool) => tool.name === call.name);
       if (definition === undefined) return refused(`no tool named ${call.name}`);
@@ -2367,6 +2379,43 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
           delay,
         );
         return document({ sessionId: toSessionId, peek });
+      }
+      // The two usage tools read what the stats page and the session page read, under a window
+      // the caller names rather than the fixed ones those pages hold.
+      if (call.name === "recall_usage") {
+        const asked = parseUsageArgs(args.value, deps.now());
+        if (!asked.ok) return refused(asked.error);
+        const named = asked.value.repo;
+        const repo = named === null ? null : await forRepo(named);
+        if (repo !== null && !repo.ok) return refused(repo.error);
+        const query = { ...asked.value, repo: repo === null ? null : repo.value };
+        return document(usageReport(query, await readUsage(db, userId, query)));
+      }
+      if (call.name === "recall_session_usage") {
+        const asked = parseSessionUsageArgs(args.value, deps.now());
+        if (!asked.ok) return refused(asked.error);
+        const named = asked.value.repo;
+        const repo = named === null ? null : await forRepo(named);
+        if (repo !== null && !repo.ok) return refused(repo.error);
+        const { window, session, limit } = asked.value;
+        // A session is named by its id, by the name its harness gave it or by the handle every
+        // listing shows, live or long over, which is what findSession resolves for the CLI.
+        const found = session === "" ? null : await findSession(db, userId, session, deps.now());
+        if (session !== "" && found === null) return refused(`no session named ${session}`);
+        const query = {
+          window,
+          sessionId: found === null ? "" : found.session.sessionId,
+          repo: repo === null ? null : repo.value,
+          limit,
+        };
+        const sessions = await readSessionUsage(db, userId, query, deps.now());
+        if (session !== "" && sessions.length === 0) return refused(`${session} spent nothing in this window`);
+        return document({
+          from: window.from,
+          to: window.to,
+          repo: query.repo,
+          sessions: sessions.map(sessionUsageReport),
+        });
       }
       const input = parseSendArgs(args.value);
       if (!input.ok) return refused(input.error);

@@ -13,6 +13,16 @@ const REPO_TAG_SHAPE = /^repo:[^/]+\/.+$/;
 
 export const isRepoTag = (tag: string): boolean => REPO_TAG_SHAPE.test(tag);
 
+const GITHUB_TAG = `${REPO_TAG}github.com/`;
+
+// The tag without the scheme it was recorded under, which is what a repository is called wherever
+// a person reads or names one. An empty tag is a reading taken outside a working copy.
+export const repoLabel = (repo: string): string => {
+  if (repo === "") return "global";
+  if (repo.startsWith(GITHUB_TAG)) return repo.slice(GITHUB_TAG.length);
+  return repo.startsWith(REPO_TAG) ? repo.slice(REPO_TAG.length) : repo;
+};
+
 export type MemoryType = (typeof memoryTypes)[number];
 export type Mode = (typeof modes)[number];
 
@@ -307,16 +317,22 @@ export interface DayWindow {
   until: number;
 }
 
+// A window named by its two ends, which is how a caller asks for one: it closes at the last
+// instant of the day it names rather than at the midnight opening it, so a day asked for is a day
+// counted.
+export const daysBetween = (from: string, to: string): DayWindow => {
+  const since = Date.parse(`${from}T00:00:00Z`);
+  const until = Date.parse(`${to}T00:00:00Z`) + DAY_MS - 1;
+  const span: string[] = [];
+  for (let at = since; at < until; at += DAY_MS) span.push(usageDay(at));
+  return { days: span, from, to, since, until };
+};
+
+// A window named by its length, which is how a page asks for one. It ends at the moment it is
+// read rather than at the end of today, so a session is never clipped against a time still ahead.
 export const dayWindow = (now: number, days: number): DayWindow => {
   const since = usageDayStart(now) - (days - 1) * DAY_MS;
-  const span = Array.from({ length: days }, (_, index) => usageDay(since + index * DAY_MS));
-  return {
-    days: span,
-    from: span[0] ?? usageDay(now),
-    to: span.at(-1) ?? usageDay(now),
-    since,
-    until: now,
-  };
+  return { ...daysBetween(usageDay(since), usageDay(now)), until: now };
 };
 
 export interface TokenCounts {
@@ -347,6 +363,43 @@ export interface UsageSplit extends ModelTotals {
 // What one session spent on one model, under the account that paid for it.
 export interface SessionSpend extends ModelTotals {
   account: string;
+}
+
+// The grain a usage read is bucketed at. The rollup is keyed by UTC day, so a week is the Monday
+// it opens on and a month the first seven characters of that same day.
+export const usagePeriods = ["day", "week", "month"] as const;
+
+export type UsagePeriod = (typeof usagePeriods)[number];
+
+// What a usage read covers: a window, one grain, and either one repository or every one of them.
+// A repository is named by the tag it was recorded under, where the empty tag is a reading taken
+// outside a working copy; naming none is null and counts them all.
+export interface UsageQuery {
+  window: DayWindow;
+  repo: string | null;
+  period: UsagePeriod;
+}
+
+// One row of the rollup under that query: the bucket it falls in and the repo it was spent on.
+export interface UsageRow extends ModelBucket {
+  repo: string;
+}
+
+// Which sessions a per-session read covers. A session counts when its life overlaps the window,
+// the same test the repo ranking applies, so one that opened last week and ran into today answers
+// for today; what it spent is still bounded by the window, so the two usage reads reconcile.
+export interface SessionUsageQuery {
+  window: DayWindow;
+  sessionId: string;
+  repo: string | null;
+  limit: number;
+}
+
+// One session and what it spent, which no rollup can answer: usage_daily is keyed by day, host,
+// repo and account and never by session.
+export interface SessionUsage {
+  session: PastSession;
+  spend: SessionSpend[];
 }
 
 export interface DaySessions {

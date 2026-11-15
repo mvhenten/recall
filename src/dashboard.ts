@@ -43,8 +43,8 @@ import {
   PEEK_HISTORY,
   type Peek,
   pending,
-  REPO_TAG,
   type RepoHours,
+  repoLabel,
   type Session,
   type SessionSpend,
   STALE_AFTER_DAYS,
@@ -62,6 +62,7 @@ import { CSRF_COOKIE, escapeHtml, htmlPage, SCRIPT_CSP, SENT_COOKIE, sizeText, T
 import { MAX_EMAIL_SHARES, SHARE_DAYS, type ShareView, shareTimeLeft } from "./shares";
 import { type Follow, gapsInSpans, listedSpans, type Plan, type RecordSpan, type SpanListing } from "./transcript-plan";
 import { TRANSCRIPT_SCRIPT } from "./transcript-view.generated";
+import { byModel, cacheHit, costOf, countedTokens, keyOf, pricedIn, priceOf, spent, totalled } from "./usage";
 import { sessionNameOf } from "./v2";
 
 export interface Tab {
@@ -416,62 +417,7 @@ const focusHtml = (focus: Focus): string => {
 const isBusy = (session: { lastActivityAt: number }, now: number): boolean =>
   now - session.lastActivityAt < IDLE_AFTER_MS;
 
-// Anthropic's published list prices in US dollars per million tokens. A cache write is the
-// five-minute write rate, 1.25x input, and a cache read is 0.1x input. Tokens are stored and the
-// money is worked out here on every read, so correcting a price needs no backfill.
-interface Price {
-  input: number;
-  output: number;
-  cacheWrite: number;
-  cacheRead: number;
-}
-
-const perMillion = (input: number, output: number): Price => ({
-  input,
-  output,
-  cacheWrite: input * 1.25,
-  cacheRead: input * 0.1,
-});
-
-const FABLE = perMillion(10, 50);
-const OPUS = perMillion(5, 25);
-const SONNET = perMillion(3, 15);
-const HAIKU = perMillion(1, 5);
-
-const CLAUDE_FAMILIES: Array<[RegExp, Price]> = [
-  [/^claude-(fable|mythos)\b/, FABLE],
-  [/^claude-opus\b/, OPUS],
-  [/^claude-sonnet\b/, SONNET],
-  [/^claude-haiku\b/, HAIKU],
-];
-
-// The hooks send "claude"; a delta recorded by another client may name the vendor instead.
-const PROVIDERS = new Map<string, Array<[RegExp, Price]>>([
-  ["claude", CLAUDE_FAMILIES],
-  ["anthropic", CLAUDE_FAMILIES],
-]);
-
 const MILLION = 1_000_000;
-
-const priceOf = (provider: string, model: string): Price | null => {
-  const families = PROVIDERS.get(provider.toLowerCase());
-  if (!families) return null;
-  return families.find(([family]) => family.test(model.toLowerCase()))?.[1] ?? null;
-};
-
-const costOf = (totals: ModelTotals): number | null => {
-  const price = priceOf(totals.provider, totals.model);
-  if (!price) return null;
-  return (
-    (totals.inputTokens * price.input +
-      totals.outputTokens * price.output +
-      totals.cacheWriteTokens * price.cacheWrite +
-      totals.cacheReadTokens * price.cacheRead) /
-    MILLION
-  );
-};
-
-const spent = (totals: ModelTotals[]): number => totals.reduce((sum, entry) => sum + (costOf(entry) ?? 0), 0);
 
 const money = (amount: number): string => `$${amount.toFixed(2)}`;
 
@@ -889,8 +835,6 @@ export const memoryBodyPage = (email: string, live: Live, memory: Memory, now: n
 
 const SERIES_COLORS = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)"];
 
-const keyOf = (totals: ModelTotals): string => `${totals.provider} ${totals.model}`;
-
 const modelLabel = (model: string): string => {
   if (!model.startsWith("claude-")) return model;
   const [family, ...version] = model
@@ -902,51 +846,10 @@ const modelLabel = (model: string): string => {
   return version.length === 0 ? name : `${name} ${version.join(".")}`;
 };
 
-const GITHUB_TAG = `${REPO_TAG}github.com/`;
-
-const repoLabel = (repo: string): string => {
-  if (repo === "") return "global";
-  return repo.startsWith(GITHUB_TAG) ? repo.slice(GITHUB_TAG.length) : repo;
-};
-
-const NOTHING: TokenCounts = {
-  prompts: 0,
-  inputTokens: 0,
-  outputTokens: 0,
-  cacheWriteTokens: 0,
-  cacheReadTokens: 0,
-};
-
-const totalled = (rows: TokenCounts[]): TokenCounts =>
-  rows.reduce(
-    (sum, row) => ({
-      prompts: sum.prompts + row.prompts,
-      inputTokens: sum.inputTokens + row.inputTokens,
-      outputTokens: sum.outputTokens + row.outputTokens,
-      cacheWriteTokens: sum.cacheWriteTokens + row.cacheWriteTokens,
-      cacheReadTokens: sum.cacheReadTokens + row.cacheReadTokens,
-    }),
-    NOTHING,
-  );
-
-const countedTokens = (counts: TokenCounts): number =>
-  counts.inputTokens + counts.outputTokens + counts.cacheWriteTokens + counts.cacheReadTokens;
-
 const within = (rows: ModelBucket[], from: string, to: string): ModelBucket[] =>
   rows.filter((row) => row.bucket >= from && row.bucket <= to);
 
 const inBucket = (rows: ModelBucket[], bucket: string): ModelBucket[] => rows.filter((row) => row.bucket === bucket);
-
-const byModel = (rows: ModelTotals[]): ModelTotals[] => {
-  const merged = new Map<string, ModelTotals[]>();
-  for (const row of rows) merged.set(keyOf(row), [...(merged.get(keyOf(row)) ?? []), row]);
-  return [...merged.values()]
-    .flatMap((group) => {
-      const first = group[0];
-      return first ? [{ provider: first.provider, model: first.model, ...totalled(group) }] : [];
-    })
-    .sort((left, right) => (costOf(right) ?? -1) - (costOf(left) ?? -1));
-};
 
 interface Band {
   kind: "model" | "other";
@@ -985,11 +888,6 @@ const costSeries = (rows: ModelBucket[], buckets: string[], bands: Band[]): Seri
 
 const perBucket = (rows: ModelBucket[], buckets: string[], pick: (counts: TokenCounts) => number): number[] =>
   buckets.map((bucket) => inBucket(rows, bucket).reduce((sum, row) => sum + pick(row), 0));
-
-const cacheHit = (counts: TokenCounts): number => {
-  const fresh = counts.inputTokens + counts.cacheReadTokens;
-  return fresh === 0 ? 0 : counts.cacheReadTokens / fresh;
-};
 
 interface Graded {
   bucket: string;
@@ -1040,9 +938,6 @@ const mixRows = (models: ModelTotals[], bands: Band[], total: number): string =>
       return `<tr><td><em style="background:${swatch}"></em>${escapeHtml(modelLabel(model.model))}</td><td class="r">${tokens(countedTokens(model))}</td><td class="r">${cost === null ? "unpriced" : dollars(cost)}</td><td class="r">${share}</td></tr>`;
     })
     .join("");
-
-const pricedIn = (models: ModelTotals[]): number =>
-  models.filter((model) => priceOf(model.provider, model.model) !== null).length;
 
 // A row whose models are all unpriced must not read as free, and one that mixes priced and unpriced
 // models is marked as the floor it is rather than a total.
