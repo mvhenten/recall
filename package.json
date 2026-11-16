@@ -22,7 +22,8 @@
     "deploy": "node npm-scripts/deploy.mjs",
     "presetup": "npm run build:browser",
     "setup": "node npm-scripts/setup.mjs",
-    "release": "node npm-scripts/release.mjs"
+    "release": "node npm-scripts/release.mjs",
+  "doctor": "node -e \"console.log('Node version:', process.version); console.log('node_modules installed:', require('fs').existsSync('node_modules'));\""
   },
   "dependencies": {
     "drizzle-orm": "^0.45.4",
