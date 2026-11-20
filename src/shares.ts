@@ -13,6 +13,7 @@ export const SHARE_LINK_PREFIX = "/link";
 export const SHARE_EMAIL_PREFIX = "/email";
 export const FILE_SEGMENT = "f";
 export const PLAYER_SEGMENT = "player.js";
+export const EDITOR_SEGMENT = "editor.js";
 
 export const SHARE_DAYS = 30;
 export const SHARE_WINDOW_MS = SHARE_DAYS * 86_400_000;

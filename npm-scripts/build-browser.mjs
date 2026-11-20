@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Bundles the two scripts the browser runs — browser/view.ts, which the session page reads its
-// transcript with, and browser/player.ts, which drives an audio artifact's player — into strings
+// Bundles the scripts the browser runs — browser/view.ts, which the session page reads its
+// transcript with, browser/player.ts, which drives an audio artifact's player, and
+// browser/editor.ts, which wires a document's editor — into strings
 // the Worker serves. It is a build step because the browser and the Worker share code: the turn
 // reader the index runs, the arithmetic of the walk, and the player's state machine. A Worker
 // cannot read its own source. The output is generated on install and before every deploy, never
@@ -16,6 +17,7 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const BUNDLES = [
   { entry: "view.ts", out: "transcript-view.generated.ts", name: "TRANSCRIPT_SCRIPT" },
   { entry: "player.ts", out: "player-view.generated.ts", name: "PLAYER_SCRIPT" },
+  { entry: "editor.ts", out: "editor-view.generated.ts", name: "EDITOR_SCRIPT" },
 ];
 
 for (const bundle of BUNDLES) {
