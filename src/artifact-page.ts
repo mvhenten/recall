@@ -1,8 +1,22 @@
 import { type ArtifactFile, type ArtifactRecord, RAW_INLINE_BYTES } from "./artifacts";
-import { ARTIFACT_PAGE_CSP, ARTIFACT_PLAYER_CSP, escapeHtml, htmlPage, sizeText, TOKENS } from "./page";
+import { EDIT_VIEW, type EditorPlan } from "./editor-plan";
+import { EDITOR_SCRIPT } from "./editor-view.generated";
+import {
+  ARTIFACT_EDITOR_CSP,
+  ARTIFACT_PAGE_CSP,
+  ARTIFACT_PLAYER_CSP,
+  CSRF_COOKIE,
+  EASYMDE_SCRIPT,
+  EASYMDE_STYLE,
+  escapeHtml,
+  htmlPage,
+  ICONS_STYLE,
+  sizeText,
+  TOKENS,
+} from "./page";
 import type { PlayerPlan } from "./player";
 import { PLAYER_SCRIPT } from "./player-view.generated";
-import { FILE_SEGMENT, PLAYER_SEGMENT } from "./shares";
+import { EDITOR_SEGMENT, FILE_SEGMENT, PLAYER_SEGMENT } from "./shares";
 
 // A document this long is not rendered: the bare address answers the raw view instead, and the
 // raw page names the ceiling, the document's own size and the fix. One constant, so changing the
@@ -14,9 +28,12 @@ export const RAW_VIEW = "raw";
 // Where the page sits and who is reading it. Every address the module draws is built from `base`:
 // an owner's page passes `/a/<name>` and a shared page passes `/link/<token>` or `/email/<id>`, so
 // the three are values of one parameter rather than three cases.
+// `editable` is true for the owner of a document on its own address, and only then does a page
+// draw the Edit control.
 export interface ArtifactChrome {
   base: string;
   audience: Audience;
+  editable: boolean;
 }
 
 // The band is one slot with one tenant, and the type is what makes that true: a recipient's page
@@ -99,6 +116,14 @@ a{color:var(--accent)}
 .bar input[type=range]:disabled{opacity:.45}
 .bar .at{flex:none;font:400 .76rem/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
 .player{padding-bottom:5rem}
+.editor{display:grid;gap:.6rem}
+.editor button{justify-self:start;font:600 .85rem/1 var(--sans);padding:.5rem 1rem;border:1px solid var(--accent);border-radius:6px;background:var(--accent);color:var(--on-accent);cursor:pointer}
+.editor button[disabled]{opacity:.45;cursor:default}
+.editor .why{margin:0;font-size:.85rem;color:var(--bad)}
+.editor .why:empty{display:none}
+.EasyMDEContainer .CodeMirror,.editor-toolbar,.editor-preview{background:var(--surface);color:var(--ink);border-color:var(--line2)}
+.editor-toolbar button{color:var(--ink)}
+.CodeMirror-cursor{border-color:var(--ink)}
 @media (min-width:48rem){.wrap{padding-left:1.5rem;padding-right:1.5rem}}`;
 
 interface Frame {
@@ -113,7 +138,7 @@ interface Frame {
   referrer: string;
 }
 
-const page = (frame: Frame): Response =>
+const page = (frame: Frame, headers: Record<string, string> = {}): Response =>
   htmlPage(
     frame.status,
     frame.title,
@@ -125,6 +150,7 @@ const page = (frame: Frame): Response =>
       "content-security-policy": frame.csp,
       "cache-control": "private, no-cache",
       "referrer-policy": frame.referrer,
+      ...headers,
     },
   );
 
@@ -181,14 +207,14 @@ const heading = (record: ArtifactRecord, meta: string): string =>
     record.description === "" ? "" : `<p class="adesc">${escapeHtml(record.description)}</p>`
   }<p class="ameta">${escapeHtml(meta)}</p>`;
 
-const views = (base: string, raw: boolean, renders: boolean): string => {
-  const address = escapeHtml(base);
-  const rendered = renders
-    ? `<a href="${address}"${raw ? "" : ' aria-current="page"'}>Rendered</a>`
-    : "<span>Rendered</span>";
-  return `<p class="views">${rendered}<a href="${address}?view=${RAW_VIEW}"${
-    raw ? ' aria-current="page"' : ""
-  }>Raw</a></p>`;
+type View = "rendered" | "raw" | "edit";
+
+const views = (chrome: ArtifactChrome, current: View, renders: boolean): string => {
+  const address = escapeHtml(chrome.base);
+  const mark = (view: View): string => (view === current ? ' aria-current="page"' : "");
+  const rendered = renders ? `<a href="${address}"${mark("rendered")}>Rendered</a>` : "<span>Rendered</span>";
+  const edit = chrome.editable ? `<a href="${address}?view=${EDIT_VIEW}"${mark("edit")}>Edit</a>` : "";
+  return `<p class="views">${rendered}<a href="${address}?view=${RAW_VIEW}"${mark("raw")}>Raw</a>${edit}</p>`;
 };
 
 // The last writer is an email address, so a shared page drops it and keeps the size and the publish
@@ -222,7 +248,7 @@ export const documentPage = (record: ArtifactRecord, chrome: ArtifactChrome, ren
     title: record.title,
     badge: record.type,
     band: band(audience),
-    main: `${heading(record, documentMeta(record, audience))}${views(chrome.base, false, true)}${main}${footer(record, audience)}`,
+    main: `${heading(record, documentMeta(record, audience))}${views(chrome, "rendered", true)}${main}${footer(record, audience)}`,
     status: 200,
     csp: ARTIFACT_PAGE_CSP,
     column: "",
@@ -261,7 +287,7 @@ export const rawDocumentPage = (
     title: record.title,
     badge: record.type,
     band: band(audience),
-    main: `${heading(record, documentMeta(record, audience))}${views(chrome.base, true, !over)}${notice}${cut}<pre class="src">${escapeHtml(
+    main: `${heading(record, documentMeta(record, audience))}${views(chrome, "raw", !over)}${notice}${cut}<pre class="src">${escapeHtml(
       source,
     )}</pre>${footer(record, audience)}`,
     status: 200,
@@ -271,6 +297,55 @@ export const rawDocumentPage = (
     referrer: referrerFor(audience),
   });
 };
+
+const EASYMDE_SCRIPT_SRI = "sha384-mTM6vzy+/UiHrMBClNGViM9qEv0/26iCGqpJKhSzdnjrxbKjO3vkT62ujXQ8B5iv";
+const EASYMDE_STYLE_SRI = "sha384-ZoLYv3S+AsZX+zhbN1D1+WPpc8f+DmLfxfgw+qn0Nq8wJPOYQQXEW5ZrRhcGozlG";
+const ICONS_SRI = "sha384-wvfXpqpZZVQGK6TAh5PVlGOfQNHSoD2xbE+QkPxCAFlNEevoEH3Sl0sibVcOQVnN";
+
+// The owner's editor: the markdown in a textarea EasyMDE takes over, saved through the publish.
+// It is the one page on this host that loads script from another origin, so it alone carries the
+// policy naming it, and it sets the token the publish sends back.
+export const editorPage = (
+  record: ArtifactRecord,
+  chrome: ArtifactChrome,
+  source: string,
+  plan: EditorPlan,
+): Response =>
+  page(
+    {
+      title: `Edit ${record.title}`,
+      badge: record.type,
+      band: band(chrome.audience),
+      main: `${heading(record, documentMeta(record, chrome.audience))}${views(chrome, "edit", true)}
+<link rel="stylesheet" href="${ICONS_STYLE}" integrity="${ICONS_SRI}" crossorigin="anonymous">
+<link rel="stylesheet" href="${EASYMDE_STYLE}" integrity="${EASYMDE_STYLE_SRI}" crossorigin="anonymous">
+<form class="editor" id="eform"><textarea id="esource">${escapeHtml(source)}</textarea>
+<button type="submit" id="esave">Save</button><p class="why" id="ewhy" role="status" aria-live="polite"></p></form>
+<noscript><p class="notice">The editor needs a script to run. Publish with recall publish --replace instead.</p></noscript>
+<script type="application/json" id="eplan">${JSON.stringify(plan).replaceAll("<", "\\u003c")}</script>
+<script src="${EASYMDE_SCRIPT}" integrity="${EASYMDE_SCRIPT_SRI}" crossorigin="anonymous" defer></script>
+<script src="${escapeHtml(`${chrome.base}/${EDITOR_SEGMENT}`)}" defer></script>${footer(record, chrome.audience)}`,
+      status: 200,
+      csp: ARTIFACT_EDITOR_CSP,
+      column: "",
+      pinned: "",
+      referrer: "same-origin",
+    },
+    {
+      "cache-control": "no-store",
+      "set-cookie": `${CSRF_COOKIE}=${plan.csrf}; Path=/; Secure; HttpOnly; SameSite=Strict`,
+    },
+  );
+
+export const editorScript = (): Response =>
+  new Response(EDITOR_SCRIPT, {
+    headers: {
+      "content-type": "text/javascript; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'",
+      "x-content-type-options": "nosniff",
+    },
+  });
 
 const GONE_TAG = "UNAVAILABLE";
 

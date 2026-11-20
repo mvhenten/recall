@@ -5,6 +5,8 @@ import {
   type Audience,
   artifactNotice,
   documentPage,
+  editorPage,
+  editorScript,
   playerPage,
   playerScript,
   RAW_VIEW,
@@ -98,6 +100,7 @@ import {
   TOKEN_PATTERN,
   userForEmail,
 } from "./device";
+import { CSRF_HEADER, EDIT_VIEW, type EditorPlan } from "./editor-plan";
 import { ARTIFACT_SORTS, CURSOR_PARAM, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortInForce } from "./listing";
 import {
   DEVICE_HEADER,
@@ -210,6 +213,7 @@ import {
 } from "./records";
 import {
   ARTIFACT_PREFIX,
+  EDITOR_SEGMENT,
   FILE_SEGMENT,
   hashShareToken,
   MAX_EMAIL_SHARES,
@@ -1738,13 +1742,19 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const manifest = parseManifest(jsonOrNull(text));
     if (!manifest.ok) return error(400, manifest.error);
     const declaredFiles = manifest.value.files;
-    const total = declaredFiles.reduce((running, file) => running + file.bytes, 0);
-    if (total > MAX_ARTIFACT_BYTES || declaredFiles.some((file) => file.bytes > MAX_FILE_BYTES)) return tooLarge();
     const replacing = url.searchParams.get("replace") === "true";
     const target = await writeTarget(account, store, caller.userId, name, replacing);
     if (target instanceof Response) return target;
     if (target !== null && !replacing) return conflict(target);
     const owner = target?.ownerUserId ?? caller.userId;
+    const current = new Map((target?.files ?? []).map((file) => [file.path, file.bytes]));
+    const sizes = declaredFiles.map((file) => ("keep" in file ? current.get(file.path) : file.bytes));
+    const unheld = declaredFiles.find((_file, at) => sizes[at] === undefined);
+    if (unheld !== undefined) {
+      return error(400, `${unheld.path} is marked keep and ${name} holds no such file to keep; send its bytes instead`);
+    }
+    const total = sizes.reduce((running: number, bytes) => running + (bytes ?? 0), 0);
+    if (total > MAX_ARTIFACT_BYTES || sizes.some((bytes) => (bytes ?? 0) > MAX_FILE_BYTES)) return tooLarge();
     if (manifest.value.read === "account" && (await accountReadableElsewhere(account, owner, name))) {
       return nameTaken(name);
     }
@@ -1755,10 +1765,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     };
     const files: ArtifactFile[] = [];
     for (const file of declaredFiles) {
-      const part = await parts.nextPart();
-      if (part === null) {
-        return refuse(400, `the manifest names ${declaredFiles.length} files and the body holds ${files.length}`);
+      if ("keep" in file) {
+        const source = target === null ? null : await readArtifactFile(host.bucket, owner, name, target.rev, file.path);
+        if (source === null)
+          return refuse(409, `${file.path} is gone from storage; send its bytes instead of keeping it`);
+        const copy = source.body.pipeThrough(new FixedLengthStream(source.size));
+        await host.bucket.put(fileKey(owner, name, rev, file.path), copy);
+        files.push({ path: file.path, bytes: source.size, contentType: contentTypeFor(file.path) });
+        continue;
       }
+      const part = await parts.nextPart();
+      if (part === null) return refuse(400, `the body ends before the part for ${file.path}`);
       // R2 takes a stream whose length is known, so the length the manifest declared is the length
       // the object is written at and the part is held to it exactly.
       const sized = new FixedLengthStream(file.bytes);
@@ -3064,6 +3081,7 @@ export const createApp = (deps: Deps): App => {
   // spend the CPU on. Both views are recall's own HTML off the publisher's markdown, so neither
   // carries a script and the renderer escapes every character it prints.
   const documentView = async (
+    request: Request,
     url: URL,
     host: ArtifactHost,
     record: ArtifactRecord,
@@ -3071,6 +3089,25 @@ export const createApp = (deps: Deps): App => {
   ): Promise<Response> => {
     const entry = record.files[0];
     if (entry === undefined) throw new Error(`artifact ${record.name} names no file`);
+    if (url.searchParams.get("view") === EDIT_VIEW && chrome.editable) {
+      const source = await (await entryBody(host.bucket, record)).text();
+      const plan: EditorPlan = {
+        base: chrome.base,
+        publish: `/v2/artifacts/${encodeURIComponent(record.name)}?replace=true`,
+        csrf: readCookie(request.headers.get("cookie"), CSRF_COOKIE) ?? randomToken(),
+        entry: entry.path,
+        files: record.files.map((file) => file.path),
+        fileBase: `${chrome.base}/${FILE_SEGMENT}`,
+        meta: {
+          type: record.type,
+          title: record.title,
+          description: record.description,
+          read: record.read,
+          write: record.write,
+        },
+      };
+      return editorPage(record, chrome, source, plan);
+    }
     if (url.searchParams.get("view") === RAW_VIEW) {
       const source = await entryHead(host.bucket, record, RAW_INLINE_BYTES);
       return rawDocumentPage(record, chrome, source, entry.bytes > RAW_INLINE_BYTES);
@@ -3100,11 +3137,17 @@ export const createApp = (deps: Deps): App => {
   // both the page, because recipients copy addresses with a trailing slash; the script answers
   // directly under the base and a file under the file segment, so no file path and no name can
   // reach either position.
-  type UnderBase = { kind: "page" } | { kind: "script" } | { kind: "file"; path: string } | { kind: "elsewhere" };
+  type UnderBase =
+    | { kind: "page" }
+    | { kind: "script" }
+    | { kind: "editor" }
+    | { kind: "file"; path: string }
+    | { kind: "elsewhere" };
 
   const underBase = (tail: readonly string[]): UnderBase => {
     if (tail.length === 0 || (tail.length === 1 && tail[0] === "")) return { kind: "page" };
     if (tail.length === 1 && tail[0] === PLAYER_SEGMENT) return { kind: "script" };
+    if (tail.length === 1 && tail[0] === EDITOR_SEGMENT) return { kind: "editor" };
     if (tail.length > 1 && tail[0] === FILE_SEGMENT) return { kind: "file", path: tail.slice(1).join("/") };
     return { kind: "elsewhere" };
   };
@@ -3123,8 +3166,9 @@ export const createApp = (deps: Deps): App => {
   ): Promise<Response> | Response => {
     if (route.kind === "elsewhere") return lost();
     if (route.kind === "script") return playerScript();
+    if (route.kind === "editor") return editorScript();
     if (route.kind === "file") return artifactFile(request, host.bucket, record, route.path, lost);
-    if (record.type === "document") return documentView(url, host, record, chrome);
+    if (record.type === "document") return documentView(request, url, host, record, chrome);
     if (record.type === "audio") return playerView(host, record, chrome);
     return entryBody(host.bucket, record).then((object) => artifactPage(object.body));
   };
@@ -3188,7 +3232,9 @@ export const createApp = (deps: Deps): App => {
       return route.kind === "page" ? ((await legacySite(host, userId, name.value)) ?? lost()) : lost();
     }
     const audience = await audienceFor(db, host, record, userId, deps.now());
-    return artifactView(request, url, host, record, { base: artifactBase(name.value), audience }, route, lost);
+    const editable = record.ownerUserId === userId && record.type === "document";
+    const chrome: ArtifactChrome = { base: artifactBase(name.value), audience, editable };
+    return artifactView(request, url, host, record, chrome, route, lost);
   };
 
   const SHARE_PREFIXES: ReadonlyArray<readonly [ShareMode, string]> = [
@@ -3277,6 +3323,7 @@ export const createApp = (deps: Deps): App => {
     const chrome: ArtifactChrome = {
       base: lane.base,
       audience: { kind: "recipient", expiresAt: share.expiresAt },
+      editable: false,
     };
     if (route.kind === "page") await recordShareUse(db, share.shareId, now);
     return artifactView(request, url, host, record, chrome, route, gone);
@@ -3661,10 +3708,32 @@ export const createApp = (deps: Deps): App => {
     return tenantOf(env, caller.userId).api(request, caller, handed());
   };
 
+  // The publish an edit page sends. It is the API's own PUT, answered on the artifact hostname so
+  // the page calls it on its own origin, with the Access sign-in standing in for the device token
+  // and the page's token proving the request came from an edit page of this host.
+  const browserPublish = async (request: Request, url: URL, env: WorkerEnv, host: ArtifactHost): Promise<Response> => {
+    const [, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
+    if (collection !== "artifacts" || rawName === undefined || rest.length > 0) return error(404, "not found");
+    if (request.method !== "PUT") return error(405, "this host answers a publish and nothing else under /v2");
+    const refuse = (status: number, _title: string, text: string): Response => error(status, text);
+    const email = await approver(request, host.verify, refuse);
+    if (email instanceof Response) return email;
+    const userId = await invited(env.DB, email, refuse);
+    if (userId instanceof Response) return userId;
+    const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
+    const token = request.headers.get(CSRF_HEADER) ?? "";
+    if (request.headers.get("origin") !== url.origin || cookie === null || !sameSecret(cookie, token)) {
+      return error(403, "the publish did not come from an edit page of this host; reload the page and try again");
+    }
+    const caller: Caller = { userId, deviceId: "", name: "browser", host: url.hostname };
+    return account.artifacts(request, url, env.DB, artifactStoreFor(env), caller, rawName, rest);
+  };
+
   const route = async (request: Request, env: WorkerEnv): Promise<Response> => {
     const url = new URL(request.url);
     const host = deps.artifactHost;
     if (host !== null && url.hostname === host.hostname) {
+      if (url.pathname.startsWith("/v2/")) return browserPublish(request, url, env, host);
       return underSharePrefix(url.pathname)
         ? sharedSite(request, url, env, host)
         : artifactSite(request, url, env, host);

@@ -122,10 +122,9 @@ export const revisionPrefix = (userId: string, name: string, rev: number): strin
 
 const SEGMENT = /^[a-z0-9][a-z0-9._-]*$/;
 
-export interface ManifestFile {
-  path: string;
-  bytes: number;
-}
+// A file marked keep is copied from the revision being replaced and its part is not sent, so an
+// edit sends the markdown and any new image rather than every file the artifact holds.
+export type ManifestFile = { path: string; keep: true } | { path: string; bytes: number };
 
 export interface Manifest {
   type: ArtifactType;
@@ -142,7 +141,7 @@ const WRITE_MESSAGE = `write must be one of ${writePermissions.join(", ")}`;
 const META_MESSAGE = `title must hold at most ${MAX_TITLE_CHARS} characters and description at most ${MAX_DESCRIPTION_CHARS}`;
 const FILES_MESSAGE = `files must name 1 to ${MAX_FILES} files`;
 const PATH_MESSAGE = `a file path holds at most ${MAX_PATH_SEGMENTS} segments of [a-z0-9][a-z0-9._-]* and at most ${MAX_PATH_CHARS} characters`;
-const BYTES_MESSAGE = "each file must declare bytes as a whole number of zero or more";
+const BYTES_MESSAGE = "each file must declare bytes as a whole number of zero or more, or keep: true";
 const MANIFEST_MESSAGE = "the manifest must name type, title, description, read, write and files";
 
 // A site is served inside `sandbox`, which gives it an opaque origin, so `'self'` matches nothing
@@ -185,6 +184,10 @@ const parseManifestFiles = (value: unknown): Parsed<ManifestFile[]> => {
     if (!isRecord(file)) return fail(FILES_MESSAGE);
     const path = parseFilePath(file.path);
     if (!path.ok) return path;
+    if (file.keep === true) {
+      named.push({ path: path.value, keep: true });
+      continue;
+    }
     if (!isInteger(file.bytes, 0, Number.MAX_SAFE_INTEGER)) return fail(BYTES_MESSAGE);
     named.push({ path: path.value, bytes: file.bytes });
   }
