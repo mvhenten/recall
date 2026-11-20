@@ -6,8 +6,11 @@ import {
   ARTIFACT_PAGE_CSP,
   ARTIFACT_PLAYER_CSP,
   CSRF_COOKIE,
+  EASYMDE_SCRIPT,
+  EASYMDE_STYLE,
   escapeHtml,
   htmlPage,
+  ICONS_STYLE,
   sizeText,
   TOKENS,
 } from "./page";
@@ -295,10 +298,8 @@ export const rawDocumentPage = (
   });
 };
 
-const EASYMDE = "https://cdn.jsdelivr.net/npm/easymde@2.21.0/dist";
 const EASYMDE_SCRIPT_SRI = "sha384-mTM6vzy+/UiHrMBClNGViM9qEv0/26iCGqpJKhSzdnjrxbKjO3vkT62ujXQ8B5iv";
 const EASYMDE_STYLE_SRI = "sha384-ZoLYv3S+AsZX+zhbN1D1+WPpc8f+DmLfxfgw+qn0Nq8wJPOYQQXEW5ZrRhcGozlG";
-const ICONS = "https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css";
 const ICONS_SRI = "sha384-wvfXpqpZZVQGK6TAh5PVlGOfQNHSoD2xbE+QkPxCAFlNEevoEH3Sl0sibVcOQVnN";
 
 // The owner's editor: the markdown in a textarea EasyMDE takes over, saved through the publish.
@@ -316,13 +317,13 @@ export const editorPage = (
       badge: record.type,
       band: band(chrome.audience),
       main: `${heading(record, documentMeta(record, chrome.audience))}${views(chrome, "edit", true)}
-<link rel="stylesheet" href="${ICONS}" integrity="${ICONS_SRI}" crossorigin="anonymous">
-<link rel="stylesheet" href="${EASYMDE}/easymde.min.css" integrity="${EASYMDE_STYLE_SRI}" crossorigin="anonymous">
+<link rel="stylesheet" href="${ICONS_STYLE}" integrity="${ICONS_SRI}" crossorigin="anonymous">
+<link rel="stylesheet" href="${EASYMDE_STYLE}" integrity="${EASYMDE_STYLE_SRI}" crossorigin="anonymous">
 <form class="editor" id="eform"><textarea id="esource">${escapeHtml(source)}</textarea>
 <button type="submit" id="esave">Save</button><p class="why" id="ewhy" role="status" aria-live="polite"></p></form>
 <noscript><p class="notice">The editor needs a script to run. Publish with recall publish --replace instead.</p></noscript>
 <script type="application/json" id="eplan">${JSON.stringify(plan).replaceAll("<", "\\u003c")}</script>
-<script src="${EASYMDE}/easymde.min.js" integrity="${EASYMDE_SCRIPT_SRI}" crossorigin="anonymous" defer></script>
+<script src="${EASYMDE_SCRIPT}" integrity="${EASYMDE_SCRIPT_SRI}" crossorigin="anonymous" defer></script>
 <script src="${escapeHtml(`${chrome.base}/${EDITOR_SEGMENT}`)}" defer></script>${footer(record, chrome.audience)}`,
       status: 200,
       csp: ARTIFACT_EDITOR_CSP,

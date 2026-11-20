@@ -69,7 +69,7 @@ describe("the artifact parsers", () => {
         description: "",
         read: "private",
         write: "owner",
-        files: [{ path: "index.html", bytes: 11, keep: false }],
+        files: [{ path: "index.html", bytes: 11 }],
       },
     });
     const one = (path: string): unknown[] => [{ path, bytes: 1 }];

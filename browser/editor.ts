@@ -1,6 +1,6 @@
-// The edit page's wiring. EasyMDE draws the editor; everything this file sends goes through the
-// artifact's own publish, with the files that did not change marked keep so only the markdown and
-// a new image travel.
+// The edit page's wiring. EasyMDE draws the editor, and Save sends one publish: the markdown, the
+// images added since the page opened that the text still names, and every other file marked keep.
+// An image is held in the page until then, so an edit abandoned before Save stores nothing.
 //
 // npm-scripts/build-browser.mjs bundles this to the script the edit page names.
 
@@ -8,6 +8,7 @@ import { CSRF_HEADER, type EditorPlan } from "../src/editor-plan";
 
 interface EasyMde {
   value(): string;
+  markdown(text: string): string;
 }
 
 interface EasyMdeOptions {
@@ -18,6 +19,7 @@ interface EasyMdeOptions {
   imageAccept: string;
   imageMaxSize: number;
   toolbar: string[];
+  previewRender: (text: string) => string;
   imageUploadFunction: (file: File, onSuccess: (url: string) => void, onError: (message: string) => void) => void;
 }
 
@@ -33,9 +35,11 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 
-interface Sent {
-  path: string;
-  body: Blob;
+const ABSOLUTE = /^(?:[a-z][a-z0-9+.-]*:|\/)/i;
+
+interface Pending {
+  file: File;
+  preview: string;
 }
 
 const refusalOf = async (response: Response): Promise<string> => {
@@ -48,34 +52,39 @@ const refusalOf = async (response: Response): Promise<string> => {
 const boot = (
   form: HTMLFormElement,
   source: HTMLTextAreaElement,
-  save: HTMLButtonElement,
+  saveButton: HTMLButtonElement,
   why: HTMLElement,
   plan: EditorPlan,
 ): void => {
-  let files = [...plan.files];
+  const pending = new Map<string, Pending>();
 
-  const publish = async (sent: readonly Sent[]): Promise<string | null> => {
-    const paths = [...files, ...sent.map((one) => one.path).filter((path) => !files.includes(path))];
-    const manifest = {
-      ...plan.meta,
-      files: paths.map((path) => {
-        const one = sent.find((candidate) => candidate.path === path);
-        return one === undefined ? { path, keep: true } : { path, bytes: one.body.size };
-      }),
-    };
-    const body = new FormData();
-    body.append("manifest", JSON.stringify(manifest));
-    for (const path of paths) {
-      const one = sent.find((candidate) => candidate.path === path);
-      if (one !== undefined) body.append(path, one.body, path);
-    }
-    const response = await fetch(plan.publish, { method: "PUT", body, headers: { [CSRF_HEADER]: plan.csrf } });
-    if (!response.ok) return refusalOf(response);
-    files = paths;
-    return null;
+  // A relative image resolves into the artifact's own files, as the rendered page resolves it, and
+  // an image not yet saved shows from the browser's copy.
+  const previewSrc = (src: string): string => {
+    const held = pending.get(src);
+    if (held !== undefined) return held.preview;
+    return ABSOLUTE.test(src) ? src : `${plan.fileBase}/${src}`;
   };
 
-  const editor = new EasyMDE({
+  const publish = async (markdown: string): Promise<string | null> => {
+    const added = [...pending].filter(([path]) => markdown.includes(path));
+    const body = new FormData();
+    const manifest = {
+      ...plan.meta,
+      files: [
+        { path: plan.entry, bytes: new Blob([markdown]).size },
+        ...plan.files.filter((path) => path !== plan.entry).map((path) => ({ path, keep: true })),
+        ...added.map(([path, held]) => ({ path, bytes: held.file.size })),
+      ],
+    };
+    body.append("manifest", JSON.stringify(manifest));
+    body.append(plan.entry, new Blob([markdown], { type: "text/markdown" }), plan.entry);
+    for (const [path, held] of added) body.append(path, held.file, path);
+    const response = await fetch(plan.publish, { method: "PUT", body, headers: { [CSRF_HEADER]: plan.csrf } });
+    return response.ok ? null : refusalOf(response);
+  };
+
+  const editor: EasyMde = new EasyMDE({
     element: source,
     spellChecker: false,
     autoDownloadFontAwesome: false,
@@ -98,6 +107,14 @@ const boot = (
       "side-by-side",
       "fullscreen",
     ],
+    previewRender: (text) => {
+      const template = document.createElement("template");
+      template.innerHTML = editor.markdown(text);
+      template.content.querySelectorAll("img").forEach((image) => {
+        image.src = previewSrc(image.getAttribute("src") ?? "");
+      });
+      return template.innerHTML;
+    },
     imageUploadFunction: (file, onSuccess, onError) => {
       const extension = IMAGE_EXTENSIONS[file.type];
       if (extension === undefined) {
@@ -105,29 +122,26 @@ const boot = (
         return;
       }
       const path = `images/${crypto.randomUUID()}.${extension}`;
-      publish([{ path, body: file }]).then(
-        (refusal) => (refusal === null ? onSuccess(path) : onError(refusal)),
-        (failure: unknown) => onError(`The upload failed: ${String(failure)}`),
-      );
+      pending.set(path, { file, preview: URL.createObjectURL(file) });
+      onSuccess(path);
     },
   });
 
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    save.disabled = true;
+    saveButton.disabled = true;
     why.textContent = "Saving…";
-    const markdown = new Blob([editor.value()], { type: "text/markdown" });
-    publish([{ path: plan.entry, body: markdown }]).then(
+    publish(editor.value()).then(
       (refusal) => {
         if (refusal === null) {
           window.location.assign(plan.base);
           return;
         }
-        save.disabled = false;
+        saveButton.disabled = false;
         why.textContent = refusal;
       },
       (failure: unknown) => {
-        save.disabled = false;
+        saveButton.disabled = false;
         why.textContent = `The save failed: ${String(failure)}`;
       },
     );
@@ -136,10 +150,10 @@ const boot = (
 
 const form = document.querySelector<HTMLFormElement>("#eform");
 const source = document.querySelector<HTMLTextAreaElement>("#esource");
-const save = document.querySelector<HTMLButtonElement>("#esave");
+const saveButton = document.querySelector<HTMLButtonElement>("#esave");
 const why = document.querySelector<HTMLElement>("#ewhy");
 const planSource = document.querySelector<HTMLElement>("#eplan");
-if (form === null || source === null || save === null || why === null || planSource === null) {
+if (form === null || source === null || saveButton === null || why === null || planSource === null) {
   throw new Error("the artifact page carries no editor");
 }
-boot(form, source, save, why, JSON.parse(planSource.textContent ?? "") as EditorPlan);
+boot(form, source, saveButton, why, JSON.parse(planSource.textContent ?? "") as EditorPlan);

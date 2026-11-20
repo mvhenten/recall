@@ -124,11 +124,7 @@ const SEGMENT = /^[a-z0-9][a-z0-9._-]*$/;
 
 // A file marked keep is copied from the revision being replaced and its part is not sent, so an
 // edit sends the markdown and any new image rather than every file the artifact holds.
-export interface ManifestFile {
-  path: string;
-  bytes: number;
-  keep: boolean;
-}
+export type ManifestFile = { path: string; keep: true } | { path: string; bytes: number };
 
 export interface Manifest {
   type: ArtifactType;
@@ -189,11 +185,11 @@ const parseManifestFiles = (value: unknown): Parsed<ManifestFile[]> => {
     const path = parseFilePath(file.path);
     if (!path.ok) return path;
     if (file.keep === true) {
-      named.push({ path: path.value, bytes: 0, keep: true });
+      named.push({ path: path.value, keep: true });
       continue;
     }
     if (!isInteger(file.bytes, 0, Number.MAX_SAFE_INTEGER)) return fail(BYTES_MESSAGE);
-    named.push({ path: path.value, bytes: file.bytes, keep: false });
+    named.push({ path: path.value, bytes: file.bytes });
   }
   return { ok: true, value: named };
 };

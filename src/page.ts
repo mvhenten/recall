@@ -68,12 +68,16 @@ export const ARTIFACT_PAGE_CSP =
 // nowhere: the audio element issues its own range requests against the file route.
 export const ARTIFACT_PLAYER_CSP = `${ARTIFACT_PAGE_CSP}; script-src 'self'; media-src 'self'`;
 
-// The editor, and nothing else on that hostname, loads EasyMDE and its icons off jsDelivr, each
-// file pinned by its hash in the page. It connects to this host alone, where the publish answers,
-// and shows a pasted image from a blob before it is stored.
-const CDN = "https://cdn.jsdelivr.net";
+// The editor, and nothing else on that hostname, loads EasyMDE and its icons off jsDelivr. The
+// policy names each file and the page pins each by its hash. It connects to this host alone, where
+// the publish answers, and previews an image not yet saved from a blob.
+export const EASYMDE_SCRIPT = "https://cdn.jsdelivr.net/npm/easymde@2.21.0/dist/easymde.min.js";
+export const EASYMDE_STYLE = "https://cdn.jsdelivr.net/npm/easymde@2.21.0/dist/easymde.min.css";
+export const ICONS_STYLE = "https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css";
+const ICONS_FONTS = "https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/fonts/";
 export const ARTIFACT_EDITOR_CSP =
-  `default-src 'none'; script-src 'self' ${CDN}; style-src 'unsafe-inline' ${CDN}; font-src ${CDN}; ` +
+  `default-src 'none'; script-src 'self' ${EASYMDE_SCRIPT}; style-src 'unsafe-inline' ${EASYMDE_STYLE} ${ICONS_STYLE}; ` +
+  `font-src ${ICONS_FONTS}; ` +
   "img-src 'self' blob:; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
 
 // A size of a megabyte or more reads in MB to one decimal, on a dashboard row and on an artifact

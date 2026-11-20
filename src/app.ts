@@ -1742,23 +1742,19 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     const manifest = parseManifest(jsonOrNull(text));
     if (!manifest.ok) return error(400, manifest.error);
     const declaredFiles = manifest.value.files;
-    const total = declaredFiles.reduce((running, file) => running + file.bytes, 0);
-    if (total > MAX_ARTIFACT_BYTES || declaredFiles.some((file) => file.bytes > MAX_FILE_BYTES)) return tooLarge();
     const replacing = url.searchParams.get("replace") === "true";
     const target = await writeTarget(account, store, caller.userId, name, replacing);
     if (target instanceof Response) return target;
     if (target !== null && !replacing) return conflict(target);
     const owner = target?.ownerUserId ?? caller.userId;
     const current = new Map((target?.files ?? []).map((file) => [file.path, file.bytes]));
-    const missing = declaredFiles.find((file) => file.keep && !current.has(file.path));
-    if (missing !== undefined) {
-      return error(
-        400,
-        `${missing.path} is marked keep and ${name} holds no such file to keep; send its bytes instead`,
-      );
+    const sizes = declaredFiles.map((file) => ("keep" in file ? current.get(file.path) : file.bytes));
+    const unheld = declaredFiles.find((_file, at) => sizes[at] === undefined);
+    if (unheld !== undefined) {
+      return error(400, `${unheld.path} is marked keep and ${name} holds no such file to keep; send its bytes instead`);
     }
-    const kept = declaredFiles.reduce((running, file) => running + (file.keep ? (current.get(file.path) ?? 0) : 0), 0);
-    if (total + kept > MAX_ARTIFACT_BYTES) return tooLarge();
+    const total = sizes.reduce((running: number, bytes) => running + (bytes ?? 0), 0);
+    if (total > MAX_ARTIFACT_BYTES || sizes.some((bytes) => (bytes ?? 0) > MAX_FILE_BYTES)) return tooLarge();
     if (manifest.value.read === "account" && (await accountReadableElsewhere(account, owner, name))) {
       return nameTaken(name);
     }
@@ -1767,12 +1763,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       await collect(host.bucket, owner, name, rev);
       return error(status, message);
     };
-    const sending = declaredFiles.filter((file) => !file.keep).length;
-    let sent = 0;
     const files: ArtifactFile[] = [];
     for (const file of declaredFiles) {
-      if (file.keep && target !== null) {
-        const source = await readArtifactFile(host.bucket, owner, name, target.rev, file.path);
+      if ("keep" in file) {
+        const source = target === null ? null : await readArtifactFile(host.bucket, owner, name, target.rev, file.path);
         if (source === null)
           return refuse(409, `${file.path} is gone from storage; send its bytes instead of keeping it`);
         const copy = source.body.pipeThrough(new FixedLengthStream(source.size));
@@ -1781,10 +1775,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         continue;
       }
       const part = await parts.nextPart();
-      if (part === null) {
-        return refuse(400, `the manifest names ${sending} files to send and the body holds ${sent}`);
-      }
-      sent += 1;
+      if (part === null) return refuse(400, `the body ends before the part for ${file.path}`);
       // R2 takes a stream whose length is known, so the length the manifest declared is the length
       // the object is written at and the part is held to it exactly.
       const sized = new FixedLengthStream(file.bytes);
@@ -3106,6 +3097,7 @@ export const createApp = (deps: Deps): App => {
         csrf: readCookie(request.headers.get("cookie"), CSRF_COOKIE) ?? randomToken(),
         entry: entry.path,
         files: record.files.map((file) => file.path),
+        fileBase: `${chrome.base}/${FILE_SEGMENT}`,
         meta: {
           type: record.type,
           title: record.title,
@@ -3723,16 +3715,11 @@ export const createApp = (deps: Deps): App => {
     const [, collection, rawName, ...rest] = url.pathname.split("/").filter((part) => part !== "");
     if (collection !== "artifacts" || rawName === undefined || rest.length > 0) return error(404, "not found");
     if (request.method !== "PUT") return error(405, "this host answers a publish and nothing else under /v2");
-    const assertion = request.headers.get("cf-access-jwt-assertion");
-    if (!assertion) return error(401, "this host saw no Cloudflare Access sign-in; reload the page to sign in again");
-    const verified = await host.verify(assertion);
-    if (!verified.ok) {
-      return error(401, `Cloudflare Access rejected the sign-in: ${verified.reason}; reload the page to sign in again`);
-    }
-    const email = emailOf(verified.principal);
-    if (email === null) return error(401, EMAIL_ONLY);
-    const userId = await userForEmail(env.DB, email);
-    if (userId === null) return error(403, `${email} is not invited to this recall`);
+    const refuse = (status: number, _title: string, text: string): Response => error(status, text);
+    const email = await approver(request, host.verify, refuse);
+    if (email instanceof Response) return email;
+    const userId = await invited(env.DB, email, refuse);
+    if (userId instanceof Response) return userId;
     const cookie = readCookie(request.headers.get("cookie"), CSRF_COOKIE);
     const token = request.headers.get(CSRF_HEADER) ?? "";
     if (request.headers.get("origin") !== url.origin || cookie === null || !sameSecret(cookie, token)) {
