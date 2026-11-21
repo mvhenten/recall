@@ -1,5 +1,7 @@
 import manifest from "../.claude-plugin/plugin.json";
-import { TOOLS } from "./tools";
+import { MAX_CONNECTOR_HTML_BYTES } from "./artifacts";
+import { parseName } from "./model";
+import { TOOLS, toolArguments } from "./tools";
 
 // The remote MCP endpoint, on streamable HTTP. It answers both eras of the transport: a client that
 // opens with initialize is served the handshake revisions, and one that declares its version in
@@ -41,6 +43,72 @@ export type ToolResult = { ok: true; text: string } | { ok: false; error: string
 export type RunTool = (call: ToolCall) => Promise<ToolResult>;
 
 export type Authorize = () => Promise<RunTool | Response>;
+
+// Artifact bytes stay in the Worker; only the remaining tools cross to the tenant object.
+export const authenticatedTools =
+  (
+    publish: (name: string, bytes: Uint8Array) => Promise<Response>,
+    artifacts: (params: URLSearchParams) => Promise<Response>,
+    tenant: RunTool,
+  ): RunTool =>
+  async (call) => {
+    if (call.name !== "recall_publish" && call.name !== "recall_artifacts") return tenant(call);
+    const refused = (reason: string): ToolResult => ({ ok: false, error: `recall: ${reason}` });
+    const definition = toolNamed(call.name);
+    if (definition === undefined) return refused(`no tool named ${call.name}`);
+    const parsed = toolArguments(definition, call.arguments);
+    if (!parsed.ok) return refused(parsed.error);
+    const args = parsed.value;
+    let response: Response;
+    if (call.name === "recall_publish") {
+      if (typeof args.name !== "string") return refused("name must be a kebab-case slug");
+      const name = parseName(args.name);
+      if (!name.ok) return refused(name.error);
+      if (typeof args.content !== "string" || args.content.trim().length === 0) {
+        return refused("content must be a nonblank HTML string");
+      }
+      if (args.content.length > MAX_CONNECTOR_HTML_BYTES) {
+        return refused(`content must hold at most ${MAX_CONNECTOR_HTML_BYTES} UTF-8 bytes`);
+      }
+      const buffer = new Uint8Array(MAX_CONNECTOR_HTML_BYTES);
+      const { read, written } = new TextEncoder().encodeInto(args.content, buffer);
+      if (read < args.content.length) {
+        return refused(`content must hold at most ${MAX_CONNECTOR_HTML_BYTES} UTF-8 bytes`);
+      }
+      response = await publish(name.value, buffer.subarray(0, written));
+    } else {
+      const params = new URLSearchParams();
+      for (const [field, max] of [
+        ["query", 2_000],
+        ["cursor", 2_048],
+      ] as const) {
+        const value = args[field];
+        if (value === undefined) continue;
+        if (typeof value !== "string" || value.length > max)
+          return refused(`${field} must be a string of at most ${max} characters`);
+        params.set(field === "query" ? "q" : field, value);
+      }
+      for (const [field, choices] of [
+        ["type", ["site", "document", "audio"]],
+        ["sort", ["newest", "name", "largest"]],
+      ] as const) {
+        const value = args[field];
+        if (value === undefined) continue;
+        if (typeof value !== "string" || !(choices as readonly string[]).includes(value))
+          return refused(`${field} must be one of ${choices.join(", ")}`);
+        params.set(field, value);
+      }
+      if (args.limit !== undefined) {
+        if (typeof args.limit !== "number" || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)
+          return refused("limit must be a whole number from 1 to 100");
+        params.set("limit", String(args.limit));
+      }
+      response = await artifacts(params);
+    }
+    const result: { error?: string; artifact?: unknown } = await response.json();
+    if (!response.ok) return refused(result.error ?? `artifact operation failed (${response.status})`);
+    return { ok: true, text: JSON.stringify(call.name === "recall_publish" ? result.artifact : result) };
+  };
 
 type Id = string | number | null;
 
@@ -114,7 +182,11 @@ const callResult = async (id: Id, params: unknown, run: RunTool): Promise<Respon
   if (tool === undefined) return refuse(id, INVALID_PARAMS, `Unknown tool: ${String(params.name)}`, 200);
   const args = params.arguments;
   if (args !== undefined && !isRecord(args)) {
-    return refuse(id, INVALID_PARAMS, `${tool.name} takes its arguments as a JSON object`, 200);
+    const text = `${tool.name} takes its arguments as a JSON object`;
+    if (tool.name === "recall_publish" || tool.name === "recall_artifacts") {
+      return reply(id, { content: [{ type: "text", text: `recall: ${text}` }], isError: true });
+    }
+    return refuse(id, INVALID_PARAMS, text, 200);
   }
   const outcome = await run({ name: tool.name, arguments: args ?? {} });
   const text = outcome.ok ? outcome.text : outcome.error;
