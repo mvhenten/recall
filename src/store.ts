@@ -8,6 +8,7 @@ import {
   gt,
   gte,
   inArray,
+  isNull,
   lt,
   lte,
   ne,
@@ -39,6 +40,18 @@ import {
 import type { OpenChunk } from "./chunks";
 import type { AccountDb, TenantDb, TenantTx } from "./db";
 import type { Caller } from "./device";
+import {
+  INBOX_CAPACITY,
+  INBOX_PAGE_BYTES,
+  INBOX_RETENTION_MS,
+  type InboxMessage,
+  type InboxPage,
+  type InboxResult,
+  inboxRefusal,
+  parseInboxPost,
+  parseInboxQuery,
+  parseInboxRead,
+} from "./inbox";
 import {
   DAY_MS,
   type DayWindow,
@@ -91,6 +104,8 @@ import {
   boardMessages,
   boardPickups,
   countedFiles as countedFilesTable,
+  inboxCounters,
+  inboxMessages,
   labels as labelsTable,
   memories,
   memoryTags,
@@ -2764,5 +2779,145 @@ export const commitRecords = async (db: TenantDb, commit: RecordCommit): Promise
       .returning({ file: sessionRecords.file })
       .all();
     return marked.length === 1;
+  });
+};
+
+const inboxHighWater = (tx: TenantTx, userId: string): number =>
+  tx.select().from(inboxCounters).where(eq(inboxCounters.userId, userId)).get()?.highWater ?? 0;
+
+const purgeInbox = (tx: TenantTx, userId: string, now: number): void => {
+  tx.delete(inboxMessages)
+    .where(and(eq(inboxMessages.userId, userId), lte(inboxMessages.expiresAt, now)))
+    .run();
+};
+
+export const postInbox = async (
+  db: TenantDb,
+  userId: string,
+  input: unknown,
+  now: number,
+): Promise<InboxResult<{ message: InboxMessage }>> => {
+  const parsed = parseInboxPost(input);
+  if (!parsed.ok) return parsed;
+  return db.transaction((tx) => {
+    const highWater = inboxHighWater(tx, userId);
+    if (highWater === Number.MAX_SAFE_INTEGER) return inboxRefusal(429, "inbox ids exhausted");
+    purgeInbox(tx, userId, now);
+    const retained =
+      tx.select({ n: count() }).from(inboxMessages).where(eq(inboxMessages.userId, userId)).get()?.n ?? 0;
+    if (retained >= INBOX_CAPACITY) {
+      const oldest = tx
+        .select({ id: inboxMessages.id })
+        .from(inboxMessages)
+        .where(and(eq(inboxMessages.userId, userId), sql`${inboxMessages.readAt} IS NOT NULL`))
+        .orderBy(asc(inboxMessages.id))
+        .limit(retained - INBOX_CAPACITY + 1)
+        .all();
+      if (oldest.length < retained - INBOX_CAPACITY + 1) return inboxRefusal(429, "inbox is full of unread messages");
+      tx.delete(inboxMessages)
+        .where(
+          and(
+            eq(inboxMessages.userId, userId),
+            inArray(
+              inboxMessages.id,
+              oldest.map((row) => row.id),
+            ),
+          ),
+        )
+        .run();
+    }
+    const message: InboxMessage = {
+      ...parsed.value,
+      link: parsed.value.link ?? null,
+      id: highWater + 1,
+      createdAt: now,
+      expiresAt: now + INBOX_RETENTION_MS,
+      readAt: null,
+    };
+    tx.insert(inboxCounters)
+      .values({ userId, highWater: message.id })
+      .onConflictDoUpdate({ target: inboxCounters.userId, set: { highWater: message.id } })
+      .run();
+    tx.insert(inboxMessages)
+      .values({ userId, ...message })
+      .run();
+    return { ok: true, value: { message } };
+  });
+};
+
+export const unreadInbox = async (
+  db: TenantDb,
+  userId: string,
+  input: unknown,
+  now: number,
+): Promise<InboxResult<InboxPage>> => {
+  const parsed = parseInboxQuery(input);
+  if (!parsed.ok) return parsed;
+  const { after, limit } = parsed.value;
+  return db.transaction((tx) => {
+    if (after > inboxHighWater(tx, userId)) return inboxRefusal(400, "after exceeds the allocated high-water mark");
+    purgeInbox(tx, userId, now);
+    const rows = tx
+      .select({
+        id: inboxMessages.id,
+        sender: inboxMessages.sender,
+        subject: inboxMessages.subject,
+        body: inboxMessages.body,
+        link: inboxMessages.link,
+        createdAt: inboxMessages.createdAt,
+        expiresAt: inboxMessages.expiresAt,
+        readAt: inboxMessages.readAt,
+      })
+      .from(inboxMessages)
+      .where(and(eq(inboxMessages.userId, userId), gt(inboxMessages.id, after), isNull(inboxMessages.readAt)))
+      .orderBy(asc(inboxMessages.id))
+      .limit(limit)
+      .all();
+    const page: InboxPage = { messages: [], nextCursor: after };
+    for (const row of rows) {
+      const candidate = { messages: [...page.messages, row], nextCursor: row.id };
+      if (new TextEncoder().encode(JSON.stringify(candidate)).length > INBOX_PAGE_BYTES) break;
+      page.messages.push(row);
+      page.nextCursor = row.id;
+    }
+    return { ok: true, value: page };
+  });
+};
+
+export const markInboxRead = async (
+  db: TenantDb,
+  userId: string,
+  input: unknown,
+  now: number,
+): Promise<InboxResult<{ updated: number }>> => {
+  const parsed = parseInboxRead(input);
+  if (!parsed.ok) return parsed;
+  const { id, up_to } = parsed.value;
+  return db.transaction((tx) => {
+    if (up_to !== undefined && up_to > inboxHighWater(tx, userId))
+      return inboxRefusal(400, "up_to exceeds the allocated high-water mark");
+    purgeInbox(tx, userId, now);
+    if (
+      id !== undefined &&
+      !tx
+        .select({ id: inboxMessages.id })
+        .from(inboxMessages)
+        .where(and(eq(inboxMessages.userId, userId), eq(inboxMessages.id, id)))
+        .get()
+    )
+      return inboxRefusal(404, "no such inbox message");
+    const updated = tx
+      .update(inboxMessages)
+      .set({ readAt: now })
+      .where(
+        and(
+          eq(inboxMessages.userId, userId),
+          isNull(inboxMessages.readAt),
+          id !== undefined ? eq(inboxMessages.id, id) : lte(inboxMessages.id, up_to),
+        ),
+      )
+      .returning({ id: inboxMessages.id })
+      .all().length;
+    return { ok: true, value: { updated } };
   });
 };
