@@ -52,6 +52,8 @@ export interface ArtifactView {
   shareCount: number;
 }
 
+export const MAX_CONNECTOR_HTML_BYTES = 16_777_216;
+
 export const MAX_FILE_BYTES = 32 * 1024 * 1024;
 export const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 export const MAX_FILES = 50;

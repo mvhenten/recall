@@ -27,6 +27,7 @@ import {
   headArtifactFile,
   MAX_ARTIFACT_BYTES,
   MAX_FILE_BYTES,
+  type Manifest,
   parseArtifactList,
   parseFilePath,
   parseManifest,
@@ -112,7 +113,15 @@ import {
   type SendInput,
 } from "./mailbox";
 import { render } from "./markdown";
-import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
+import {
+  authenticatedTools,
+  MCP_PATH,
+  mcpEndpoint,
+  mcpRefusal,
+  type RunTool,
+  type ToolCall,
+  type ToolResult,
+} from "./mcp";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -471,6 +480,15 @@ export interface TenantApi {
 // the same way. The Worker is also the only half that can hold two tenants at once, which
 // resolving a name on the artifact hostname needs.
 export interface AccountApi {
+  publishContent(
+    account: AccountDb,
+    store: ArtifactStore,
+    caller: Caller,
+    name: string,
+    bytes: Uint8Array,
+  ): Promise<Response>;
+  listArtifacts(account: AccountDb, store: ArtifactStore, caller: Caller, params: URLSearchParams): Promise<Response>;
+
   artifacts(
     request: Request,
     url: URL,
@@ -1741,11 +1759,55 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (text === null) return error(400, `the manifest part holds at most ${MANIFEST_BYTES} bytes`);
     const manifest = parseManifest(jsonOrNull(text));
     if (!manifest.ok) return error(400, manifest.error);
-    const declaredFiles = manifest.value.files;
-    const replacing = url.searchParams.get("replace") === "true";
-    const target = await writeTarget(account, store, caller.userId, name, replacing);
+    return publishArtifact(
+      account,
+      store,
+      host,
+      caller,
+      name,
+      manifest.value,
+      url.searchParams.get("replace") === "true" ? "replace" : "create",
+      async (file, into) => {
+        if ((await parts.nextPart()) === null) return null;
+        return parts.pipe(into, file.bytes);
+      },
+    );
+  };
+
+  // Both publishing entry points commit through this revision and storage path.
+  const publishArtifact = async (
+    account: AccountDb,
+    store: ArtifactStore,
+    host: ArtifactSurface,
+    caller: Caller,
+    name: string,
+    manifest: Manifest,
+    mode: "create" | "replace" | "own-site",
+    upload: (
+      file: { path: string; bytes: number },
+      into: WritableStream<Uint8Array>,
+    ) => Promise<{ ok: boolean; bytes: number } | null>,
+  ): Promise<Response> => {
+    const tooLarge = (): Response =>
+      error(413, `a file holds at most ${MAX_FILE_BYTES} bytes and an artifact at most ${MAX_ARTIFACT_BYTES}`);
+    const declaredFiles = manifest.files;
+    const ownSite = mode === "own-site";
+    const target = await writeTarget(account, store, caller.userId, name, mode !== "create");
     if (target instanceof Response) return target;
-    if (target !== null && !replacing) return conflict(target);
+    if (target !== null && mode === "create") return conflict(target);
+    if (ownSite && target !== null) {
+      if (target.ownerUserId !== caller.userId)
+        return error(403, "recall_publish only replaces your own sites; choose another name");
+      if (target.type !== "site")
+        return error(409, `${name} holds a ${target.type}; recall_publish only replaces sites; choose another name`);
+      manifest = {
+        ...manifest,
+        title: target.title,
+        description: target.description,
+        read: target.read,
+        write: target.write,
+      };
+    }
     const owner = target?.ownerUserId ?? caller.userId;
     const current = new Map((target?.files ?? []).map((file) => [file.path, file.bytes]));
     const sizes = declaredFiles.map((file) => ("keep" in file ? current.get(file.path) : file.bytes));
@@ -1755,7 +1817,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     }
     const total = sizes.reduce((running: number, bytes) => running + (bytes ?? 0), 0);
     if (total > MAX_ARTIFACT_BYTES || sizes.some((bytes) => (bytes ?? 0) > MAX_FILE_BYTES)) return tooLarge();
-    if (manifest.value.read === "account" && (await accountReadableElsewhere(account, owner, name))) {
+    if (manifest.read === "account" && (await accountReadableElsewhere(account, owner, name))) {
       return nameTaken(name);
     }
     const rev = await store.claimArtifactRevision(owner, name);
@@ -1774,13 +1836,16 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
         files.push({ path: file.path, bytes: source.size, contentType: contentTypeFor(file.path) });
         continue;
       }
-      const part = await parts.nextPart();
-      if (part === null) return refuse(400, `the body ends before the part for ${file.path}`);
       // R2 takes a stream whose length is known, so the length the manifest declared is the length
       // the object is written at and the part is held to it exactly.
       const sized = new FixedLengthStream(file.bytes);
       const stored = host.bucket.put(fileKey(owner, name, rev, file.path), sized.readable);
-      const written = await parts.pipe(sized.writable, file.bytes);
+      const written = await upload(file, sized.writable);
+      if (written === null) {
+        await sized.writable.abort();
+        await stored.catch(() => undefined);
+        return refuse(400, `the body ends before the part for ${file.path}`);
+      }
       if (!written.ok) {
         await stored.catch(() => undefined);
         return refuse(400, `${file.path} holds ${written.bytes} bytes and the manifest names ${file.bytes}`);
@@ -1793,8 +1858,8 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     // what decides a race between two of them rather than a read either could win. A private
     // publish wants the name and does not need it: it loses the claim to the account that holds
     // it and is reachable through this account's own object all the same.
-    const claimed = await claimArtifactName(account, owner, name, manifest.value.read);
-    if (!claimed && manifest.value.read === "account") {
+    const claimed = await claimArtifactName(account, owner, name, manifest.read);
+    if (!claimed && manifest.read === "account") {
       await collect(host.bucket, owner, name, rev);
       return nameTaken(name);
     }
@@ -1802,11 +1867,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       userId: owner,
       name,
       rev,
-      type: manifest.value.type,
-      title: manifest.value.title,
-      description: manifest.value.description,
-      read: manifest.value.read,
-      write: manifest.value.write,
+      type: manifest.type,
+      title: manifest.title,
+      description: manifest.description,
+      read: manifest.read,
+      write: manifest.write,
       files,
       at: deps.now(),
       writer: await emailForUser(account, caller.userId),
@@ -1816,8 +1881,11 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (!committed) {
       await collect(host.bucket, owner, name, rev);
       const held = await store.artifact(owner, name);
-      return held === null
-        ? error(409, `${name} was written by another request while this one was publishing`)
+      return held === null || ownSite
+        ? error(
+            409,
+            `${name} was written by another request while this one was publishing; read the artifact and try again`,
+          )
         : conflict(held);
     }
     const saved = await store.artifact(owner, name);
@@ -2957,6 +3025,34 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     },
     dashboard,
     artifacts,
+    async publishContent(account, store, caller, name, bytes) {
+      const host = deps.artifacts;
+      if (host === null)
+        return error(404, "this recall publishes no artifacts; its deployment names no artifact hostname");
+      const manifest = parseManifest({
+        type: "site",
+        title: name,
+        description: "",
+        read: "private",
+        write: "owner",
+        files: [{ path: "index.html", bytes: bytes.byteLength }],
+      });
+      if (!manifest.ok) return error(400, manifest.error);
+      return publishArtifact(account, store, host, caller, name, manifest.value, "own-site", async (_file, into) => {
+        const writer = into.getWriter();
+        await writer.write(bytes);
+        await writer.close();
+        return { ok: true, bytes: bytes.byteLength };
+      });
+    },
+    async listArtifacts(account, store, caller, params) {
+      const host = deps.artifacts;
+      if (host === null)
+        return error(404, "this recall publishes no artifacts; its deployment names no artifact hostname");
+      const url = new URL("https://recall/v2/artifacts");
+      url.search = params.toString();
+      return artifactsListing(url, account, store, host, caller.userId, deps.now());
+    },
     tool(made: ToolCall, env: TenantEnv, caller: Caller): Promise<ToolResult> {
       return runTool(env, caller)(made);
     },
@@ -3606,7 +3702,12 @@ export const createApp = (deps: Deps): App => {
       const caller = await mcpCaller(request, env);
       if (caller instanceof Response) return caller;
       const tenant = tenantOf(env, caller.userId);
-      return (made: ToolCall): Promise<ToolResult> => tenant.tool(made, caller, handed());
+      const store = artifactStoreFor(env);
+      return authenticatedTools(
+        (name, bytes) => account.publishContent(env.DB, store, caller, name, bytes),
+        (params) => account.listArtifacts(env.DB, store, caller, params),
+        (made) => tenant.tool(made, caller, handed()),
+      );
     });
     return withHeaders(answered, corsHeaders(request));
   };
