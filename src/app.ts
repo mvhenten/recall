@@ -113,7 +113,7 @@ import {
   type SendInput,
 } from "./mailbox";
 import { render } from "./markdown";
-import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
+import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult, waitInbox } from "./mcp";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -2337,6 +2337,19 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (definition === undefined) return refused(`no tool named ${call.name}`);
       const args = toolArguments(definition, call.arguments);
       if (!args.ok) return refused(args.error);
+      if (
+        call.name === "recall_inbox_post" ||
+        call.name === "recall_inbox_unread" ||
+        call.name === "recall_inbox_mark_read"
+      ) {
+        const result =
+          call.name === "recall_inbox_post"
+            ? await postInbox(db, userId, args.value, deps.now())
+            : call.name === "recall_inbox_unread"
+              ? await unreadInbox(db, userId, args.value, deps.now())
+              : await markInboxRead(db, userId, args.value, deps.now());
+        return result.ok ? document(result.value) : refused(result.error);
+      }
       if (call.name === "recall_search") {
         const input = parseSearchArgs(args.value);
         if (!input.ok) return refused(input.error);
@@ -3642,7 +3655,15 @@ export const createApp = (deps: Deps): App => {
       const caller = await mcpCaller(request, env);
       if (caller instanceof Response) return caller;
       const tenant = tenantOf(env, caller.userId);
-      return (made: ToolCall): Promise<ToolResult> => tenant.tool(made, caller, handed());
+      return (made: ToolCall): Promise<ToolResult> =>
+        made.name === "recall_inbox_wait"
+          ? waitInbox(
+              made.arguments,
+              (query) => tenant.inboxUnread(caller.userId, query, deps.now()),
+              request.signal,
+              deps.now,
+            )
+          : tenant.tool(made, caller, handed());
     });
     return withHeaders(answered, corsHeaders(request));
   };

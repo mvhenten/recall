@@ -1030,7 +1030,8 @@ mod tests {
         let cwd = sandbox.work("recall");
         let lines = session("2026-11-02T10:00:00.000Z");
         let live = sandbox.transcript(&cwd, "s-live", &lines);
-        std::thread::sleep(Duration::from_millis(5));
+        // Filesystem creation timestamps can share a clock tick on a busy VM.
+        std::thread::sleep(Duration::from_secs(1));
         let headless = sandbox.transcript(&cwd, "s-headless-run", &lines);
         stamp(&live, ago(600));
         stamp(&headless, ago(5));
@@ -1055,12 +1056,13 @@ mod tests {
         let cwd = sandbox.work("recall");
         let lines = session("2026-11-02T10:00:00.000Z");
         let first = sandbox.transcript(&cwd, "s-first", &lines);
-        std::thread::sleep(Duration::from_millis(5));
+        // Filesystem creation timestamps can share a clock tick on a busy VM.
+        std::thread::sleep(Duration::from_secs(1));
         let second = sandbox.transcript(&cwd, "s-second", &lines);
         let born_first = sandbox.born(&first);
         assert!(born_first < sandbox.born(&second), "the fixtures must be born in order");
         sandbox.claude(4242, &cwd, &["claude"], born_first - Duration::from_secs(7));
-        sandbox.claude(4300, &cwd, &["claude"], born_first + Duration::from_millis(1));
+        sandbox.claude(4300, &cwd, &["claude"], sandbox.born(&second));
 
         let adopted: Vec<String> = adopt(&sandbox.scope)
             .unwrap()
