@@ -70,7 +70,7 @@ export const authenticatedTools =
       if (args.content.length > MAX_CONNECTOR_HTML_BYTES) {
         return refused(`content must hold at most ${MAX_CONNECTOR_HTML_BYTES} UTF-8 bytes`);
       }
-      const buffer = new Uint8Array(MAX_CONNECTOR_HTML_BYTES);
+      const buffer = new Uint8Array(Math.min(MAX_CONNECTOR_HTML_BYTES, args.content.length * 3));
       const { read, written } = new TextEncoder().encodeInto(args.content, buffer);
       if (read < args.content.length) {
         return refused(`content must hold at most ${MAX_CONNECTOR_HTML_BYTES} UTF-8 bytes`);

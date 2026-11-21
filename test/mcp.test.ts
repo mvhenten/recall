@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { type ArtifactView, artifactPrefix, MAX_CONNECTOR_HTML_BYTES } from "../src/artifacts";
 import { NO_PEEK_LISTENING, ORDERS, ORDERS_HEADER, type PeekFrame, type PeekOrder } from "../src/mailbox";
-import { MCP_PATH } from "../src/mcp";
+import { authenticatedTools, MCP_PATH } from "../src/mcp";
 import type { Peek } from "../src/model";
 import {
   PEEK_ATTACH_MS,
@@ -710,6 +710,19 @@ describe("reusing a peek the session already holds", () => {
 });
 
 describe("publishing from the connector", () => {
+  it("keeps a tiny publish's encoding buffer below the full cap", async () => {
+    const publish = vi.fn(async (_name: string, bytes: Uint8Array) => {
+      expect(bytes.buffer.byteLength).toBeLessThan(MAX_CONNECTOR_HTML_BYTES);
+      return Response.json({ artifact: { bytes: bytes.byteLength } });
+    });
+    const run = authenticatedTools(publish, vi.fn(), vi.fn());
+    expect(await run({ name: "recall_publish", arguments: { name: "tiny", content: "<p>x</p>" } })).toEqual({
+      ok: true,
+      text: JSON.stringify({ bytes: 8 }),
+    });
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
   it("publishes, lists and replaces verbatim HTML at one URL", async () => {
     const { h, email, mcp } = await signedIn();
     const content = "  <!doctype html><p>café 🌍</p>\n";
