@@ -294,3 +294,63 @@ export const InjectedMemorySchema = z.object({
   description: z.string().min(1).max(500),
   inScope: z.boolean(),
 });
+
+export const InboxPostSchema = z.strictObject({
+  sender: z.string().min(1).max(64),
+  subject: z.string().min(1).max(160),
+  body: z.string().min(1).max(4096),
+  link: z
+    .string()
+    .regex(/^[hH][tT][tT][pP][sS]:\/\/[^/\s]+/)
+    .max(2048)
+    .optional(),
+});
+
+export const InboxUnreadSchema = z.strictObject({
+  after: z.int().min(0).max(9007199254740991).optional(),
+  limit: z.int().min(1).max(20).optional(),
+});
+
+export const InboxWaitSchema = z.strictObject({
+  after: z.int().min(0).max(9007199254740991).optional(),
+  limit: z.int().min(1).max(20).optional(),
+  timeout_seconds: z.int().min(0).max(120).optional(),
+});
+
+export const InboxReadOneSchema = z.strictObject({
+  id: z.int().min(1).max(9007199254740991),
+});
+
+export const InboxReadThroughSchema = z.strictObject({
+  up_to: z.int().min(0).max(9007199254740991),
+});
+
+export const InboxMessageSchema = z.strictObject({
+  id: z.int().min(1).max(9007199254740991),
+  sender: z.string().min(1).max(64),
+  subject: z.string().min(1).max(160),
+  body: z.string().min(1).max(4096),
+  link: z.union([
+    z
+      .string()
+      .regex(/^[hH][tT][tT][pP][sS]:\/\/[^/\s]+/)
+      .max(2048),
+    z.null(),
+  ]),
+  createdAt: z.int(),
+  expiresAt: z.int(),
+  readAt: z.union([z.int(), z.null()]),
+});
+
+export const InboxPostedSchema = z.strictObject({
+  message: InboxMessageSchema,
+});
+
+export const InboxPageSchema = z.strictObject({
+  messages: z.array(InboxMessageSchema).max(20),
+  nextCursor: z.int().min(0).max(9007199254740991),
+});
+
+export const InboxReadResultSchema = z.strictObject({
+  updated: z.int().min(0).max(1000),
+});

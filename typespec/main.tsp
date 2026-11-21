@@ -1,4 +1,5 @@
 import "@typespec/json-schema";
+import "@typespec/openapi";
 import "@kattebak/typespec-zod-emitter";
 
 using TypeSpec.JsonSchema;
@@ -460,4 +461,115 @@ model InjectedMemory {
 
   description: MemoryDescription;
   inScope: boolean;
+}
+
+@minValue(0)
+@maxValue(9007199254740991)
+scalar InboxCursor extends safeint;
+
+@minValue(1)
+@maxValue(9007199254740991)
+scalar InboxId extends safeint;
+
+@doc("A caller-supplied label, never authorization. Nonblank, at most 64 UTF-8 bytes.")
+@minLength(1)
+@maxLength(64)
+scalar InboxSender extends string;
+
+@doc("Nonblank subject, at most 160 UTF-8 bytes.")
+@minLength(1)
+@maxLength(160)
+scalar InboxSubject extends string;
+
+@doc("Nonblank body, at most 4096 UTF-8 bytes.")
+@minLength(1)
+@maxLength(4096)
+scalar InboxBody extends string;
+
+@doc("Absolute HTTPS URL, at most 2048 UTF-8 bytes.")
+@maxLength(2048)
+@pattern("^[hH][tT][tT][pP][sS]://[^/\\s]+")
+scalar InboxLink extends string;
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxPost {
+  sender: InboxSender;
+  subject: InboxSubject;
+  body: InboxBody;
+  link?: InboxLink;
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxUnread {
+  after?: InboxCursor = 0;
+  @minValue(1)
+  @maxValue(20)
+  limit?: int32 = 10;
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxWait {
+  ...InboxUnread;
+  @minValue(0)
+  @maxValue(120)
+  timeout_seconds?: int32 = 60;
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxReadOne {
+  id: InboxId;
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxReadThrough {
+  up_to: InboxCursor;
+}
+
+@oneOf
+union InboxMarkRead {
+  InboxReadOne,
+  InboxReadThrough,
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxMessage {
+  id: InboxId;
+  sender: InboxSender;
+  subject: InboxSubject;
+  body: InboxBody;
+  link: InboxLink | null;
+  @doc("Epoch milliseconds.")
+  createdAt: safeint;
+  @doc("Epoch milliseconds, 30 days after creation.")
+  expiresAt: safeint;
+  @doc("Epoch milliseconds, null until explicitly acknowledged.")
+  readAt: safeint | null;
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxPosted {
+  message: InboxMessage;
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxPage {
+  @maxItems(20)
+  messages: InboxMessage[];
+  nextCursor: InboxCursor;
+}
+
+@extension("additionalProperties", false)
+@TypeSpec.OpenAPI.extension("additionalProperties", false)
+model InboxReadResult {
+  @minValue(0)
+  @maxValue(1000)
+  updated: int32;
 }

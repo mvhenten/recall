@@ -341,3 +341,126 @@ describe("the tenant store", () => {
     }
   });
 });
+
+describe("the user inbox", () => {
+  const post = { sender: "builder", subject: "Done", body: "Ready for review" };
+  const value = <T>(result: import("../src/inbox").InboxResult<T>): T => {
+    if (!result.ok) throw new Error(result.error);
+    return result.value;
+  };
+
+  it("orders pages, shares acknowledgements, and keeps newer messages unread", async () => {
+    const userId = crypto.randomUUID();
+    const tenant = storeOf(userId);
+    for (let n = 0; n < 4; n++) value(await tenant.inboxPost(userId, post, NOW));
+    const first = value(await tenant.inboxUnread(userId, { limit: 2 }, NOW));
+    expect(first.messages.map((m) => m.id)).toEqual([1, 2]);
+    expect(first.nextCursor).toBe(2);
+    expect(value(await tenant.inboxUnread(userId, { after: 2 }, NOW)).messages.map((m) => m.id)).toEqual([3, 4]);
+    expect(value(await tenant.inboxUnread(userId, {}, NOW)).messages).toHaveLength(4);
+    const [a, b] = await Promise.all([
+      tenant.inboxMarkRead(userId, { up_to: 2 }, NOW + 1),
+      tenant.inboxMarkRead(userId, { up_to: 2 }, NOW + 1),
+    ]);
+    expect(value(a).updated + value(b).updated).toBe(2);
+    expect(value(await tenant.inboxMarkRead(userId, { id: 2 }, NOW + 2))).toEqual({ updated: 0 });
+    expect(value(await tenant.inboxUnread(userId, {}, NOW)).messages.map((m) => m.id)).toEqual([3, 4]);
+    expect(value(await tenant.inboxUnread(userId, { after: 4 }, NOW))).toEqual({ messages: [], nextCursor: 4 });
+    expect(await tenant.inboxUnread(userId, { after: 5 }, NOW)).toMatchObject({ ok: false, status: 400 });
+    expect(await tenant.inboxMarkRead(userId, { up_to: 5 }, NOW)).toMatchObject({ ok: false, status: 400 });
+    expect(await tenant.inboxMarkRead(userId, { id: 5 }, NOW)).toMatchObject({ ok: false, status: 404 });
+  });
+
+  it("validates closed inputs and UTF-8 byte bounds before allocating", async () => {
+    const userId = crypto.randomUUID();
+    const tenant = storeOf(userId);
+    for (const invalid of [
+      { ...post, sender: " " },
+      { ...post, subject: "\n" },
+      { ...post, body: "" },
+      { ...post, sender: "é".repeat(33) },
+      { ...post, subject: "é".repeat(81) },
+      { ...post, body: "é".repeat(2049) },
+      { ...post, link: "http://example.com" },
+      { ...post, link: "/relative" },
+      { ...post, link: `https://example.com/${"é".repeat(1024)}` },
+      { ...post, userId: "other" },
+    ])
+      expect(await tenant.inboxPost(userId, invalid, NOW)).toMatchObject({ ok: false, status: 400 });
+    expect(
+      value(
+        await tenant.inboxPost(
+          userId,
+          { sender: "é".repeat(32), subject: "é".repeat(80), body: "é".repeat(2048), link: "https://example.com" },
+          NOW,
+        ),
+      ).message.id,
+    ).toBe(1);
+    for (const query of [
+      { after: -1 },
+      { after: 0.1 },
+      { after: Number.MAX_SAFE_INTEGER + 1 },
+      { limit: 0 },
+      { limit: 21 },
+      { extra: true },
+    ]) {
+      expect(await tenant.inboxUnread(userId, query, NOW)).toMatchObject({ ok: false, status: 400 });
+    }
+    for (const read of [{}, { id: 1, up_to: 1 }, { id: 0 }, { up_to: -1 }, { id: 1.5 }]) {
+      expect(await tenant.inboxMarkRead(userId, read, NOW)).toMatchObject({ ok: false, status: 400 });
+    }
+  });
+
+  it("bounds serialized pages including JSON escapes", async () => {
+    const userId = crypto.randomUUID();
+    const tenant = storeOf(userId);
+    for (let n = 0; n < 20; n++)
+      value(await tenant.inboxPost(userId, { ...post, body: `${"\u0001".repeat(4095)}x` }, NOW));
+    const page = value(await tenant.inboxUnread(userId, { limit: 20 }, NOW));
+    expect(page.messages.length).toBeGreaterThan(0);
+    expect(page.messages.length).toBeLessThan(20);
+    expect(new TextEncoder().encode(JSON.stringify(page)).length).toBeLessThanOrEqual(96 * 1024);
+    expect(page.nextCursor).toBe(page.messages.at(-1)?.id);
+  });
+
+  it("purges expiry, retains allocation across eviction and deletion, and isolates users", async () => {
+    const userId = crypto.randomUUID();
+    const tenant = storeOf(userId);
+    value(await tenant.inboxPost(userId, post, NOW));
+    const expiredAt = NOW + 30 * 86400000;
+    expect(value(await tenant.inboxUnread(userId, {}, expiredAt)).messages).toEqual([]);
+    expect(await tenant.inboxMarkRead(userId, { id: 1 }, expiredAt)).toMatchObject({ ok: false, status: 404 });
+    await evictDurableObject(tenant);
+    expect(value(await storeOf(userId).inboxPost(userId, post, expiredAt)).message.id).toBe(2);
+    await tenantRows(userId, "DELETE FROM inbox_messages WHERE user_id = ?1", userId);
+    expect(value(await storeOf(userId).inboxPost(userId, post, expiredAt)).message.id).toBe(3);
+    await inStore(userId, async (db) => {
+      const { postInbox, unreadInbox, markInboxRead } = await import("../src/store");
+      expect(value(await unreadInbox(db, "other", {}, NOW)).messages).toEqual([]);
+      expect(await markInboxRead(db, "other", { id: 3 }, NOW)).toMatchObject({ ok: false, status: 404 });
+      expect(value(await postInbox(db, "other", post, NOW)).message.id).toBe(1);
+    });
+  });
+
+  it("evicts oldest read rows at capacity, refuses unread loss and safe-integer overflow", async () => {
+    const userId = crypto.randomUUID();
+    await inStore(userId, async (db) => {
+      const { postInbox, markInboxRead, unreadInbox } = await import("../src/store");
+      for (let n = 0; n < 1000; n++) value(await postInbox(db, userId, post, NOW));
+      expect(await postInbox(db, userId, post, NOW)).toMatchObject({ ok: false, status: 429 });
+      value(await markInboxRead(db, userId, { id: 2 }, NOW));
+      expect(value(await postInbox(db, userId, post, NOW)).message.id).toBe(1001);
+      expect(await markInboxRead(db, userId, { id: 2 }, NOW)).toMatchObject({ ok: false, status: 404 });
+      expect(value(await unreadInbox(db, userId, {}, NOW)).messages[0]?.id).toBe(1);
+    });
+    await tenantRows(
+      userId,
+      "UPDATE inbox_counters SET high_water = ?1 WHERE user_id = ?2",
+      Number.MAX_SAFE_INTEGER - 1,
+      userId,
+    );
+    const expiredAt = NOW + 30 * 86400000;
+    expect(value(await storeOf(userId).inboxPost(userId, post, expiredAt)).message.id).toBe(Number.MAX_SAFE_INTEGER);
+    expect(await storeOf(userId).inboxPost(userId, post, expiredAt)).toMatchObject({ ok: false, status: 429 });
+  });
+});

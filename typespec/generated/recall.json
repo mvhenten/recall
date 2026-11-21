@@ -932,6 +932,246 @@
       },
       "required": ["score", "memoryName", "type", "tags", "description", "inScope"],
       "description": "One memory worth putting in front of a prompt, without its body: enough to decide whether to read it."
+    },
+    "InboxPost": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxPost.json",
+      "type": "object",
+      "properties": {
+        "sender": {
+          "$ref": "InboxSender.json"
+        },
+        "subject": {
+          "$ref": "InboxSubject.json"
+        },
+        "body": {
+          "$ref": "InboxBody.json"
+        },
+        "link": {
+          "$ref": "InboxLink.json"
+        }
+      },
+      "required": ["sender", "subject", "body"],
+      "additionalProperties": false
+    },
+    "InboxSender": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxSender.json",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "A caller-supplied label, never authorization. Nonblank, at most 64 UTF-8 bytes."
+    },
+    "InboxSubject": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxSubject.json",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "description": "Nonblank subject, at most 160 UTF-8 bytes."
+    },
+    "InboxBody": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxBody.json",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Nonblank body, at most 4096 UTF-8 bytes."
+    },
+    "InboxLink": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxLink.json",
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^[hH][tT][tT][pP][sS]://[^/\\s]+",
+      "description": "Absolute HTTPS URL, at most 2048 UTF-8 bytes."
+    },
+    "InboxUnread": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxUnread.json",
+      "type": "object",
+      "properties": {
+        "after": {
+          "$ref": "InboxCursor.json",
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "default": 10
+        }
+      },
+      "additionalProperties": false
+    },
+    "InboxCursor": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxCursor.json",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "InboxWait": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxWait.json",
+      "type": "object",
+      "properties": {
+        "after": {
+          "$ref": "InboxCursor.json",
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "default": 10
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 120,
+          "default": 60
+        }
+      },
+      "additionalProperties": false
+    },
+    "InboxReadOne": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxReadOne.json",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "InboxId.json"
+        }
+      },
+      "required": ["id"],
+      "additionalProperties": false
+    },
+    "InboxId": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxId.json",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "InboxReadThrough": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxReadThrough.json",
+      "type": "object",
+      "properties": {
+        "up_to": {
+          "$ref": "InboxCursor.json"
+        }
+      },
+      "required": ["up_to"],
+      "additionalProperties": false
+    },
+    "InboxMessage": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxMessage.json",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "InboxId.json"
+        },
+        "sender": {
+          "$ref": "InboxSender.json"
+        },
+        "subject": {
+          "$ref": "InboxSubject.json"
+        },
+        "body": {
+          "$ref": "InboxBody.json"
+        },
+        "link": {
+          "anyOf": [
+            {
+              "$ref": "InboxLink.json"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "createdAt": {
+          "type": "integer",
+          "description": "Epoch milliseconds."
+        },
+        "expiresAt": {
+          "type": "integer",
+          "description": "Epoch milliseconds, 30 days after creation."
+        },
+        "readAt": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Epoch milliseconds, null until explicitly acknowledged."
+        }
+      },
+      "required": ["id", "sender", "subject", "body", "link", "createdAt", "expiresAt", "readAt"],
+      "additionalProperties": false
+    },
+    "InboxPosted": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxPosted.json",
+      "type": "object",
+      "properties": {
+        "message": {
+          "$ref": "InboxMessage.json"
+        }
+      },
+      "required": ["message"],
+      "additionalProperties": false
+    },
+    "InboxPage": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxPage.json",
+      "type": "object",
+      "properties": {
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "InboxMessage.json"
+          },
+          "maxItems": 20
+        },
+        "nextCursor": {
+          "$ref": "InboxCursor.json"
+        }
+      },
+      "required": ["messages", "nextCursor"],
+      "additionalProperties": false
+    },
+    "InboxReadResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxReadResult.json",
+      "type": "object",
+      "properties": {
+        "updated": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        }
+      },
+      "required": ["updated"],
+      "additionalProperties": false
+    },
+    "InboxMarkRead": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "InboxMarkRead.json",
+      "oneOf": [
+        {
+          "$ref": "InboxReadOne.json"
+        },
+        {
+          "$ref": "InboxReadThrough.json"
+        }
+      ]
     }
   }
 }

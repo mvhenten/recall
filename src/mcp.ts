@@ -1,5 +1,6 @@
 import manifest from "../.claude-plugin/plugin.json";
 import { MAX_CONNECTOR_HTML_BYTES } from "./artifacts";
+import { type InboxPage, type InboxQuery, type InboxResult, parseInboxWait } from "./inbox";
 import { parseName } from "./model";
 import { TOOLS, toolArguments } from "./tools";
 
@@ -304,4 +305,58 @@ export const mcpEndpoint = async (request: Request, authorize: Authorize): Promi
   }
   const answered = await answer(request, authorize);
   return takesEventStream(request) ? asEventStream(answered) : answered;
+};
+
+// Waiting belongs to the Worker. Each read is one short Tenant RPC, and the clock is
+// read again after every await rather than carried over as TenantCall.now.
+export const waitInbox = async (
+  input: unknown,
+  read: (query: InboxQuery) => Promise<InboxResult<InboxPage>>,
+  signal: AbortSignal,
+  now: () => number,
+): Promise<ToolResult> => {
+  const parsed = parseInboxWait(input);
+  if (!parsed.ok) return { ok: false, error: `recall: ${parsed.error}` };
+  const { after, limit, timeout_seconds } = parsed.value;
+  const started = now();
+  const deadline = started + timeout_seconds * 1000;
+  const cancelled = (): ToolResult => ({ ok: false, error: "recall: inbox wait cancelled" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let wake: (() => void) | undefined;
+  // This wait stays in the request's response path, never ctx.waitUntil. Workers cancels
+  // its tasks and timers on disconnect; request.signal adds abort cleanup when enabled.
+  // The live deadline caps the wait at 120 seconds regardless of signal availability.
+  const abort = (): void => {
+    clearTimeout(timer);
+    wake?.();
+  };
+  signal.addEventListener("abort", abort);
+  try {
+    if (signal.aborted) return cancelled();
+    let page = await read({ after, limit });
+    while (true) {
+      if (signal.aborted) return cancelled();
+      if (!page.ok) return { ok: false, error: `recall: ${page.error}` };
+      if (page.value.messages.length > 0 || now() >= deadline) {
+        return { ok: true, text: JSON.stringify(page.value) };
+      }
+      const interval = now() - started < 10_000 ? 1000 : 2000;
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+        timer = setTimeout(resolve, Math.min(interval, deadline - now()));
+        if (signal.aborted) abort();
+      });
+      clearTimeout(timer);
+      timer = undefined;
+      wake = undefined;
+      if (signal.aborted) return cancelled();
+      if (now() >= deadline) {
+        return { ok: true, text: JSON.stringify({ messages: [], nextCursor: after }) };
+      }
+      page = await read({ after, limit });
+    }
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", abort);
+  }
 };
