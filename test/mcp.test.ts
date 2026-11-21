@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { NO_PEEK_LISTENING, ORDERS, ORDERS_HEADER, type PeekFrame, type PeekOrder } from "../src/mailbox";
-import { MCP_PATH } from "../src/mcp";
+import { MCP_PATH, waitInbox } from "../src/mcp";
 import type { Peek } from "../src/model";
 import {
   PEEK_ATTACH_MS,
@@ -104,6 +104,10 @@ describe("the connector handshake", () => {
       "recall_devices",
       "recall_edit",
       "recall_get",
+      "recall_inbox_mark_read",
+      "recall_inbox_post",
+      "recall_inbox_unread",
+      "recall_inbox_wait",
       "recall_list",
       "recall_peek",
       "recall_save",
@@ -671,5 +675,223 @@ describe("reusing a peek the session already holds", () => {
     expect(reusablePeek([pending(PEEK_FRESH_MS)], NOW)).toEqual(pending(PEEK_FRESH_MS));
     expect(reusablePeek([pending(PEEK_ATTACH_MS - 1)], NOW)).toEqual(pending(PEEK_ATTACH_MS - 1));
     expect(reusablePeek([pending(PEEK_ATTACH_MS)], NOW)).toBeNull();
+  });
+});
+
+describe("the connector inbox", () => {
+  const post = { sender: "builder", subject: "Ready", body: "Review the change" };
+
+  it("publishes all four closed schemas with byte and numeric bounds", async () => {
+    const { mcp } = await signedIn();
+    const listed = await mcp.call("tools/list");
+    const tools = (listed.result as { tools: typeof TOOLS }).tools.filter((t) => t.name.startsWith("recall_inbox_"));
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      "recall_inbox_mark_read",
+      "recall_inbox_post",
+      "recall_inbox_unread",
+      "recall_inbox_wait",
+    ]);
+    for (const tool of tools) expect(tool.inputSchema.additionalProperties).toBe(false);
+    const schema = (name: string) => tools.find((t) => t.name === name)?.inputSchema;
+    expect(schema("recall_inbox_post")?.required).toEqual(["sender", "subject", "body"]);
+    for (const [field, maxLength] of [
+      ["sender", 64],
+      ["subject", 160],
+      ["body", 4096],
+      ["link", 2048],
+    ] as const) {
+      expect(schema("recall_inbox_post")?.properties[field]).toMatchObject({
+        type: "string",
+        maxLength,
+        description: expect.stringContaining("UTF-8 bytes"),
+      });
+    }
+    expect(schema("recall_inbox_wait")?.properties.timeout_seconds).toEqual({
+      type: "integer",
+      minimum: 0,
+      maximum: 120,
+      default: 60,
+    });
+    expect(schema("recall_inbox_unread")?.properties.after).toMatchObject({
+      type: "integer",
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      default: 0,
+    });
+    expect(schema("recall_inbox_mark_read")?.oneOf).toEqual([{ required: ["id"] }, { required: ["up_to"] }]);
+  });
+
+  it("reads shared backlog immediately, preserves unread state, and acknowledges explicitly", async () => {
+    const { h, email, mcp } = await signedIn();
+    const host = h.clientWithToken(await h.login(email, "laptop"));
+    await host.request("POST", "/v2/inbox", post);
+    const posted = await mcp.json("recall_inbox_post", { ...post, subject: "Second" });
+    expect(posted.message.id).toBe(2);
+    const first = await mcp.json("recall_inbox_wait", { limit: 1 });
+    expect(first.messages.map((m: { id: number }) => m.id)).toEqual([1]);
+    expect(await mcp.json("recall_inbox_wait", { after: 1, timeout_seconds: 0 })).toMatchObject({
+      messages: [{ id: 2 }],
+      nextCursor: 2,
+    });
+    expect(await mcp.json("recall_inbox_mark_read", { id: 2 })).toEqual({ updated: 1 });
+    expect(await mcp.json("recall_inbox_unread")).toMatchObject({ messages: [{ id: 1 }], nextCursor: 1 });
+    expect(await mcp.json("recall_inbox_mark_read", { up_to: 2 })).toEqual({ updated: 1 });
+    expect(await mcp.json("recall_inbox_wait", { after: 2, timeout_seconds: 0 })).toEqual({
+      messages: [],
+      nextCursor: 2,
+    });
+  });
+
+  it("uses isError for invalid operations and gives JSON/SSE the same final result", async () => {
+    const { h, mcp } = await signedIn();
+    for (const [name, args] of [
+      ["recall_inbox_post", { ...post, body: "é".repeat(2049) }],
+      ["recall_inbox_mark_read", { id: 1, up_to: 1 }],
+      ["recall_inbox_mark_read", { id: 1 }],
+      ["recall_inbox_unread", { after: 1 }],
+      ...[-1, 121, 0.1, "1", null].map((timeout_seconds) => ["recall_inbox_wait", { timeout_seconds }]),
+      ["recall_inbox_wait", { extra: true }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const result = (await mcp.call("tools/call", { name, arguments: args })).result;
+      expect(result).toMatchObject({ isError: true });
+    }
+    await mcp.json("recall_inbox_post", post);
+    for (const args of [{ timeout_seconds: 0 }, { after: 1, timeout_seconds: 0 }]) {
+      const body = { id: 91, method: "tools/call", params: { name: "recall_inbox_wait", arguments: args } };
+      const json = await (await h.rpc(body, mcp.headers)).json();
+      const response = await h.rpc(body, { ...mcp.headers, accept: "text/event-stream" });
+      expect(response.headers.get("content-type")).toBe("text/event-stream");
+      expect(await response.text()).toBe(`event: message\ndata: ${JSON.stringify(json)}\n\n`);
+    }
+  });
+
+  it("propagates the HTTP client's abort into the Worker wait", async () => {
+    const { h, mcp } = await signedIn();
+    const controller = new AbortController();
+    const pending = h.send(MCP_PATH, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { ...mcp.headers, "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "recall_inbox_wait", arguments: {} },
+      }),
+    });
+    controller.abort();
+    expect(await (await pending).json()).toMatchObject({
+      result: { isError: true, content: [{ text: expect.stringContaining("cancelled") }] },
+    });
+  });
+
+  it("defaults to sixty seconds and accepts the full 120-second wait", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const [input, seconds] of [
+        [{}, 60],
+        [{ timeout_seconds: 120 }, 120],
+      ] as const) {
+        const read = vi.fn(async () => ({ ok: true as const, value: { messages: [], nextCursor: 0 } }));
+        const waited = waitInbox(input, read, new AbortController().signal, Date.now);
+        let done = false;
+        void waited.then(() => {
+          done = true;
+        });
+        await vi.advanceTimersByTimeAsync(seconds * 1000 - 1);
+        expect(done).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await waited).toMatchObject({ ok: true });
+        expect(vi.getTimerCount()).toBe(0);
+        expect(read.mock.calls.length).toBeLessThanOrEqual(66);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("polls every second through ten seconds then every two seconds, using a live deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const start = Date.now();
+      const times: number[] = [];
+      const read = vi.fn(async () => {
+        times.push(Date.now() - start);
+        return { ok: true as const, value: { messages: [], nextCursor: 0 } };
+      });
+      const waited = waitInbox({ timeout_seconds: 15 }, read, new AbortController().signal, Date.now);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(await waited).toEqual({ ok: true, text: JSON.stringify({ messages: [], nextCursor: 0 }) });
+      expect(times).toEqual([0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000, 14000]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns delayed messages without claiming them and cleans up timers", async () => {
+    vi.useFakeTimers();
+    try {
+      const message = { id: 2, ...post, link: null, createdAt: 1, expiresAt: 2, readAt: null };
+      let messages: (typeof message)[] = [];
+      const read = vi.fn(async () => ({ ok: true as const, value: { messages, nextCursor: messages.length ? 2 : 1 } }));
+      const waited = waitInbox({ after: 1 }, read, new AbortController().signal, Date.now);
+      await vi.advanceTimersByTimeAsync(1500);
+      messages = [message];
+      await vi.advanceTimersByTimeAsync(500);
+      expect(await waited).toEqual({ ok: true, text: JSON.stringify({ messages: [message], nextCursor: 2 }) });
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops immediately on client abort, including before or during a tenant read", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const read = vi.fn(async () => ({ ok: true as const, value: { messages: [], nextCursor: 0 } }));
+      const waited = waitInbox({}, read, controller.signal, Date.now);
+      await vi.advanceTimersByTimeAsync(1500);
+      controller.abort();
+      expect(await waited).toMatchObject({ ok: false, error: expect.stringContaining("cancelled") });
+      const count = read.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(read).toHaveBeenCalledTimes(count);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(await waitInbox({}, read, controller.signal, Date.now)).toMatchObject({ ok: false });
+      expect(read).toHaveBeenCalledTimes(count);
+      const during = new AbortController();
+      const abortingRead = async () => {
+        during.abort();
+        return { ok: true as const, value: { messages: [], nextCursor: 0 } };
+      };
+      expect(await waitInbox({}, abortingRead, during.signal, Date.now)).toMatchObject({ ok: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honors a changed live clock and clears timers on store errors", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = 0;
+      const read = vi.fn(async () => ({ ok: true as const, value: { messages: [], nextCursor: 0 } }));
+      const waited = waitInbox({}, read, new AbortController().signal, () => now);
+      await vi.advanceTimersByTimeAsync(100);
+      now = 60_000;
+      await vi.advanceTimersByTimeAsync(900);
+      expect(await waited).toMatchObject({ ok: true });
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+      const failure = async () => {
+        throw new Error("store unavailable");
+      };
+      await expect(waitInbox({}, failure, new AbortController().signal, Date.now)).rejects.toThrow("store unavailable");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

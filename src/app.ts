@@ -101,6 +101,7 @@ import {
   userForEmail,
 } from "./device";
 import { CSRF_HEADER, EDIT_VIEW, type EditorPlan } from "./editor-plan";
+import type { InboxResult } from "./inbox";
 import { ARTIFACT_SORTS, CURSOR_PARAM, HISTORY_SORTS, MAX_SEARCH_MATCHES, MEMORY_SORTS, sortInForce } from "./listing";
 import {
   DEVICE_HEADER,
@@ -112,7 +113,7 @@ import {
   type SendInput,
 } from "./mailbox";
 import { render } from "./markdown";
-import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult } from "./mcp";
+import { MCP_PATH, mcpEndpoint, mcpRefusal, type RunTool, type ToolCall, type ToolResult, waitInbox } from "./mcp";
 import {
   DAY_MS,
   DEFAULT_MIN_SCORE,
@@ -272,11 +273,13 @@ import {
   listSessions,
   liveSessionDevice,
   liveTally,
+  markInboxRead,
   memoryCounts,
   memoryCursorDirection,
   nameSession,
   openChunks,
   postBoardMessage,
+  postInbox,
   putSession,
   type RevokeScope,
   readInsights,
@@ -308,6 +311,7 @@ import {
   startCursor,
   tagsOfMemories,
   textCandidates,
+  unreadInbox,
   usageRepos,
   vectorCandidates,
   writeLabels,
@@ -856,6 +860,37 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     if (segment !== undefined) return error(404, "not found");
     if (request.method === "GET") return readBoard(url, env.DB, caller.userId);
     return request.method === "POST" ? postToBoard(request, env, caller, read) : error(405, "method not allowed");
+  };
+
+  const inboxResponse = <T>(result: InboxResult<T>, status = 200): Response =>
+    result.ok ? json(result.value, status) : error(result.status, result.error);
+
+  const inbox = async (
+    request: Request,
+    url: URL,
+    env: TenantEnv,
+    caller: Caller,
+    segment: string | undefined,
+  ): Promise<Response> => {
+    const now = deps.now();
+    if (segment === "read") {
+      return request.method === "POST"
+        ? inboxResponse(await markInboxRead(env.DB, caller.userId, await readJson(request), now))
+        : error(405, "method not allowed");
+    }
+    if (segment !== undefined) return error(404, "not found");
+    if (request.method === "POST") {
+      return inboxResponse(await postInbox(env.DB, caller.userId, await readJson(request), now), 201);
+    }
+    if (request.method !== "GET") return error(405, "method not allowed");
+    const query: Record<string, unknown> = {};
+    for (const [key, raw] of url.searchParams) {
+      if ((key !== "after" && key !== "limit") || key in query || !/^\d+$/.test(raw)) {
+        return error(400, "inbox query takes after and limit as integers, once each");
+      }
+      query[key] = Number(raw);
+    }
+    return inboxResponse(await unreadInbox(env.DB, caller.userId, query, now));
   };
 
   const readBoard = async (url: URL, db: TenantDb, userId: string): Promise<Response> => {
@@ -2302,6 +2337,19 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       if (definition === undefined) return refused(`no tool named ${call.name}`);
       const args = toolArguments(definition, call.arguments);
       if (!args.ok) return refused(args.error);
+      if (
+        call.name === "recall_inbox_post" ||
+        call.name === "recall_inbox_unread" ||
+        call.name === "recall_inbox_mark_read"
+      ) {
+        const result =
+          call.name === "recall_inbox_post"
+            ? await postInbox(db, userId, args.value, deps.now())
+            : call.name === "recall_inbox_unread"
+              ? await unreadInbox(db, userId, args.value, deps.now())
+              : await markInboxRead(db, userId, args.value, deps.now());
+        return result.ok ? document(result.value) : refused(result.error);
+      }
       if (call.name === "recall_search") {
         const input = parseSearchArgs(args.value);
         if (!input.ok) return refused(input.error);
@@ -2937,6 +2985,7 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
   ): Promise<Response> => {
     const db = env.DB;
     if (collection === "devices") return v2Devices(request, env, caller, rawName);
+    if (collection === "inbox") return inbox(request, url, env, caller, rawName);
     if (collection === "board") return board(request, url, env, caller, rawName, parseV2Post);
     if (collection === "sessions") return v2Sessions(request, url, env, caller, rawName, rest);
     if (collection === "history") {
@@ -3606,7 +3655,15 @@ export const createApp = (deps: Deps): App => {
       const caller = await mcpCaller(request, env);
       if (caller instanceof Response) return caller;
       const tenant = tenantOf(env, caller.userId);
-      return (made: ToolCall): Promise<ToolResult> => tenant.tool(made, caller, handed());
+      return (made: ToolCall): Promise<ToolResult> =>
+        made.name === "recall_inbox_wait"
+          ? waitInbox(
+              made.arguments,
+              (query) => tenant.inboxUnread(caller.userId, query, deps.now()),
+              request.signal,
+              deps.now,
+            )
+          : tenant.tool(made, caller, handed());
     });
     return withHeaders(answered, corsHeaders(request));
   };

@@ -314,3 +314,25 @@ export const boardPickups = sqliteTable(
   },
   (table) => [primaryKey({ columns: [table.userId, table.messageId] })],
 );
+
+// Kept independently of retained rows so expiry and eviction never reuse an id.
+export const inboxCounters = sqliteTable("inbox_counters", {
+  userId: text("user_id").primaryKey(),
+  highWater: integer("high_water").notNull(),
+});
+
+export const inboxMessages = sqliteTable(
+  "inbox_messages",
+  {
+    userId: text("user_id").notNull(),
+    id: integer("id").notNull(),
+    sender: text("sender").notNull(),
+    subject: text("subject").notNull(),
+    body: text("body").notNull(),
+    link: text("link"),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    readAt: integer("read_at"),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.id] })],
+);

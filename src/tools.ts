@@ -95,6 +95,7 @@ export interface ToolSchema {
   properties: Record<string, unknown>;
   required?: string[];
   additionalProperties: false;
+  oneOf?: Array<{ required: string[] }>;
 }
 
 export interface ToolDefinition {
@@ -125,7 +126,70 @@ const schema = (properties: Record<string, unknown>, required: string[] = []): T
 
 const NAME_SCHEMA = schema({ name: text("The memory's kebab-case name.") }, ["name"]);
 
+const inboxCursor = (description: string, minimum = 0): Record<string, unknown> => ({
+  type: "integer",
+  minimum,
+  maximum: Number.MAX_SAFE_INTEGER,
+  description,
+});
+const inboxUnreadProperties = {
+  after: {
+    ...inboxCursor("Unread ids greater than this cursor. Use 0 to reconnect and recover the unread backlog."),
+    default: 0,
+  },
+  limit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
+};
+
+const INBOX_TOOLS: ToolDefinition[] = [
+  {
+    name: "recall_inbox_post",
+    description:
+      "Post a retained message to this user's inbox. Sender is a caller-supplied label, never authorization. Messages expire after 30 days. Works independently of transient messaging and board pickup.",
+    inputSchema: schema(
+      {
+        sender: { ...text("Nonblank caller-supplied label, at most 64 UTF-8 bytes."), minLength: 1, maxLength: 64 },
+        subject: { ...text("Nonblank subject, at most 160 UTF-8 bytes."), minLength: 1, maxLength: 160 },
+        body: { ...text("Nonblank body, at most 4096 UTF-8 bytes."), minLength: 1, maxLength: 4096 },
+        link: {
+          ...text("Absolute HTTPS URL, at most 2048 UTF-8 bytes."),
+          maxLength: 2048,
+          pattern: "^[hH][tT][tT][pP][sS]://[^/\\s]+",
+        },
+      },
+      ["sender", "subject", "body"],
+    ),
+  },
+  {
+    name: "recall_inbox_unread",
+    description:
+      "Read this user's retained unread messages in ascending id order. Returns {messages,nextCursor}, bounded to 96 KiB. Reading and advancing the cursor do not acknowledge messages. Shared across chats; reads do not claim work.",
+    inputSchema: schema(inboxUnreadProperties),
+  },
+  {
+    name: "recall_inbox_mark_read",
+    description:
+      "Explicitly acknowledge exactly one id or all retained unread ids through up_to. Returns {updated}. Shared user read state; higher ids stay unread. A repeated acknowledgement updates zero messages; an absent or expired id is an error.",
+    inputSchema: {
+      ...schema({
+        id: inboxCursor("One message to acknowledge.", 1),
+        up_to: inboxCursor("Acknowledge retained unread messages at or below this cursor."),
+      }),
+      oneOf: [{ required: ["id"] }, { required: ["up_to"] }],
+    },
+  },
+  {
+    name: "recall_inbox_wait",
+    description:
+      "Wait for this user's unread inbox messages, reading immediately then polling until messages or timeout. Returns {messages,nextCursor}; timeout returns an empty page. Does not acknowledge or claim messages. Loop with nextCursor and explicitly mark processed messages read. Reconnect from after=0. A suspended chat does not keep running.",
+    inputSchema: schema({
+      ...inboxUnreadProperties,
+      timeout_seconds: { type: "integer", minimum: 0, maximum: 120, default: 60 },
+    }),
+  },
+];
+
 export const TOOLS: ToolDefinition[] = [
+  ...INBOX_TOOLS,
   {
     name: "recall_search",
     description:

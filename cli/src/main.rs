@@ -57,7 +57,42 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum InboxCommand {
+    #[command(about = "Post a retained message to your user inbox")]
+    Post {
+        #[arg(long)]
+        sender: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        link: Option<String>,
+        #[arg(value_name = "BODY", num_args = 1.., help = "Message body; stdin when omitted or -")]
+        body: Vec<String>,
+    },
+    #[command(about = "Read unread inbox messages without acknowledging them")]
+    Unread {
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=api::MAX_INBOX_ID))]
+        after: u64,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=20))]
+        limit: u32,
+    },
+    #[command(about = "Explicitly acknowledge one message or all retained messages through a cursor",
+        group(ArgGroup::new("ack").required(true).multiple(false)))]
+    Read {
+        #[arg(long, group = "ack", value_parser = clap::value_parser!(u64).range(1..=api::MAX_INBOX_ID))]
+        id: Option<u64>,
+        #[arg(long, group = "ack", value_parser = clap::value_parser!(u64).range(0..=api::MAX_INBOX_ID))]
+        up_to: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    #[command(about = "Post, read and acknowledge retained user inbox messages")]
+    Inbox {
+        #[command(subcommand)]
+        action: InboxCommand,
+    },
     #[command(about = "Save a memory from a markdown file with frontmatter, or from stdin")]
     Save {
         #[arg(value_name = "FILE", help = "Markdown file; stdin when omitted or -")]
@@ -619,7 +654,7 @@ fn message_body(words: &[String]) -> Result<String> {
     let joined = words.join(" ");
     let text = if joined.is_empty() || joined == "-" {
         if std::io::stdin().is_terminal() {
-            bail!("pass a message, or pipe one into recall send");
+            bail!("pass a message, or pipe one into recall");
         }
         let mut piped = String::new();
         std::io::stdin().read_to_string(&mut piped)?;
@@ -1137,6 +1172,60 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("posted {} to {to}", posted.message_id);
             }
         }
+        Command::Inbox { action } => match action {
+            InboxCommand::Post {
+                sender,
+                subject,
+                link,
+                body,
+            } => {
+                let body = message_body(&body)?;
+                let posted = client()?.inbox_post(&api::InboxPost {
+                    sender,
+                    subject,
+                    link,
+                    body,
+                })?;
+                if cli.json {
+                    print_json(&posted)?;
+                } else {
+                    println!("posted inbox message {}", posted.message.id);
+                }
+            }
+            InboxCommand::Unread { after, limit } => {
+                let page = client()?.inbox_unread(&api::InboxQuery { after, limit })?;
+                if cli.json {
+                    print_json(&page)?;
+                } else {
+                    if page.messages.is_empty() {
+                        println!("the inbox has no unread messages");
+                    }
+                    for message in &page.messages {
+                        println!(
+                            "### {}: {} — {}\n\n{}\n",
+                            message.id, message.subject, message.sender, message.body
+                        );
+                        if let Some(link) = &message.link {
+                            println!("{link}\n");
+                        }
+                    }
+                    println!("next cursor: {}", page.next_cursor);
+                }
+            }
+            InboxCommand::Read { id, up_to } => {
+                let read = match (id, up_to) {
+                    (Some(id), None) => api::InboxRead::One { id },
+                    (None, Some(up_to)) => api::InboxRead::Through { up_to },
+                    _ => unreachable!("clap requires exactly one acknowledgement target"),
+                };
+                let marked = client()?.inbox_mark_read(&read)?;
+                if cli.json {
+                    print_json(&marked)?;
+                } else {
+                    println!("marked {} messages read", marked.updated);
+                }
+            }
+        },
         Command::Board => {
             let entries = client()?.board()?;
             if cli.json {
@@ -1534,6 +1623,65 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("recall").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn inbox_commands_parse_without_enabling_messaging() {
+        let cli = parse(&[
+            "inbox",
+            "post",
+            "--sender",
+            "agent",
+            "--subject",
+            "Ready",
+            "body",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        assert!(
+            matches!(cli.command, Command::Inbox { action: InboxCommand::Post { ref body, .. } } if body == &["body"])
+        );
+        let cli = parse(&["inbox", "post", "--sender", "agent", "--subject", "Ready"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Inbox { action: InboxCommand::Post { ref body, .. } } if body.is_empty())
+        );
+        assert!(matches!(
+            parse(&["inbox", "unread"]).unwrap().command,
+            Command::Inbox {
+                action: InboxCommand::Unread { after: 0, limit: 10 }
+            }
+        ));
+        assert!(parse(&["inbox", "read", "--up-to", "0"]).is_ok());
+        assert!(parse(&["inbox", "read", "--id", "9007199254740991"]).is_ok());
+        assert!(
+            parse(&[
+                "inbox",
+                "post",
+                "--sender",
+                "agent",
+                "--subject",
+                "Ready",
+                "--link",
+                "https://example.com",
+                "body"
+            ])
+            .is_ok()
+        );
+        for args in [
+            vec!["inbox", "read"],
+            vec!["inbox", "read", "--id", "1", "--up-to", "1"],
+            vec!["inbox", "read", "--id", "0"],
+            vec!["inbox", "read", "--id", "9007199254740992"],
+            vec!["inbox", "unread", "--after", "-1"],
+            vec!["inbox", "unread", "--after", "1.5"],
+            vec!["inbox", "unread", "--after", "9007199254740992"],
+            vec!["inbox", "unread", "--limit", "0"],
+            vec!["inbox", "unread", "--limit", "21"],
+            vec!["inbox", "post", "--subject", "Ready", "body"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]

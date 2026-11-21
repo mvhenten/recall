@@ -79,6 +79,224 @@
         "type": "string",
         "maxLength": 200
       },
+      "InboxBody": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "Nonblank body, at most 4096 UTF-8 bytes."
+      },
+      "InboxCursor": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "InboxId": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 1,
+        "maximum": 9007199254740991
+      },
+      "InboxLink": {
+        "type": "string",
+        "maxLength": 2048,
+        "pattern": "^[hH][tT][tT][pP][sS]://[^/\\s]+",
+        "description": "Absolute HTTPS URL, at most 2048 UTF-8 bytes."
+      },
+      "InboxMarkRead": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/InboxReadOne"
+          },
+          {
+            "$ref": "#/components/schemas/InboxReadThrough"
+          }
+        ]
+      },
+      "InboxMessage": {
+        "type": "object",
+        "required": ["id", "sender", "subject", "body", "link", "createdAt", "expiresAt", "readAt"],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/InboxId"
+          },
+          "sender": {
+            "$ref": "#/components/schemas/InboxSender"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/InboxSubject"
+          },
+          "body": {
+            "$ref": "#/components/schemas/InboxBody"
+          },
+          "link": {
+            "type": "string",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InboxLink"
+              }
+            ],
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch milliseconds."
+          },
+          "expiresAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch milliseconds, 30 days after creation."
+          },
+          "readAt": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Epoch milliseconds, null until explicitly acknowledged."
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxPage": {
+        "type": "object",
+        "required": ["messages", "nextCursor"],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InboxMessage"
+            },
+            "maxItems": 20
+          },
+          "nextCursor": {
+            "$ref": "#/components/schemas/InboxCursor"
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxPost": {
+        "type": "object",
+        "required": ["sender", "subject", "body"],
+        "properties": {
+          "sender": {
+            "$ref": "#/components/schemas/InboxSender"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/InboxSubject"
+          },
+          "body": {
+            "$ref": "#/components/schemas/InboxBody"
+          },
+          "link": {
+            "$ref": "#/components/schemas/InboxLink"
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxPosted": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/InboxMessage"
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxReadOne": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/InboxId"
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxReadResult": {
+        "type": "object",
+        "required": ["updated"],
+        "properties": {
+          "updated": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 1000
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxReadThrough": {
+        "type": "object",
+        "required": ["up_to"],
+        "properties": {
+          "up_to": {
+            "$ref": "#/components/schemas/InboxCursor"
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxSender": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "A caller-supplied label, never authorization. Nonblank, at most 64 UTF-8 bytes."
+      },
+      "InboxSubject": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160,
+        "description": "Nonblank subject, at most 160 UTF-8 bytes."
+      },
+      "InboxUnread": {
+        "type": "object",
+        "properties": {
+          "after": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InboxCursor"
+              }
+            ],
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 10
+          }
+        },
+        "additionalProperties": false
+      },
+      "InboxWait": {
+        "type": "object",
+        "properties": {
+          "after": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InboxCursor"
+              }
+            ],
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 10
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "maximum": 120,
+            "default": 60
+          }
+        },
+        "additionalProperties": false
+      },
       "InjectMemories": {
         "type": "object",
         "required": ["query", "preferScope", "limit", "minScore"],

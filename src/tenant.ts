@@ -4,6 +4,7 @@ import type { ArtifactListInput, ArtifactRecord } from "./artifacts";
 import { accountStoreOf, type TenantDb, tenantStoreOf } from "./db";
 import type { Caller } from "./device";
 import { migrateDurableObject } from "./durable-migrate";
+import type { InboxMessage, InboxPage, InboxResult } from "./inbox";
 import type { Env } from "./index";
 import type { ToolCall, ToolResult } from "./mcp";
 import {
@@ -19,8 +20,11 @@ import {
   deleteArtifact,
   getArtifact,
   listArtifactPage,
+  markInboxRead,
+  postInbox,
   replaceArtifact,
   searchArtifacts,
+  unreadInbox,
 } from "./store";
 import { TENANT_MIGRATIONS } from "./tenant-migrations";
 
@@ -122,6 +126,18 @@ export class Tenant extends DurableObject<Env> {
     const bucket = this.env.ARTIFACTS;
     if (bucket === undefined) throw new Error("this deployment binds no artifact bucket");
     return adoptArtifacts(this.db, bucket, userId);
+  }
+
+  inboxPost(userId: string, input: unknown, now: number): Promise<InboxResult<{ message: InboxMessage }>> {
+    return postInbox(this.db, userId, input, now);
+  }
+
+  inboxUnread(userId: string, input: unknown, now: number): Promise<InboxResult<InboxPage>> {
+    return unreadInbox(this.db, userId, input, now);
+  }
+
+  inboxMarkRead(userId: string, input: unknown, now: number): Promise<InboxResult<{ updated: number }>> {
+    return markInboxRead(this.db, userId, input, now);
   }
 
   private store(): TenantEnv {

@@ -3,7 +3,7 @@
 // `float64` as the same bounded `z.number()`, so a limit of 3.5 would pass the contract's own
 // schema; the OpenAPI the same compile emits does tell the two apart. This reads the integrality
 // out of that file and rewrites the matching `z.number()` to `z.int()`, so the contract stays the
-// only place the rule is written down.
+// only place the rule is written down. Closed object schemas are carried over here too.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -13,6 +13,7 @@ const generated = join(dirname(fileURLToPath(import.meta.url)), "..", "typespec"
 const schemas = JSON.parse(readFileSync(join(generated, "openapi.json"), "utf8")).components.schemas;
 
 const resolved = (property) => {
+  if (property.allOf?.length === 1) return resolved(property.allOf[0]);
   const ref = property.$ref;
   if (!ref) return property;
   const target = schemas[ref.slice(ref.lastIndexOf("/") + 1)];
@@ -32,11 +33,12 @@ const marked = blocks.map((block) => {
   const name = /^export const (\w+)Schema = /.exec(block)?.[1];
   const schema = name === undefined ? undefined : schemas[name];
   if (!schema) return block;
+  const closed = schema.additionalProperties === false ? block.replace("z.object(", "z.strictObject(") : block;
   return integerFields(schema).reduce((held, field) => {
-    const whole = new RegExp(`(\\b${field}: z\\.)number\\(\\)`);
+    const whole = new RegExp(`(\\b${field}: (?:z\\.union\\(\\[)?z\\.)number\\(\\)`);
     if (!whole.test(held)) throw new Error(`no generated z.number() to mark whole: ${name}.${field}`);
     return held.replace(whole, "$1int()");
-  }, block);
+  }, closed);
 });
 
 writeFileSync(file, marked.join(""));
