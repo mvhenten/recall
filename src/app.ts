@@ -485,7 +485,7 @@ export interface AccountApi {
     store: ArtifactStore,
     caller: Caller,
     name: string,
-    content: string,
+    bytes: Uint8Array,
   ): Promise<Response>;
   listArtifacts(account: AccountDb, store: ArtifactStore, caller: Caller, params: URLSearchParams): Promise<Response>;
 
@@ -3025,11 +3025,10 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
     },
     dashboard,
     artifacts,
-    async publishContent(account, store, caller, name, content) {
+    async publishContent(account, store, caller, name, bytes) {
       const host = deps.artifacts;
       if (host === null)
         return error(404, "this recall publishes no artifacts; its deployment names no artifact hostname");
-      const bytes = new TextEncoder().encode(content);
       const manifest = parseManifest({
         type: "site",
         title: name,
@@ -3040,7 +3039,9 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
       });
       if (!manifest.ok) return error(400, manifest.error);
       return publishArtifact(account, store, host, caller, name, manifest.value, "own-site", async (_file, into) => {
-        await new Blob([bytes]).stream().pipeTo(into);
+        const writer = into.getWriter();
+        await writer.write(bytes);
+        await writer.close();
         return { ok: true, bytes: bytes.byteLength };
       });
     },
@@ -3703,7 +3704,7 @@ export const createApp = (deps: Deps): App => {
       const tenant = tenantOf(env, caller.userId);
       const store = artifactStoreFor(env);
       return authenticatedTools(
-        (name, content) => account.publishContent(env.DB, store, caller, name, content),
+        (name, bytes) => account.publishContent(env.DB, store, caller, name, bytes),
         (params) => account.listArtifacts(env.DB, store, caller, params),
         (made) => tenant.tool(made, caller, handed()),
       );

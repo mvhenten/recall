@@ -47,7 +47,7 @@ export type Authorize = () => Promise<RunTool | Response>;
 // Artifact bytes stay in the Worker; only the remaining tools cross to the tenant object.
 export const authenticatedTools =
   (
-    publish: (name: string, content: string) => Promise<Response>,
+    publish: (name: string, bytes: Uint8Array) => Promise<Response>,
     artifacts: (params: URLSearchParams) => Promise<Response>,
     tenant: RunTool,
   ): RunTool =>
@@ -67,13 +67,15 @@ export const authenticatedTools =
       if (typeof args.content !== "string" || args.content.trim().length === 0) {
         return refused("content must be a nonblank HTML string");
       }
-      if (
-        args.content.length > MAX_CONNECTOR_HTML_BYTES ||
-        new TextEncoder().encode(args.content).byteLength > MAX_CONNECTOR_HTML_BYTES
-      ) {
+      if (args.content.length > MAX_CONNECTOR_HTML_BYTES) {
         return refused(`content must hold at most ${MAX_CONNECTOR_HTML_BYTES} UTF-8 bytes`);
       }
-      response = await publish(name.value, args.content);
+      const buffer = new Uint8Array(MAX_CONNECTOR_HTML_BYTES);
+      const { read, written } = new TextEncoder().encodeInto(args.content, buffer);
+      if (read < args.content.length) {
+        return refused(`content must hold at most ${MAX_CONNECTOR_HTML_BYTES} UTF-8 bytes`);
+      }
+      response = await publish(name.value, buffer.subarray(0, written));
     } else {
       const params = new URLSearchParams();
       for (const [field, max] of [

@@ -758,20 +758,31 @@ describe("publishing from the connector", () => {
     expect((await mcp.json("recall_artifacts")).total).toBe(1);
   });
 
-  it("enforces the inclusive UTF-8 byte cap and preserves the live revision on rejection", async () => {
-    const { h, email, mcp } = await signedIn();
-    const content = "é".repeat(MAX_CONNECTOR_HTML_BYTES / 2);
-    const first = (await mcp.json("recall_publish", { name: "boundary", content })) as ArtifactView;
-    expect(first.bytes).toBe(MAX_CONNECTOR_HTML_BYTES);
-    for (const oversized of [`${content}a`, "a".repeat(MAX_CONNECTOR_HTML_BYTES + 1)]) {
-      await expect(mcp.tool("recall_publish", { name: "boundary", content: oversized })).rejects.toThrow(
-        "16777216 UTF-8 bytes",
-      );
-    }
-    expect((await mcp.json("recall_artifacts")).artifacts).toEqual([first]);
-    const assertion = await h.assertionFor(email, ARTIFACT_AUDIENCE);
-    expect(await (await h.sendToArtifactHost("/a/boundary", assertion)).text()).toBe(content);
-  }, 30_000);
+  it.each([
+    ["é", 2],
+    ["漢", 3],
+  ] as const)(
+    "enforces the inclusive UTF-8 byte cap with %s and preserves the live revision on rejection",
+    async (character, width) => {
+      const { h, email, mcp } = await signedIn();
+      const content = `${character.repeat(Math.floor(MAX_CONNECTOR_HTML_BYTES / width))}${"a".repeat(MAX_CONNECTOR_HTML_BYTES % width)}`;
+      const first = (await mcp.json("recall_publish", { name: "boundary", content })) as ArtifactView;
+      expect(first.bytes).toBe(MAX_CONNECTOR_HTML_BYTES);
+      for (const oversized of [
+        `${content}a`,
+        character.repeat(MAX_CONNECTOR_HTML_BYTES - 1),
+        "a".repeat(MAX_CONNECTOR_HTML_BYTES + 1),
+      ]) {
+        await expect(mcp.tool("recall_publish", { name: "boundary", content: oversized })).rejects.toThrow(
+          "16777216 UTF-8 bytes",
+        );
+      }
+      expect((await mcp.json("recall_artifacts")).artifacts).toEqual([first]);
+      const assertion = await h.assertionFor(email, ARTIFACT_AUDIENCE);
+      expect(await (await h.sendToArtifactHost("/a/boundary", assertion)).text()).toBe(content);
+    },
+    30_000,
+  );
 
   it("rejects malformed inputs without creating artifacts", async () => {
     const { h, email, mcp } = await signedIn();
