@@ -105,7 +105,7 @@ Both modes add matching memories to each prompt.
 
 ### MCP over stdio
 
-`recall mcp` serves the operations as MCP tools for a harness that speaks MCP and has no shell of its own: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`, plus `recall_send`, `recall_order` and `recall_peek` while messaging is on. They tag like the CLI, from the directory the harness runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`. Register it where you want it; the Claude Code plugin does not.
+`recall mcp` serves the operations as MCP tools for a harness that speaks MCP and has no shell of its own: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_publish`, `recall_artifacts` and `recall_unpublish`. The inbox tools `recall_inbox_post`, `recall_inbox_unread` and `recall_inbox_mark_read` are always available; `recall_send`, `recall_order` and `recall_peek` are registered while messaging is on. They tag like the CLI, from the directory the harness runs in, and `recall_save` tags `user` and `feedback` memories global unless told otherwise. A failure comes back as a tool error with the CLI's message, such as `run recall login`. Register it where you want it; the Claude Code plugin does not.
 
 ## Settings
 
@@ -156,6 +156,41 @@ recall edit indent --tag style      # no field flags opens $EDITOR
 recall delete indent
 recall --json search cache          # machine output
 ```
+
+## User inbox
+
+The inbox holds messages for the signed-in user, including chats without a Claude Code harness. It works with `messaging.enabled=false`. Every chat sees the same unread state, and reading a message never claims it or marks it read. A sender is a caller-supplied label, not an identity or authorization grant.
+
+```sh
+recall inbox post --sender builder --subject "PR ready" --link https://github.com/org/repo/pull/42 "Checks passed; ready for review."
+printf '%s\n' 'The migration is complete.' | recall inbox post --sender builder --subject "Migration complete"
+recall inbox unread                    # defaults: --after 0 --limit 10
+recall inbox unread --after 12 --limit 20 --json
+recall inbox read --id 13              # explicitly acknowledge one message
+recall inbox read --up-to 20           # acknowledge retained unread ids <= 20
+```
+
+These commands use authenticated `POST /v2/inbox`, `GET /v2/inbox?after=0&limit=10`, and `POST /v2/inbox/read`. Posting returns `{message}`; unread returns `{messages,nextCursor}` in ascending id order; acknowledging returns `{updated}`. A message contains `id`, `sender`, `subject`, `body`, nullable `link`, `createdAt`, `expiresAt`, and nullable `readAt`. Timestamps are epoch milliseconds. All commands support `--json` with the same response envelopes.
+
+Post fields must be nonblank. Sender, subject and body are capped at 64, 160 and 4,096 UTF-8 bytes; an optional absolute HTTPS link is capped at 2,048 UTF-8 bytes. Messages expire after 30 days. The inbox retains at most 1,000 messages: it purges expired rows, then evicts the oldest read messages as needed. A full inbox of unread messages refuses new posts with 429. It never silently evicts unexpired unread messages.
+
+IDs are positive JSON safe integers, monotonically allocated across expiry, eviction and deletion. Cursors allow 0 and cannot exceed the allocated high-water mark. Pages contain at most 20 messages (10 by default) and at most 96 KiB of serialized JSON. `nextCursor` is the last returned id, or the supplied `after` on an empty page. Advancing it does not acknowledge older messages: `after=0` recovers the remaining unread backlog. `read` requires exactly one of `--id` and `--up-to`; repeating an acknowledgement updates zero rows, an absent or expired id returns 404, and higher ids posted concurrently remain unread.
+
+Local MCP and the remote connector expose `recall_inbox_post`, `recall_inbox_unread`, and `recall_inbox_mark_read`, even with messaging disabled. Their arguments match the HTTP operations: post takes `{sender,subject,body,link?}`, unread takes `{after?,limit?}`, and mark-read takes exactly one of `{id}` or `{up_to}`. The remote connector additionally exposes `recall_inbox_wait` with `{after?,limit?,timeout_seconds?}`. Timeout is an integer from 0 to 120 seconds, default 60; 0 reads immediately. It returns the same page as unread, or an empty page on timeout. The wait reads immediately, then polls every second for the first 10 seconds and every two seconds thereafter until messages or its live deadline. Client cancellation stops polling. JSON and SSE clients receive the same single final response.
+
+For a background chat worker that the client keeps active, use this tool loop:
+
+```text
+cursor = 0                           # start and reconnect from unread backlog
+repeat while the client keeps this chat active:
+    page = recall_inbox_wait({after: cursor, limit: 10, timeout_seconds: 60})
+    for message in page.messages:
+        process message
+        recall_inbox_mark_read({id: message.id})  # only after processing succeeds
+    cursor = page.nextCursor
+```
+
+A failed processing step should leave its message unread; restart from `after=0` to recover it. Use `up_to` only when every retained unread message through that id has been processed. Concurrent chats can see the same messages until one explicitly acknowledges them; waits do not assign ownership. This loop receives updates only while the chat and its client are running. A suspended chat does not keep running, and MCP cannot initiate a chat turn.
 
 ## Messaging between hosts
 
@@ -430,7 +465,7 @@ A client with no shell reaches recall as a custom connector, without the CLI: th
 https://recall.example.com/mcp
 ```
 
-Paste that URL into the client's add-a-connector form. It serves twelve tools. Eight carry the names `recall mcp` serves on stdio: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_send` and `recall_peek`. Four are its own: `recall_sessions` and `recall_devices` answer what the commands of those names print, so a client with no shell reads the handles and hosts `recall_send` and `recall_peek` take, and `recall_usage` and `recall_session_usage` answer what [the Stats tab](#dashboard) draws. The publishing tools stay on stdio, because a publish names files on disk and this end holds no working copy. This is the lane for a client with no shell; a host that has one uses the CLI.
+Paste that URL into the client's add-a-connector form. It serves sixteen tools. Eleven carry the names `recall mcp` serves on stdio: `recall_search`, `recall_get`, `recall_list`, `recall_save`, `recall_edit`, `recall_delete`, `recall_send`, `recall_peek`, `recall_inbox_post`, `recall_inbox_unread` and `recall_inbox_mark_read`. Five are its own: `recall_sessions` and `recall_devices` answer what the commands of those names print, so a client with no shell reads the handles and hosts `recall_send` and `recall_peek` take, and `recall_usage` and `recall_session_usage` answer what [the Stats tab](#dashboard) draws. The fifth, `recall_inbox_wait`, waits for retained unread [inbox messages](#user-inbox). The publishing tools stay on stdio, because a publish names files on disk and this end holds no working copy. This is the lane for a client with no shell; a host that has one uses the CLI.
 
 `recall_peek` takes one session and never a host, since one summariser answers for one session. It asks and reads back the way [a peek from a host does](#taking-a-peek), and a call still pending when the read back runs out answers `Pending`, which a later call asks afresh.
 
