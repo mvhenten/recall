@@ -251,6 +251,9 @@ export const waitInbox = async (
   const cancelled = (): ToolResult => ({ ok: false, error: "recall: inbox wait cancelled" });
   let timer: ReturnType<typeof setTimeout> | undefined;
   let wake: (() => void) | undefined;
+  // This wait stays in the request's response path, never ctx.waitUntil. Workers cancels
+  // its tasks and timers on disconnect; request.signal adds abort cleanup when enabled.
+  // The live deadline caps the wait at 120 seconds regardless of signal availability.
   const abort = (): void => {
     clearTimeout(timer);
     wake?.();
