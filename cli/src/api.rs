@@ -311,6 +311,96 @@ pub struct InjectRequest<'a> {
     pub min_score: f64,
 }
 
+pub const MAX_INBOX_ID: u64 = 9_007_199_254_740_991;
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InboxPost {
+    /// Nonblank caller-supplied label, never authorization; at most 64 UTF-8 bytes.
+    #[schemars(length(min = 1, max = 64))]
+    pub sender: String,
+    /// Nonblank subject, at most 160 UTF-8 bytes.
+    #[schemars(length(min = 1, max = 160))]
+    pub subject: String,
+    /// Nonblank body, at most 4096 UTF-8 bytes.
+    #[schemars(length(min = 1, max = 4096))]
+    pub body: String,
+    /// Absolute HTTPS URL, at most 2048 UTF-8 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "inbox_link")]
+    #[schemars(
+        with = "String",
+        length(max = 2048),
+        regex(pattern = "^[hH][tT][tT][pP][sS]://[^/\\s]+")
+    )]
+    pub link: Option<String>,
+}
+
+fn inbox_link<'de, D: Deserializer<'de>>(read: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(read).map(Some)
+}
+
+fn inbox_limit() -> u32 {
+    10
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InboxQuery {
+    /// Unread ids greater than this cursor. Reconnect from 0 to recover the backlog.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub after: u64,
+    #[serde(default = "inbox_limit")]
+    #[schemars(range(min = 1, max = 20))]
+    pub limit: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
+#[schemars(extend("type" = "object"))]
+pub enum InboxRead {
+    One {
+        /// Positive JSON safe integer id to acknowledge.
+        #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+        id: u64,
+    },
+    Through {
+        /// Acknowledge retained unread ids at or below this JSON safe integer cursor.
+        #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+        up_to: u64,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxMessage {
+    pub id: u64,
+    pub sender: String,
+    pub subject: String,
+    pub body: String,
+    pub link: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub read_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InboxPosted {
+    pub message: InboxMessage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxPage {
+    pub messages: Vec<InboxMessage>,
+    pub next_cursor: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InboxReadResult {
+    pub updated: u32,
+}
+
 pub struct Client {
     agent: Agent,
     config: Config,
@@ -1123,6 +1213,36 @@ impl DeviceLogin {
 }
 
 impl Client {
+    pub fn inbox_post(&self, post: &InboxPost) -> Result<InboxPosted> {
+        let response = self.authed(self.agent.post(self.url("/v2/inbox"))).send_json(post)?;
+        Ok(check(response, "posting to the inbox")?.body_mut().read_json()?)
+    }
+
+    pub fn inbox_unread(&self, query: &InboxQuery) -> Result<InboxPage> {
+        if query.after > MAX_INBOX_ID || !(1..=20).contains(&query.limit) {
+            bail!("after must be a JSON safe integer and limit must be from 1 to 20");
+        }
+        let path = format!("/v2/inbox?after={}&limit={}", query.after, query.limit);
+        let response = self.authed(self.agent.get(self.url(&path))).call()?;
+        Ok(check(response, "reading the inbox")?.body_mut().read_json()?)
+    }
+
+    pub fn inbox_mark_read(&self, read: &InboxRead) -> Result<InboxReadResult> {
+        let valid = match read {
+            InboxRead::One { id } => (1..=MAX_INBOX_ID).contains(id),
+            InboxRead::Through { up_to } => *up_to <= MAX_INBOX_ID,
+        };
+        if !valid {
+            bail!("id must be positive and up_to nonnegative, both JSON safe integers");
+        }
+        let response = self
+            .authed(self.agent.post(self.url("/v2/inbox/read")))
+            .send_json(read)?;
+        Ok(check(response, "acknowledging inbox messages")?
+            .body_mut()
+            .read_json()?)
+    }
+
     pub fn new(config: Config) -> Client {
         Client { agent: agent(), config }
     }
@@ -1858,6 +1978,145 @@ fn multipart(boundary: &str, manifest: &str, files: &[PublishFile]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inbox_operations_use_authenticated_http_and_preserve_the_wire_contract() {
+        use serde_json::json;
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(Config {
+            endpoint: format!("http://{}", listener.local_addr().unwrap()),
+            token: "inbox-token".into(),
+        });
+        let message = json!({ "id": 1, "sender": "agent", "subject": "Ready", "body": "done", "link": null,
+            "createdAt": 1700000000000_i64, "expiresAt": 1702592000000_i64, "readAt": null });
+        let expected_message = message.clone();
+        let server = std::thread::spawn(move || {
+            let requests = [
+                (
+                    "POST /v2/inbox HTTP/1.1",
+                    Some(json!({ "sender": "agent", "subject": "Ready", "body": "done" })),
+                    201,
+                    json!({ "message": message }),
+                ),
+                (
+                    "GET /v2/inbox?after=0&limit=10 HTTP/1.1",
+                    None,
+                    200,
+                    json!({ "messages": [message], "nextCursor": 1 }),
+                ),
+                (
+                    "POST /v2/inbox/read HTTP/1.1",
+                    Some(json!({ "up_to": 1 })),
+                    200,
+                    json!({ "updated": 1 }),
+                ),
+                (
+                    "POST /v2/inbox/read HTTP/1.1",
+                    Some(json!({ "id": 99 })),
+                    404,
+                    json!({ "error": "no such inbox message" }),
+                ),
+            ];
+            for (line, body, status, response) in requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert_eq!(first.trim_end(), line);
+                let mut headers = String::new();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&header.to_lowercase());
+                }
+                assert!(headers.contains("authorization: bearer inbox-token\r\n"), "{headers}");
+                if let Some(body) = body {
+                    let size: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let mut bytes = vec![0; size];
+                    reader.read_exact(&mut bytes).unwrap();
+                    assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(), body);
+                }
+                let text = response.to_string();
+                write!(stream, "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}", text.len()).unwrap();
+            }
+        });
+        let post = InboxPost {
+            sender: "agent".into(),
+            subject: "Ready".into(),
+            body: "done".into(),
+            link: None,
+        };
+        let posted = client.inbox_post(&post).unwrap();
+        assert_eq!(serde_json::to_value(&posted.message).unwrap(), expected_message);
+        let page = client
+            .inbox_unread(&serde_json::from_value(json!({})).unwrap())
+            .unwrap();
+        assert_eq!(page.next_cursor, 1);
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(
+            client
+                .inbox_mark_read(&InboxRead::Through { up_to: 1 })
+                .unwrap()
+                .updated,
+            1
+        );
+        assert!(
+            client
+                .inbox_mark_read(&InboxRead::One { id: 99 })
+                .unwrap_err()
+                .to_string()
+                .contains("no such inbox message")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn inbox_ids_and_cursors_are_json_safe_before_a_request_is_sent() {
+        let client = Client::new(Config {
+            endpoint: "http://invalid".into(),
+            token: "token".into(),
+        });
+        for read in [
+            InboxRead::One { id: 0 },
+            InboxRead::One { id: MAX_INBOX_ID + 1 },
+            InboxRead::Through {
+                up_to: MAX_INBOX_ID + 1,
+            },
+        ] {
+            assert!(
+                client
+                    .inbox_mark_read(&read)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("JSON safe")
+            );
+        }
+        for query in [
+            InboxQuery {
+                after: MAX_INBOX_ID + 1,
+                limit: 10,
+            },
+            InboxQuery { after: 0, limit: 0 },
+            InboxQuery { after: 0, limit: 21 },
+        ] {
+            assert!(
+                client
+                    .inbox_unread(&query)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("JSON safe")
+            );
+        }
+    }
 
     /// `/v2` takes a business date as an instant carrying its offset and refuses anything else, so
     /// a host whose dates read differently syncs no session at all.

@@ -459,6 +459,30 @@ impl Recall {
     }
 
     #[tool(
+        name = "recall_inbox_post",
+        description = "Post a retained message to this user's inbox. Sender is a caller-supplied label, never authorization. Messages expire after 30 days. Works with messaging disabled."
+    )]
+    async fn inbox_post(&self, Parameters(params): Parameters<api::InboxPost>) -> Result<String, String> {
+        blocking(move || to_json(&client()?.inbox_post(&params)?)).await
+    }
+
+    #[tool(
+        name = "recall_inbox_unread",
+        description = "Read this user's unread inbox messages in ascending id order. Returns {messages,nextCursor}, at most 96 KiB. Reading or advancing the cursor never acknowledges or claims messages. Reconnect from after=0 to recover unread backlog."
+    )]
+    async fn inbox_unread(&self, Parameters(params): Parameters<api::InboxQuery>) -> Result<String, String> {
+        blocking(move || to_json(&client()?.inbox_unread(&params)?)).await
+    }
+
+    #[tool(
+        name = "recall_inbox_mark_read",
+        description = "Explicitly acknowledge exactly one id or all retained unread ids through up_to. Returns {updated}; repeated acknowledgement updates zero messages. Shared user read state; concurrent higher ids stay unread. An absent or expired id is an error."
+    )]
+    async fn inbox_mark_read(&self, Parameters(params): Parameters<api::InboxRead>) -> Result<String, String> {
+        blocking(move || to_json(&client()?.inbox_mark_read(&params)?)).await
+    }
+
+    #[tool(
         name = "recall_send",
         description = "Message one Claude Code session running on another host signed in as this user, named by the handle recall sessions prints, or every session on a host named by its label or as recall devices shows it. The message arrives as a user turn there. This is the only route to a session on another machine: Claude Code's own SendMessage and ListAgents see only sessions on this one, so answering a message from another host through them reaches a local session instead. A message is a ping that is relevant now, not a board a session reads when it starts: it is published to the hosts listening the moment it is sent and expires unread where none are, so nothing is kept for a session that starts later. Use recall_order instead where you need to know which session took the work."
     )]
@@ -667,6 +691,64 @@ mod tests {
     }
 
     #[test]
+    fn inbox_tools_are_registered_independently_of_messaging_and_publish_closed_schemas() {
+        for enabled in [false, true] {
+            let tools = names(enabled);
+            for name in ["recall_inbox_post", "recall_inbox_unread", "recall_inbox_mark_read"] {
+                assert!(tools.contains(&name.to_string()));
+            }
+            assert!(!tools.contains(&"recall_inbox_wait".to_string()));
+        }
+        assert_eq!(required("recall_inbox_post"), ["body", "sender", "subject"]);
+        assert_eq!(schema("recall_inbox_post")["additionalProperties"], false);
+        assert_eq!(schema("recall_inbox_unread")["additionalProperties"], false);
+        assert_eq!(schema("recall_inbox_post")["properties"]["sender"]["maxLength"], 64);
+        assert_eq!(schema("recall_inbox_post")["properties"]["body"]["maxLength"], 4096);
+        assert_eq!(schema("recall_inbox_post")["properties"]["link"]["type"], "string");
+        assert_eq!(
+            schema("recall_inbox_unread")["properties"]["after"]["maximum"],
+            9_007_199_254_740_991_u64
+        );
+        let read = schema("recall_inbox_mark_read");
+        assert_eq!(read["type"], "object");
+        for branch in read["anyOf"].as_array().unwrap() {
+            assert_eq!(branch["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn inbox_parameters_and_results_preserve_exact_acknowledgements_and_nullable_fields() {
+        let query: api::InboxQuery = serde_json::from_value(json!({})).unwrap();
+        assert_eq!((query.after, query.limit), (0, 10));
+        for value in [
+            json!({}),
+            json!({ "id": 1, "up_to": 2 }),
+            json!({ "id": 1, "extra": true }),
+            json!({ "id": null }),
+        ] {
+            assert!(serde_json::from_value::<api::InboxRead>(value).is_err());
+        }
+        let read: api::InboxRead = serde_json::from_value(json!({ "id": 1 })).unwrap();
+        assert_eq!(serde_json::to_value(read).unwrap(), json!({ "id": 1 }));
+        assert!(
+            serde_json::from_value::<api::InboxPost>(
+                json!({ "sender": "agent", "subject": "Ready", "body": "done", "link": null })
+            )
+            .is_err()
+        );
+        let posted: api::InboxPosted = serde_json::from_value(json!({ "message": {
+            "id": 9007199254740991_u64, "sender": "agent", "subject": "Ready", "body": "done",
+            "link": null, "createdAt": 1700000000000_i64, "expiresAt": 1702592000000_i64, "readAt": null
+        }}))
+        .unwrap();
+        let result: Value = serde_json::from_str(&to_json(&posted).unwrap()).unwrap();
+        assert_eq!(result["message"]["id"], 9007199254740991_u64);
+        assert_eq!(result["message"]["createdAt"], 1700000000000_i64);
+        assert_eq!(result["message"]["readAt"], Value::Null);
+        assert_eq!(result["message"]["link"], Value::Null);
+    }
+
+    #[test]
     fn serves_every_tool_but_recall_send_with_descriptions() {
         assert_eq!(
             names(false),
@@ -675,6 +757,9 @@ mod tests {
                 "recall_delete",
                 "recall_edit",
                 "recall_get",
+                "recall_inbox_mark_read",
+                "recall_inbox_post",
+                "recall_inbox_unread",
                 "recall_list",
                 "recall_publish",
                 "recall_save",
