@@ -1,6 +1,8 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
+import { type ArtifactView, artifactPrefix, MAX_CONNECTOR_HTML_BYTES } from "../src/artifacts";
 import { NO_PEEK_LISTENING, ORDERS, ORDERS_HEADER, type PeekFrame, type PeekOrder } from "../src/mailbox";
-import { MCP_PATH, waitInbox } from "../src/mcp";
+import { authenticatedTools, MCP_PATH, waitInbox } from "../src/mcp";
 import type { Peek } from "../src/model";
 import {
   PEEK_ATTACH_MS,
@@ -10,12 +12,40 @@ import {
   readBackPeek,
   reusablePeek,
   TOOLS,
+  type ToolDefinition,
 } from "../src/tools";
 import type { V2Peek } from "../src/v2";
-import { type Client, harness, MCP_PROTOCOL_VERSION } from "./harness";
+import { ARTIFACT_AUDIENCE, type Client, harness, MCP_PROTOCOL_VERSION } from "./harness";
 
 const MODERN = "2026-07-28";
 const MODERN_META = { "io.modelcontextprotocol/protocolVersion": MODERN };
+
+const artifactToolSchemas = (tools: ToolDefinition[]): void => {
+  expect(tools.find((tool) => tool.name === "recall_publish")).toMatchObject({
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "content"],
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 100, pattern: "^[a-z0-9]+(-[a-z0-9]+)*$" },
+        content: { type: "string", minLength: 1, maxLength: 16_777_216, description: expect.stringContaining("UTF-8") },
+      },
+    },
+  });
+  expect(tools.find((tool) => tool.name === "recall_artifacts")).toMatchObject({
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        query: { type: "string", maxLength: 2_000, default: "" },
+        type: { enum: ["site", "document", "audio"] },
+        sort: { enum: ["newest", "name", "largest"], default: "newest" },
+        limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+        cursor: { type: "string", maxLength: 2_048, default: "" },
+      },
+    },
+  });
+};
 
 const signedIn = async () => {
   const h = await harness();
@@ -98,8 +128,10 @@ describe("the connector handshake", () => {
     expect(result.instructions).toContain("durable memory");
 
     const listed = await mcp.call("tools/list");
-    const tools = (listed.result as { tools: Array<{ name: string; inputSchema: unknown }> }).tools;
+    const tools = (listed.result as { tools: ToolDefinition[] }).tools;
+    artifactToolSchemas(tools);
     expect(tools.map((tool) => tool.name).sort()).toEqual([
+      "recall_artifacts",
       "recall_delete",
       "recall_devices",
       "recall_edit",
@@ -110,6 +142,7 @@ describe("the connector handshake", () => {
       "recall_inbox_wait",
       "recall_list",
       "recall_peek",
+      "recall_publish",
       "recall_save",
       "recall_search",
       "recall_send",
@@ -227,7 +260,9 @@ describe("the per-request protocol revision", () => {
     expect(result.supportedVersions).toEqual([MODERN, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]);
 
     const listed = await h.rpc(modern("tools/list"), headers(token, "tools/list"));
-    expect(((await listed.json()) as { result: { tools: unknown[] } }).result.tools).toHaveLength(TOOLS.length);
+    const tools = ((await listed.json()) as { result: { tools: ToolDefinition[] } }).result.tools;
+    expect(tools).toHaveLength(TOOLS.length);
+    artifactToolSchemas(tools);
   });
 
   it("refuses a header that does not match the body, and a version it does not serve", async () => {
@@ -675,6 +710,247 @@ describe("reusing a peek the session already holds", () => {
     expect(reusablePeek([pending(PEEK_FRESH_MS)], NOW)).toEqual(pending(PEEK_FRESH_MS));
     expect(reusablePeek([pending(PEEK_ATTACH_MS - 1)], NOW)).toEqual(pending(PEEK_ATTACH_MS - 1));
     expect(reusablePeek([pending(PEEK_ATTACH_MS)], NOW)).toBeNull();
+  });
+});
+
+describe("publishing from the connector", () => {
+  it("keeps a tiny publish's encoding buffer below the full cap", async () => {
+    const publish = vi.fn(async (_name: string, bytes: Uint8Array) => {
+      expect(bytes.buffer.byteLength).toBeLessThan(MAX_CONNECTOR_HTML_BYTES);
+      return Response.json({ artifact: { bytes: bytes.byteLength } });
+    });
+    const run = authenticatedTools(publish, vi.fn(), vi.fn());
+    expect(await run({ name: "recall_publish", arguments: { name: "tiny", content: "<p>x</p>" } })).toEqual({
+      ok: true,
+      text: JSON.stringify({ bytes: 8 }),
+    });
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it("publishes, lists and replaces verbatim HTML at one URL", async () => {
+    const { h, email, mcp } = await signedIn();
+    const content = "  <!doctype html><p>café 🌍</p>\n";
+    const first = (await mcp.json("recall_publish", { name: "my-page", content })) as ArtifactView;
+    expect(first).toMatchObject({
+      name: "my-page",
+      type: "site",
+      title: "my-page",
+      description: "",
+      read: "private",
+      write: "owner",
+      fileCount: 1,
+      bytes: new TextEncoder().encode(content).length,
+      shareCount: 0,
+      createdAt: h.now(),
+      updatedAt: h.now(),
+      lastWriter: email,
+    });
+    expect(Object.keys(first).sort()).toEqual(
+      [
+        "name",
+        "url",
+        "type",
+        "title",
+        "description",
+        "read",
+        "write",
+        "fileCount",
+        "bytes",
+        "createdAt",
+        "updatedAt",
+        "lastWriter",
+        "shareCount",
+      ].sort(),
+    );
+    const assertion = await h.assertionFor(email, ARTIFACT_AUDIENCE);
+    const served = await h.sendToArtifactHost(new URL(first.url).pathname, assertion);
+    expect(await served.text()).toBe(content);
+    expect(served.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(served.headers.get("content-security-policy")).toContain("sandbox allow-scripts allow-downloads");
+    expect(await mcp.json("recall_artifacts")).toEqual({ artifacts: [first], nextCursor: "", total: 1, cut: false });
+    h.advance(1000);
+    const second = (await mcp.json("recall_publish", { name: "my-page", content: "<p>updated</p>" })) as ArtifactView;
+    expect(second).toMatchObject({ url: first.url, createdAt: first.createdAt, updatedAt: h.now(), bytes: 14 });
+    expect(await (await h.sendToArtifactHost(new URL(first.url).pathname, assertion)).text()).toBe("<p>updated</p>");
+    expect((await mcp.json("recall_artifacts")).total).toBe(1);
+  });
+
+  it.each([
+    ["é", 2],
+    ["漢", 3],
+  ] as const)(
+    "enforces the inclusive UTF-8 byte cap with %s and preserves the live revision on rejection",
+    async (character, width) => {
+      const { h, email, mcp } = await signedIn();
+      const content = `${character.repeat(Math.floor(MAX_CONNECTOR_HTML_BYTES / width))}${"a".repeat(MAX_CONNECTOR_HTML_BYTES % width)}`;
+      const first = (await mcp.json("recall_publish", { name: "boundary", content })) as ArtifactView;
+      expect(first.bytes).toBe(MAX_CONNECTOR_HTML_BYTES);
+      for (const oversized of [
+        `${content}a`,
+        character.repeat(MAX_CONNECTOR_HTML_BYTES - 1),
+        "a".repeat(MAX_CONNECTOR_HTML_BYTES + 1),
+      ]) {
+        await expect(mcp.tool("recall_publish", { name: "boundary", content: oversized })).rejects.toThrow(
+          "16777216 UTF-8 bytes",
+        );
+      }
+      expect((await mcp.json("recall_artifacts")).artifacts).toEqual([first]);
+      const assertion = await h.assertionFor(email, ARTIFACT_AUDIENCE);
+      expect(await (await h.sendToArtifactHost("/a/boundary", assertion)).text()).toBe(content);
+    },
+    30_000,
+  );
+
+  it("rejects malformed inputs without creating artifacts", async () => {
+    const { h, email, mcp } = await signedIn();
+    const publishInputs: Record<string, unknown>[] = [
+      {},
+      { name: "x" },
+      { name: "Bad Name", content: "x" },
+      { name: "x", content: "" },
+      { name: "x", content: " \n\t" },
+      { name: "x", content: 7 },
+      { name: "x", content: "x", extra: true },
+      { name: "x", content: "x", constructor: "unexpected" },
+      { name: "a".repeat(101), content: "x" },
+    ];
+    const listInputs: Record<string, unknown>[] = [
+      { query: "x".repeat(2001) },
+      { query: 1 },
+      { type: "" },
+      { type: "video" },
+      { sort: "oldest" },
+      { limit: 0 },
+      { limit: 101 },
+      { limit: 1.5 },
+      { limit: "1" },
+      { cursor: "bad" },
+      { cursor: "x".repeat(2049) },
+      { cursor: 1 },
+      { extra: true },
+    ];
+    for (const [name, inputs] of [
+      ["recall_publish", publishInputs],
+      ["recall_artifacts", listInputs],
+    ] as const) {
+      for (const args of inputs) {
+        const answer = await mcp.call("tools/call", { name, arguments: args });
+        expect(answer.result).toMatchObject({
+          isError: true,
+          content: [{ type: "text", text: expect.stringContaining("recall:") }],
+        });
+      }
+      for (const args of [null, [], "wrong"]) {
+        expect((await mcp.call("tools/call", { name, arguments: args })).result).toMatchObject({ isError: true });
+      }
+    }
+    expect((await mcp.json("recall_artifacts")).artifacts).toEqual([]);
+    const userId = await h.userIdFor(email);
+    expect((await env.ARTIFACTS.list({ prefix: `${userId}/` })).objects).toEqual([]);
+  });
+
+  it("uses the existing search, filters, sorts and pagination", async () => {
+    const { h, email, mcp } = await signedIn();
+    for (const name of ["report-a", "report-b"]) await mcp.json("recall_publish", { name, content: name });
+    const client = h.clientWithToken(await h.login(email));
+    await client.publishArtifact("report-document", {
+      type: "document",
+      files: [{ path: "notes.md", body: "# notes" }],
+    });
+    const args = { type: "site", sort: "name", limit: 1 };
+    const first = await mcp.json("recall_artifacts", args);
+    expect(first).toMatchObject({ artifacts: [{ name: "report-a" }], total: 3, cut: false });
+    expect(first.nextCursor).not.toBe("");
+    const next = await mcp.json("recall_artifacts", { ...args, cursor: first.nextCursor });
+    expect(next).toMatchObject({ artifacts: [{ name: "report-b" }], nextCursor: "", total: 3 });
+    const http = await client.request("GET", "/v2/artifacts?q=report&type=site&sort=largest&limit=1");
+    expect(await mcp.json("recall_artifacts", { ...args, query: "report", sort: "largest" })).toEqual(
+      await http.json(),
+    );
+  });
+
+  it("isolates tenants and refuses replacing another owner's writable site", async () => {
+    const { h, email, mcp } = await signedIn();
+    const bob = await h.invite(`bob-${crypto.randomUUID()}@example.com`);
+    const other = await h.connector(bob);
+    const client = h.clientWithToken(await h.login(email));
+    await client.publishArtifact("shared-page", {
+      read: "account",
+      write: "account",
+      files: [{ path: "index.html", body: "original" }],
+    });
+    await expect(other.tool("recall_publish", { name: "shared-page", content: "changed" })).rejects.toThrow(
+      "only replaces your own sites",
+    );
+    await mcp.json("recall_publish", { name: "private-page", content: "alice" });
+    expect((await other.json("recall_artifacts")).artifacts).toEqual([]);
+    await other.json("recall_publish", { name: "private-page", content: "bob" });
+    expect((await mcp.json("recall_artifacts", { query: "private-page" })).artifacts[0].bytes).toBe(5);
+    expect((await other.json("recall_artifacts")).artifacts[0].bytes).toBe(3);
+  });
+
+  it("reports concurrent replacement conflicts and collects only the losing revision", async () => {
+    const { h, email, mcp } = await signedIn();
+    await mcp.json("recall_publish", { name: "race", content: "original" });
+    const userId = await h.userIdFor(email);
+    let release = (): void => {};
+    let reached = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const waiting = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const put = env.ARTIFACTS.put.bind(env.ARTIFACTS);
+    const held = vi.spyOn(env.ARTIFACTS, "put").mockImplementationOnce(async (...args: Parameters<typeof put>) => {
+      const stored = await put(...args);
+      reached();
+      await gate;
+      return stored;
+    });
+    const losing = mcp.call("tools/call", { name: "recall_publish", arguments: { name: "race", content: "loser" } });
+    try {
+      await waiting;
+      await mcp.json("recall_publish", { name: "race", content: "winner" });
+    } finally {
+      release();
+      held.mockRestore();
+    }
+    expect((await losing).result).toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("was written by another request") }],
+    });
+    const assertion = await h.assertionFor(email, ARTIFACT_AUDIENCE);
+    expect(await (await h.sendToArtifactHost("/a/race", assertion)).text()).toBe("winner");
+    expect((await env.ARTIFACTS.list({ prefix: artifactPrefix(userId, "race") })).objects).toHaveLength(1);
+  });
+
+  it("returns tool errors when artifacts are disabled", async () => {
+    const h = await harness({ artifacts: "off" });
+    const email = await h.invite(`off-${crypto.randomUUID()}@example.com`);
+    const mcp = await h.connector(email);
+    for (const [name, args] of [
+      ["recall_publish", { name: "x", content: "x" }],
+      ["recall_artifacts", {}],
+    ] as const) {
+      await expect(mcp.tool(name, args)).rejects.toThrow("publishes no artifacts");
+    }
+  });
+
+  it("returns the same publish, listing and error results in JSON and SSE", async () => {
+    const { h, mcp } = await signedIn();
+    for (const [name, args] of [
+      ["recall_publish", { name: "parity", content: "<p>parity</p>" }],
+      ["recall_artifacts", {}],
+      ["recall_publish", { name: "parity", content: " " }],
+    ] as const) {
+      const message = { id: 10, method: "tools/call", params: { name, arguments: args, _meta: MODERN_META } };
+      const headers = { ...mcp.headers, "mcp-protocol-version": MODERN, "mcp-method": "tools/call", "mcp-name": name };
+      const json = await h.rpc(message, headers);
+      const sse = await h.rpc(message, { ...headers, accept: "text/event-stream" });
+      expect(sse.headers.get("content-type")).toBe("text/event-stream");
+      expect(JSON.parse((await sse.text()).slice("event: message\ndata: ".length))).toEqual(await json.json());
+    }
   });
 });
 

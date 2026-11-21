@@ -37,8 +37,8 @@ import { sessionNameOf, type V2Device, type V2Peek, type V2Session } from "./v2"
 // where this end has no repo tag to read: both search every memory, but there a search ranks the
 // current repo's first and here it ranks by score alone, and a project or reference save is
 // refused here rather than tagged. A tool added to one side is therefore a known gap on the other
-// until it is added there too. The tools that take a path on disk are not here at all: this end
-// holds no working copy. The two listings are this end's own: a harness with a shell runs recall
+// until it is added there too. Publishing takes HTML content here instead of a disk path, since
+// this end holds no working copy. The two listings are this end's own: a harness with a shell runs recall
 // sessions and recall devices for them, and one without a shell had no way at all to learn what it
 // can send to.
 
@@ -190,6 +190,36 @@ const INBOX_TOOLS: ToolDefinition[] = [
 
 export const TOOLS: ToolDefinition[] = [
   ...INBOX_TOOLS,
+  {
+    name: "recall_publish",
+    description:
+      "Publish self-contained HTML as a private site with index.html. A new site uses its name as title. Republishing your own site replaces its HTML at the same URL, preserving title, description, permissions, shares and creation time. Refuses non-sites and other users' artifacts. Returns ArtifactView metadata, never the HTML.",
+    inputSchema: schema(
+      {
+        name: { type: "string", minLength: 1, maxLength: 100, pattern: "^[a-z0-9]+(-[a-z0-9]+)*$" },
+        content: {
+          type: "string",
+          minLength: 1,
+          maxLength: 16_777_216,
+          description:
+            "Self-contained HTML, nonblank, at most 16,777,216 UTF-8 encoded bytes (inclusive). Preserved verbatim.",
+        },
+      },
+      ["name", "content"],
+    ),
+  },
+  {
+    name: "recall_artifacts",
+    description:
+      "List your published artifacts. Returns {artifacts: ArtifactView[], nextCursor, total, cut}. Pass nextCursor for the next page; an empty cursor ends pagination.",
+    inputSchema: schema({
+      query: { type: "string", maxLength: 2_000, default: "" },
+      type: { type: "string", enum: ["site", "document", "audio"] },
+      sort: { type: "string", enum: ["newest", "name", "largest"], default: "newest" },
+      limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+      cursor: { type: "string", maxLength: 2_048, default: "" },
+    }),
+  },
   {
     name: "recall_search",
     description:
@@ -357,7 +387,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 export const toolArguments = (definition: ToolDefinition, params: unknown): Parsed<Record<string, unknown>> => {
   if (params === undefined) return { ok: true, value: {} };
   if (!isRecord(params)) return fail(`${definition.name} takes its arguments as a JSON object`);
-  const unknown = Object.keys(params).filter((field) => !(field in definition.inputSchema.properties));
+  const unknown = Object.keys(params).filter((field) => !Object.hasOwn(definition.inputSchema.properties, field));
   if (unknown.length > 0) return fail(`${definition.name} takes no argument ${unknown.join(", ")}`);
   for (const field of definition.inputSchema.required ?? []) {
     if (params[field] === undefined) return fail(`${definition.name} needs ${field}`);

@@ -30,6 +30,37 @@ const listed = async (
 };
 
 describe("publishing", () => {
+  it("preserves site metadata and live shares when the connector replaces its HTML", async () => {
+    const { h, email, alice } = await publisher();
+    const published = await alice.publishArtifact("preserved", {
+      title: "My title",
+      description: "My description",
+      read: "account",
+      write: "account",
+    });
+    const { artifact: before }: { artifact: ArtifactView } = await published.json();
+    const made = await alice.request("POST", "/v2/artifacts/preserved/shares", { mode: "link" });
+    expect(made.status).toBe(200);
+    const shares = await (await alice.request("GET", "/v2/artifacts/preserved/shares")).json();
+    h.advance(1000);
+    const mcp = await h.connector(email);
+    const after = (await mcp.json("recall_publish", { name: "preserved", content: "<p>new</p>" })) as ArtifactView;
+    expect(after).toMatchObject({ ...before, bytes: 10, shareCount: 1, updatedAt: h.now() });
+    expect(await (await alice.request("GET", "/v2/artifacts/preserved/shares")).json()).toEqual(shares);
+  });
+
+  it("refuses a connector replacement of a non-site without changing its revision", async () => {
+    const { h, email, alice } = await publisher();
+    await alice.publishArtifact("notes", { type: "document", files: [{ path: "notes.md", body: "# original" }] });
+    const before = await listed(alice);
+    const mcp = await h.connector(email);
+    await expect(mcp.tool("recall_publish", { name: "notes", content: "<p>new</p>" })).rejects.toThrow(
+      "only replaces sites",
+    );
+    expect(await listed(alice)).toEqual(before);
+    expect(await (await alice.request("GET", "/v2/artifacts/notes/files/notes.md")).text()).toBe("# original");
+  });
+
   it("serves the stored bytes raw on the artifact hostname", async () => {
     const { h, alice, assertion } = await publisher();
     expect((await alice.publish("burn-up", PAGE)).status).toBe(200);
