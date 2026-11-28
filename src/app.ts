@@ -539,6 +539,25 @@ const GRANT_ERRORS = {
 // the account can be mistaken for the sender of something it did not send.
 export const DASHBOARD_DEVICE = "dashboard";
 
+// The routes the Claude Code hooks call, which are the only ones a connector access token opens.
+// `*` is any one path segment.
+const ACCESS_TOKEN_ROUTES: ReadonlyArray<readonly [method: string, ...path: string[]]> = [
+  ["POST", "memories", "inject"],
+  ["PUT", "memories", "*"],
+  ["POST", "board", "pickup"],
+  ["POST", "sessions", "*", "usage"],
+  ["POST", "sessions", "*", "records"],
+  ["DELETE", "sessions", "*"],
+];
+
+const accessTokenRoute = (method: string, path: readonly string[]): boolean =>
+  ACCESS_TOKEN_ROUTES.some(
+    ([allowed, ...pattern]) =>
+      allowed === method &&
+      pattern.length === path.length &&
+      pattern.every((segment, index) => segment === "*" || segment === path[index]),
+  );
+
 // How many board messages one page of the listing holds, for the dashboard and `recall board`
 // alike. The window is a week, so a board a fleet actually works from fits in one or two.
 const BOARD_PAGE = 50;
@@ -3110,23 +3129,17 @@ export const createTenant = (deps: TenantDeps): TenantApi & AccountApi => {
 };
 
 export const createApp = (deps: Deps): App => {
-  const authenticate = async (request: Request, db: AccountDb): Promise<Caller | Response> => {
+  const authenticate = async (request: Request, db: AccountDb, path: readonly string[]): Promise<Caller | Response> => {
     const authorization = request.headers.get("authorization") ?? "";
     const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     if (!TOKEN_PATTERN.test(token)) {
-      return error(
-        401,
-        "missing or malformed Authorization: Bearer <token>; run recall login, or connect Recall on the Connectors page",
-      );
+      return error(401, "missing or malformed Authorization: Bearer <token>; run recall login");
     }
     const device = await deviceForToken(db, token, deps.now());
     if (device !== null) return device;
-    const userId = await userForAccessToken(db, token, deps.now());
+    const userId = accessTokenRoute(request.method, path) ? await userForAccessToken(db, token, deps.now()) : null;
     if (userId !== null) return connectorDevice(db, userId, deps.now());
-    return error(
-      401,
-      "this token is unknown, expired or revoked; run recall login, or connect Recall again on the Connectors page",
-    );
+    return error(401, "this token is unknown, expired or revoked; run recall login");
   };
 
   const grantError = (code: string, description: string): Response =>
@@ -3859,7 +3872,11 @@ export const createApp = (deps: Deps): App => {
       if (rawName === "token") return pollDevice(request, env.DB);
       return error(404, "not found");
     }
-    const caller = await authenticate(request, env.DB);
+    const caller = await authenticate(
+      request,
+      env.DB,
+      [collection, rawName, ...rest].filter((part) => part !== undefined),
+    );
     if (caller instanceof Response) return caller;
     // The bus is the Worker's: a listener holds a socket open against its own object for as long
     // as the host runs, and nothing it does reads a row of this account.
