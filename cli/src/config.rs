@@ -12,12 +12,16 @@ pub struct Config {
 
 /// What this host is signed in with, wherever it is read from. A login writes these and a process
 /// this one starts has them taken back out of its environment.
-pub const AUTH_KEYS: [&str; 4] = [
+pub const AUTH_KEYS: [&str; 5] = [
     "RECALL_ENDPOINT",
     "RECALL_TOKEN",
+    CONNECTOR_TOKEN_KEY,
     "RECALL_CLIENT_ID",
     "RECALL_CLIENT_SECRET",
 ];
+
+/// The Recall connector's OAuth access token, which cde hands each turn of a session.
+pub const CONNECTOR_TOKEN_KEY: &str = "CDE_CONNECTOR_RECALL";
 
 pub fn config_home() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -72,6 +76,10 @@ fn lookup(file: &HashMap<String, String>, key: &str) -> Option<String> {
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| file.get(key).filter(|value| !value.is_empty()).cloned())
+}
+
+fn token(file: &HashMap<String, String>) -> Option<String> {
+    lookup(file, "RECALL_TOKEN").or_else(|| lookup(file, CONNECTOR_TOKEN_KEY))
 }
 
 pub fn endpoint() -> Result<Option<String>> {
@@ -131,7 +139,7 @@ pub fn load() -> Result<Config> {
             path.display()
         );
     };
-    let Some(token) = lookup(&file, "RECALL_TOKEN") else {
+    let Some(token) = token(&file) else {
         bail!("this host is not signed in to recall; run recall login");
     };
     Ok(Config {
@@ -198,6 +206,26 @@ mod tests {
             keep_lines(text, &["RECALL_TOKEN"]),
             "# recall\nRECALL_ENDPOINT=https://old\nexport RECALL_CLIENT_ID=a\nRECALL_CLIENT_SECRET=b\nOTHER=1\n"
         );
+    }
+
+    #[test]
+    fn a_login_token_wins_over_the_connector_token() {
+        let signed_in = HashMap::from([("RECALL_TOKEN".to_string(), "from-file".to_string())]);
+        let signed_out = HashMap::new();
+        unsafe {
+            std::env::remove_var("RECALL_TOKEN");
+            std::env::set_var(CONNECTOR_TOKEN_KEY, "from-cde");
+        }
+        assert_eq!(token(&signed_in).as_deref(), Some("from-file"));
+        assert_eq!(token(&signed_out).as_deref(), Some("from-cde"));
+        unsafe { std::env::set_var("RECALL_TOKEN", "from-env") };
+        assert_eq!(token(&signed_out).as_deref(), Some("from-env"));
+        unsafe {
+            std::env::remove_var("RECALL_TOKEN");
+            std::env::set_var(CONNECTOR_TOKEN_KEY, "");
+        }
+        assert_eq!(token(&signed_out), None);
+        unsafe { std::env::remove_var(CONNECTOR_TOKEN_KEY) };
     }
 
     #[test]
