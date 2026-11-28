@@ -3114,10 +3114,19 @@ export const createApp = (deps: Deps): App => {
     const authorization = request.headers.get("authorization") ?? "";
     const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
     if (!TOKEN_PATTERN.test(token)) {
-      return error(401, "missing or malformed Authorization: Bearer <device token>; run recall login");
+      return error(
+        401,
+        "missing or malformed Authorization: Bearer <token>; run recall login, or connect Recall on the Connectors page",
+      );
     }
-    const caller = await deviceForToken(db, token, deps.now());
-    return caller ?? error(401, "this device token is unknown or revoked; run recall login");
+    const device = await deviceForToken(db, token, deps.now());
+    if (device !== null) return device;
+    const userId = await userForAccessToken(db, token, deps.now());
+    if (userId !== null) return connectorDevice(db, userId, deps.now());
+    return error(
+      401,
+      "this token is unknown, expired or revoked; run recall login, or connect Recall again on the Connectors page",
+    );
   };
 
   const grantError = (code: string, description: string): Response =>

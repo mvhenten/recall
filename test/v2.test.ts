@@ -63,6 +63,35 @@ describe("the /v2 surface", () => {
     expect((await clientWithToken(token.access_token).request("GET", "/v2/devices")).status).toBe(200);
   });
 
+  it("takes a connector access token while it lives and refuses it once expired", async () => {
+    const { connect, invite, clientWithToken, tick } = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const { accessToken } = await connect(await invite(`connector-${crypto.randomUUID()}@example.com`, userId));
+    const connector = clientWithToken(accessToken, userId);
+    await connector.save("deploy-notes", { body: "deploy pipeline uses blue green" });
+    const inject = (client: typeof connector) =>
+      client.request("POST", "/v2/memories/inject", {
+        query: "deploy pipeline",
+        preferScope: ["global"],
+        limit: 5,
+        minScore: 0.1,
+      });
+
+    const live = await inject(connector);
+    expect(live.status).toBe(200);
+    const found: { hits: Array<{ memoryName: string }> } = await live.json();
+    expect(found.hits.map((hit) => hit.memoryName)).toEqual(["deploy-notes"]);
+
+    const unknown = await inject(clientWithToken("u".repeat(43)));
+    expect(unknown.status).toBe(401);
+    expect(await unknown.text()).toMatch(/recall login.*Connectors page/);
+
+    tick(14_400_001);
+    const expired = await inject(connector);
+    expect(expired.status).toBe(401);
+    expect(await expired.text()).toMatch(/recall login.*Connectors page/);
+  });
+
   it("names a session's mode and dates it with an offset", async () => {
     const { user } = await harness();
     const client = await user("shapes");

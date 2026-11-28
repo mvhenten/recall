@@ -32,7 +32,7 @@ Without a release for your platform, build from source with `cargo install --git
 recall login --endpoint https://recall.example.com
 ```
 
-The CLI prints a URL and a code and opens a browser when it can. Open the URL, sign in with the one-time PIN Cloudflare Access mails you, check the code and approve. The CLI then writes `RECALL_ENDPOINT` and `RECALL_TOKEN` to `~/.config/recall/env` (mode 600; `RECALL_ENV_FILE` points elsewhere). Both can also come from the environment.
+The CLI prints a URL and a code and opens a browser when it can. Open the URL, sign in with the one-time PIN Cloudflare Access mails you, check the code and approve. The CLI then writes `RECALL_ENDPOINT` and `RECALL_TOKEN` to `~/.config/recall/env` (mode 600; `RECALL_ENV_FILE` points elsewhere). Both can also come from the environment. When `RECALL_TOKEN` is unset, the CLI uses the Recall connector access token in `CDE_CONNECTOR_RECALL`, which a cde session sets.
 
 ```bash
 recall devices                  # every device signed in as you

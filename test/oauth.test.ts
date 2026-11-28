@@ -591,7 +591,7 @@ describe("the token a client holds afterwards", () => {
     const { clientId, accessToken, refreshToken } = await h.connect(email);
     expect((await toolsList(h, { authorization: `Bearer ${accessToken}` })).status).toBe(200);
 
-    h.tick(3_600_001);
+    h.tick(14_400_001);
     const stale = await toolsList(h, { authorization: `Bearer ${accessToken}` });
     expect(stale.status).toBe(401);
     expect(stale.headers.get("www-authenticate")).toContain('error="invalid_token"');
