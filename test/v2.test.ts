@@ -117,9 +117,20 @@ describe("the /v2 surface", () => {
     const revoke = `/v2/devices/${desktop?.deviceId}`;
 
     const refused = await connector.request("DELETE", revoke);
-    expect(refused.status).toBe(401);
-    expect(await refused.text()).toMatch(/unknown, expired or revoked; run recall login"/);
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).toMatch(/connector access token does not open DELETE \/v2\/devices\//);
     expect((await laptop.request("DELETE", revoke)).status).toBe(204);
+  });
+
+  it("lets a connector access token sync and end a session", async () => {
+    const { connect, invite, clientWithToken } = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const { accessToken } = await connect(await invite(`session-${crypto.randomUUID()}@example.com`, userId));
+    const connector = clientWithToken(accessToken, userId);
+    const session = crypto.randomUUID();
+
+    expect((await connector.v2.sync(session)).status).toBe(204);
+    expect((await connector.request("DELETE", `/v2/sessions/${session}`)).status).toBe(204);
   });
 
   it("names a session's mode and dates it with an offset", async () => {

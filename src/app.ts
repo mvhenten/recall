@@ -544,7 +544,7 @@ export const DASHBOARD_DEVICE = "dashboard";
 const ACCESS_TOKEN_ROUTES: ReadonlyArray<readonly [method: string, ...path: string[]]> = [
   ["POST", "memories", "inject"],
   ["PUT", "memories", "*"],
-  ["POST", "board", "pickup"],
+  ["PUT", "sessions", "*"],
   ["POST", "sessions", "*", "usage"],
   ["POST", "sessions", "*", "records"],
   ["DELETE", "sessions", "*"],
@@ -3137,9 +3137,15 @@ export const createApp = (deps: Deps): App => {
     }
     const device = await deviceForToken(db, token, deps.now());
     if (device !== null) return device;
-    const userId = accessTokenRoute(request.method, path) ? await userForAccessToken(db, token, deps.now()) : null;
-    if (userId !== null) return connectorDevice(db, userId, deps.now());
-    return error(401, "this token is unknown, expired or revoked; run recall login");
+    const userId = await userForAccessToken(db, token, deps.now());
+    if (userId === null) return error(401, "this token is unknown, expired or revoked; run recall login");
+    if (!accessTokenRoute(request.method, path)) {
+      return error(
+        403,
+        `a Recall connector access token does not open ${request.method} /v2/${path.join("/")}; use a device token from recall login`,
+      );
+    }
+    return connectorDevice(db, userId, deps.now());
   };
 
   const grantError = (code: string, description: string): Response =>
