@@ -79,7 +79,11 @@ fn lookup(file: &HashMap<String, String>, key: &str) -> Option<String> {
 }
 
 fn token(file: &HashMap<String, String>) -> Option<String> {
-    let connector = || std::env::var(CONNECTOR_TOKEN_KEY).ok().filter(|value| !value.is_empty());
+    let connector = || {
+        std::env::var(CONNECTOR_TOKEN_KEY)
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
     lookup(file, "RECALL_TOKEN").or_else(connector)
 }
 
