@@ -495,7 +495,7 @@ Switching it on is one flag — `--mcp-connector` for `npm run setup`, `RECALL_M
 
 ## API
 
-The routes under `/v2` need `Authorization: Bearer <device token>`, apart from the two device-grant routes that mint one. A Recall connector OAuth access token opens only the routes the Claude Code hooks call: `POST /v2/memories/inject`, `PUT /v2/memories/:name`, `PUT /v2/sessions/:id`, `POST /v2/sessions/:id/usage`, `POST /v2/sessions/:id/records` and `DELETE /v2/sessions/:id`. Every other route answers it 403. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
+The routes under `/v2` need `Authorization: Bearer <device token>`, apart from the two device-grant routes that mint one. A Recall connector OAuth access token opens every route a device token opens. The Worker resolves the user from the token; a client never names a user. D1 stores only the SHA-256 hash of each token.
 
 | Method   | Path                                             |                                                                                                                                                                                                                                                                                                             |
 | -------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

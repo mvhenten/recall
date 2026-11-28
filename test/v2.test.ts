@@ -92,34 +92,21 @@ describe("the /v2 surface", () => {
     expect(await expired.text()).toMatch(/unknown, expired or revoked; run recall login"/);
   });
 
-  it("opens only the hook routes to a connector access token and every route to a device token", async () => {
+  it("opens every route to a connector access token, as to a device token", async () => {
     const { connect, invite, login, clientWithToken } = await harness();
     const userId = `user-${crypto.randomUUID()}`;
-    const email = await invite(`hooks-${crypto.randomUUID()}@example.com`, userId);
+    const email = await invite(`routes-${crypto.randomUUID()}@example.com`, userId);
     const laptop = clientWithToken(await login(email, "laptop"), userId);
     await login(email, "desktop");
     const connector = clientWithToken((await connect(email)).accessToken, userId);
-    const inject = (client: typeof laptop) =>
-      client.request("POST", "/v2/memories/inject", {
-        query: "deploy",
-        preferScope: ["global"],
-        limit: 5,
-        minScore: 0.1,
-      });
 
-    expect((await inject(connector)).status).toBe(200);
-    expect((await inject(laptop)).status).toBe(200);
+    const listed = await connector.request("GET", "/v2/devices");
+    expect(listed.status).toBe(200);
+    const { devices }: { devices: Array<{ deviceId: string; name: string }> } = await listed.json();
+    const desktop = devices.find((device) => device.name === "desktop");
 
-    const listed: { devices: Array<{ deviceId: string; name: string }> } = await (
-      await laptop.request("GET", "/v2/devices")
-    ).json();
-    const desktop = listed.devices.find((device) => device.name === "desktop");
-    const revoke = `/v2/devices/${desktop?.deviceId}`;
-
-    const refused = await connector.request("DELETE", revoke);
-    expect(refused.status).toBe(403);
-    expect(await refused.text()).toMatch(/connector access token does not open DELETE \/v2\/devices\//);
-    expect((await laptop.request("DELETE", revoke)).status).toBe(204);
+    expect((await connector.request("DELETE", `/v2/devices/${desktop?.deviceId}`)).status).toBe(204);
+    expect((await laptop.request("GET", "/v2/devices")).status).toBe(200);
   });
 
   it("lets a connector access token sync and end a session", async () => {
