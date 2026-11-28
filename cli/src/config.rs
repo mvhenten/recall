@@ -79,7 +79,12 @@ fn lookup(file: &HashMap<String, String>, key: &str) -> Option<String> {
 }
 
 fn token(file: &HashMap<String, String>) -> Option<String> {
-    lookup(file, "RECALL_TOKEN").or_else(|| lookup(file, CONNECTOR_TOKEN_KEY))
+    let connector = || {
+        std::env::var(CONNECTOR_TOKEN_KEY)
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    lookup(file, "RECALL_TOKEN").or_else(connector)
 }
 
 pub fn endpoint() -> Result<Option<String>> {
@@ -212,6 +217,7 @@ mod tests {
     fn a_login_token_wins_over_the_connector_token() {
         let signed_in = HashMap::from([("RECALL_TOKEN".to_string(), "from-file".to_string())]);
         let signed_out = HashMap::new();
+        let file_only = HashMap::from([(CONNECTOR_TOKEN_KEY.to_string(), "from-file".to_string())]);
         unsafe {
             std::env::remove_var("RECALL_TOKEN");
             std::env::set_var(CONNECTOR_TOKEN_KEY, "from-cde");
@@ -226,6 +232,7 @@ mod tests {
         }
         assert_eq!(token(&signed_out), None);
         unsafe { std::env::remove_var(CONNECTOR_TOKEN_KEY) };
+        assert_eq!(token(&file_only), None);
     }
 
     #[test]

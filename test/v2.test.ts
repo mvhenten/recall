@@ -84,12 +84,53 @@ describe("the /v2 surface", () => {
 
     const unknown = await inject(clientWithToken("u".repeat(43)));
     expect(unknown.status).toBe(401);
-    expect(await unknown.text()).toMatch(/recall login.*Connectors page/);
+    expect(await unknown.text()).toMatch(/unknown, expired or revoked; run recall login"/);
 
     tick(14_400_001);
     const expired = await inject(connector);
     expect(expired.status).toBe(401);
-    expect(await expired.text()).toMatch(/recall login.*Connectors page/);
+    expect(await expired.text()).toMatch(/unknown, expired or revoked; run recall login"/);
+  });
+
+  it("opens only the hook routes to a connector access token and every route to a device token", async () => {
+    const { connect, invite, login, clientWithToken } = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const email = await invite(`hooks-${crypto.randomUUID()}@example.com`, userId);
+    const laptop = clientWithToken(await login(email, "laptop"), userId);
+    await login(email, "desktop");
+    const connector = clientWithToken((await connect(email)).accessToken, userId);
+    const inject = (client: typeof laptop) =>
+      client.request("POST", "/v2/memories/inject", {
+        query: "deploy",
+        preferScope: ["global"],
+        limit: 5,
+        minScore: 0.1,
+      });
+
+    expect((await inject(connector)).status).toBe(200);
+    expect((await inject(laptop)).status).toBe(200);
+
+    const listed: { devices: Array<{ deviceId: string; name: string }> } = await (
+      await laptop.request("GET", "/v2/devices")
+    ).json();
+    const desktop = listed.devices.find((device) => device.name === "desktop");
+    const revoke = `/v2/devices/${desktop?.deviceId}`;
+
+    const refused = await connector.request("DELETE", revoke);
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).toMatch(/connector access token does not open DELETE \/v2\/devices\//);
+    expect((await laptop.request("DELETE", revoke)).status).toBe(204);
+  });
+
+  it("lets a connector access token sync and end a session", async () => {
+    const { connect, invite, clientWithToken } = await harness();
+    const userId = `user-${crypto.randomUUID()}`;
+    const { accessToken } = await connect(await invite(`session-${crypto.randomUUID()}@example.com`, userId));
+    const connector = clientWithToken(accessToken, userId);
+    const session = crypto.randomUUID();
+
+    expect((await connector.v2.sync(session)).status).toBe(204);
+    expect((await connector.request("DELETE", `/v2/sessions/${session}`)).status).toBe(204);
   });
 
   it("names a session's mode and dates it with an offset", async () => {
