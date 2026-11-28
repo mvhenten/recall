@@ -105,7 +105,7 @@ export const oauthCodes = sqliteTable("oauth_codes", {
 });
 
 // The tokens the connector issued, as digests. They are opaque rather than signed, so `/mcp` reads
-// one by looking it up and a revoke is a delete; `kind` separates the hour-long access token from
+// one by looking it up and a revoke is a delete; `kind` separates the four-hour access token from
 // the month-long refresh token it is rotated with. A row names the account and the client and no
 // audience: one deployment serves one connector endpoint, so there is no second resource a token
 // of this table could have been minted for.

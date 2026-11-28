@@ -264,7 +264,7 @@ describe("the authorize, consent, code and token chain", () => {
     expect(answered.status).toBe(200);
     const tokens = await body<Tokens>(answered);
     expect(tokens.token_type).toBe("Bearer");
-    expect(tokens.expires_in).toBe(3600);
+    expect(tokens.expires_in).toBe(14400);
     expect(tokens.scope).toBe("recall");
 
     const listed = await toolsList(h, { authorization: `Bearer ${tokens.access_token}` });

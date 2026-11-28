@@ -46,7 +46,7 @@ export const CONNECTOR_ORIGINS = ["https://claude.ai", "https://chatgpt.com", "h
 
 const REQUEST_TTL_MS = 600_000;
 const CODE_TTL_MS = 120_000;
-const ACCESS_TTL_MS = 3_600_000;
+const ACCESS_TTL_MS = 14_400_000;
 const REFRESH_TTL_MS = 2_592_000_000;
 // How long a registration that never reached a sign-in is kept. It outlasts the authorize request
 // it was made for, which lives ten minutes, so a sweep never takes a client out from under a
